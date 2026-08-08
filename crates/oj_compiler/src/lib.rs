@@ -161,7 +161,7 @@ pub fn compile_module(
             ("import.meta.env".into(), obj),
         ];
         if let Ok(config) = ReplaceGlobalDefinesConfig::new(&defines) {
-            ReplaceGlobalDefines::new(&allocator, config).build(scoping, &mut program);
+            let _ = ReplaceGlobalDefines::new(&allocator, config).build(scoping, &mut program);
         }
     }
 

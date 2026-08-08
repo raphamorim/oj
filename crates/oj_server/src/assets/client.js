@@ -11,10 +11,19 @@ const hotModules = new Map(); // id -> { acceptCallbacks: [], disposeCallbacks: 
 
 export function createHotContext(ownerId) {
   const id = ownerId.split("?")[0];
-  const existing = hotModules.get(id);
-  const data = existing ? existing.data : {};
-  const mod = { acceptCallbacks: [], disposeCallbacks: [], data };
-  hotModules.set(id, mod);
+  // Reuse the existing entry and clear its callbacks IN PLACE (stable object
+  // reference), rather than replacing it with a fresh object. A replaced
+  // object detaches any in-flight snapshot and, combined with deferred
+  // registration, drops a fast second edit. Mirrors Vite's HMRContext.
+  let mod = hotModules.get(id);
+  if (mod) {
+    mod.acceptCallbacks = [];
+    mod.disposeCallbacks = [];
+  } else {
+    mod = { acceptCallbacks: [], disposeCallbacks: [], data: {} };
+    hotModules.set(id, mod);
+  }
+  const data = mod.data;
   return {
     data,
     accept(callback) {
@@ -45,6 +54,15 @@ export function updateStyle(id, css) {
     styleTags.set(id, tag);
   }
   tag.textContent = css;
+}
+
+// Serialize updates: each applyUpdate fully completes (re-import + accept
+// callbacks) before the next starts, so a second update can never read a
+// module's hot context while the first update is mid-re-import.
+let updateChain = Promise.resolve();
+function queueUpdate(update) {
+  updateChain = updateChain.then(() => applyUpdate(update)).catch(() => {});
+  return updateChain;
 }
 
 async function applyUpdate(update) {
@@ -127,7 +145,7 @@ let socket = null;
       return;
     }
     if (msg.type === "update") {
-      (msg.updates || []).forEach(applyUpdate);
+      (msg.updates || []).forEach(queueUpdate);
     } else if (msg.type === "css-update") {
       swapCss(msg);
     } else if (msg.type === "full-reload") {

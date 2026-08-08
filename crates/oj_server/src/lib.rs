@@ -71,6 +71,10 @@ struct ServerState {
     /// packages etc). /@fs/ requests are served ONLY from this set, so the
     /// scheme cannot be used for directory traversal.
     fs_allow: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+    /// Monotonic patch counter; the client detects a gap in the sequence
+    /// (a dropped WS frame after a backgrounded tab / reconnect) and reloads
+    /// rather than applying patches onto a diverged module graph.
+    patch_seq: std::sync::atomic::AtomicU64,
     /// Assembled bundle-mode chunk: (etag, bytes), memoized until the
     /// watcher sees a change (FBM's staleness model: fresh reloads do zero
     /// assembly work and mostly answer 304).
@@ -115,6 +119,7 @@ impl DevServer {
             tailwind: tokio::sync::OnceCell::new(),
             tailwind_urls: Mutex::new(std::collections::HashSet::new()),
             fs_allow: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            patch_seq: std::sync::atomic::AtomicU64::new(0),
             chunk_cache: Mutex::new(None),
             cache_writes: write_tx,
             preload_snapshot: load_graph_snapshot(&root),
@@ -649,13 +654,15 @@ if (import.meta.hot) {{
     throw new Error("oj: Fast Refresh preamble missing — was index.html served by oj?");
   }}
   const currentExports = __oj_currentExports;
-  queueMicrotask(() => {{
-    RefreshRuntime.registerExportsForReactRefresh({url:?}, currentExports);
-    import.meta.hot.accept((nextExports) => {{
-      if (!nextExports) return;
-      const invalidateMessage = RefreshRuntime.validateRefreshBoundaryAndEnqueueUpdate({url:?}, currentExports, nextExports);
-      if (invalidateMessage) import.meta.hot.invalidate(invalidateMessage);
-    }});
+  // Register synchronously during module evaluation (NOT in a microtask):
+  // a fast second edit must find the accept callback the instant the first
+  // edit's dynamic import resolves, or it snapshots an empty list and is
+  // silently dropped. This mirrors Vite's shared/hmr.ts.
+  RefreshRuntime.registerExportsForReactRefresh({url:?}, currentExports);
+  import.meta.hot.accept((nextExports) => {{
+    if (!nextExports) return;
+    const invalidateMessage = RefreshRuntime.validateRefreshBoundaryAndEnqueueUpdate({url:?}, currentExports, nextExports);
+    if (invalidateMessage) import.meta.hot.invalidate(invalidateMessage);
   }});
 }}
 function $RefreshReg$(type, id) {{ return RefreshRuntime.register(type, {url:?} + " " + id); }}
@@ -1164,19 +1171,38 @@ fn spawn_watcher(state: Arc<ServerState>) {
             return;
         }
 
-        let mut last_sent = Instant::now() - Duration::from_secs(1);
-        for event in rx.into_iter().flatten() {
-            // Editor atomic saves fire several events per keystroke; debounce.
-            if last_sent.elapsed() < Duration::from_millis(80) {
-                continue;
+        // Trailing/coalescing debounce. Editor and OS writes fire several
+        // events per save; we collect a burst and process it once after a
+        // short quiet gap. Crucially this NEVER drops an event: a leading
+        // "skip if within Nms of the last send" debounce silently loses a
+        // second edit whose event lands in the shadow of a trailing event
+        // from the first — the bug that made consecutive edits fail.
+        use std::sync::mpsc::RecvTimeoutError;
+        loop {
+            // Block for the first event of a burst.
+            let first = match rx.recv() {
+                Ok(Ok(ev)) => ev,
+                Ok(Err(_)) => continue,
+                Err(_) => break, // channel closed
+            };
+            let mut paths: std::collections::HashSet<PathBuf> =
+                first.paths.into_iter().collect();
+            // Drain the rest of the burst until things go quiet.
+            loop {
+                match rx.recv_timeout(Duration::from_millis(30)) {
+                    Ok(Ok(ev)) => paths.extend(ev.paths),
+                    Ok(Err(_)) => {}
+                    Err(RecvTimeoutError::Timeout) => break,
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
             }
-            let messages = decide(&state, &event.paths);
+            let paths: Vec<PathBuf> = paths.into_iter().collect();
+            let messages = decide(&state, &paths);
             if messages.is_empty() {
                 continue;
             }
             // Anything changed: the assembled chunk is stale.
             *state.chunk_cache.lock().unwrap() = None;
-            last_sent = Instant::now();
             for message in messages {
                 let _ = state.reload_tx.send(message);
             }
@@ -1257,6 +1283,10 @@ fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
                     let to_urls = |v: &[PathBuf]| -> Vec<String> {
                         v.iter().map(|p| p.display().to_string()).collect()
                     };
+                    let seq = state
+                        .patch_seq
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
                     messages.push(
                         serde_json::json!({
                             "type": "patch",
@@ -1264,6 +1294,7 @@ fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
                             "dirty": to_urls(&plan.dirty),
                             "boundaries": to_urls(&plan.boundaries),
                             "timestamp": now_millis() as u64,
+                            "seq": seq,
                         })
                         .to_string(),
                     );

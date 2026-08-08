@@ -136,7 +136,19 @@ function makeHot(url) {
   };
 }
 
+let lastPatchSeq = 0;
+
 async function applyPatch(msg) {
+  // Sequence-gap detection: a dropped patch (backgrounded tab, WS reconnect)
+  // would leave the module graph diverged, so reload instead of applying.
+  if (typeof msg.seq === "number") {
+    if (lastPatchSeq !== 0 && msg.seq !== lastPatchSeq + 1) {
+      console.warn(`[oj] patch gap (${lastPatchSeq} -> ${msg.seq}), reloading`);
+      location.reload();
+      return;
+    }
+    lastPatchSeq = msg.seq;
+  }
   const prevExports = new Map();
   for (const boundary of msg.boundaries) {
     const record = instances.get(boundary);
