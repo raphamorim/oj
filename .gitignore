@@ -6,3 +6,5 @@ node_modules/
 .oj-cache/
 bench/apps/
 dist*/
+bench/oj-benchmarks.png
+bench/card.html
