@@ -56,3 +56,5 @@ jobs:
           test -f playground/dist/index.html
           ls playground/dist/assets/*.js
           grep -q underline playground/dist/tailwind.css
+          test -f playground/dist/.vite/manifest.json
+          grep -q isEntry playground/dist/.vite/manifest.json

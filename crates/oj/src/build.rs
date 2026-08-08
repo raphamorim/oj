@@ -142,6 +142,7 @@ pub async fn build(root: PathBuf, out: PathBuf) -> anyhow::Result<()> {
     // Map each entry url to its hashed chunk filename for HTML rewriting.
     let mut rewritten_html = html.clone();
     let mut emitted: Vec<(String, usize)> = Vec::new();
+    let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
     for asset in &output.assets {
         if let rolldown_common::Output::Chunk(chunk) = asset {
             emitted.push((chunk.filename.to_string(), chunk.code.len()));
@@ -149,6 +150,19 @@ pub async fn build(root: PathBuf, out: PathBuf) -> anyhow::Result<()> {
                 continue;
             }
             let Some(facade) = &chunk.facade_module_id else { continue };
+            // Root-relative source path is the Vite manifest key.
+            let src = Path::new(facade.as_ref())
+                .strip_prefix(&root)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| chunk.name.to_string());
+            manifest_entries.push(ManifestEntry {
+                name: chunk.name.to_string(),
+                file: chunk.filename.to_string(),
+                src: src.clone(),
+                is_entry: true,
+                imports: chunk.imports.iter().map(|i| i.to_string()).collect(),
+                css: Vec::new(),
+            });
             for entry in &entries {
                 let entry_abs = root.join(entry.trim_start_matches('/'));
                 if Path::new(facade.as_ref()) == entry_abs.as_path() {
@@ -213,7 +227,19 @@ pub async fn build(root: PathBuf, out: PathBuf) -> anyhow::Result<()> {
             Some(idx) => format!("{}{}\n{}", &rewritten_html[..idx], link, &rewritten_html[idx..]),
             None => format!("{link}\n{rewritten_html}"),
         };
+        // The app's css belongs to every entry (no per-entry css splitting yet).
+        for entry in &mut manifest_entries {
+            entry.css.push(css_name.clone());
+        }
     }
+
+    // Vite-compatible manifest for backend integrations (Laravel/Rails/etc.),
+    // at the location their plugins expect: dist/.vite/manifest.json.
+    fs::create_dir_all(out_dir.join(".vite"))?;
+    fs::write(
+        out_dir.join(".vite").join("manifest.json"),
+        serde_json::to_string_pretty(&build_manifest(&manifest_entries))?,
+    )?;
 
     fs::write(out_dir.join("index.html"), rewritten_html)?;
 
@@ -268,4 +294,87 @@ fn scan_attrs(html: &str, tag_prefix: &str, attr_prefix: &str) -> Vec<String> {
         }
     }
     values
+}
+
+/// One entry in the Vite-compatible build manifest.
+struct ManifestEntry {
+    name: String,
+    file: String,
+    src: String,
+    is_entry: bool,
+    imports: Vec<String>,
+    css: Vec<String>,
+}
+
+/// Build a Vite-compatible `manifest.json` value: keyed by root-relative
+/// source path, each row carrying the emitted file plus name/isEntry/imports/
+/// css. This is the exact shape Laravel/Rails/Django Vite plugins consume.
+fn build_manifest(entries: &[ManifestEntry]) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for e in entries {
+        let mut row = serde_json::Map::new();
+        row.insert("file".into(), e.file.clone().into());
+        row.insert("name".into(), e.name.clone().into());
+        row.insert("src".into(), e.src.clone().into());
+        if e.is_entry {
+            row.insert("isEntry".into(), true.into());
+        }
+        if !e.imports.is_empty() {
+            row.insert("imports".into(), e.imports.clone().into());
+        }
+        if !e.css.is_empty() {
+            row.insert("css".into(), e.css.clone().into());
+        }
+        map.insert(e.src.clone(), serde_json::Value::Object(row));
+    }
+    serde_json::Value::Object(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_matches_vite_shape() {
+        let m = build_manifest(&[ManifestEntry {
+            name: "main".into(),
+            file: "assets/main-abc123.js".into(),
+            src: "src/main.tsx".into(),
+            is_entry: true,
+            imports: vec!["assets/vendor-def456.js".into()],
+            css: vec!["assets/style-99.css".into()],
+        }]);
+        let row = &m["src/main.tsx"];
+        assert_eq!(row["file"], "assets/main-abc123.js");
+        assert_eq!(row["name"], "main");
+        assert_eq!(row["src"], "src/main.tsx");
+        assert_eq!(row["isEntry"], true);
+        assert_eq!(row["imports"][0], "assets/vendor-def456.js");
+        assert_eq!(row["css"][0], "assets/style-99.css");
+    }
+
+    #[test]
+    fn non_entry_omits_isentry_and_empty_fields() {
+        let m = build_manifest(&[ManifestEntry {
+            name: "chunk".into(),
+            file: "assets/chunk-1.js".into(),
+            src: "chunk".into(),
+            is_entry: false,
+            imports: vec![],
+            css: vec![],
+        }]);
+        let row = m["chunk"].as_object().unwrap();
+        assert!(!row.contains_key("isEntry"));
+        assert!(!row.contains_key("imports"));
+        assert!(!row.contains_key("css"));
+    }
+
+    #[test]
+    fn module_script_srcs_only_module_type_absolute() {
+        let html = r#"<script type="module" src="/src/main.tsx"></script>
+                      <script src="/legacy.js"></script>
+                      <script type="module" src="https://cdn/x.js"></script>"#;
+        let srcs = module_script_srcs(html);
+        assert_eq!(srcs, vec!["/src/main.tsx"]);
+    }
 }
