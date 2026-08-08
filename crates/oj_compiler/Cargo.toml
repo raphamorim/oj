@@ -3,7 +3,7 @@ name = "oj_compiler"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Fused per-file pipeline: parse -> TS strip -> JSX -> Fast Refresh instrumentation -> codegen + sourcemap, single oxc pass-set"
+description = "Fused per-file pipeline"
 
 [dependencies]
 oxc_allocator.workspace = true
