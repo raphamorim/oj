@@ -174,7 +174,7 @@ pub async fn build(root: PathBuf, out: PathBuf) -> anyhow::Result<()> {
             if source.contains("@import \"tailwindcss\"") || source.contains("@tailwind ") {
                 // One-shot sidecar run with the app's own tailwind install.
                 let script = out_dir.join(".tailwind-sidecar.mjs");
-                fs::write(&script, include_str!("../../oj_server/src/assets/tailwind-sidecar.mjs"))?;
+                fs::write(&script, oj_server::sidecar::SIDECAR_JS)?;
                 let out = std::process::Command::new("node")
                     .args([script.to_str().unwrap(), "--once", src.to_str().unwrap(), root.to_str().unwrap()])
                     .output()

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
 
-const SIDECAR_JS: &str = include_str!("assets/tailwind-sidecar.mjs");
+pub const SIDECAR_JS: &str = include_str!("assets/tailwind-sidecar.mjs");
 
 pub fn is_tailwind_css(source: &str) -> bool {
     source.contains("@import \"tailwindcss\"")
