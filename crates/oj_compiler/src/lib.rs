@@ -23,6 +23,7 @@ use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
 use oxc_transformer::{JsxRuntime, ReactRefreshOptions, TransformOptions, Transformer};
+use oxc_transformer_plugins::{ReplaceGlobalDefines, ReplaceGlobalDefinesConfig};
 
 /// Maps an import specifier to a replacement (e.g. `./App` -> `/src/App.tsx`).
 /// Returning `None` leaves the specifier untouched.
@@ -140,6 +141,28 @@ pub fn compile_module(
             .collect::<Vec<_>>()
             .join("\n");
         return Err(CompileError::Transform { path: path.to_path_buf(), message });
+    }
+
+    // Vite-compatible import.meta.env static replacement. Gated on a cheap
+    // substring test so the common module pays nothing.
+    if source_text.contains("import.meta.env") {
+        let scoping = SemanticBuilder::new().build(&program).semantic.into_scoping();
+        let mode = if opts.dev { "development" } else { "production" };
+        let obj = format!(
+            "({{\"BASE_URL\":\"/\",\"MODE\":\"{mode}\",\"DEV\":{dev},\"PROD\":{prod},\"SSR\":false}})",
+            dev = opts.dev, prod = !opts.dev,
+        );
+        let defines: Vec<(String, String)> = vec![
+            ("import.meta.env.BASE_URL".into(), "\"/\"".into()),
+            ("import.meta.env.MODE".into(), format!("\"{mode}\"")),
+            ("import.meta.env.DEV".into(), opts.dev.to_string()),
+            ("import.meta.env.PROD".into(), (!opts.dev).to_string()),
+            ("import.meta.env.SSR".into(), "false".into()),
+            ("import.meta.env".into(), obj),
+        ];
+        if let Ok(config) = ReplaceGlobalDefinesConfig::new(&defines) {
+            ReplaceGlobalDefines::new(&allocator, config).build(scoping, &mut program);
+        }
     }
 
     let imports = rewrite_module_specifiers(&allocator, &mut program, &mut rewriter);
