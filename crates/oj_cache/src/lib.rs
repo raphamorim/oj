@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bump whenever the wrapper/glue/output shape changes so old caches
 /// can never poison a new binary.
-pub const CACHE_FORMAT: u32 = 4;
+pub const CACHE_FORMAT: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CachedModule {
@@ -37,6 +37,11 @@ pub struct CachedModule {
     /// CSS modules only: exported class name -> scoped name.
     #[serde(default)]
     pub css_exports: Vec<(String, String)>,
+    /// Absolute out-of-root paths this module's rewritten /@fs/ urls point
+    /// at; re-added to the server allow-set on every serve (cache hits too),
+    /// so a cached module's /@fs/ imports stay servable across restarts.
+    #[serde(default)]
+    pub fs_allow: Vec<String>,
 }
 
 pub struct PersistentCache {
@@ -114,6 +119,7 @@ mod tests {
             kind: "esm".into(),
             require_map: vec![("react".into(), "/node_modules/react/index.js".into())],
             css_exports: Vec::new(),
+            fs_allow: Vec::new(),
         }
     }
 
