@@ -16,8 +16,13 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
-# oxc pinned as one set — these crates move together and churn monthly.
-# When bumping, bump all of them and re-run the compiler snapshot tests.
+oj_compiler = { version = "0.0.1", path = "crates/oj_compiler" }
+oj_resolver = { version = "0.0.1", path = "crates/oj_resolver" }
+oj_graph = { version = "0.0.1", path = "crates/oj_graph" }
+oj_cache = { version = "0.0.1", path = "crates/oj_cache" }
+oj_css = { version = "0.0.1", path = "crates/oj_css" }
+oj_server = { version = "0.0.1", path = "crates/oj_server" }
+
 oxc_allocator = "0.143.0"
 oxc_parser = "0.143.0"
 oxc_ast = "0.143.0"
@@ -42,13 +47,6 @@ tokio = { version = "1.53.1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 notify = "8.2.0"
 clap = { version = "4.6.6", features = ["derive"] }
-
-oj_compiler = { path = "crates/oj_compiler" }
-oj_resolver = { path = "crates/oj_resolver" }
-oj_graph = { path = "crates/oj_graph" }
-oj_cache = { path = "crates/oj_cache" }
-oj_css = { path = "crates/oj_css" }
-oj_server = { path = "crates/oj_server" }
 
 [profile.release]
 lto = "thin"
