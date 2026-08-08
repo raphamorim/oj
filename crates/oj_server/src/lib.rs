@@ -195,7 +195,11 @@ async fn serve_path(
 
     let file = if let Some(abs) = uri.path().strip_prefix("/@fs") {
         let candidate = PathBuf::from(abs);
-        if !state.fs_allow.lock().unwrap().contains(&candidate) {
+        let allowed = {
+            let allow = state.fs_allow.lock().unwrap();
+            allow.iter().any(|root| candidate.starts_with(root))
+        };
+        if !allowed {
             return (StatusCode::FORBIDDEN, "oj: /@fs path not allow-listed").into_response();
         }
         candidate
@@ -363,6 +367,7 @@ async fn ensure_module(
             imports: Vec::new(),
             require_map: Vec::new(),
             css_exports: Vec::new(),
+            fs_allow: Vec::new(),
         });
         register_in_graph(state, url, &module);
         return Ok((String::new(), module));
@@ -414,6 +419,7 @@ async fn ensure_module(
                 imports: Vec::new(),
                 require_map: Vec::new(),
                 css_exports: output.exports.unwrap_or_default(),
+                fs_allow: Vec::new(),
             });
         }
         let mut rewrite =
@@ -430,6 +436,7 @@ async fn ensure_module(
                 },
                 code: factory.code,
                 map_data_url: None,
+                fs_allow: fs_allow_from(&factory.imports),
                 imports: factory.imports,
                 require_map: factory.require_map,
                 css_exports: Vec::new(),
@@ -450,6 +457,7 @@ async fn ensure_module(
                 is_boundary: !is_dep && output.has_refresh_registrations(),
                 code: output.code,
                 map_data_url: output.map_data_url,
+                fs_allow: fs_allow_from(&output.imports),
                 imports: output.imports,
                 kind: String::new(),
                 require_map: Vec::new(),
@@ -487,7 +495,37 @@ fn memory_put(state: &ServerState, url: &str, key: &str, module: &Arc<CachedModu
         .insert(url.to_string(), (key.to_string(), Arc::clone(module)));
 }
 
+/// The package a file belongs to: nearest ancestor with a package.json
+/// (fallback: the file's own directory). This is the /@fs trust boundary —
+/// pulling in one file from a resolved dependency trusts that package's
+/// shipped assets (e.g. a wasm loaded at runtime via new URL(import.meta.url)).
+fn package_root(path: &Path) -> PathBuf {
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        if d.join("package.json").is_file() {
+            return d.to_path_buf();
+        }
+        dir = d.parent();
+    }
+    path.parent().unwrap_or(path).to_path_buf()
+}
+
+/// Package-root prefixes for a module's /@fs/ imports (query stripped).
+fn fs_allow_from(imports: &[String]) -> Vec<String> {
+    imports
+        .iter()
+        .filter_map(|i| i.split('?').next().unwrap_or(i).strip_prefix("/@fs"))
+        .map(|p| package_root(Path::new(p)).display().to_string())
+        .collect()
+}
+
 fn register_in_graph(state: &ServerState, url: &str, module: &CachedModule) {
+    if !module.fs_allow.is_empty() {
+        let mut allow = state.fs_allow.lock().unwrap();
+        for p in &module.fs_allow {
+            allow.insert(PathBuf::from(p));
+        }
+    }
     let mut graph = state.graph.lock().unwrap();
     let local_imports: Vec<PathBuf> = module
         .imports
@@ -646,14 +684,29 @@ fn rewrite_specifier(
     if let Some(base) = spec.strip_suffix("?url") {
         let resolved = rewrite_specifier(root, dir, resolver, fs_allow, base, false)
             .or_else(|| resolver.resolve(dir, base).ok().map(|p| {
-                fs_allow.lock().unwrap().insert(p.clone());
+                fs_allow.lock().unwrap().insert(package_root(&p));
                 url_of(root, &p)
             }))?;
         return Some(format!("{resolved}?url"));
     }
 
     if spec.starts_with("./") || spec.starts_with("../") {
-        let joined = normalize(&dir.join(spec));
+        let mut joined = normalize(&dir.join(spec));
+        // TS convention: `import "./x.js"` resolves the sibling `./x.ts`
+        // (also .tsx/.jsx). If the literal .js/.jsx target is absent, retarget.
+        if !joined.is_file() {
+            if let Some(ext) = joined.extension().and_then(|e| e.to_str()) {
+                if ext == "js" || ext == "jsx" {
+                    for cand in ["ts", "tsx"] {
+                        let alt = joined.with_extension(cand);
+                        if alt.is_file() {
+                            joined = alt;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         let quick = if joined.is_file() {
             Some(joined)
         } else if joined.extension().is_none() {
@@ -677,8 +730,8 @@ fn rewrite_specifier(
         Ok(resolved) if resolved.starts_with(root) => Some(url_of(root, &resolved)),
         Ok(resolved) => {
             // Outside the served root (workspace packages, hoisted installs):
-            // allow-list the exact file and serve it under /@fs/.
-            fs_allow.lock().unwrap().insert(resolved.clone());
+            // trust the whole package and serve it under /@fs/.
+            fs_allow.lock().unwrap().insert(package_root(&resolved));
             Some(url_of(root, &resolved))
         }
         Err(err) => {
@@ -729,6 +782,11 @@ fn locate(root: &Path, rel: &str) -> Option<PathBuf> {
             }
         }
     }
+    // Vite-style publicDir: assets under <root>/public are served at root.
+    let public = root.join("public").join(rel);
+    if public.is_file() {
+        return Some(public);
+    }
     None
 }
 
@@ -742,6 +800,14 @@ fn content_type(ext: &str) -> &'static str {
         "jpg" | "jpeg" => "image/jpeg",
         "ico" => "image/x-icon",
         "wasm" => "application/wasm",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "eot" => "application/vnd.ms-fontobject",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "txt" | "map2" => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
     }
 }
@@ -1014,7 +1080,9 @@ fn spawn_crawl(state: Arc<ServerState>, done_tx: tokio::sync::watch::Sender<bool
                 }
                 let file = if let Some(abs) = url.strip_prefix("/@fs") {
                     let f = PathBuf::from(abs);
-                    if !state.fs_allow.lock().unwrap().contains(&f) { continue; }
+                    let ok = { let a = state.fs_allow.lock().unwrap();
+                        a.iter().any(|r| f.starts_with(r)) };
+                    if !ok { continue; }
                     f
                 } else {
                     let rel = url.trim_start_matches('/').to_string();
