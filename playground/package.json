@@ -1,0 +1,11 @@
+{
+  "name": "oj-playground",
+  "private": true,
+  "dependencies": {
+    "@tailwindcss/node": "^4.3.3",
+    "@tailwindcss/oxide": "^4.3.3",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "tailwindcss": "^4.3.3"
+  }
+}

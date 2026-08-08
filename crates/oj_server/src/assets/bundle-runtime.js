@@ -1,0 +1,225 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Raphael Amorim
+
+// oj bundle-mode runtime: module registry, require, Fast Refresh wiring,
+// HMR patches, CSS swap, error overlay. Loaded as the first module script;
+// the chunk (plain registrations) executes after it.
+import * as RefreshRuntime from "/@oj/refresh-runtime.js";
+
+RefreshRuntime.injectIntoGlobalHook(window);
+window.$RefreshReg$ = () => {};
+window.$RefreshSig$ = () => (type) => type;
+window.process ??= { env: { NODE_ENV: "development" } };
+window.global ??= window;
+
+const registry = new Map(); // url -> { kind, deps, factory }
+const instances = new Map(); // url -> { module, exports, ns }
+
+window.__oj_register = (url, kind, deps, factory) => {
+  registry.set(url, { kind, deps: deps || {}, factory });
+};
+
+function instantiate(url) {
+  const reg = registry.get(url);
+  if (!reg) throw new Error(`[oj] module not registered: ${url}`);
+  const module = { exports: {}, hot: makeHot(url) };
+  const record = { module, exports: module.exports, ns: null };
+  instances.set(url, record); // set before exec: cycles see partial exports
+
+  const localRequire = (spec) => {
+    const target = reg.deps[spec] ?? spec;
+    return requireRaw(target, reg.kind);
+  };
+
+  const isAppEsm = reg.kind === "esm" && !url.startsWith("/node_modules/");
+  const prevReg = window.$RefreshReg$;
+  const prevSig = window.$RefreshSig$;
+  if (isAppEsm) {
+    window.$RefreshReg$ = (type, id) => RefreshRuntime.register(type, url + " " + id);
+    window.$RefreshSig$ = RefreshRuntime.createSignatureFunctionForTransform;
+  }
+  try {
+    if (reg.kind === "cjs") {
+      reg.factory.call(module.exports, module, module.exports, localRequire);
+      record.exports = module.exports; // may have been reassigned
+    } else {
+      reg.factory.call(undefined, module, module.exports, localRequire);
+    }
+  } finally {
+    if (isAppEsm) {
+      window.$RefreshReg$ = prevReg;
+      window.$RefreshSig$ = prevSig;
+    }
+  }
+  if (isAppEsm) {
+    RefreshRuntime.registerExportsForReactRefresh(url, module.exports);
+  }
+  return record;
+}
+
+function requireRaw(url, importerKind) {
+  const record = instances.get(url) ?? instantiate(url);
+  const target = registry.get(url);
+  // ESM importer of a CJS module sees a namespace with a fixed default.
+  if (importerKind === "esm" && target && target.kind === "cjs") {
+    if (!record.ns) record.ns = cjsNamespace(record);
+    return record.ns;
+  }
+  return record.exports;
+}
+
+function cjsNamespace(record) {
+  const ns = { __proto__: null };
+  const raw = () => record.exports;
+  Object.defineProperty(ns, "default", {
+    enumerable: true,
+    get: () => (raw().__esModule ? raw().default : raw()),
+  });
+  for (const key of Object.keys(record.exports)) {
+    if (key !== "default") {
+      Object.defineProperty(ns, key, { enumerable: true, get: () => raw()[key] });
+    }
+  }
+  Object.defineProperty(ns, "__cjs_exports", { enumerable: true, get: raw });
+  return ns;
+}
+
+// Factory-side helpers (referenced by compiled ESM factories).
+window.__oj_esm = (exports, getters) => {
+  Object.defineProperty(exports, "__esModule", { value: true });
+  for (const name of Object.keys(getters)) {
+    Object.defineProperty(exports, name, { enumerable: true, get: getters[name] });
+  }
+};
+window.__oj_export_star = (from, exports) => {
+  for (const key of Object.keys(from)) {
+    if (key !== "default" && !Object.prototype.hasOwnProperty.call(exports, key)) {
+      Object.defineProperty(exports, key, { enumerable: true, get: () => from[key] });
+    }
+  }
+};
+
+const styleTags = new Map();
+window.__oj_inject_css = (id, css) => {
+  let tag = styleTags.get(id);
+  if (!tag) {
+    tag = document.createElement("style");
+    tag.setAttribute("data-oj-id", id);
+    document.head.appendChild(tag);
+    styleTags.set(id, tag);
+  }
+  tag.textContent = css;
+};
+
+window.__oj_start = (entry) => {
+  try {
+    requireRaw(entry, "esm");
+  } catch (err) {
+    showOverlay(`boot failed\n\n${err && err.stack ? err.stack : err}`);
+    throw err;
+  }
+};
+
+// --- HMR ------------------------------------------------------------------
+
+function makeHot(url) {
+  return {
+    data: {},
+    accept() {}, // registry-mode acceptance is driven by the server plan
+    dispose() {},
+    invalidate() {
+      location.reload();
+    },
+  };
+}
+
+async function applyPatch(msg) {
+  const prevExports = new Map();
+  for (const boundary of msg.boundaries) {
+    const record = instances.get(boundary);
+    if (record) prevExports.set(boundary, record.exports);
+  }
+  try {
+    // The patch module re-registers changed factories.
+    await import(`/@oj/patch.js?m=${encodeURIComponent(msg.changed.join(","))}&t=${msg.timestamp}`);
+    for (const url of msg.dirty) instances.delete(url);
+    for (const boundary of msg.boundaries) {
+      const next = requireRaw(boundary, "esm");
+      // CSS boundaries: re-execution already swapped the style tag; their
+      // exports are class maps, not components — never refresh-validate.
+      if (boundary.split("?")[0].endsWith(".css")) continue;
+      const prev = prevExports.get(boundary);
+      if (prev) {
+        const invalidate = RefreshRuntime.validateRefreshBoundaryAndEnqueueUpdate(
+          boundary,
+          prev,
+          next
+        );
+        if (invalidate) {
+          console.warn(`[oj] ${boundary}: ${invalidate}, reloading`);
+          location.reload();
+          return;
+        }
+      }
+    }
+    clearOverlay();
+    console.log(`[oj] patched ${msg.changed.join(", ")}`);
+  } catch (err) {
+    showOverlay(`patch failed\n\n${err && err.stack ? err.stack : err}`);
+  }
+}
+
+// --- css + overlay + ws (mirrors client.js; kept separate on purpose — the
+// unbundled client carries import.meta.hot machinery this mode replaces) ---
+
+function swapCss(update) {
+  const links = [...document.querySelectorAll("link[rel=stylesheet]")];
+  const link = links.find((l) => new URL(l.href).pathname === update.path);
+  if (!link) {
+    location.reload();
+    return;
+  }
+  const next = link.cloneNode();
+  next.href = update.path + "?t=" + update.timestamp;
+  next.addEventListener("load", () => link.remove());
+  link.after(next);
+}
+
+let overlayEl = null;
+function showOverlay(text) {
+  clearOverlay();
+  overlayEl = document.createElement("div");
+  overlayEl.style.cssText =
+    "position:fixed;inset:0;z-index:99999;background:rgba(12,12,14,0.92);" +
+    "color:#ff8484;font:13px/1.5 ui-monospace,Menlo,monospace;padding:2rem;overflow:auto";
+  const pre = document.createElement("pre");
+  pre.style.cssText = "white-space:pre-wrap;margin:0";
+  pre.textContent = "[oj] " + text;
+  overlayEl.appendChild(pre);
+  overlayEl.addEventListener("click", clearOverlay);
+  document.body.appendChild(overlayEl);
+}
+function clearOverlay() {
+  if (overlayEl) {
+    overlayEl.remove();
+    overlayEl = null;
+  }
+}
+
+(function connect() {
+  const ws = new WebSocket("ws://" + location.host + "/__ws");
+  ws.addEventListener("message", (event) => {
+    let msg;
+    try {
+      msg = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    if (msg.type === "patch") applyPatch(msg);
+    else if (msg.type === "css-update") swapCss(msg);
+    else if (msg.type === "full-reload") location.reload();
+    else if (msg.type === "error") showOverlay(msg.message || "unknown error");
+  });
+  ws.addEventListener("open", () => console.log("[oj] dev server connected (bundle mode)"));
+  ws.addEventListener("close", () => setTimeout(connect, 1000));
+})();

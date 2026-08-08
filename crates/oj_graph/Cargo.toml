@@ -1,0 +1,6 @@
+[package]
+name = "oj_graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Module graph and HMR boundary propagation"

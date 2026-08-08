@@ -1,0 +1,13 @@
+body {
+  font-family: system-ui, sans-serif;
+  margin: 3rem auto;
+  max-width: 40rem;
+  line-height: 1.6;
+  padding: 0 1rem;
+}
+
+button {
+  font-size: 1rem;
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+}

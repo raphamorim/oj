@@ -1,0 +1,8 @@
+{
+  "name": "oj-bench",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "playwright": "^1.62"
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "name": "oj-e2e",
+  "private": true,
+  "devDependencies": { "playwright": "^1.62" }
+}

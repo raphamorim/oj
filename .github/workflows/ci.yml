@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  unit:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  e2e:
+    name: e2e (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [unbundled, bundle]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            playground/package-lock.json
+            e2e/package-lock.json
+      - run: npm ci --prefix playground
+      - run: npm install --prefix e2e
+      - run: npx --prefix e2e playwright install --with-deps chromium
+      - name: run e2e suite
+        run: node e2e/run.mjs ${{ matrix.mode == 'bundle' && '--bundle' || '' }}
+
+  build:
+    name: prod build smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --prefix playground
+      - run: cargo run -p oj -- build playground
+      - name: check outputs
+        run: |
+          test -f playground/dist/index.html
+          ls playground/dist/assets/*.js
+          grep -q underline playground/dist/tailwind.css

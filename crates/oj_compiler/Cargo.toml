@@ -1,0 +1,21 @@
+[package]
+name = "oj_compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Fused per-file pipeline: parse -> TS strip -> JSX -> Fast Refresh instrumentation -> codegen + sourcemap, single oxc pass-set"
+
+[dependencies]
+oxc_allocator.workspace = true
+oxc_ast.workspace = true
+oxc_ast_visit.workspace = true
+oxc_parser.workspace = true
+oxc_span.workspace = true
+oxc_semantic.workspace = true
+oxc_transformer.workspace = true
+oxc_transformer_plugins.workspace = true
+oxc_minifier.workspace = true
+oxc_ecmascript.workspace = true
+oxc_syntax.workspace = true
+oxc_codegen.workspace = true
+thiserror.workspace = true

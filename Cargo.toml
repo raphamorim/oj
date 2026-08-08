@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/oj_compiler",
+    "crates/oj_css",
+    "crates/oj_resolver",
+    "crates/oj_graph",
+    "crates/oj_cache",
+    "crates/oj_server",
+    "crates/oj",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# oxc pinned as one set — these crates move together and churn monthly.
+# When bumping, bump all of them and re-run the compiler snapshot tests.
+oxc_allocator = "0.143.0"
+oxc_parser = "0.143.0"
+oxc_ast = "0.143.0"
+oxc_ast_visit = "0.143.0"
+oxc_span = "0.143.0"
+oxc_semantic = "0.143.0"
+oxc_transformer = "0.143.0"
+oxc_transformer_plugins = "0.143.0"
+oxc_minifier = "0.143.0"
+oxc_ecmascript = "0.143.0"
+oxc_syntax = "0.143.0"
+oxc_codegen = "0.143.0"
+oxc_diagnostics = "0.143.0"
+oxc_resolver = "11"
+
+anyhow = "1"
+blake3 = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+notify = "8"
+clap = { version = "4", features = ["derive"] }
+
+oj_compiler = { path = "crates/oj_compiler" }
+oj_resolver = { path = "crates/oj_resolver" }
+oj_graph = { path = "crates/oj_graph" }
+oj_cache = { path = "crates/oj_cache" }
+oj_css = { path = "crates/oj_css" }
+oj_server = { path = "crates/oj_server" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

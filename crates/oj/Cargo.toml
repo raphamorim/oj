@@ -1,0 +1,23 @@
+[package]
+name = "oj"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "oj: a Rust-native build tool for React apps"
+
+[[bin]]
+name = "oj"
+path = "src/main.rs"
+
+[dependencies]
+oj_compiler.workspace = true
+oj_server.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+rolldown = "1.2"
+rolldown_common = "1.2"
+rolldown_plugin = "1.2"
+arcstr = "1"
+serde_json.workspace = true
+oj_css.workspace = true
