@@ -20,12 +20,15 @@ use anyhow::{Context, bail};
 use rolldown::{
     BundlerBuilder, BundlerOptions, InputItem, OutputFormat, RawMinifyOptions, SourceMapType,
 };
-use rolldown_plugin::{HookLoadArgs, HookLoadReturn, Plugin, SharedLoadPluginContext};
+use rolldown_plugin::{
+    HookLoadArgs, HookLoadReturn, HookTransformArgs, HookTransformReturn, Plugin,
+    SharedLoadPluginContext, SharedTransformPluginContext,
+};
 
-/// Rolldown dropped native CSS bundling (rolldown/rolldown#4271); like Vite,
-/// the host tool owns CSS. This plugin loads `.css` imports as JS stubs
-/// (CSS Modules export their scoped class map), collects the compiled CSS,
-/// and `build()` emits one minified stylesheet linked from the HTML.
+/// The oj build plugin: loads `.css`/`.scss` imports as JS stubs (CSS Modules
+/// export their scoped class map) collecting compiled CSS for one emitted
+/// stylesheet, and — via `transform` — expands `import.meta.glob` (Rolldown
+/// has no native glob), keeping prod builds in sync with dev.
 #[derive(Debug)]
 struct OjCssPlugin {
     collected: Arc<Mutex<Vec<(String, String)>>>,
@@ -33,11 +36,30 @@ struct OjCssPlugin {
 
 impl Plugin for OjCssPlugin {
     fn name(&self) -> Cow<'static, str> {
-        Cow::Borrowed("oj:css")
+        Cow::Borrowed("oj:build")
     }
 
     fn register_hook_usage(&self) -> rolldown_plugin::HookUsage {
-        rolldown_plugin::HookUsage::Load
+        rolldown_plugin::HookUsage::Load | rolldown_plugin::HookUsage::Transform
+    }
+
+    fn transform(
+        &self,
+        _ctx: SharedTransformPluginContext,
+        args: &HookTransformArgs<'_>,
+    ) -> impl std::future::Future<Output = HookTransformReturn> + Send {
+        let id = args.id.to_string();
+        let code = args.code.to_string();
+        async move {
+            if !code.contains("import.meta.glob") {
+                return Ok(None);
+            }
+            let expanded = oj_compiler::glob::expand_source(&code, std::path::Path::new(&id));
+            Ok(Some(rolldown_plugin::HookTransformOutput {
+                code: Some(expanded),
+                ..Default::default()
+            }))
+        }
     }
 
     fn load(

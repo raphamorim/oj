@@ -44,6 +44,17 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Preview a production build (static server over the build dir)
+    Preview {
+        /// App root (defaults to ./playground when present)
+        root: Option<PathBuf>,
+        /// Build dir to serve (overrides oj.config build.outDir; default dist)
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Preview port (overrides oj.config preview.port; default 4173)
+        #[arg(long)]
+        port: Option<u16>,
+    },
 }
 
 #[tokio::main]
@@ -74,6 +85,29 @@ async fn main() -> anyhow::Result<()> {
                 if playground.join("index.html").is_file() { playground } else { PathBuf::from(".") }
             });
             build::build(root, out).await
+        }
+        Command::Preview { root, out, port } => {
+            let root = root
+                .unwrap_or_else(|| {
+                    let playground = PathBuf::from("playground");
+                    if playground.join("index.html").is_file() {
+                        playground
+                    } else {
+                        PathBuf::from(".")
+                    }
+                })
+                .canonicalize()
+                .with_context(|| "app root not found")?;
+            let config = oj_config::load(&root).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let out_dir = out
+                .or_else(|| config.build.as_ref().and_then(|b| b.out_dir.as_ref()).map(PathBuf::from))
+                .unwrap_or_else(|| PathBuf::from("dist"));
+            let out_dir = if out_dir.is_absolute() { out_dir } else { root.join(out_dir) };
+            let port = port
+                .or_else(|| config.preview.as_ref().and_then(|p| p.port))
+                .unwrap_or(4173);
+            let base = config.base.clone().unwrap_or_else(|| "/".into());
+            oj_server::preview(out_dir, port, base).await
         }
     }
 }

@@ -211,6 +211,64 @@ fn js(body: &'static str) -> Response {
     ([(header::CONTENT_TYPE, "text/javascript")], body).into_response()
 }
 
+/// Static server for a production build (`oj preview`). Serves `dir`,
+/// strips `base`, refuses traversal, and falls back to `index.html` for
+/// extensionless routes (SPA client routing).
+pub async fn preview(dir: PathBuf, port: u16, base: String) -> anyhow::Result<()> {
+    let dir = dir
+        .canonicalize()
+        .with_context(|| format!("build dir not found: {} (run `oj build` first)", dir.display()))?;
+    let state = Arc::new((dir.clone(), base));
+    let app = Router::new().fallback(get(preview_serve)).with_state(state);
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("cannot bind {addr}"))?;
+    println!("  oj preview");
+    println!("  serving: {}", dir.display());
+    println!("  http://localhost:{port}/");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Map a request path (with the base stripped) to a file under the build
+/// dir, or `None` for a traversal attempt. Empty -> `index.html`.
+fn preview_rel<'a>(path: &'a str, base: &str) -> Option<String> {
+    let trimmed = path.strip_prefix(base.trim_end_matches('/')).unwrap_or(path);
+    let rel = trimmed.trim_start_matches('/');
+    if rel.split('/').any(|seg| seg == "..") {
+        return None;
+    }
+    Some(if rel.is_empty() { "index.html".to_string() } else { rel.to_string() })
+}
+
+async fn preview_serve(
+    State(state): State<Arc<(PathBuf, String)>>,
+    uri: Uri,
+) -> Response {
+    let (dir, base) = &*state;
+    let Some(rel) = preview_rel(uri.path(), base) else {
+        return (StatusCode::FORBIDDEN, "oj: path traversal denied").into_response();
+    };
+    let file = dir.join(&rel);
+    let ext = Path::new(&rel).extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    // Existing file -> serve it. Otherwise, extensionless routes fall back to
+    // index.html so client-side routing works on deep links.
+    let (target, ctype) = if file.is_file() {
+        (file, content_type(ext))
+    } else if ext.is_empty() {
+        (dir.join("index.html"), "text/html; charset=utf-8")
+    } else {
+        return (StatusCode::NOT_FOUND, format!("oj: not found: {rel}")).into_response();
+    };
+
+    match tokio::fs::read(&target).await {
+        Ok(bytes) => ([(header::CONTENT_TYPE, ctype)], bytes).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "oj: not found").into_response(),
+    }
+}
+
 async fn ws_upgrade(
     State(state): State<Arc<ServerState>>,
     upgrade: WebSocketUpgrade,
@@ -1023,6 +1081,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 fn content_type(ext: &str) -> &'static str {
     match ext {
         "html" => "text/html; charset=utf-8",
+        "js" | "mjs" | "cjs" => "text/javascript",
         "css" => "text/css",
         "json" | "map" => "application/json",
         "svg" => "image/svg+xml",
@@ -1589,5 +1648,16 @@ mod tests {
             normalize(Path::new("/a/b/../c/./d.ts")),
             PathBuf::from("/a/c/d.ts")
         );
+    }
+
+    #[test]
+    fn preview_rel_maps_base_and_guards_traversal() {
+        assert_eq!(preview_rel("/", "/").as_deref(), Some("index.html"));
+        assert_eq!(preview_rel("/assets/x.js", "/").as_deref(), Some("assets/x.js"));
+        // base stripping
+        assert_eq!(preview_rel("/app/assets/x.js", "/app/").as_deref(), Some("assets/x.js"));
+        assert_eq!(preview_rel("/app/", "/app/").as_deref(), Some("index.html"));
+        // traversal denied
+        assert_eq!(preview_rel("/../etc/passwd", "/"), None);
     }
 }

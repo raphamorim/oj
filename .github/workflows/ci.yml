@@ -69,3 +69,10 @@ jobs:
           test -f /tmp/lib/dist/index.js
           test -f /tmp/lib/dist/index.cjs
           test -f /tmp/lib/dist/index.umd.js
+      - name: preview smoke
+        run: |
+          (cargo run -p oj -- preview playground &)
+          for i in $(seq 1 30); do curl -sf http://localhost:4173/ >/dev/null && break; sleep 1; done
+          curl -sf http://localhost:4173/ | grep -q 'id="root"'
+          test "$(curl -sf -o /dev/null -w '%{http_code}' http://localhost:4173/deep/route)" = 200
+          lsof -ti:4173 -sTCP:LISTEN | xargs -r kill || true

@@ -24,6 +24,26 @@ use oxc_ast_visit::{VisitMut, walk_mut};
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 
+/// Expand `import.meta.glob(...)` in a source string (used by the production
+/// build's Rolldown transform hook, which sees raw TSX/TS before type
+/// stripping). Returns the source unchanged if there is nothing to expand.
+pub fn expand_source(source: &str, path: &Path) -> String {
+    if !source.contains("import.meta.glob") {
+        return source.to_string();
+    }
+    let allocator = Allocator::default();
+    // Parse with the file's real dialect (TSX/TS/JSX), not plain ESM.
+    let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::mjs());
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+    if parsed.panicked {
+        return source.to_string();
+    }
+    let mut program = parsed.program;
+    let dir = path.parent().unwrap_or(path);
+    expand(&allocator, dir, &mut program);
+    oxc_codegen::Codegen::new().build(&program).code
+}
+
 /// Expand every `import.meta.glob(...)` in `program`. `dir` is the importing
 /// module's directory (patterns and match keys are relative to it).
 pub fn expand<'a>(allocator: &'a Allocator, dir: &Path, program: &mut Program<'a>) {

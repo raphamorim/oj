@@ -22,8 +22,15 @@ pub struct OjConfig {
     pub env_prefix: Option<String>,
     pub env_dir: Option<String>,
     pub build: Option<BuildConfig>,
+    pub preview: Option<PreviewConfig>,
     /// oj-specific: default the dev server to registry bundle mode.
     pub bundle: Option<bool>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreviewConfig {
+    pub port: Option<u16>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
