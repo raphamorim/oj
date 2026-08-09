@@ -1,5 +1,6 @@
 import { Counter } from "@/Counter";
 import meta, { appName } from "./data.json";
+import "./theme.scss";
 
 const pages = import.meta.glob("./pages/*.ts", { eager: true });
 

@@ -3,11 +3,18 @@
 
 //! CSS compilation on Lightning CSS — the same engine inside Tailwind v4,
 //! Vite's CSS pipeline, and Parcel. Handles plain CSS (syntax lowering,
-//! optional minify) and CSS Modules scoping for `*.module.css`.
+//! autoprefixing, optional minify), CSS Modules scoping for `*.module.css`,
+//! and Sass/SCSS via the pure-Rust `grass` compiler (no Node sidecar).
+//!
+//! Targets drive both autoprefixing and modern-CSS lowering (nesting, etc.),
+//! which is what most apps reach for PostCSS/autoprefixer to do.
+
+use std::path::Path;
 
 use lightningcss::css_modules;
 use lightningcss::printer::PrinterOptions;
-use lightningcss::stylesheet::{ParserOptions, StyleSheet};
+use lightningcss::stylesheet::{MinifyOptions, ParserOptions, StyleSheet};
+use lightningcss::targets::{Browsers, Targets};
 
 #[derive(Debug)]
 pub struct CssOutput {
@@ -20,12 +27,41 @@ pub fn is_css_module(url: &str) -> bool {
     url.rsplit('/').next().is_some_and(|f| f.contains(".module."))
 }
 
+/// Sass/SCSS files, by url extension.
+pub fn is_sass(url: &str) -> bool {
+    let f = url.split('?').next().unwrap_or(url);
+    f.ends_with(".scss") || f.ends_with(".sass")
+}
+
+/// Compile Sass/SCSS to plain CSS. `load_dir` is where `@use`/`@import` of
+/// sibling stylesheets resolve from.
+pub fn compile_sass(source: &str, load_dir: Option<&Path>) -> Result<String, String> {
+    let mut options = grass::Options::default();
+    if let Some(dir) = load_dir {
+        options = options.load_path(dir);
+    }
+    grass::from_string(source.to_string(), &options).map_err(|e| format!("sass error: {e}"))
+}
+
+fn default_targets() -> Targets {
+    // A broadly-supported modern baseline (version = major<<16). Enables
+    // autoprefixing + nesting/custom-media lowering without transpiling away
+    // everything. Roughly "last 2 years" of the major engines.
+    Targets::from(Browsers {
+        chrome: Some(100 << 16),
+        edge: Some(100 << 16),
+        firefox: Some(100 << 16),
+        safari: Some(14 << 16),
+        ios_saf: Some(14 << 16),
+        ..Browsers::default()
+    })
+}
+
 pub fn compile_css(url: &str, source: &str, minify: bool) -> Result<CssOutput, String> {
     let is_module = is_css_module(url);
     let options = ParserOptions {
         filename: url.to_string(),
         css_modules: is_module.then(|| css_modules::Config {
-            // Deterministic, readable in dev: `Counter_button_<hash>`.
             pattern: css_modules::Pattern::parse("[name]_[local]_[hash]")
                 .expect("static pattern"),
             ..css_modules::Config::default()
@@ -33,11 +69,18 @@ pub fn compile_css(url: &str, source: &str, minify: bool) -> Result<CssOutput, S
         ..ParserOptions::default()
     };
 
-    let stylesheet = StyleSheet::parse(source, options)
+    let mut stylesheet = StyleSheet::parse(source, options)
         .map_err(|err| format!("css parse error in {url}: {err}"))?;
 
+    let targets = default_targets();
+    // The minify pass applies target-driven transforms (autoprefixing,
+    // nesting lowering) regardless of the `minify` whitespace setting.
+    stylesheet
+        .minify(MinifyOptions { targets: targets.clone(), ..MinifyOptions::default() })
+        .map_err(|err| format!("css transform error in {url}: {err}"))?;
+
     let result = stylesheet
-        .to_css(PrinterOptions { minify, ..PrinterOptions::default() })
+        .to_css(PrinterOptions { minify, targets, ..PrinterOptions::default() })
         .map_err(|err| format!("css print error in {url}: {err}"))?;
 
     let exports = result.exports.map(|map| {
@@ -78,9 +121,29 @@ mod tests {
     }
 
     #[test]
+    fn sass_nesting_and_variables_compile() {
+        let scss = "$pad: 1rem;\n.card { padding: $pad; .title { font-weight: bold; } }";
+        let css = compile_sass(scss, None).unwrap();
+        assert!(css.contains("padding: 1rem"), "variable resolved: {css}");
+        assert!(css.contains(".card .title"), "nesting flattened: {css}");
+    }
+
+    #[test]
+    fn sass_then_lightningcss_pipeline() {
+        let css = compile_sass(".a { .b { color: red } }", None).unwrap();
+        let out = compile_css("/x.scss", &css, true).unwrap();
+        assert!(out.css.contains(".a .b{color:red}"), "{}", out.css);
+    }
+
+    #[test]
+    fn autoprefixing_applies_for_targets() {
+        // user-select needs -webkit- for older Safari in the "defaults" set.
+        let out = compile_css("/p.css", ".x { user-select: none; }", true).unwrap();
+        assert!(out.css.contains("-webkit-user-select"), "autoprefixed: {}", out.css);
+    }
+
+    #[test]
     fn parse_errors_are_reported_not_panicked() {
-        // Note: `body { color: ` is VALID per spec (EOF closes blocks,
-        // invalid declarations drop) — needs a truly malformed rule.
         assert!(compile_css("/x.css", "!!not-css!!", false).is_err());
     }
 }

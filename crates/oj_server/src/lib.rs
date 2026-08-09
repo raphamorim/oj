@@ -350,11 +350,18 @@ async fn serve_path(
         )
             .into_response();
     }
-    if ext == "css" && uri.query().is_some_and(|q| q.contains("import")) {
+    if matches!(ext, "css" | "scss" | "sass")
+        && uri.query().is_some_and(|q| q.contains("import"))
+    {
         let url = url_of(&state.root, &file);
         return serve_css_wrapper(&state, &file, &url).await;
     }
     if COMPILABLE.contains(&ext) {
+        let url = url_of(&state.root, &file);
+        return serve_compiled(&state, &file, &url, uri.query(), &headers).await;
+    }
+    // JSON imported from JS becomes a module; JSON under publicDir stays raw.
+    if ext == "json" && !file.starts_with(state.root.join("public")) {
         let url = url_of(&state.root, &file);
         return serve_compiled(&state, &file, &url, uri.query(), &headers).await;
     }
@@ -535,10 +542,37 @@ async fn ensure_module(
     let url_owned = url.to_string();
     let is_dep = url.contains("/node_modules/") || url.starts_with("/@fs/");
     let bundle = state.bundle;
-    let is_css = file.extension().and_then(|e| e.to_str()) == Some("css");
+    let ext = file.extension().and_then(|e| e.to_str());
+    let is_css = matches!(ext, Some("css") | Some("scss") | Some("sass"));
+    let is_json = ext == Some("json");
     let compiled = tokio::task::spawn_blocking(move || -> Result<CachedModule, String> {
+        if is_json {
+            // JSON as a module: a JS body exporting default + named keys.
+            let code = if bundle {
+                oj_compiler::json::to_factory_body(&source, &url_owned)
+            } else {
+                oj_compiler::json::to_esm(&source, &url_owned)
+            }
+            .map_err(|err| format!("compile error:\n{err}"))?;
+            return Ok(CachedModule {
+                is_boundary: false,
+                kind: if bundle { "esm".into() } else { String::new() },
+                code,
+                map_data_url: None,
+                imports: Vec::new(),
+                require_map: Vec::new(),
+                css_exports: Vec::new(),
+                fs_allow: Vec::new(),
+            });
+        }
         if is_css {
-            let output = oj_css::compile_css(&url_owned, &source, false)?;
+            // Sass/SCSS -> CSS first (sibling @use/@import resolve from dir).
+            let css_src = if oj_css::is_sass(&url_owned) {
+                oj_css::compile_sass(&source, Some(&dir))?
+            } else {
+                source.clone()
+            };
+            let output = oj_css::compile_css(&url_owned, &css_src, false)?;
             return Ok(CachedModule {
                 is_boundary: true, // JS-imported css self-accepts its updates
                 kind: "css".into(),
@@ -848,7 +882,9 @@ fn rewrite_specifier(
             let url = url_of(root, &p);
             // JS-imported css is served as a style-injecting JS module; the
             // ?import marker distinguishes it from <link> requests.
-            if css_import_marker && url.ends_with(".css") {
+            if css_import_marker
+                && (url.ends_with(".css") || url.ends_with(".scss") || url.ends_with(".sass"))
+            {
                 return Some(format!("{url}?import"));
             }
             return Some(url);
@@ -972,9 +1008,9 @@ fn inject_module_preloads(html: String, state: &ServerState) -> String {
     let links: String = paths
         .iter()
         .map(|p| {
-            // css modules live in the graph under their clean url but are
+            // Stylesheets live in the graph under their clean url but are
             // served as JS only with the ?import marker.
-            if p.ends_with(".css") {
+            if p.ends_with(".css") || p.ends_with(".scss") || p.ends_with(".sass") {
                 format!("<link rel=\"modulepreload\" href=\"{p}?import\" />\n")
             } else {
                 format!("<link rel=\"modulepreload\" href=\"{p}\" />\n")
@@ -1219,7 +1255,7 @@ fn spawn_crawl(state: Arc<ServerState>, done_tx: tokio::sync::watch::Sender<bool
                     match locate(&state.root, &rel) { Some(f) => f, None => continue }
                 };
                 let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if !COMPILABLE.contains(&ext) && ext != "css" {
+                if !COMPILABLE.contains(&ext) && !matches!(ext, "css" | "scss" | "sass" | "json") {
                     continue;
                 }
                 let state = Arc::clone(&state);
@@ -1393,7 +1429,7 @@ fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
             );
             return messages;
         }
-        if !COMPILABLE.contains(&ext) && ext != "css" {
+        if !COMPILABLE.contains(&ext) && !matches!(ext, "css" | "scss" | "sass" | "json") {
             continue;
         }
 
