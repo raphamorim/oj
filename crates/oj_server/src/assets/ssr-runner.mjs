@@ -158,13 +158,13 @@ async function entryNamespace() {
   return rec.mod.namespace;
 }
 
-// Produce the render, calling `emit` with one framed message per line:
-// `{chunk}` (repeated) then `{end}` for a streaming entry (renderStream ->
-// a web ReadableStream), or a single `{html}` for a buffered entry (render).
-async function handleRender(emit) {
+// Produce the render for `url`, calling `emit` with one framed message per
+// line: `{chunk}` (repeated) then `{end}` for a streaming entry (renderStream
+// -> a web ReadableStream), or a single `{html}` for a buffered entry (render).
+async function handleRender(emit, url) {
   const ns = await entryNamespace();
   if (typeof ns.renderStream === "function") {
-    const stream = await ns.renderStream();
+    const stream = await ns.renderStream(url);
     const reader = stream.getReader();
     const decoder = new TextDecoder();
     for (;;) {
@@ -177,7 +177,7 @@ async function handleRender(emit) {
     if (tail) emit({ chunk: tail });
     emit({ end: true });
   } else if (typeof ns.render === "function") {
-    emit({ html: String(await ns.render()) });
+    emit({ html: String(await ns.render(url)) });
   } else {
     throw new Error(`SSR entry ${ENTRY} exports neither render() nor renderStream()`);
   }
@@ -235,7 +235,8 @@ rl.on("line", (line) => {
   }
   if (msg.cmd === "render") {
     const emit = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
-    withLock(() => handleRender(emit)).catch((e) =>
+    const url = typeof msg.url === "string" ? msg.url : "/";
+    withLock(() => handleRender(emit, url)).catch((e) =>
       emit({ error: String((e && e.stack) || e) }),
     );
   }

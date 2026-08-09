@@ -28,12 +28,11 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use axum::{
-    Router,
     body::{Body, Bytes},
-    extract::State,
-    http::header,
+    extract::{Request, State},
+    http::{Method, header},
+    middleware::Next,
     response::{Html, IntoResponse, Response},
-    routing::get,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout};
@@ -50,6 +49,8 @@ struct SsrState {
     /// URL of the client hydration entry (`/src/entry-client.tsx`), served by
     /// the dev pipeline. `None` => SSR-only, inert page.
     client_url: Option<String>,
+    /// `server.proxy` prefixes, which must reach the proxy layer, not SSR.
+    proxy_prefixes: Vec<String>,
     runner: Arc<tokio::sync::Mutex<Runner>>,
 }
 
@@ -66,15 +67,16 @@ pub async fn ssr_dev(root: PathBuf, entry: String, port: Option<u16>) -> anyhow:
 
     let ssr_state = Arc::new(SsrState {
         client_url: client_url.clone(),
+        proxy_prefixes: built.proxy_prefixes.clone(),
         runner: Arc::new(tokio::sync::Mutex::new(runner)),
     });
 
-    // The explicit `/` route overrides the dev server's index.html fallback;
-    // every other path flows to the dev router unchanged.
-    let app = Router::new()
-        .route("/", get(render))
-        .with_state(Arc::clone(&ssr_state))
-        .merge(built.router);
+    // A layer in front of the dev router: browser document navigations (any
+    // path) are server-rendered per route; module/asset/proxy requests fall
+    // through to the dev pipeline unchanged.
+    let app = built
+        .router
+        .layer(axum::middleware::from_fn_with_state(Arc::clone(&ssr_state), ssr_route));
 
     let addr = std::net::SocketAddr::from((built.host, built.port));
     let listener = tokio::net::TcpListener::bind(addr)
@@ -118,11 +120,41 @@ async fn spawn_runner(root: &Path, base: &str, entry_abs: &Path) -> anyhow::Resu
     Ok(Runner { stdin, lines: BufReader::new(stdout).lines(), _child: child })
 }
 
-async fn render(State(state): State<Arc<SsrState>>) -> Response {
+/// Route document navigations to the SSR renderer; everything else (modules,
+/// `/@oj/*`, `/@ssr-*`, assets, proxy, `/__ws`) to the dev pipeline.
+async fn ssr_route(State(state): State<Arc<SsrState>>, req: Request, next: Next) -> Response {
+    if is_document_route(&req, &state.proxy_prefixes) {
+        render_route(&state, req.uri().path()).await
+    } else {
+        next.run(req).await
+    }
+}
+
+/// A document route is a GET to an extensionless path that isn't a reserved dev
+/// prefix (`/@…`, `/__…`) or a configured proxy prefix. Modules and assets have
+/// extensions or the `/@` prefix; proxied paths (`/api`) reach the proxy layer;
+/// everything else — `/`, `/about`, … — is an app route we server-render.
+fn is_document_route(req: &Request, proxy_prefixes: &[String]) -> bool {
+    if req.method() != Method::GET {
+        return false;
+    }
+    let path = req.uri().path();
+    if path.starts_with("/@") || path.starts_with("/__") {
+        return false;
+    }
+    if path.rsplit('/').next().is_some_and(|seg| seg.contains('.')) {
+        return false; // has a file extension -> asset
+    }
+    if proxy_prefixes.iter().any(|p| path.starts_with(p.as_str())) {
+        return false;
+    }
+    true
+}
+
+async fn render_route(state: &SsrState, path: &str) -> Response {
     let mut guard = Arc::clone(&state.runner).lock_owned().await;
-    if guard.stdin.write_all(b"{\"cmd\":\"render\"}\n").await.is_err()
-        || guard.stdin.flush().await.is_err()
-    {
+    let cmd = format!("{}\n", serde_json::json!({ "cmd": "render", "url": path }));
+    if guard.stdin.write_all(cmd.as_bytes()).await.is_err() || guard.stdin.flush().await.is_err() {
         return error_page("SSR runner is not accepting input (did it crash?)");
     }
     let first = match guard.lines.next_line().await {
@@ -136,14 +168,14 @@ async fn render(State(state): State<Arc<SsrState>>) -> Response {
 
     // Buffered entry (render): one `{html}` message.
     if let Some(html) = v.get("html").and_then(|h| h.as_str()) {
-        return Html(page(&state, html)).into_response();
+        return Html(page(state, html)).into_response();
     }
     // Streaming entry (renderStream): `{chunk}`… then `{end}`. Flush the shell
     // immediately, forward each chunk as React produces it, close with the tail.
     if let Some(first_chunk) = v.get("chunk").and_then(|c| c.as_str()).map(str::to_owned) {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
         let head = page_head();
-        let tail = page_tail(&state);
+        let tail = page_tail(state);
         tokio::spawn(async move {
             let mut guard = guard; // hold the runner lock for the whole stream
             let _ = tx.send(Ok(Bytes::from(head))).await;

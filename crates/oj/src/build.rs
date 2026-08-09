@@ -482,7 +482,7 @@ createServer(async (req, res) => {
     }
   }
   try {
-    const stream = await entry.renderStream();
+    const stream = await entry.renderStream(url);
     res.writeHead(200, { "content-type": "text/html; charset=utf-8", "transfer-encoding": "chunked" });
     res.write(HEAD);
     const reader = stream.getReader();

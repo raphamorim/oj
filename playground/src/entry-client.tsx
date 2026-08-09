@@ -1,4 +1,4 @@
 import { hydrateRoot } from "react-dom/client";
-import { SsrApp } from "@/ssr-app";
+import { App } from "@/routes";
 
-hydrateRoot(document.getElementById("app")!, <SsrApp />);
+hydrateRoot(document.getElementById("app")!, <App url={location.pathname} />);

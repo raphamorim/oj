@@ -83,6 +83,16 @@ try {
   }
   console.log("ssr-dev: streaming ok (chunked transfer + deferred Suspense content)");
 
+  // 1c. Per-route SSR: distinct paths render distinct trees; modules/assets and
+  //     proxied paths do not get server-rendered.
+  const about = await (await fetch(`${base}/about`)).text();
+  if (!about.includes('data-page="about"') || !about.includes("About")) {
+    throw new Error(`/about did not render the about route:\n${about}`);
+  }
+  if (about.includes("deferred-streamed")) throw new Error("/about leaked home-route content");
+  if (!first.includes('data-page="home"')) throw new Error("/ did not render the home route");
+  console.log("ssr-dev: per-route ok (/ -> home, /about -> about)");
+
   // 2. The persistent module runner re-evaluates changed modules on the next
   //    load — two consecutive edits both show up, with no Rolldown SSR bundle.
   fs.writeFileSync(counter, baseline.replace("useState<number>(0)", "useState<number>(41)"));

@@ -83,7 +83,10 @@ try {
   if (!html.includes("deferred-streamed")) throw new Error(`missing streamed Suspense content:\n${html}`);
   if (!html.includes(`/assets/${clientAsset}`)) throw new Error("client hydration bundle not referenced");
   if (!(await fetch(`${base}/assets/${clientAsset}`)).ok) throw new Error("client bundle not served");
-  console.log("ssr-prod: streaming ok (chunked + deferred content + client assets served)");
+  if (!html.includes('data-page="home"')) throw new Error("/ did not render the home route");
+  const about = await (await fetch(`${base}/about`)).text();
+  if (!about.includes('data-page="about"')) throw new Error("/about did not render the about route");
+  console.log("ssr-prod: streaming + per-route ok (/ -> home, /about -> about)");
 
   // 3. Hydration.
   let pw = null;
@@ -104,8 +107,11 @@ try {
       await page.waitForFunction(() => document.querySelector("button").textContent.includes(": 1"), {
         timeout: 5000,
       });
+      // A second route also hydrates cleanly.
+      await page.goto(`${base}/about`, { waitUntil: "networkidle" });
+      if (!(await page.locator('[data-page="about"]').isVisible())) throw new Error("/about not visible");
       if (errors.length) throw new Error(`console errors: ${errors.join("; ")}`);
-      console.log("ssr-prod: hydration ok (interactive, deferred content, no errors)");
+      console.log("ssr-prod: hydration ok (home interactive + /about route, no errors)");
     } finally {
       await browser.close();
     }
