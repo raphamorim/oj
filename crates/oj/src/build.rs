@@ -356,7 +356,7 @@ fn scan_attrs(html: &str, tag_prefix: &str, attr_prefix: &str) -> Vec<String> {
 /// dependencies external (Node resolves them at runtime), emit one ESM
 /// `<stem>.mjs`. This is the server-build half of SSR; a dev-server SSR module
 /// runner (Environment API) is separate, larger work.
-async fn build_ssr(
+pub(crate) async fn build_ssr(
     root: &Path,
     out_dir: &Path,
     entry: &str,

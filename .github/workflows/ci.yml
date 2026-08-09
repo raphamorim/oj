@@ -74,6 +74,8 @@ jobs:
           cargo run -p oj -- build playground --ssr src/entry-server.tsx --out dist-ssr
           test -f playground/dist-ssr/entry-server.mjs
           cd playground && node --input-type=module -e "import('./dist-ssr/entry-server.mjs').then(m => { const h = m.render(); if (!h.includes('ssr')) throw new Error('no ssr html'); console.log('ssr ok'); })"
+      - name: ssr dev
+        run: node e2e/ssr-dev.mjs
       - name: preview smoke
         run: |
           (cargo run -p oj -- preview playground &)

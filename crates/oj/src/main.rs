@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Raphael Amorim
 
 mod build;
+mod ssr_dev;
 
 use std::path::PathBuf;
 
@@ -28,6 +29,10 @@ enum Command {
         /// native ESM modules (experimental)
         #[arg(long)]
         bundle: bool,
+        /// SSR dev mode: render this entry (exporting `render(): string`)
+        /// server-side, rebuilding on change with full page reload
+        #[arg(long)]
+        ssr: Option<String>,
     },
     /// Compile one file and print the output (debugging aid)
     Compile {
@@ -63,12 +68,16 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
-        Command::Dev { root, port, bundle } => {
+        Command::Dev { root, port, bundle, ssr } => {
             let root = root.unwrap_or_else(|| {
                 let playground = PathBuf::from("playground");
                 if playground.join("index.html").is_file() { playground } else { PathBuf::from(".") }
             });
-            oj_server::DevServer { root, port, bundle }.run().await
+            if let Some(entry) = ssr {
+                ssr_dev::ssr_dev(root, entry, port.unwrap_or(5199)).await
+            } else {
+                oj_server::DevServer { root, port, bundle }.run().await
+            }
         }
         Command::Compile { file, prod } => {
             let source = std::fs::read_to_string(&file)

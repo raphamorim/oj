@@ -23,3 +23,5 @@ rolldown_plugin = "1.2.3"
 arcstr = "1.2.0"
 serde_json.workspace = true
 oj_css.workspace = true
+axum.workspace = true
+notify.workspace = true
