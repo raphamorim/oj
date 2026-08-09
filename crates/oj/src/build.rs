@@ -434,6 +434,73 @@ pub(crate) async fn build_ssr(
     Ok(())
 }
 
+/// Build a browser client bundle for dev-server SSR hydration: target the
+/// browser, bundle everything (React included, nothing external), emit one ESM
+/// `<stem>.js` plus a `<stem>.css` for any imported styles. Pairs with
+/// `build_ssr`; the client hydrates the server-rendered markup. CSS Modules use
+/// the same scoped-name hashing here as in the server build, so the class names
+/// in the SSR HTML match what the client renders (no hydration mismatch).
+pub(crate) async fn build_client(
+    root: &Path,
+    out_dir: &Path,
+    entry: &str,
+) -> anyhow::Result<()> {
+    let entry_import = if entry.starts_with('.') { entry.to_string() } else { format!("./{entry}") };
+    let stem =
+        Path::new(entry).file_stem().and_then(|s| s.to_str()).unwrap_or("client").to_string();
+
+    let _ = fs::remove_dir_all(out_dir);
+    fs::create_dir_all(out_dir)?;
+    let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let mut bundler = BundlerBuilder::default()
+        .with_plugins(vec![Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css) })])
+        .with_options(BundlerOptions {
+            input: Some(vec![InputItem {
+                name: Some(stem.clone()),
+                import: entry_import,
+                ..Default::default()
+            }]),
+            cwd: Some(root.to_path_buf()),
+            dir: Some(out_dir.display().to_string()),
+            format: Some(OutputFormat::Esm),
+            entry_filenames: Some(format!("{stem}.js").into()),
+            chunk_filenames: Some(format!("{stem}-[hash].js").into()),
+            minify: Some(RawMinifyOptions::Bool(false)),
+            // Match the server bundle's mode so both render identically.
+            define: Some(
+                vec![
+                    ("process.env.NODE_ENV".to_string(), "'production'".to_string()),
+                    ("import.meta.env.SSR".to_string(), "false".to_string()),
+                    ("import.meta.env.PROD".to_string(), "true".to_string()),
+                    ("import.meta.env.DEV".to_string(), "false".to_string()),
+                    ("import.meta.env.MODE".to_string(), "\"production\"".to_string()),
+                    ("import.meta.env.BASE_URL".to_string(), "\"/\"".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            ..Default::default()
+        })
+        .build()
+        .map_err(|errs| anyhow::anyhow!("rolldown init failed: {errs:?}"))?;
+
+    bundler
+        .write()
+        .await
+        .map_err(|errs| anyhow::anyhow!("client build failed:\n{errs:?}"))?;
+
+    // One stylesheet for any CSS the client graph imported.
+    let mut css_entries = collected_css.lock().unwrap().clone();
+    if !css_entries.is_empty() {
+        css_entries.sort();
+        let combined: String =
+            css_entries.into_iter().map(|(_, css)| css).collect::<Vec<_>>().join("\n");
+        fs::write(out_dir.join(format!("{stem}.css")), combined)?;
+    }
+    Ok(())
+}
+
 /// Build a library (`build.lib`): one Rolldown pass per output format,
 /// emitting `<fileName>.<ext>` files plus a single stylesheet for any
 /// imported CSS. No HTML, no manifest.

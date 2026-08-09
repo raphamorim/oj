@@ -39,6 +39,9 @@ jobs:
       - run: npx --prefix e2e playwright install --with-deps chromium
       - name: run e2e suite
         run: node e2e/run.mjs ${{ matrix.mode == 'bundle' && '--bundle' || '' }}
+      - name: ssr dev + hydration
+        if: matrix.mode == 'unbundled'
+        run: node e2e/ssr-dev.mjs
 
   build:
     name: prod build smoke
