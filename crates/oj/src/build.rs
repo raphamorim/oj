@@ -103,7 +103,7 @@ impl Plugin for OjCssPlugin {
     }
 }
 
-pub async fn build(root: PathBuf, out: Option<PathBuf>) -> anyhow::Result<()> {
+pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> anyhow::Result<()> {
     let root = root
         .canonicalize()
         .with_context(|| format!("app root not found: {}", root.display()))?;
@@ -119,6 +119,11 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>) -> anyhow::Result<()> {
     let sourcemap = build_cfg.sourcemap.unwrap_or(true);
     if build_cfg.target.is_some() {
         eprintln!("oj build: note: build.target is accepted but not yet applied");
+    }
+
+    // SSR mode: build a Node-runnable server bundle from the entry.
+    if let Some(entry) = ssr.or_else(|| build_cfg.ssr.clone()) {
+        return build_ssr(&root, &out_dir, &entry, sourcemap).await;
     }
 
     // Library mode: build a distributable, not an app — no index.html.
@@ -345,6 +350,88 @@ fn scan_attrs(html: &str, tag_prefix: &str, attr_prefix: &str) -> Vec<String> {
         }
     }
     values
+}
+
+/// Build an SSR server bundle (`build.ssr` / `--ssr`): target Node, keep bare
+/// dependencies external (Node resolves them at runtime), emit one ESM
+/// `<stem>.mjs`. This is the server-build half of SSR; a dev-server SSR module
+/// runner (Environment API) is separate, larger work.
+async fn build_ssr(
+    root: &Path,
+    out_dir: &Path,
+    entry: &str,
+    sourcemap: bool,
+) -> anyhow::Result<()> {
+    use rolldown::{IsExternal, Platform};
+
+    let entry_import = if entry.starts_with('.') { entry.to_string() } else { format!("./{entry}") };
+    let stem =
+        Path::new(entry).file_stem().and_then(|s| s.to_str()).unwrap_or("server").to_string();
+
+    let _ = fs::remove_dir_all(out_dir);
+    fs::create_dir_all(out_dir)?;
+    let started = Instant::now();
+    let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Externalize a module once it resolves into node_modules (Node requires
+    // those at runtime); aliases (`@/…`) and relative imports resolve to
+    // source and stay bundled.
+    let external = IsExternal::Fn(Some(Arc::new(|spec: &str, _importer, is_resolved: bool| {
+        let ext = is_resolved && spec.contains("node_modules");
+        Box::pin(async move { Ok(ext) })
+    })));
+
+    let mut bundler = BundlerBuilder::default()
+        .with_plugins(vec![Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css) })])
+        .with_options(BundlerOptions {
+            input: Some(vec![InputItem {
+                name: Some(stem.clone()),
+                import: entry_import,
+                ..Default::default()
+            }]),
+            cwd: Some(root.to_path_buf()),
+            dir: Some(out_dir.display().to_string()),
+            platform: Some(Platform::Node),
+            external: Some(external),
+            format: Some(OutputFormat::Esm),
+            entry_filenames: Some(format!("{stem}.mjs").into()),
+            chunk_filenames: Some(format!("{stem}-[hash].mjs").into()),
+            minify: Some(RawMinifyOptions::Bool(false)),
+            sourcemap: sourcemap.then_some(SourceMapType::File),
+            define: Some(
+                vec![
+                    ("process.env.NODE_ENV".to_string(), "'production'".to_string()),
+                    ("import.meta.env.SSR".to_string(), "true".to_string()),
+                    ("import.meta.env.PROD".to_string(), "true".to_string()),
+                    ("import.meta.env.DEV".to_string(), "false".to_string()),
+                    ("import.meta.env.MODE".to_string(), "\"production\"".to_string()),
+                    ("import.meta.env.BASE_URL".to_string(), "\"/\"".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            ..Default::default()
+        })
+        .build()
+        .map_err(|errs| anyhow::anyhow!("rolldown init failed: {errs:?}"))?;
+
+    let output = bundler
+        .write()
+        .await
+        .map_err(|errs| anyhow::anyhow!("ssr build failed:\n{errs:?}"))?;
+
+    let mut emitted: Vec<(String, usize)> = Vec::new();
+    for asset in &output.assets {
+        if let rolldown_common::Output::Chunk(c) = asset {
+            emitted.push((c.filename.to_string(), c.code.len()));
+        }
+    }
+    println!("oj build (ssr): {} in {:?}", out_dir.display(), started.elapsed());
+    emitted.sort_by(|a, b| b.1.cmp(&a.1));
+    for (name, bytes) in &emitted {
+        println!("  {:>9}  {}", human_bytes(*bytes), name);
+    }
+    Ok(())
 }
 
 /// Build a library (`build.lib`): one Rolldown pass per output format,

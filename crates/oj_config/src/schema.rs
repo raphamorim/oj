@@ -114,6 +114,8 @@ pub struct BuildConfig {
     pub sourcemap: Option<bool>,
     /// Library mode: build a distributable library instead of an app.
     pub lib: Option<LibConfig>,
+    /// SSR mode: build a Node-runnable server bundle from this entry.
+    pub ssr: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

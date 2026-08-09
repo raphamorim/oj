@@ -69,6 +69,11 @@ jobs:
           test -f /tmp/lib/dist/index.js
           test -f /tmp/lib/dist/index.cjs
           test -f /tmp/lib/dist/index.umd.js
+      - name: ssr build
+        run: |
+          cargo run -p oj -- build playground --ssr src/entry-server.tsx --out dist-ssr
+          test -f playground/dist-ssr/entry-server.mjs
+          cd playground && node --input-type=module -e "import('./dist-ssr/entry-server.mjs').then(m => { const h = m.render(); if (!h.includes('ssr')) throw new Error('no ssr html'); console.log('ssr ok'); })"
       - name: preview smoke
         run: |
           (cargo run -p oj -- preview playground &)

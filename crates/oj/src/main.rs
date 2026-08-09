@@ -43,6 +43,9 @@ enum Command {
         /// Output directory (overrides oj.config build.outDir; default dist)
         #[arg(long)]
         out: Option<PathBuf>,
+        /// SSR entry: build a Node server bundle (overrides oj.config build.ssr)
+        #[arg(long)]
+        ssr: Option<String>,
     },
     /// Preview a production build (static server over the build dir)
     Preview {
@@ -79,12 +82,12 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", output.code);
             Ok(())
         }
-        Command::Build { root, out } => {
+        Command::Build { root, out, ssr } => {
             let root = root.unwrap_or_else(|| {
                 let playground = PathBuf::from("playground");
                 if playground.join("index.html").is_file() { playground } else { PathBuf::from(".") }
             });
-            build::build(root, out).await
+            build::build(root, out, ssr).await
         }
         Command::Preview { root, out, port } => {
             let root = root
