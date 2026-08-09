@@ -846,11 +846,12 @@ fn rewrite_specifier(
         return None;
     }
 
-    // Query-suffixed asset imports (`./x.wasm?url`, `./x.txt?raw`,
-    // `./x.png?inline`): resolve the base file, keep the marker; the server
-    // answers with a JS module (a url string / file contents / data URI).
-    for suffix in ["?url", "?raw", "?inline"] {
-        if let Some(base) = spec.strip_suffix(suffix) {
+    // Query-suffixed imports (`./x.wasm?url`, `./x.txt?raw`, `./x.png?inline`,
+    // `./w.ts?worker`): resolve the base file, keep the marker; the server
+    // answers with a JS module (url string / contents / data URI / Worker
+    // factory).
+    if let Some((base, query)) = spec.split_once('?') {
+        if matches!(query, "url" | "raw" | "inline" | "worker" | "sharedworker") {
             let resolved = rewrite_specifier(root, dir, resolver, fs_allow, base, false)
                 .or_else(|| {
                     resolver.resolve(dir, base).ok().map(|p| {
@@ -858,7 +859,7 @@ fn rewrite_specifier(
                         url_of(root, &p)
                     })
                 })?;
-            return Some(format!("{resolved}{suffix}"));
+            return Some(format!("{resolved}?{query}"));
         }
     }
 
@@ -967,7 +968,7 @@ fn locate(root: &Path, rel: &str) -> Option<PathBuf> {
 /// Which query-suffix asset module a request wants, if any.
 fn query_asset_kind(query: Option<&str>) -> Option<&'static str> {
     let q = query?;
-    for kind in ["url", "raw", "inline"] {
+    for kind in ["url", "raw", "inline", "worker", "sharedworker"] {
         if q.split('&').any(|kv| kv == kind) {
             return Some(kind);
         }
@@ -992,6 +993,14 @@ async fn asset_module(file: &Path, url: &str, kind: &str) -> Result<String, Stri
             let mime = content_type(ext).split(';').next().unwrap_or("application/octet-stream");
             let data_uri = format!("data:{mime};base64,{}", base64_encode(&bytes));
             Ok(format!("export default {data_uri:?};\n"))
+        }
+        // `?worker` / `?sharedworker`: a factory that constructs a module
+        // Worker over the (separately compiled+served) worker script.
+        "worker" | "sharedworker" => {
+            let ctor = if kind == "sharedworker" { "SharedWorker" } else { "Worker" };
+            Ok(format!(
+                "export default function () {{ return new {ctor}({clean_url:?}, {{ type: \"module\" }}); }}\n"
+            ))
         }
         _ => Err(format!("unknown asset query: {kind}")),
     }
