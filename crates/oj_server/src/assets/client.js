@@ -7,7 +7,15 @@
 // `import.meta.hot = createHotContext("/src/X.tsx")` appended by the server,
 // and the Fast Refresh glue registers an accept callback through it.
 
-const hotModules = new Map(); // id -> { acceptCallbacks: [], disposeCallbacks: [], data: {} }
+const hotModules = new Map(); // id -> { acceptCallbacks, disposeCallbacks, pruneCallbacks, data, listeners }
+
+// Custom event bus shared across all modules' hot.on() plus built-in
+// `vite:*` lifecycle events, so tooling written against Vite's API works.
+const customListeners = new Map(); // event -> Set<cb>
+function emit(event, data) {
+  const set = customListeners.get(event);
+  if (set) for (const cb of [...set]) cb(data);
+}
 
 export function createHotContext(ownerId) {
   const id = ownerId.split("?")[0];
@@ -19,25 +27,60 @@ export function createHotContext(ownerId) {
   if (mod) {
     mod.acceptCallbacks = [];
     mod.disposeCallbacks = [];
+    mod.pruneCallbacks = [];
+    // Drop this module's previous hot.on listeners so a re-exec doesn't
+    // accumulate duplicates.
+    if (mod.listeners) for (const [ev, cb] of mod.listeners) customListeners.get(ev)?.delete(cb);
+    mod.listeners = [];
   } else {
-    mod = { acceptCallbacks: [], disposeCallbacks: [], data: {} };
+    mod = {
+      acceptCallbacks: [],
+      disposeCallbacks: [],
+      pruneCallbacks: [],
+      data: {},
+      listeners: [],
+    };
     hotModules.set(id, mod);
   }
   const data = mod.data;
   return {
     data,
-    accept(callback) {
-      mod.acceptCallbacks.push(callback || (() => {}));
+    // accept() | accept(cb) | accept(dep, cb) | accept([deps], cb). We
+    // re-execute the whole boundary regardless, so all forms register a
+    // callback invoked with the new module namespace.
+    accept(first, second) {
+      const cb = typeof first === "function" ? first : second || (() => {});
+      mod.acceptCallbacks.push(cb);
     },
-    dispose(callback) {
-      mod.disposeCallbacks.push(callback);
+    acceptExports(_names, cb) {
+      mod.acceptCallbacks.push(cb || (() => {}));
     },
+    dispose(cb) {
+      mod.disposeCallbacks.push(cb);
+    },
+    prune(cb) {
+      mod.pruneCallbacks.push(cb);
+    },
+    decline() {}, // back-compat no-op (matches Vite)
     invalidate(message) {
       console.warn(`[oj] ${id} invalidated${message ? ": " + message : ""}`);
       if (socket && socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ type: "invalidate", path: id }));
       } else {
         location.reload();
+      }
+    },
+    on(event, cb) {
+      if (!customListeners.has(event)) customListeners.set(event, new Set());
+      customListeners.get(event).add(cb);
+      mod.listeners.push([event, cb]);
+    },
+    off(event, cb) {
+      customListeners.get(event)?.delete(cb);
+    },
+    send(event, payload) {
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: "custom", event, data: payload }));
       }
     },
   };
@@ -76,14 +119,17 @@ async function applyUpdate(update) {
   // Snapshot before re-import: the new instance re-registers its own context.
   const accepts = mod.acceptCallbacks.slice();
   const disposes = mod.disposeCallbacks.slice();
+  emit("vite:beforeUpdate", { type: "js-update", path: cleanPath });
   try {
     for (const dispose of disposes) await dispose(mod.data);
     const sep = update.path.includes("?") ? "&" : "?";
     const next = await import(update.path + sep + "t=" + update.timestamp);
     for (const accept of accepts) await accept(next);
     clearOverlay();
+    emit("vite:afterUpdate", { type: "js-update", path: cleanPath });
     console.log(`[oj] hot updated ${update.path}`);
   } catch (err) {
+    emit("vite:error", { err: { message: String(err) } });
     showOverlay(`hot update failed for ${update.path}\n\n${err && err.stack ? err.stack : err}`);
   }
 }
@@ -149,10 +195,15 @@ let socket = null;
     } else if (msg.type === "css-update") {
       swapCss(msg);
     } else if (msg.type === "full-reload") {
+      emit("vite:beforeFullReload", { path: msg.reason });
       console.log("[oj] full reload:", msg.reason || "");
       location.reload();
     } else if (msg.type === "error") {
+      emit("vite:error", { err: { message: msg.message } });
       showOverlay(msg.message || "unknown error");
+    } else if (msg.type === "custom") {
+      // Server-sent custom event -> import.meta.hot.on(event) listeners.
+      emit(msg.event, msg.data);
     }
   });
   ws.addEventListener("open", () => console.log("[oj] dev server connected"));

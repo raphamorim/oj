@@ -844,6 +844,20 @@ fn handle_client_message(state: &Arc<ServerState>, text: &str) {
             }
         };
         let _ = state.reload_tx.send(reply.to_string());
+    } else if msg["type"] == "custom" {
+        // A client `import.meta.hot.send(event, data)`. With no plugin system
+        // yet, broadcast it to all clients so hot.on(event) listeners (this
+        // tab and others) receive it — enough for round-trip messaging.
+        if msg["event"].is_string() {
+            let _ = state.reload_tx.send(
+                serde_json::json!({
+                    "type": "custom",
+                    "event": msg["event"],
+                    "data": msg["data"],
+                })
+                .to_string(),
+            );
+        }
     }
 }
 
