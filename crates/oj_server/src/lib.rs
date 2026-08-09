@@ -26,7 +26,7 @@ use anyhow::Context;
 use axum::{
     Router,
     body::Body,
-    extract::{State, WebSocketUpgrade, ws::Message},
+    extract::{Query, State, WebSocketUpgrade, ws::Message},
     http::{HeaderMap, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::get,
@@ -43,6 +43,9 @@ const CLIENT_JS: &str = include_str!("assets/client.js");
 const REFRESH_RUNTIME_JS: &str = include_str!("assets/refresh-runtime.js");
 const REFRESH_PREAMBLE_JS: &str = include_str!("assets/refresh-preamble.js");
 const BUNDLE_RUNTIME_JS: &str = include_str!("assets/bundle-runtime.js");
+/// The persistent SSR module-runner script (`oj dev --ssr`), spawned by the
+/// `oj` crate under the app root so Node resolves the app's `node_modules`.
+pub const SSR_RUNNER_JS: &str = include_str!("assets/ssr-runner.mjs");
 const COMPILABLE: &[&str] = &["tsx", "ts", "jsx", "js", "mjs"];
 
 pub struct DevServer {
@@ -213,6 +216,8 @@ impl DevServer {
             .route("/@oj/bundle-runtime.js", get(|| async { js(BUNDLE_RUNTIME_JS) }))
             .route("/@oj/chunk.js", get(serve_chunk))
             .route("/@oj/patch.js", get(serve_patch))
+            .route("/@ssr-resolve", get(ssr_resolve))
+            .route("/@ssr-module", get(ssr_module))
             .route("/__ws", get(ws_upgrade))
             .fallback(get(serve_path));
         // Proxy runs ahead of routing so configured prefixes (/api, ...) are
@@ -233,6 +238,106 @@ impl DevServer {
 
 fn js(body: &'static str) -> Response {
     ([(header::CONTENT_TYPE, "text/javascript")], body).into_response()
+}
+
+fn js_owned(body: String) -> Response {
+    ([(header::CONTENT_TYPE, "text/javascript")], body).into_response()
+}
+
+/// Module-runner endpoint: resolve `spec` as imported from `importer`. Returns
+/// `{"external":true,"spec":...}` for anything under node_modules (the runner
+/// imports those natively in Node) or `{"id":"<abs>"}` for app source (which
+/// the runner fetches from [`ssr_module`]). This plus [`ssr_module`] is the
+/// server-side half of dev SSR: a persistent Node runner links the SSR module
+/// graph on demand, so edits re-evaluate incrementally with no bundle step.
+async fn ssr_resolve(
+    State(state): State<Arc<ServerState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let (Some(importer), Some(spec)) = (q.get("importer"), q.get("spec")) else {
+        return (StatusCode::BAD_REQUEST, "importer and spec required").into_response();
+    };
+    let importer_dir = Path::new(importer).parent().unwrap_or(&state.root);
+    match state.resolver.resolve(importer_dir, spec) {
+        Ok(p) => {
+            let s = p.to_string_lossy();
+            let body = if s.contains("/node_modules/") {
+                serde_json::json!({ "external": true, "spec": spec })
+            } else {
+                serde_json::json!({ "id": s })
+            };
+            js_response_json(body)
+        }
+        // Unresolvable bare specifier (e.g. a Node builtin): let Node try it.
+        Err(_) if !spec.starts_with('.') && !spec.starts_with('/') => {
+            js_response_json(serde_json::json!({ "external": true, "spec": spec }))
+        }
+        Err(e) => (StatusCode::NOT_FOUND, format!("cannot resolve {spec}: {}", e.reason)).into_response(),
+    }
+}
+
+fn js_response_json(v: serde_json::Value) -> Response {
+    ([(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response()
+}
+
+/// Module-runner endpoint: compile one app-source module for server-side
+/// evaluation. Plain TS/JSX prod transform (no Fast Refresh, no browser HMR
+/// glue), import specifiers left raw for the runner's linker; CSS Modules
+/// become their class-name map (hashed off the root-relative id, matching the
+/// client) and JSON becomes an ESM module.
+async fn ssr_module(
+    State(state): State<Arc<ServerState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(id) = q.get("id") else {
+        return (StatusCode::BAD_REQUEST, "id required").into_response();
+    };
+    let path = PathBuf::from(id);
+    let source = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => return (StatusCode::NOT_FOUND, format!("{id}: {e}")).into_response(),
+    };
+    let ext = path.extension().and_then(|e| e.to_str());
+    if matches!(ext, Some("css") | Some("scss") | Some("sass")) {
+        return match ssr_css_module(&state.root, &path, &source) {
+            Ok(code) => js_owned(code),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        };
+    }
+    if ext == Some("json") {
+        return match oj_compiler::json::to_esm(&source, id) {
+            Ok(code) => js_owned(code),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+        };
+    }
+    match oj_compiler::compile(&path, &source, &oj_compiler::CompileOptions::prod()) {
+        Ok(out) => js_owned(out.code),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+/// Compile a (possibly CSS-module / Sass) stylesheet into an ESM module for the
+/// runner: `export default <class map>`. Class names hash off the root-relative
+/// id, so they match the dev pipeline and the SSR markup hydrates cleanly.
+fn ssr_css_module(root: &Path, path: &Path, source: &str) -> Result<String, String> {
+    let css_src = if oj_css::is_sass(&path.to_string_lossy()) {
+        oj_css::compile_sass(source, path.parent())?
+    } else {
+        source.to_string()
+    };
+    let css_id = match path.strip_prefix(root) {
+        Ok(rel) => format!("/{}", rel.display()),
+        Err(_) => path.to_string_lossy().to_string(),
+    };
+    let output = oj_css::compile_css(&css_id, &css_src, true)?;
+    Ok(match output.exports {
+        Some(exports) => {
+            let map: serde_json::Map<String, serde_json::Value> =
+                exports.into_iter().map(|(k, v)| (k, serde_json::Value::String(v))).collect();
+            format!("export default {};", serde_json::Value::Object(map))
+        }
+        None => "export default {};".to_string(),
+    })
 }
 
 /// Static server for a production build (`oj preview`). Serves `dir`,

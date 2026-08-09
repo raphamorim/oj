@@ -63,12 +63,17 @@ try {
   if (!/ssr[^0-9]*0/.test(stripTags(first))) throw new Error(`first render missing "ssr: 0":\n${first}`);
   console.log("ssr-dev: first render ok (ssr: 0)");
 
-  // 2. An edit shows up on the next full load (server bundle rebuilt per load).
+  // 2. The persistent module runner re-evaluates changed modules on the next
+  //    load — two consecutive edits both show up, with no Rolldown SSR bundle.
   fs.writeFileSync(counter, baseline.replace("useState<number>(0)", "useState<number>(41)"));
   const edited = await waitFor((h) => /ssr[^0-9]*41/.test(stripTags(h)));
   if (!/ssr[^0-9]*41/.test(stripTags(edited))) throw new Error(`edit not reflected:\n${edited}`);
+  fs.writeFileSync(counter, baseline.replace("useState<number>(0)", "useState<number>(8)"));
+  await waitFor((h) => /ssr[^0-9]*8[^0-9]/.test(stripTags(h) + " "));
   fs.writeFileSync(counter, baseline);
-  console.log("ssr-dev: server rebuild-on-load ok (ssr: 41)");
+  const runnerScript = path.join(repo, "playground", ".oj-cache", "ssr", "runner.mjs");
+  if (!fs.existsSync(runnerScript)) throw new Error("module runner script was not spawned");
+  console.log("ssr-dev: module runner re-eval ok (ssr: 41, then 8)");
 
   // 3. Hydration wiring + CSS-module class parity with the dev pipeline.
   const html = await waitFor((h) => /ssr[^0-9]*0/.test(stripTags(h)));

@@ -1,30 +1,31 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-//! Dev-server SSR with HMR (`oj dev --ssr <entry>`).
+//! Dev-server SSR with a module runner (`oj dev --ssr <entry>`).
 //!
-//! The initial paint is server-rendered: on a full page load the server bundle
-//! is (re)built and executed in Node to produce HTML. Hydration and hot module
-//! replacement are then handled by oj's normal unbundled dev pipeline — the SSR
-//! route is merged onto [`oj_server::DevServer`], so the client entry, module
-//! graph, Fast Refresh, and the HMR WebSocket all come from it. Editing a
+//! The initial paint is server-rendered by a persistent Node **module runner**
+//! (`oj_server::SSR_RUNNER_JS`): oj spawns it once, under the app root, and
+//! drives it over stdin/stdout. The runner links the SSR module graph on demand
+//! — app source is fetched already-compiled from the dev server's `/@ssr-*`
+//! endpoints and evaluated with `vm.SourceTextModule`; node_modules import
+//! natively. There is no Rolldown bundle and no per-render Node spawn, and an
+//! edit re-evaluates only the changed modules and their importers (the runner
+//! invalidates by file mtime).
+//!
+//! Hydration and client HMR are handled by oj's normal unbundled dev pipeline:
+//! the SSR `/` route is merged onto [`oj_server::DevServer`], so the client
+//! entry, Fast Refresh, and the HMR WebSocket all come from it. Editing a
 //! component hot-updates the running page with React state preserved and no
-//! full reload, exactly like the non-SSR dev server. This is how Vite's dev SSR
-//! works too: the server renders first paint, the dev server drives the client.
+//! reload; the server-rendered markup follows on the next full navigation.
 //!
-//! CSS-module class names hash identically in the server bundle and the dev
-//! pipeline (both key off the root-relative id), so the hydrated markup matches
-//! the SSR HTML — no hydration mismatch.
-//!
-//! What's still coarse: the server bundle is rebuilt wholesale per full load
-//! (Node per render), and there is no server-side module graph / SSR-side HMR —
-//! an edit is reflected server-side only on the next full navigation. The
-//! Environment API module runner is the larger remaining work.
+//! CSS-module class names hash identically in the runner and the dev pipeline
+//! (both key off the root-relative id), so the hydrated markup matches the SSR
+//! HTML — no hydration mismatch.
 
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::{
     Router,
@@ -32,42 +33,41 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::get,
 };
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::{Child, ChildStdin, ChildStdout};
+
+/// A live handle to the spawned Node module runner.
+struct Runner {
+    stdin: ChildStdin,
+    lines: Lines<BufReader<ChildStdout>>,
+    _child: Child,
+}
 
 struct SsrState {
-    root: PathBuf,
-    entry: String,
-    server_dir: PathBuf,
-    server_stem: String,
     /// URL of the client hydration entry (`/src/entry-client.tsx`), served by
     /// the dev pipeline. `None` => SSR-only, inert page.
     client_url: Option<String>,
-    /// Serializes bundle rebuilds so a concurrent build can't wipe the `.mjs`
-    /// out from under an in-flight Node render.
-    build_lock: tokio::sync::Mutex<()>,
-    version: AtomicU64,
+    runner: tokio::sync::Mutex<Runner>,
 }
 
 pub async fn ssr_dev(root: PathBuf, entry: String, port: Option<u16>) -> anyhow::Result<()> {
     // Reuse the full dev server for the client side (Fast Refresh, HMR, module
-    // compilation). We only add the server-rendered `/` route on top.
+    // compilation, and the /@ssr-* runner endpoints). We add the server-rendered
+    // `/` route on top.
     let built = oj_server::DevServer { root, port, bundle: false }.build_app().await?;
 
-    let server_stem = stem_of(&entry, "server");
     let client_url = derive_client_entry(&built.root, &entry).map(|rel| format!("/{rel}"));
+    let base = format!("http://{}:{}", built.host, built.port);
+    let entry_abs = built.root.join(&entry);
+    let runner = spawn_runner(&built.root, &base, &entry_abs).await?;
 
     let ssr_state = Arc::new(SsrState {
-        server_dir: built.root.join(".oj-cache").join("ssr").join("server"),
-        server_stem,
         client_url: client_url.clone(),
-        build_lock: tokio::sync::Mutex::new(()),
-        version: AtomicU64::new(0),
-        root: built.root.clone(),
-        entry,
+        runner: tokio::sync::Mutex::new(runner),
     });
 
     // The explicit `/` route overrides the dev server's index.html fallback;
-    // every other path (modules, /@oj/*, /__ws, CSS, proxy) flows to the dev
-    // router unchanged.
+    // every other path flows to the dev router unchanged.
     let app = Router::new()
         .route("/", get(render))
         .with_state(Arc::clone(&ssr_state))
@@ -77,8 +77,8 @@ pub async fn ssr_dev(root: PathBuf, entry: String, port: Option<u16>) -> anyhow:
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| anyhow::anyhow!("cannot bind {addr}: {e}"))?;
-    println!("  oj dev (ssr + hmr)");
-    println!("  entry:  {}", ssr_state.entry);
+    println!("  oj dev (ssr + module runner)");
+    println!("  entry:  {entry}");
     match &client_url {
         Some(u) => println!("  client: {u} (hydration + hmr on)"),
         None => println!("  client: none (SSR only; add a *-client entry to hydrate)"),
@@ -88,34 +88,49 @@ pub async fn ssr_dev(root: PathBuf, entry: String, port: Option<u16>) -> anyhow:
     Ok(())
 }
 
-async fn render(State(state): State<Arc<SsrState>>) -> Response {
-    let _guard = state.build_lock.lock().await;
-    if let Err(e) =
-        crate::build::build_ssr(&state.root, &state.server_dir, &state.entry, false).await
-    {
-        return error_page(&format!("SSR build failed:\n{e}"));
-    }
-    let bundle = state.server_dir.join(format!("{}.mjs", state.server_stem));
-    let v = state.version.fetch_add(1, Ordering::Relaxed);
-    // Cache-bust the import so a rebuilt bundle is re-evaluated by Node.
-    let script = format!(
-        "import('file://{}?v={v}').then(m => process.stdout.write(String(m.render())))",
-        bundle.display()
-    );
-    let out = tokio::process::Command::new("node")
-        .args(["--input-type=module", "-e", &script])
-        .current_dir(&state.root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await;
+/// Write the runner script under the app root (so Node resolves the app's
+/// `node_modules`) and spawn it, piping stdin/stdout for the render protocol.
+async fn spawn_runner(root: &Path, base: &str, entry_abs: &Path) -> anyhow::Result<Runner> {
+    let dir = root.join(".oj-cache").join("ssr");
+    std::fs::create_dir_all(&dir)?;
+    let script = dir.join("runner.mjs");
+    std::fs::write(&script, oj_server::SSR_RUNNER_JS)?;
 
-    match out {
-        Ok(o) if o.status.success() => {
-            Html(page(&state, &String::from_utf8_lossy(&o.stdout))).into_response()
-        }
-        Ok(o) => error_page(&format!("SSR render failed:\n{}", String::from_utf8_lossy(&o.stderr))),
-        Err(e) => error_page(&format!("could not spawn node: {e}")),
+    let mut child = tokio::process::Command::new("node")
+        .args([
+            "--experimental-vm-modules",
+            &script.to_string_lossy(),
+            base,
+            &entry_abs.to_string_lossy(),
+        ])
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("could not spawn SSR runner (node): {e}"))?;
+
+    let stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    Ok(Runner { stdin, lines: BufReader::new(stdout).lines(), _child: child })
+}
+
+async fn render(State(state): State<Arc<SsrState>>) -> Response {
+    let mut runner = state.runner.lock().await;
+    if runner.stdin.write_all(b"{\"cmd\":\"render\"}\n").await.is_err()
+        || runner.stdin.flush().await.is_err()
+    {
+        return error_page("SSR runner is not accepting input (did it crash?)");
+    }
+    match runner.lines.next_line().await {
+        Ok(Some(line)) => match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(v) if v.get("html").and_then(|h| h.as_str()).is_some() => {
+                Html(page(&state, v["html"].as_str().unwrap())).into_response()
+            }
+            Ok(v) => error_page(v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown SSR error")),
+            Err(_) => error_page(&format!("SSR runner sent malformed output:\n{line}")),
+        },
+        _ => error_page("SSR runner did not respond"),
     }
 }
 
@@ -148,25 +163,16 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-/// Stem of an entry path, falling back to `default` (e.g. "entry-server").
-fn stem_of(entry: &str, default: &str) -> String {
-    std::path::Path::new(entry)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(default)
-        .to_string()
-}
-
 /// Derive the client hydration entry from the server entry by convention:
 /// swap "server" -> "client" in the filename and return it (root-relative) if
 /// that file exists, else None.
-fn derive_client_entry(root: &std::path::Path, server_entry: &str) -> Option<String> {
-    let file = std::path::Path::new(server_entry).file_name()?.to_str()?;
+fn derive_client_entry(root: &Path, server_entry: &str) -> Option<String> {
+    let file = Path::new(server_entry).file_name()?.to_str()?;
     if !file.contains("server") {
         return None;
     }
     let client_file = file.replace("server", "client");
-    let client_rel = match std::path::Path::new(server_entry).parent() {
+    let client_rel = match Path::new(server_entry).parent() {
         Some(dir) if !dir.as_os_str().is_empty() => {
             format!("{}/{}", dir.to_string_lossy(), client_file)
         }
