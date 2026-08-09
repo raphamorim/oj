@@ -158,14 +158,36 @@ async function entryNamespace() {
   return rec.mod.namespace;
 }
 
+// JSON-serialize loader data with `<` escaped so it can't close the inline
+// <script> the transport embeds it in.
+const serialize = (data) => JSON.stringify(data ?? null).replace(/</g, "\\u003c");
+
+async function loadData(ns, url) {
+  return typeof ns.load === "function" ? await ns.load(url) : null;
+}
+
+// Loader-only: emit `{data}` (server-authoritative route data for a client
+// navigation).
+async function handleLoad(emit, url) {
+  emit({ data: serialize(await loadData(await entryNamespace(), url)) });
+}
+
+// Action: run the server-side mutation, then revalidate the loader and emit the
+// fresh `{data}`.
+async function handleAction(emit, url, body) {
+  const ns = await entryNamespace();
+  if (typeof ns.action === "function") await ns.action(url, body);
+  emit({ data: serialize(await loadData(ns, url)) });
+}
+
 // Produce the render for `url`. First runs the route loader (if any) and emits
-// `{data}` (JSON, `<` escaped so it can't close the inline <script>) for the
-// transport to serialize into the document; then the render output — `{chunk}`…
-// `{end}` for a streaming entry (renderStream), or a single `{html}`.
+// `{data}` for the transport to serialize into the document; then the render
+// output — `{chunk}`… `{end}` for a streaming entry (renderStream), or a single
+// `{html}`.
 async function handleRender(emit, url) {
   const ns = await entryNamespace();
-  const data = typeof ns.load === "function" ? await ns.load(url) : null;
-  emit({ data: JSON.stringify(data ?? null).replace(/</g, "\\u003c") });
+  const data = await loadData(ns, url);
+  emit({ data: serialize(data) });
   if (typeof ns.renderStream === "function") {
     const stream = await ns.renderStream(url, data);
     const reader = stream.getReader();
@@ -236,11 +258,11 @@ rl.on("line", (line) => {
   } catch {
     return;
   }
-  if (msg.cmd === "render") {
-    const emit = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
-    const url = typeof msg.url === "string" ? msg.url : "/";
-    withLock(() => handleRender(emit, url)).catch((e) =>
-      emit({ error: String((e && e.stack) || e) }),
-    );
-  }
+  const emit = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
+  const url = typeof msg.url === "string" ? msg.url : "/";
+  const body = typeof msg.body === "string" ? msg.body : "";
+  const fail = (e) => emit({ error: String((e && e.stack) || e) });
+  if (msg.cmd === "render") withLock(() => handleRender(emit, url)).catch(fail);
+  else if (msg.cmd === "load") withLock(() => handleLoad(emit, url)).catch(fail);
+  else if (msg.cmd === "action") withLock(() => handleAction(emit, url, body)).catch(fail);
 });

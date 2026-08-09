@@ -86,10 +86,15 @@ try {
   if (!html.includes('data-page="home"')) throw new Error("/ did not render the home route");
   const about = await (await fetch(`${base}/about`)).text();
   if (!about.includes('data-page="about"')) throw new Error("/about did not render the about route");
-  if (!html.includes("window.__OJ_DATA__=") || !html.includes('"loadedOn":"server"') || !html.includes('data-loaded="server"')) {
+  if (!html.includes("window.__OJ_DATA__=") || !html.includes('"likes":') || !html.includes('data-likes="0"')) {
     throw new Error(`route data not loaded/serialized server-side:\n${html}`);
   }
-  console.log("ssr-prod: streaming + per-route + data loading ok (/ -> home, /about -> about)");
+  // Action + revalidation over HTTP: POST mutates server state, GET reflects it.
+  const acted = await (await fetch(`${base}/`, { method: "POST", headers: { "oj-loader": "1" } })).json();
+  if (acted.likes !== 1) throw new Error(`action did not mutate server state: ${JSON.stringify(acted)}`);
+  const reloaded = await (await fetch(`${base}/about`, { headers: { "oj-loader": "1" } })).json();
+  if (reloaded.likes !== 1) throw new Error("mutation not visible via server-authoritative loader");
+  console.log("ssr-prod: streaming + per-route + data loading + action ok");
 
   // 3. Hydration.
   let pw = null;
@@ -106,19 +111,22 @@ try {
       await page.goto(`${base}/`, { waitUntil: "networkidle" });
       const deferred = await page.locator("[data-deferred]").textContent();
       if (!deferred.includes("deferred-streamed")) throw new Error(`deferred content lost: ${deferred}`);
-      await page.locator("button").click();
-      await page.waitForFunction(() => document.querySelector("button").textContent.includes(": 1"), {
-        timeout: 5000,
-      });
-      // Client-side SPA routing: navigate to /about via a link, no full reload.
+      await page.locator("button", { hasText: "ssr" }).click(); // counter is interactive
+      await page.waitForFunction(
+        () => document.querySelector("button").textContent.includes(": 1"),
+        { timeout: 5000 },
+      );
+      // Action + SPA routing, no full reload.
       await page.evaluate(() => (window.__spa = 1));
+      const before = Number(await page.locator("[data-likes]").getAttribute("data-likes"));
+      await page.locator("button", { hasText: "like" }).click();
+      await page.waitForSelector(`[data-likes="${before + 1}"]`, { timeout: 5000 });
       await page.locator('a[href="/about"]').click();
       await page.waitForSelector('[data-page="about"]');
-      await page.waitForSelector('[data-loaded="client"]', { timeout: 5000 }); // client loader ran
       if ((await page.evaluate(() => window.__spa)) !== 1) throw new Error("SPA navigation caused a full reload");
       if ((await page.evaluate(() => location.pathname)) !== "/about") throw new Error("URL did not update to /about");
       if (errors.length) throw new Error(`console errors: ${errors.join("; ")}`);
-      console.log("ssr-prod: hydration + SPA + client loader ok (home interactive, link -> /about, no reload)");
+      console.log("ssr-prod: hydration + SPA + action ok (counter interactive, like mutation, link -> /about, no reload)");
     } finally {
       await browser.close();
     }

@@ -463,6 +463,13 @@ const CLIENT_JS = "__CLIENT_JS__";
 const CLIENT_CSS = "__CLIENT_CSS__";
 const TAIL = "</div></body></html>";
 const TYPES = { ".js": "text/javascript", ".css": "text/css", ".map": "application/json" };
+const serialize = (data) => JSON.stringify(data ?? null).replace(/</g, "\\u003c");
+const readBody = (req) =>
+  new Promise((resolve) => {
+    let b = "";
+    req.on("data", (c) => (b += c));
+    req.on("end", () => resolve(b));
+  });
 
 createServer(async (req, res) => {
   const url = req.url.split("?")[0];
@@ -478,8 +485,24 @@ createServer(async (req, res) => {
     }
   }
   try {
+    const wantsData = Boolean(req.headers["oj-loader"]);
+    // Action (mutation): run it server-side, then revalidate.
+    if (req.method === "POST") {
+      if (typeof entry.action === "function") await entry.action(url, await readBody(req));
+      if (wantsData) {
+        res.writeHead(200, { "content-type": "application/json" });
+        return void res.end(serialize(typeof entry.load === "function" ? await entry.load(url) : null));
+      }
+      // No-JS form: redirect so the browser re-GETs the updated document.
+      return void res.writeHead(303, { location: url }).end();
+    }
+    // Client data fetch for a navigation.
+    if (wantsData) {
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(serialize(typeof entry.load === "function" ? await entry.load(url) : null));
+    }
     const data = typeof entry.load === "function" ? await entry.load(url) : null;
-    const json = JSON.stringify(data ?? null).replace(/</g, "\\u003c");
+    const json = serialize(data);
     const HEAD =
       '<!doctype html><html><head><meta charset="utf-8">' +
       `<script>window.__OJ_DATA__=${json}</script>` +

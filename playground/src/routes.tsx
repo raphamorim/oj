@@ -1,26 +1,30 @@
 import { SsrApp } from "@/ssr-app";
+import { addLike, getLikes } from "@/store";
 
-// Route-level data. `loadedOn` records where the loader ran ("server" on the
-// initial SSR load, "client" after an SPA navigation) so the flow is visible.
-export type RouteData = { loadedOn: "server" | "client"; label: string } | null;
+// Route data is now backed by server state, so loaders are server-authoritative:
+// the client fetches loader data on navigation rather than recomputing it, and
+// a mutation (action) is visible everywhere afterward.
+export type RouteData = { likes: number } | null;
 
-// The loader is isomorphic: the server runs it before rendering and serializes
-// the result; the client runs it on SPA navigation. Real loaders fetch/query —
-// this one just stamps where it ran, after an async tick.
 export async function loadRoute(url: string): Promise<RouteData> {
   const path = url.split("?")[0];
-  const loadedOn = typeof window === "undefined" ? "server" : "client";
   await Promise.resolve();
-  if (path === "/") return { loadedOn, label: "home data" };
-  if (path === "/about") return { loadedOn, label: "about data" };
+  if (path === "/" || path === "/about") return { likes: getLikes() };
   return null;
 }
 
-function Loaded({ data }: { data: RouteData }) {
+// The action mutates server state; the framework then revalidates the loader.
+export async function actionRoute(_url: string, _body: string): Promise<void> {
+  addLike();
+}
+
+function Likes({ data }: { data: RouteData }) {
+  const likes = data?.likes ?? 0;
   return (
-    <p data-loaded={data?.loadedOn ?? "none"}>
-      {data ? `${data.label} (loaded on ${data.loadedOn})` : "no data"}
-    </p>
+    <form method="post" data-likes-form>
+      <span data-likes={likes}>likes: {likes}</span>
+      <button type="submit">like</button>
+    </form>
   );
 }
 
@@ -28,7 +32,7 @@ function Home({ data }: { data: RouteData }) {
   return (
     <main data-page="home">
       <SsrApp />
-      <Loaded data={data} />
+      <Likes data={data} />
       <a href="/about">about</a>
     </main>
   );
@@ -38,7 +42,7 @@ function About({ data }: { data: RouteData }) {
   return (
     <main data-page="about">
       <h1>About</h1>
-      <Loaded data={data} />
+      <Likes data={data} />
       <a href="/">home</a>
     </main>
   );

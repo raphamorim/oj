@@ -93,13 +93,19 @@ try {
   if (!first.includes('data-page="home"')) throw new Error("/ did not render the home route");
   console.log("ssr-dev: per-route ok (/ -> home, /about -> about)");
 
-  // 1d. Route data loading: the loader ran on the server, its data is
+  // 1d. Route data loading: the server-authoritative loader ran, its data is
   //     serialized into the document, and the route rendered with it.
-  if (!first.includes("window.__OJ_DATA__=") || !first.includes('"loadedOn":"server"')) {
+  if (!first.includes("window.__OJ_DATA__=") || !first.includes('"likes":')) {
     throw new Error(`route data not serialized into the document:\n${first}`);
   }
-  if (!first.includes('data-loaded="server"')) throw new Error("home not rendered with server data");
-  console.log("ssr-dev: route data loaded server-side + serialized");
+  if (!first.includes('data-likes="0"')) throw new Error("home not rendered with loader data");
+  // A server-authoritative loader fetch (oj-loader header) returns JSON data.
+  const loaderRes = await fetch(`${base}/about`, { headers: { "oj-loader": "1" } });
+  if (loaderRes.headers.get("content-type")?.includes("application/json") !== true) {
+    throw new Error("loader fetch did not return JSON");
+  }
+  if (typeof (await loaderRes.json()).likes !== "number") throw new Error("loader JSON missing likes");
+  console.log("ssr-dev: route data loaded server-side + serialized + loader fetch");
 
   // 2. The persistent module runner re-evaluates changed modules on the next
   //    load — two consecutive edits both show up, with no Rolldown SSR bundle.
@@ -155,35 +161,42 @@ try {
     try {
       await page.goto(`${base}/`, { waitUntil: "networkidle" });
       await page.waitForSelector("button");
+      const counterBtn = page.locator("button", { hasText: "ssr" });
+      const likeBtn = page.locator("button", { hasText: "like" });
       // The streamed Suspense content survived hydration (no mismatch).
       const deferred = await page.locator("[data-deferred]").textContent();
       if (!deferred.includes("deferred-streamed")) throw new Error(`deferred content lost: ${deferred}`);
       // One window marker proves nothing below triggers a full reload — not
-      // the SPA navigations, not the hot edit.
+      // the action, not the SPA navigations, not the hot edit.
       await page.evaluate(() => (window.__marker = 7));
 
-      // Client-side SPA routing: a link click navigates without a reload, and
-      // the back button restores the previous route (popstate), both in place.
+      // Action/mutation: submitting the form runs the server-side action and
+      // revalidates the loader, in place (no reload).
+      if ((await page.locator("[data-likes]").getAttribute("data-likes")) !== "0") throw new Error("likes did not start at 0");
+      await likeBtn.click();
+      await page.waitForSelector('[data-likes="1"]', { timeout: 5000 });
+      console.log("ssr-dev: action ok (form submit mutated server state -> likes 1, no reload)");
+
+      // Client-side SPA routing: a link click navigates without a reload, the
+      // navigated route's data comes from the server (shared store shows the
+      // mutation), and the back button restores the previous route (popstate).
       await page.locator('a[href="/about"]').click();
       await page.waitForSelector('[data-page="about"]');
       if ((await page.evaluate(() => location.pathname)) !== "/about") throw new Error("pushState did not update the URL");
-      // The client loader ran for the navigated route (server data was for /).
-      await page.waitForSelector('[data-loaded="client"]', { timeout: 5000 });
+      await page.waitForSelector('[data-likes="1"]', { timeout: 5000 }); // server-authoritative loader
       await page.goBack();
       await page.waitForSelector('[data-page="home"]');
       if ((await page.evaluate(() => window.__marker)) !== 7) throw new Error("SPA navigation caused a full reload");
-      console.log("ssr-dev: SPA routing + client loader ok (link -> /about, back -> /, no reload)");
+      console.log("ssr-dev: SPA routing + server loader ok (link -> /about, back -> /, no reload)");
 
-      for (let i = 0; i < 3; i++) await page.locator("button").click();
-      const clicked = (await page.locator("button").textContent()).trim();
+      for (let i = 0; i < 3; i++) await counterBtn.click();
+      const clicked = (await counterBtn.textContent()).trim();
       if (!clicked.includes(": 3")) throw new Error(`hydration did not attach handler: ${clicked}`);
 
       // Hot edit: change the separator, keep the component and its state.
       fs.writeFileSync(counter, baseline.replace("{label}: {count}", "{label} = {count}"));
-      await page.waitForFunction(() => document.querySelector("button").textContent.includes(" = "), {
-        timeout: 10000,
-      });
-      const afterEdit = (await page.locator("button").textContent()).trim();
+      await counterBtn.filter({ hasText: " = " }).waitFor({ timeout: 10000 });
+      const afterEdit = (await counterBtn.textContent()).trim();
       const marker = await page.evaluate(() => window.__marker);
       if (!afterEdit.includes("= 3")) throw new Error(`state lost or edit not applied: ${afterEdit}`);
       if (marker !== 7) throw new Error("page fully reloaded (state would be lost)");

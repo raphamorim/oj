@@ -1,10 +1,14 @@
 import { renderToReadableStream, renderToString } from "react-dom/server";
-import { App, loadRoute, type RouteData } from "@/routes";
+import { App, actionRoute, loadRoute, type RouteData } from "@/routes";
 
-// The runner calls load() first, then passes the data to the render so the
-// route renders with it and the transport can serialize it for the client.
+// Loader: runs on the server for the initial render and for client data fetches.
 export function load(url = "/"): Promise<RouteData> {
   return loadRoute(url);
+}
+
+// Action: a server-side mutation (POST). The caller revalidates via load().
+export function action(url = "/", body = ""): Promise<void> {
+  return actionRoute(url, body);
 }
 
 export function renderStream(url = "/", data: RouteData = null): Promise<ReadableStream<Uint8Array>> {

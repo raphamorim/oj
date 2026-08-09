@@ -30,7 +30,7 @@ use std::sync::Arc;
 use axum::{
     body::{Body, Bytes},
     extract::{Request, State},
-    http::{Method, header},
+    http::{Method, StatusCode, header},
     middleware::Next,
     response::{Html, IntoResponse, Response},
 };
@@ -120,35 +120,94 @@ async fn spawn_runner(root: &Path, base: &str, entry_abs: &Path) -> anyhow::Resu
     Ok(Runner { stdin, lines: BufReader::new(stdout).lines(), _child: child })
 }
 
-/// Route document navigations to the SSR renderer; everything else (modules,
-/// `/@oj/*`, `/@ssr-*`, assets, proxy, `/__ws`) to the dev pipeline.
+/// How an app-route request should be served.
+enum Route {
+    /// Browser navigation -> full HTML document.
+    Document,
+    /// Client data fetch (`oj-loader` header) -> JSON loader data.
+    Loader,
+    /// Form submit / mutation (POST) -> run the action, then revalidate.
+    /// `json` = a fetch call wants JSON back; otherwise redirect (no-JS form).
+    Action { json: bool },
+    /// Not an app route (module, asset, `/@…`, `/__…`, proxy) -> dev pipeline.
+    Pass,
+}
+
+/// Route app navigations/data/actions to the SSR runner; everything else
+/// (modules, `/@oj/*`, `/@ssr-*`, assets, proxy, `/__ws`) to the dev pipeline.
 async fn ssr_route(State(state): State<Arc<SsrState>>, req: Request, next: Next) -> Response {
-    if is_document_route(&req, &state.proxy_prefixes) {
-        render_route(&state, req.uri().path()).await
-    } else {
-        next.run(req).await
+    match classify(&req, &state.proxy_prefixes) {
+        Route::Document => render_route(&state, req.uri().path()).await,
+        Route::Loader => {
+            data_response(run_data(&state, serde_json::json!({ "cmd": "load", "url": req.uri().path() })).await)
+        }
+        Route::Action { json } => {
+            let path = req.uri().path().to_string();
+            let bytes = axum::body::to_bytes(req.into_body(), 256 * 1024).await.unwrap_or_default();
+            let body = String::from_utf8_lossy(&bytes).into_owned();
+            let cmd = serde_json::json!({ "cmd": "action", "url": path, "body": body });
+            let data = run_data(&state, cmd).await;
+            if json {
+                data_response(data)
+            } else if data.is_ok() {
+                // Progressive enhancement: the mutation ran; redirect so the
+                // browser re-GETs the updated document (POST/redirect/GET).
+                (StatusCode::SEE_OTHER, [(header::LOCATION, path)]).into_response()
+            } else {
+                error_page(&data.unwrap_err())
+            }
+        }
+        Route::Pass => next.run(req).await,
     }
 }
 
-/// A document route is a GET to an extensionless path that isn't a reserved dev
-/// prefix (`/@…`, `/__…`) or a configured proxy prefix. Modules and assets have
-/// extensions or the `/@` prefix; proxied paths (`/api`) reach the proxy layer;
-/// everything else — `/`, `/about`, … — is an app route we server-render.
-fn is_document_route(req: &Request, proxy_prefixes: &[String]) -> bool {
-    if req.method() != Method::GET {
-        return false;
-    }
+/// Classify a request. App routes are extensionless paths that aren't a reserved
+/// dev prefix (`/@…`, `/__…`) or a configured proxy prefix (`/api`). Modules and
+/// assets carry extensions or the `/@` prefix; proxied paths reach the proxy
+/// layer; everything else — `/`, `/about`, … — is ours.
+fn classify(req: &Request, proxy_prefixes: &[String]) -> Route {
     let path = req.uri().path();
     if path.starts_with("/@") || path.starts_with("/__") {
-        return false;
+        return Route::Pass;
     }
     if path.rsplit('/').next().is_some_and(|seg| seg.contains('.')) {
-        return false; // has a file extension -> asset
+        return Route::Pass; // has a file extension -> asset
     }
     if proxy_prefixes.iter().any(|p| path.starts_with(p.as_str())) {
-        return false;
+        return Route::Pass;
     }
-    true
+    let is_loader = req.headers().contains_key("oj-loader");
+    match *req.method() {
+        Method::GET if is_loader => Route::Loader,
+        Method::GET => Route::Document,
+        Method::POST => Route::Action { json: is_loader },
+        _ => Route::Pass,
+    }
+}
+
+/// Send a data command (`load`/`action`) to the runner and return its
+/// serialized loader data (or an error message).
+async fn run_data(state: &SsrState, cmd: serde_json::Value) -> Result<String, String> {
+    let mut guard = Arc::clone(&state.runner).lock_owned().await;
+    let line = format!("{cmd}\n");
+    guard.stdin.write_all(line.as_bytes()).await.map_err(|e| e.to_string())?;
+    guard.stdin.flush().await.map_err(|e| e.to_string())?;
+    match read_message(&mut guard.lines).await {
+        Some(v) if v.get("data").and_then(|d| d.as_str()).is_some() => {
+            Ok(v["data"].as_str().unwrap().to_owned())
+        }
+        Some(v) if v.get("error").and_then(|e| e.as_str()).is_some() => {
+            Err(v["error"].as_str().unwrap().to_owned())
+        }
+        _ => Err("SSR runner did not respond".to_string()),
+    }
+}
+
+fn data_response(data: Result<String, String>) -> Response {
+    match data {
+        Ok(json) => ([(header::CONTENT_TYPE, "application/json")], json).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
 
 async fn render_route(state: &SsrState, path: &str) -> Response {
