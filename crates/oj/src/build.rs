@@ -118,13 +118,15 @@ pub async fn build(root: PathBuf, out: PathBuf) -> anyhow::Result<()> {
         chunk_filenames: Some("assets/[name]-[hash].js".to_string().into()),
         minify: Some(RawMinifyOptions::Bool(true)),
         sourcemap: Some(SourceMapType::File),
-        define: Some(
-            std::iter::once((
-                "process.env.NODE_ENV".to_string(),
-                "'production'".to_string(),
-            ))
-            .collect(),
-        ),
+        define: Some({
+            // NODE_ENV plus the app's .env-derived import.meta.env.* values,
+            // loaded in production mode.
+            let env = oj_env::load(&root, "production");
+            let mut pairs: Vec<(String, String)> =
+                vec![("process.env.NODE_ENV".into(), "'production'".into())];
+            pairs.extend(oj_env::import_meta_env_defines(&env, "production", false, "/", "VITE_"));
+            pairs.into_iter().collect()
+        }),
             ..Default::default()
         })
         .build()

@@ -1524,6 +1524,7 @@ dependencies = [
  "clap",
  "oj_compiler",
  "oj_css",
+ "oj_env",
  "oj_server",
  "rolldown",
  "rolldown_common",
@@ -1568,6 +1569,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oj_env"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "oj_graph"
 version = "0.0.1"
 
@@ -1589,6 +1597,7 @@ dependencies = [
  "oj_cache",
  "oj_compiler",
  "oj_css",
+ "oj_env",
  "oj_graph",
  "oj_resolver",
  "serde_json",

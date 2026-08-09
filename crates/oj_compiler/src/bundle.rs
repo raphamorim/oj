@@ -136,6 +136,18 @@ fn compile_esm_factory(
         return Err(CompileError::Transform { path: path.to_path_buf(), message });
     }
 
+    // import.meta.env static replacement (same as unbundled). Essential in
+    // bundle mode: the factory is a plain function where `import.meta` is
+    // invalid, so any `import.meta.env` MUST be replaced away here.
+    if source_text.contains("import.meta.env") {
+        use oxc_transformer_plugins::{ReplaceGlobalDefines, ReplaceGlobalDefinesConfig};
+        let scoping = SemanticBuilder::new().build(&program).semantic.into_scoping();
+        let defines = crate::import_meta_env_defines(true);
+        if let Ok(config) = ReplaceGlobalDefinesConfig::new(&defines) {
+            let _ = ReplaceGlobalDefines::new(&allocator, config).build(scoping, &mut program);
+        }
+    }
+
     // Canonicalize specifiers to urls (shared with unbundled mode).
     let _ = crate::rewrite_module_specifiers_pub(&allocator, &mut program, resolve);
 

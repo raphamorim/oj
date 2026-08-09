@@ -58,3 +58,5 @@ jobs:
           grep -q underline playground/dist/tailwind.css
           test -f playground/dist/.vite/manifest.json
           grep -q isEntry playground/dist/.vite/manifest.json
+          grep -rq hello-from-env playground/dist/assets/*.js
+          ! grep -rq must-not-leak playground/dist/assets/*.js

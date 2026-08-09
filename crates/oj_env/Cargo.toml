@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Raphael Amorim
+[package]
+name = "oj_env"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "dotenv loading and import.meta.env define construction (Vite-compatible)"
+
+[dependencies]
+serde_json.workspace = true

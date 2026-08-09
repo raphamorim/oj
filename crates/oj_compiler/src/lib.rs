@@ -29,6 +29,37 @@ use oxc_transformer_plugins::{ReplaceGlobalDefines, ReplaceGlobalDefinesConfig};
 /// Returning `None` leaves the specifier untouched.
 pub type ImportRewriter<'r> = dyn FnMut(&str) -> Option<String> + 'r;
 
+/// `import.meta.env.*` define pairs, set once at dev/build startup from the
+/// app's `.env` files. Unset (e.g. in unit tests) falls back to built-ins.
+static ENV_DEFINES: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+
+/// Install the env defines for this process (call once, before compiling).
+pub fn set_import_meta_env(defines: Vec<(String, String)>) {
+    let _ = ENV_DEFINES.set(defines);
+}
+
+pub(crate) fn import_meta_env_defines(dev: bool) -> Vec<(String, String)> {
+    if let Some(defines) = ENV_DEFINES.get() {
+        return defines.clone();
+    }
+    // Built-in fallback: no .env loaded (unit tests, minimal usage).
+    let mode = if dev { "development" } else { "production" };
+    vec![
+        ("import.meta.env.BASE_URL".into(), "\"/\"".into()),
+        ("import.meta.env.MODE".into(), format!("\"{mode}\"")),
+        ("import.meta.env.DEV".into(), dev.to_string()),
+        ("import.meta.env.PROD".into(), (!dev).to_string()),
+        ("import.meta.env.SSR".into(), "false".into()),
+        (
+            "import.meta.env".into(),
+            format!(
+                "({{\"BASE_URL\":\"/\",\"MODE\":\"{mode}\",\"DEV\":{dev},\"PROD\":{prod},\"SSR\":false}})",
+                prod = !dev
+            ),
+        ),
+    ]
+}
+
 #[derive(Debug, Clone)]
 pub struct CompileOptions {
     /// Dev mode: jsxDEV runtime, no pure annotations needed for shaking yet.
@@ -147,19 +178,7 @@ pub fn compile_module(
     // substring test so the common module pays nothing.
     if source_text.contains("import.meta.env") {
         let scoping = SemanticBuilder::new().build(&program).semantic.into_scoping();
-        let mode = if opts.dev { "development" } else { "production" };
-        let obj = format!(
-            "({{\"BASE_URL\":\"/\",\"MODE\":\"{mode}\",\"DEV\":{dev},\"PROD\":{prod},\"SSR\":false}})",
-            dev = opts.dev, prod = !opts.dev,
-        );
-        let defines: Vec<(String, String)> = vec![
-            ("import.meta.env.BASE_URL".into(), "\"/\"".into()),
-            ("import.meta.env.MODE".into(), format!("\"{mode}\"")),
-            ("import.meta.env.DEV".into(), opts.dev.to_string()),
-            ("import.meta.env.PROD".into(), (!opts.dev).to_string()),
-            ("import.meta.env.SSR".into(), "false".into()),
-            ("import.meta.env".into(), obj),
-        ];
+        let defines = import_meta_env_defines(opts.dev);
         if let Ok(config) = ReplaceGlobalDefinesConfig::new(&defines) {
             let _ = ReplaceGlobalDefines::new(&allocator, config).build(scoping, &mut program);
         }

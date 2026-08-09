@@ -98,6 +98,17 @@ impl DevServer {
             .canonicalize()
             .with_context(|| format!("app root not found: {}", self.root.display()))?;
 
+        // Load .env files (dev mode) and install the import.meta.env defines
+        // before any module compiles.
+        let env = oj_env::load(&root, "development");
+        oj_compiler::set_import_meta_env(oj_env::import_meta_env_defines(
+            &env,
+            "development",
+            true,
+            "/",
+            "VITE_",
+        ));
+
         let started = Instant::now();
         let (reload_tx, _) = broadcast::channel::<String>(64);
         let (crawl_tx, crawl_rx) = tokio::sync::watch::channel(false);
