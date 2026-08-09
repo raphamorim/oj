@@ -1624,6 +1624,7 @@ dependencies = [
  "oxc_syntax",
  "oxc_transformer",
  "oxc_transformer_plugins",
+ "serde_json",
  "thiserror",
 ]
 

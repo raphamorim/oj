@@ -14,6 +14,7 @@
 pub mod bundle;
 pub mod cjs;
 pub mod glob;
+pub mod json;
 
 use std::path::{Path, PathBuf};
 

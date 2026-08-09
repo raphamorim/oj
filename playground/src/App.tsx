@@ -1,4 +1,5 @@
 import { Counter } from "@/Counter";
+import meta, { appName } from "./data.json";
 
 const pages = import.meta.glob("./pages/*.ts", { eager: true });
 
@@ -19,6 +20,7 @@ export function App() {
         hidden
       />
       <div data-pages={Object.keys(pages).length} hidden />
+      <div data-json={`${appName}|${meta.version}`} hidden />
     </main>
   );
 }
