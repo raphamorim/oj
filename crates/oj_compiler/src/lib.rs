@@ -13,6 +13,7 @@
 
 pub mod bundle;
 pub mod cjs;
+pub mod glob;
 
 use std::path::{Path, PathBuf};
 
@@ -182,6 +183,13 @@ pub fn compile_module(
         if let Ok(config) = ReplaceGlobalDefinesConfig::new(&defines) {
             let _ = ReplaceGlobalDefines::new(&allocator, config).build(scoping, &mut program);
         }
+    }
+
+    // Expand import.meta.glob before specifier rewriting, so the generated
+    // import()/import statements get canonicalized to URLs by the rewriter.
+    if source_text.contains("import.meta.glob") {
+        let dir = path.parent().unwrap_or(path);
+        glob::expand(&allocator, dir, &mut program);
     }
 
     let imports = rewrite_module_specifiers(&allocator, &mut program, &mut rewriter);

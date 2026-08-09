@@ -1,5 +1,7 @@
 import { Counter } from "@/Counter";
 
+const pages = import.meta.glob("./pages/*.ts", { eager: true });
+
 export function App() {
   return (
     <main>
@@ -16,6 +18,7 @@ export function App() {
         }`}
         hidden
       />
+      <div data-pages={Object.keys(pages).length} hidden />
     </main>
   );
 }

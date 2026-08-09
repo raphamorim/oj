@@ -148,6 +148,12 @@ fn compile_esm_factory(
         }
     }
 
+    // Expand import.meta.glob before specifier rewriting (eager globs become
+    // static imports the factory transform then handles).
+    if source_text.contains("import.meta.glob") {
+        crate::glob::expand(&allocator, path.parent().unwrap_or(path), &mut program);
+    }
+
     // Canonicalize specifiers to urls (shared with unbundled mode).
     let _ = crate::rewrite_module_specifiers_pub(&allocator, &mut program, resolve);
 

@@ -17,5 +17,6 @@ oxc_transformer_plugins.workspace = true
 oxc_minifier.workspace = true
 oxc_ecmascript.workspace = true
 oxc_syntax.workspace = true
+glob = "0.3"
 oxc_codegen.workspace = true
 thiserror.workspace = true
