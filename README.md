@@ -73,8 +73,8 @@ Caveats: one machine, one app shape. Reproduce with `bench/`.
 
 ## Reference reading
 
-- `reference/oxc/crates/oxc_transformer/examples/transformer.rs`: the pipeline oj's compiler is based on
-- `reference/oxc/crates/oxc_transformer/src/jsx/`: JSX + ReactRefresh transform internals
-- `reference/vite-plugin-react/`: the Fast Refresh glue semantics oj replicates
-- `reference/vite/packages/vite/src/node/server/`: HMR propagation, `import.meta.hot` protocol
-- `reference/rolldown/`: plugin hook filters, the prod linker oj embeds
+- [oxc_transformer/examples/transformer.rs](https://github.com/oxc-project/oxc/blob/main/crates/oxc_transformer/examples/transformer.rs): the pipeline oj's compiler is based on
+- [oxc_transformer/src/jsx](https://github.com/oxc-project/oxc/tree/main/crates/oxc_transformer/src/jsx): JSX + ReactRefresh transform internals
+- [vitejs/vite-plugin-react](https://github.com/vitejs/vite-plugin-react): the Fast Refresh glue semantics oj replicates
+- [vite/packages/vite/src/node/server](https://github.com/vitejs/vite/tree/main/packages/vite/src/node/server): HMR propagation, `import.meta.hot` protocol
+- [rolldown/rolldown](https://github.com/rolldown/rolldown): plugin hook filters, the prod linker oj embeds
