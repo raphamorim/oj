@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
                 if playground.join("index.html").is_file() { playground } else { PathBuf::from(".") }
             });
             if let Some(entry) = ssr {
-                ssr_dev::ssr_dev(root, entry, port.unwrap_or(5199)).await
+                ssr_dev::ssr_dev(root, entry, port).await
             } else {
                 oj_server::DevServer { root, port, bundle }.run().await
             }

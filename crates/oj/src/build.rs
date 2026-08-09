@@ -32,6 +32,10 @@ use rolldown_plugin::{
 #[derive(Debug)]
 struct OjCssPlugin {
     collected: Arc<Mutex<Vec<(String, String)>>>,
+    /// App root, so CSS-module class names hash from the same root-relative id
+    /// (`/src/x.module.css`) the dev server uses — keeping `oj dev`, `oj build`,
+    /// and the SSR/client bundles all in agreement (matters for hydration).
+    root: PathBuf,
 }
 
 impl Plugin for OjCssPlugin {
@@ -69,6 +73,7 @@ impl Plugin for OjCssPlugin {
     ) -> impl std::future::Future<Output = HookLoadReturn> + Send {
         let id = args.id.to_string();
         let collected = Arc::clone(&self.collected);
+        let root = self.root.clone();
         async move {
             let path = id.split('?').next().unwrap_or(&id);
             if !(path.ends_with(".css") || oj_css::is_sass(path)) {
@@ -81,7 +86,12 @@ impl Plugin for OjCssPlugin {
                 let dir = std::path::Path::new(path).parent();
                 source = oj_css::compile_sass(&source, dir).map_err(|e| anyhow::anyhow!(e))?;
             }
-            let output = oj_css::compile_css(path, &source, true)
+            // Hash class names from the dev server's root-relative id form.
+            let css_id = match std::path::Path::new(path).strip_prefix(&root) {
+                Ok(rel) => format!("/{}", rel.display()),
+                Err(_) => path.to_string(),
+            };
+            let output = oj_css::compile_css(&css_id, &source, true)
                 .map_err(|e| anyhow::anyhow!(e))?;
             let js = match &output.exports {
                 Some(exports) => {
@@ -163,7 +173,7 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
 
     let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let mut bundler = BundlerBuilder::default()
-        .with_plugins(vec![Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css) })])
+        .with_plugins(vec![Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf() })])
         .with_options(BundlerOptions {
         input: Some(inputs),
         cwd: Some(root.clone()),
@@ -382,7 +392,7 @@ pub(crate) async fn build_ssr(
     })));
 
     let mut bundler = BundlerBuilder::default()
-        .with_plugins(vec![Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css) })])
+        .with_plugins(vec![Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf() })])
         .with_options(BundlerOptions {
             input: Some(vec![InputItem {
                 name: Some(stem.clone()),
@@ -434,73 +444,6 @@ pub(crate) async fn build_ssr(
     Ok(())
 }
 
-/// Build a browser client bundle for dev-server SSR hydration: target the
-/// browser, bundle everything (React included, nothing external), emit one ESM
-/// `<stem>.js` plus a `<stem>.css` for any imported styles. Pairs with
-/// `build_ssr`; the client hydrates the server-rendered markup. CSS Modules use
-/// the same scoped-name hashing here as in the server build, so the class names
-/// in the SSR HTML match what the client renders (no hydration mismatch).
-pub(crate) async fn build_client(
-    root: &Path,
-    out_dir: &Path,
-    entry: &str,
-) -> anyhow::Result<()> {
-    let entry_import = if entry.starts_with('.') { entry.to_string() } else { format!("./{entry}") };
-    let stem =
-        Path::new(entry).file_stem().and_then(|s| s.to_str()).unwrap_or("client").to_string();
-
-    let _ = fs::remove_dir_all(out_dir);
-    fs::create_dir_all(out_dir)?;
-    let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
-
-    let mut bundler = BundlerBuilder::default()
-        .with_plugins(vec![Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css) })])
-        .with_options(BundlerOptions {
-            input: Some(vec![InputItem {
-                name: Some(stem.clone()),
-                import: entry_import,
-                ..Default::default()
-            }]),
-            cwd: Some(root.to_path_buf()),
-            dir: Some(out_dir.display().to_string()),
-            format: Some(OutputFormat::Esm),
-            entry_filenames: Some(format!("{stem}.js").into()),
-            chunk_filenames: Some(format!("{stem}-[hash].js").into()),
-            minify: Some(RawMinifyOptions::Bool(false)),
-            // Match the server bundle's mode so both render identically.
-            define: Some(
-                vec![
-                    ("process.env.NODE_ENV".to_string(), "'production'".to_string()),
-                    ("import.meta.env.SSR".to_string(), "false".to_string()),
-                    ("import.meta.env.PROD".to_string(), "true".to_string()),
-                    ("import.meta.env.DEV".to_string(), "false".to_string()),
-                    ("import.meta.env.MODE".to_string(), "\"production\"".to_string()),
-                    ("import.meta.env.BASE_URL".to_string(), "\"/\"".to_string()),
-                ]
-                .into_iter()
-                .collect(),
-            ),
-            ..Default::default()
-        })
-        .build()
-        .map_err(|errs| anyhow::anyhow!("rolldown init failed: {errs:?}"))?;
-
-    bundler
-        .write()
-        .await
-        .map_err(|errs| anyhow::anyhow!("client build failed:\n{errs:?}"))?;
-
-    // One stylesheet for any CSS the client graph imported.
-    let mut css_entries = collected_css.lock().unwrap().clone();
-    if !css_entries.is_empty() {
-        css_entries.sort();
-        let combined: String =
-            css_entries.into_iter().map(|(_, css)| css).collect::<Vec<_>>().join("\n");
-        fs::write(out_dir.join(format!("{stem}.css")), combined)?;
-    }
-    Ok(())
-}
-
 /// Build a library (`build.lib`): one Rolldown pass per output format,
 /// emitting `<fileName>.<ext>` files plus a single stylesheet for any
 /// imported CSS. No HTML, no manifest.
@@ -545,7 +488,7 @@ async fn build_library(
         }
 
         let mut bundler = BundlerBuilder::default()
-            .with_plugins(vec![Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css) })])
+            .with_plugins(vec![Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf() })])
             .with_options(BundlerOptions {
                 input: Some(vec![InputItem {
                     name: Some(file_name.clone()),

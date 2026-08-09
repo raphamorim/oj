@@ -99,8 +99,40 @@ struct ServerState {
     virtual_modules: std::collections::BTreeMap<String, String>,
 }
 
+/// A fully-configured dev server that hasn't been bound to a socket yet.
+/// Returned by [`DevServer::build_app`] so other servers (dev-server SSR) can
+/// compose the dev pipeline — Fast Refresh, HMR WebSocket, on-demand module
+/// compilation — beneath their own routes.
+pub struct BuiltApp {
+    pub router: Router,
+    pub host: std::net::IpAddr,
+    pub port: u16,
+    pub proxy_prefixes: Vec<String>,
+    pub root: PathBuf,
+    pub started: Instant,
+}
+
 impl DevServer {
     pub async fn run(self) -> anyhow::Result<()> {
+        let built = self.build_app().await?;
+        let addr = SocketAddr::from((built.host, built.port));
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("cannot bind {addr}"))?;
+        println!("  oj dev server");
+        println!("  root: {}", built.root.display());
+        println!("  http://localhost:{}/", built.port);
+        if !built.proxy_prefixes.is_empty() {
+            println!("  proxy: {}", built.proxy_prefixes.join(", "));
+        }
+        println!("  ready in {:?}", built.started.elapsed());
+        axum::serve(listener, built.router).await?;
+        Ok(())
+    }
+
+    /// Configure the dev server (config, .env, state, watcher, crawl, routes,
+    /// proxy) and return it as a [`BuiltApp`] without binding a listener.
+    pub async fn build_app(self) -> anyhow::Result<BuiltApp> {
         let root = self
             .root
             .canonicalize()
@@ -195,19 +227,7 @@ impl DevServer {
             state.proxy.iter().map(|(p, _)| p.clone()).collect();
         let app = app.with_state(state);
 
-        let addr = SocketAddr::from((host, port));
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("cannot bind {addr}"))?;
-        println!("  oj dev server");
-        println!("  root: {}", root.display());
-        println!("  http://localhost:{}/", port);
-        if !proxy_prefixes.is_empty() {
-            println!("  proxy: {}", proxy_prefixes.join(", "));
-        }
-        println!("  ready in {:?}", started.elapsed());
-        axum::serve(listener, app).await?;
-        Ok(())
+        Ok(BuiltApp { router: app, host, port, proxy_prefixes, root, started })
     }
 }
 
