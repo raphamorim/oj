@@ -47,8 +47,9 @@ const COMPILABLE: &[&str] = &["tsx", "ts", "jsx", "js", "mjs"];
 
 pub struct DevServer {
     pub root: PathBuf,
-    pub port: u16,
-    /// Full bundle mode: registry-runtime chunk instead of native ESM.
+    /// CLI `--port`; `None` falls back to config `server.port` then 5199.
+    pub port: Option<u16>,
+    /// CLI `--bundle`; OR-ed with config `bundle`.
     pub bundle: bool,
 }
 
@@ -89,6 +90,10 @@ struct ServerState {
     /// start emit the full modulepreload list immediately, without HTML
     /// ever waiting on the live crawl.
     preload_snapshot: Vec<String>,
+    /// `server.proxy` rules: (path prefix, entry). Empty = no proxying.
+    proxy: Vec<(String, oj_config::ProxyEntry)>,
+    /// Client for forwarding proxied requests.
+    http: reqwest::Client,
 }
 
 impl DevServer {
@@ -98,16 +103,33 @@ impl DevServer {
             .canonicalize()
             .with_context(|| format!("app root not found: {}", self.root.display()))?;
 
+        // Load oj.config.* — the source for proxy/port/host/bundle/envPrefix.
+        let config = oj_config::load(&root).map_err(|e| anyhow::anyhow!("{e}"))?;
+
         // Load .env files (dev mode) and install the import.meta.env defines
-        // before any module compiles.
-        let env = oj_env::load(&root, "development");
+        // before any module compiles. envPrefix from config overrides VITE_.
+        let env_prefix = config.env_prefix.as_deref().unwrap_or("VITE_");
+        let env_dir = config.env_dir.as_deref().map(|d| root.join(d)).unwrap_or_else(|| root.clone());
+        let env = oj_env::load(&env_dir, "development");
         oj_compiler::set_import_meta_env(oj_env::import_meta_env_defines(
             &env,
             "development",
             true,
-            "/",
-            "VITE_",
+            config.base.as_deref().unwrap_or("/"),
+            env_prefix,
         ));
+
+        // Precedence: CLI flag > config > built-in default.
+        let server_cfg = config.server.clone().unwrap_or_default();
+        let port = self.port.or(server_cfg.port).unwrap_or(5199);
+        let bundle = self.bundle || config.bundle.unwrap_or(false);
+        let host: std::net::IpAddr = match server_cfg.host.as_deref() {
+            Some("0.0.0.0") | Some("true") => [0, 0, 0, 0].into(),
+            Some(h) => h.parse().unwrap_or([127, 0, 0, 1].into()),
+            None => [127, 0, 0, 1].into(),
+        };
+        let proxy: Vec<(String, oj_config::ProxyEntry)> =
+            server_cfg.proxy.clone().unwrap_or_default().into_iter().collect();
 
         let started = Instant::now();
         let (reload_tx, _) = broadcast::channel::<String>(64);
@@ -116,7 +138,7 @@ impl DevServer {
             tokio::sync::mpsc::channel::<(String, Arc<CachedModule>)>(65536);
         let state = Arc::new(ServerState {
             root: root.clone(),
-            bundle: self.bundle,
+            bundle,
             reload_tx,
             graph: Mutex::new(ModuleGraph::new()),
             resolver: Arc::new(OjResolver::new(&root)),
@@ -134,6 +156,8 @@ impl DevServer {
             chunk_cache: Mutex::new(None),
             cache_writes: write_tx,
             preload_snapshot: load_graph_snapshot(&root),
+            proxy,
+            http: reqwest::Client::new(),
         });
         {
             let state = Arc::clone(&state);
@@ -146,7 +170,7 @@ impl DevServer {
         spawn_watcher(Arc::clone(&state));
         spawn_crawl(Arc::clone(&state), crawl_tx);
 
-        let app = Router::new()
+        let mut app = Router::new()
             .route("/@oj/client.js", get(|| async { js(CLIENT_JS) }))
             .route("/@oj/refresh-runtime.js", get(|| async { js(REFRESH_RUNTIME_JS) }))
             .route("/@oj/refresh-preamble.js", get(|| async { js(REFRESH_PREAMBLE_JS) }))
@@ -154,16 +178,29 @@ impl DevServer {
             .route("/@oj/chunk.js", get(serve_chunk))
             .route("/@oj/patch.js", get(serve_patch))
             .route("/__ws", get(ws_upgrade))
-            .fallback(get(serve_path))
-            .with_state(state);
+            .fallback(get(serve_path));
+        // Proxy runs ahead of routing so configured prefixes (/api, ...) are
+        // forwarded before hitting the file fallback.
+        if !state.proxy.is_empty() {
+            app = app.layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                proxy_middleware,
+            ));
+        }
+        let proxy_prefixes: Vec<String> =
+            state.proxy.iter().map(|(p, _)| p.clone()).collect();
+        let app = app.with_state(state);
 
-        let addr = SocketAddr::from(([127, 0, 0, 1], self.port));
+        let addr = SocketAddr::from((host, port));
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("cannot bind {addr}"))?;
         println!("  oj dev server");
         println!("  root: {}", root.display());
-        println!("  http://localhost:{}/", self.port);
+        println!("  http://localhost:{}/", port);
+        if !proxy_prefixes.is_empty() {
+            println!("  proxy: {}", proxy_prefixes.join(", "));
+        }
         println!("  ready in {:?}", started.elapsed());
         axum::serve(listener, app).await?;
         Ok(())
@@ -199,6 +236,81 @@ async fn ws_upgrade(
             }
         }
     })
+}
+
+/// Forward requests whose path matches a `server.proxy` prefix to the
+/// configured target (longest prefix wins), otherwise pass through. Supports
+/// `changeOrigin`, `ws` (marker only for now), and `^from -> to` rewrite.
+async fn proxy_middleware(
+    State(state): State<Arc<ServerState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = req.uri().path().to_string();
+    let matched = state
+        .proxy
+        .iter()
+        .filter(|(prefix, _)| path.starts_with(prefix.as_str()))
+        .max_by_key(|(prefix, _)| prefix.len());
+    let Some((prefix, entry)) = matched else {
+        return next.run(req).await;
+    };
+
+    // Compose the target URL: target + (rewritten) path + query.
+    let mut fwd_path = path.clone();
+    if let Some((from, to)) = entry.rewrite() {
+        if let Some(stripped) = from.strip_prefix('^') {
+            if let Some(rest) = fwd_path.strip_prefix(stripped) {
+                fwd_path = format!("{to}{rest}");
+            }
+        } else {
+            fwd_path = fwd_path.replacen(from, to, 1);
+        }
+    }
+    let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+    let target = format!("{}{}{}", entry.target().trim_end_matches('/'), fwd_path, query);
+
+    let method = req.method().clone();
+    let req_headers = req.headers().clone();
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 100 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY, format!("oj proxy: body read: {e}")).into_response()
+        }
+    };
+
+    let mut out = state.http.request(method, &target).body(body_bytes.to_vec());
+    for (name, value) in req_headers.iter() {
+        // Host is set by reqwest per target when changeOrigin; else forward.
+        if entry.change_origin() && name == header::HOST {
+            continue;
+        }
+        out = out.header(name, value);
+    }
+
+    match out.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let bytes = resp.bytes().await.unwrap_or_default();
+            let mut response = Response::new(Body::from(bytes));
+            *response.status_mut() = status;
+            for (name, value) in headers.iter() {
+                // reqwest already decompressed; drop framing headers that
+                // would now be wrong.
+                if name == header::TRANSFER_ENCODING || name == header::CONTENT_LENGTH {
+                    continue;
+                }
+                response.headers_mut().insert(name, value.clone());
+            }
+            response
+        }
+        Err(e) => {
+            let via = if entry.ws() { " (ws proxying not yet supported)" } else { "" };
+            (StatusCode::BAD_GATEWAY, format!("oj proxy to {}{} failed: {e}", prefix, via))
+                .into_response()
+        }
+    }
 }
 
 async fn serve_path(

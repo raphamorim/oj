@@ -21,8 +21,9 @@ enum Command {
     Dev {
         /// App root containing index.html (defaults to ./playground when present)
         root: Option<PathBuf>,
-        #[arg(long, default_value_t = 5199)]
-        port: u16,
+        /// Dev server port (overrides oj.config server.port; default 5199)
+        #[arg(long)]
+        port: Option<u16>,
         /// Full bundle mode: serve one registry-runtime chunk instead of
         /// native ESM modules (experimental)
         #[arg(long)]
