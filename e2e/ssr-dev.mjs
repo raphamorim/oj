@@ -32,16 +32,21 @@ try {
   execSync(`lsof -ti:${port} -sTCP:LISTEN | xargs kill`, { shell: "/bin/bash", stdio: "ignore" });
 } catch {} // nothing was listening
 
+// Capture the server's stderr (which includes the runner's) so we can assert
+// the server-side HMR push actually fired.
+const errLog = path.join(here, ".ssr-stderr.log");
+const errFd = fs.openSync(errLog, "w");
 const server = spawn(
   path.join(repo, "target", "debug", "oj"),
   ["dev", path.join(repo, "playground"), "--ssr", "src/entry-server.tsx", "--port", String(port)],
-  { stdio: "ignore" },
+  { stdio: ["ignore", "ignore", errFd] },
 );
 
 const cleanup = () => {
   fs.writeFileSync(counter, baseline);
   server.kill("SIGKILL");
   fs.rmSync(path.join(repo, "playground", ".oj-cache", "ssr"), { recursive: true, force: true });
+  fs.rmSync(errLog, { force: true });
 };
 
 const get = async () => (await fetch(`${base}/`)).text();
@@ -74,6 +79,17 @@ try {
   const runnerScript = path.join(repo, "playground", ".oj-cache", "ssr", "runner.mjs");
   if (!fs.existsSync(runnerScript)) throw new Error("module runner script was not spawned");
   console.log("ssr-dev: module runner re-eval ok (ssr: 41, then 8)");
+
+  // 2b. Server-side HMR push: the runner subscribes to the dev server's HMR
+  //     channel and invalidates the SSR graph on the server's change event
+  //     (not lazily at render). The edits above should have pushed to it.
+  let pushed = false;
+  for (let i = 0; i < 20 && !pushed; i++) {
+    pushed = fs.readFileSync(errLog, "utf8").includes("hmr push -> invalidated");
+    if (!pushed) await new Promise((r) => setTimeout(r, 250));
+  }
+  if (!pushed) throw new Error("runner did not receive a server-side HMR push");
+  console.log("ssr-dev: server-side HMR push ok (runner invalidated on change event)");
 
   // 3. Hydration wiring + CSS-module class parity with the dev pipeline.
   const html = await waitFor((h) => /ssr[^0-9]*0/.test(stripTags(h)));

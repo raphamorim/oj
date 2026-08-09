@@ -8,3 +8,4 @@ bench/apps/
 dist*/
 bench/oj-benchmarks.png
 bench/card.html
+e2e/.ssr-stderr.log

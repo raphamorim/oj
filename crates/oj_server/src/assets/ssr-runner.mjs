@@ -11,10 +11,15 @@
 // across the vm realm via `Symbol.for`, so `renderToString` just works).
 //
 // A module's identity is its absolute file path, so invalidation is by mtime:
-// on each render, any source whose file changed — plus every module that
-// transitively imports it — is dropped and rebuilt, and `vm` re-evaluates only
-// those. Unchanged subtrees and native imports are reused. No bundle step, one
-// long-lived process.
+// any source whose file changed — plus every module that transitively imports
+// it — is dropped and rebuilt, and `vm` re-evaluates only those. Unchanged
+// subtrees and native imports are reused. No bundle step, one long-lived
+// process.
+//
+// Invalidation is push-driven: the runner subscribes to the dev server's HMR
+// WebSocket and drops stale modules the instant the server reports a change,
+// so the SSR graph tracks edits in the background rather than only at the next
+// render. A render-time mtime scan remains as a fallback.
 //
 // Usage: node --experimental-vm-modules ssr-runner.mjs <baseUrl> <entryAbsPath>
 
@@ -138,6 +143,7 @@ function invalidate() {
     }
   }
   for (const id of dirty) registry.delete(id);
+  return dirty.size;
 }
 
 async function render() {
@@ -156,8 +162,50 @@ async function render() {
   return String(await render());
 }
 
+// Serialize renders and push-invalidations so a change event can't delete a
+// module mid-render (Node is single-threaded, but both are async).
+let lock = Promise.resolve();
+function withLock(fn) {
+  const run = lock.then(fn, fn);
+  lock = run.then(
+    () => {},
+    () => {},
+  );
+  return run;
+}
+
+// Server-side HMR push: subscribe to the dev server's HMR channel and drop
+// stale SSR modules the moment the server reports a change, rather than waiting
+// to poll mtimes at the next render. The message is just a "re-check now"
+// trigger; invalidate() (mtime-precise) decides exactly what to drop.
+function connectHmr() {
+  if (typeof WebSocket === "undefined") return; // older Node: fall back to poll
+  let ws;
+  try {
+    ws = new WebSocket(`${BASE.replace(/^http/, "ws")}/__ws`);
+  } catch {
+    return;
+  }
+  ws.addEventListener("message", (ev) => {
+    let msg;
+    try {
+      msg = JSON.parse(String(ev.data));
+    } catch {
+      return;
+    }
+    if (msg.type === "error") return;
+    withLock(() => {
+      const dropped = invalidate();
+      if (dropped) process.stderr.write(`oj ssr: hmr push -> invalidated ${dropped} module(s)\n`);
+    });
+  });
+  ws.addEventListener("close", () => setTimeout(connectHmr, 1000));
+  ws.addEventListener("error", () => {}); // close handler retries
+}
+connectHmr();
+
 const rl = readline.createInterface({ input: process.stdin });
-rl.on("line", async (line) => {
+rl.on("line", (line) => {
   let msg;
   try {
     msg = JSON.parse(line);
@@ -165,10 +213,9 @@ rl.on("line", async (line) => {
     return;
   }
   if (msg.cmd === "render") {
-    try {
-      process.stdout.write(JSON.stringify({ html: await render() }) + "\n");
-    } catch (e) {
-      process.stdout.write(JSON.stringify({ error: String((e && e.stack) || e) }) + "\n");
-    }
+    withLock(render).then(
+      (html) => process.stdout.write(JSON.stringify({ html }) + "\n"),
+      (e) => process.stdout.write(JSON.stringify({ error: String((e && e.stack) || e) }) + "\n"),
+    );
   }
 });
