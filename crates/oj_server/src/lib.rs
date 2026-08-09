@@ -119,7 +119,7 @@ impl DevServer {
             bundle: self.bundle,
             reload_tx,
             graph: Mutex::new(ModuleGraph::new()),
-            resolver: Arc::new(OjResolver::new()),
+            resolver: Arc::new(OjResolver::new(&root)),
             cache: PersistentCache::new(
                 root.join(".oj-cache"),
                 env!("CARGO_PKG_VERSION"),

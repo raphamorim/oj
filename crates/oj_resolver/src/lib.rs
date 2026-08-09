@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use oxc_resolver::{ResolveOptions, Resolver};
+use oxc_resolver::{ResolveOptions, Resolver, TsconfigDiscovery, TsconfigOptions, TsconfigReferences};
 
 pub struct OjResolver {
     inner: Resolver,
@@ -27,7 +27,12 @@ pub struct ResolveFailure {
 }
 
 impl OjResolver {
-    pub fn new() -> Self {
+    /// Build a resolver for an app rooted at `root`. If the app has a
+    /// `tsconfig.json`, its `paths` (the `@/*` alias convention) are wired in
+    /// via oxc_resolver's tsconfig support — this IS resolve.alias for the
+    /// TS+Vite apps that make up almost all of the target.
+    pub fn new(root: &Path) -> Self {
+        let tsconfig = root.join("tsconfig.json");
         let options = ResolveOptions {
             extensions: [".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs", ".json"]
                 .map(String::from)
@@ -35,6 +40,12 @@ impl OjResolver {
             condition_names: ["browser", "import", "module", "default"]
                 .map(String::from)
                 .to_vec(),
+            tsconfig: tsconfig.is_file().then(|| {
+                TsconfigDiscovery::Manual(TsconfigOptions {
+                    config_file: tsconfig,
+                    references: TsconfigReferences::Auto,
+                })
+            }),
             ..ResolveOptions::default()
         };
         Self { inner: Resolver::new(options) }
@@ -57,30 +68,36 @@ impl OjResolver {
     }
 }
 
-impl Default for OjResolver {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn playground_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../playground")
+    }
     fn playground_src() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../playground/src")
+        playground_root().join("src")
     }
 
     #[test]
     fn resolves_relative_import_with_tsx_extension_probing() {
-        let resolver = OjResolver::new();
+        let resolver = OjResolver::new(&playground_root());
         let resolved = resolver.resolve(&playground_src(), "./App").unwrap();
         assert!(resolved.ends_with("App.tsx"), "got {resolved:?}");
     }
 
     #[test]
+    fn resolves_tsconfig_paths_alias() {
+        // `@/*` -> `src/*` from the playground tsconfig.json.
+        let resolver = OjResolver::new(&playground_root());
+        let resolved = resolver.resolve(&playground_src(), "@/App").unwrap();
+        assert!(resolved.ends_with("App.tsx"), "alias @/App -> {resolved:?}");
+    }
+
+    #[test]
     fn reports_unresolvable_specifier() {
-        let resolver = OjResolver::new();
+        let resolver = OjResolver::new(&playground_root());
         let err = resolver.resolve(&playground_src(), "./does-not-exist").unwrap_err();
         assert_eq!(err.specifier, "./does-not-exist");
     }
