@@ -107,11 +107,14 @@ try {
       await page.waitForFunction(() => document.querySelector("button").textContent.includes(": 1"), {
         timeout: 5000,
       });
-      // A second route also hydrates cleanly.
-      await page.goto(`${base}/about`, { waitUntil: "networkidle" });
-      if (!(await page.locator('[data-page="about"]').isVisible())) throw new Error("/about not visible");
+      // Client-side SPA routing: navigate to /about via a link, no full reload.
+      await page.evaluate(() => (window.__spa = 1));
+      await page.locator('a[href="/about"]').click();
+      await page.waitForSelector('[data-page="about"]');
+      if ((await page.evaluate(() => window.__spa)) !== 1) throw new Error("SPA navigation caused a full reload");
+      if ((await page.evaluate(() => location.pathname)) !== "/about") throw new Error("URL did not update to /about");
       if (errors.length) throw new Error(`console errors: ${errors.join("; ")}`);
-      console.log("ssr-prod: hydration ok (home interactive + /about route, no errors)");
+      console.log("ssr-prod: hydration + SPA routing ok (home interactive, link -> /about, no reload)");
     } finally {
       await browser.close();
     }

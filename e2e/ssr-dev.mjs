@@ -150,7 +150,20 @@ try {
       // The streamed Suspense content survived hydration (no mismatch).
       const deferred = await page.locator("[data-deferred]").textContent();
       if (!deferred.includes("deferred-streamed")) throw new Error(`deferred content lost: ${deferred}`);
+      // One window marker proves nothing below triggers a full reload — not
+      // the SPA navigations, not the hot edit.
       await page.evaluate(() => (window.__marker = 7));
+
+      // Client-side SPA routing: a link click navigates without a reload, and
+      // the back button restores the previous route (popstate), both in place.
+      await page.locator('a[href="/about"]').click();
+      await page.waitForSelector('[data-page="about"]');
+      if ((await page.evaluate(() => location.pathname)) !== "/about") throw new Error("pushState did not update the URL");
+      await page.goBack();
+      await page.waitForSelector('[data-page="home"]');
+      if ((await page.evaluate(() => window.__marker)) !== 7) throw new Error("SPA navigation caused a full reload");
+      console.log("ssr-dev: SPA routing ok (link -> /about, back -> /, no reload)");
+
       for (let i = 0; i < 3; i++) await page.locator("button").click();
       const clicked = (await page.locator("button").textContent()).trim();
       if (!clicked.includes(": 3")) throw new Error(`hydration did not attach handler: ${clicked}`);
