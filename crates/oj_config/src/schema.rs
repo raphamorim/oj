@@ -101,4 +101,19 @@ pub struct BuildConfig {
     pub target: Option<String>,
     pub minify: Option<bool>,
     pub sourcemap: Option<bool>,
+    /// Library mode: build a distributable library instead of an app.
+    pub lib: Option<LibConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LibConfig {
+    /// Library entry module, relative to the app root.
+    pub entry: String,
+    /// Global/UMD export name (required for `umd`/`iife`).
+    pub name: Option<String>,
+    /// Output formats: any of `es`, `cjs`, `umd`, `iife`. Default `["es"]`.
+    pub formats: Option<Vec<String>>,
+    /// Output base filename (default: the entry's file stem).
+    pub file_name: Option<String>,
 }

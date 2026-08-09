@@ -17,7 +17,9 @@ use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, bail};
-use rolldown::{BundlerBuilder, BundlerOptions, InputItem, RawMinifyOptions, SourceMapType};
+use rolldown::{
+    BundlerBuilder, BundlerOptions, InputItem, OutputFormat, RawMinifyOptions, SourceMapType,
+};
 use rolldown_plugin::{HookLoadArgs, HookLoadReturn, Plugin, SharedLoadPluginContext};
 
 /// Rolldown dropped native CSS bundling (rolldown/rolldown#4271); like Vite,
@@ -83,6 +85,25 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>) -> anyhow::Result<()> {
     let root = root
         .canonicalize()
         .with_context(|| format!("app root not found: {}", root.display()))?;
+
+    let config = oj_config::load(&root).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let build_cfg = config.build.clone().unwrap_or_default();
+    // Precedence: CLI --out > config build.outDir > "dist".
+    let out = out
+        .or_else(|| build_cfg.out_dir.as_ref().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("dist"));
+    let out_dir = if out.is_absolute() { out } else { root.join(&out) };
+    let minify = build_cfg.minify.unwrap_or(true);
+    let sourcemap = build_cfg.sourcemap.unwrap_or(true);
+    if build_cfg.target.is_some() {
+        eprintln!("oj build: note: build.target is accepted but not yet applied");
+    }
+
+    // Library mode: build a distributable, not an app — no index.html.
+    if let Some(lib) = build_cfg.lib.clone() {
+        return build_library(&root, &out_dir, lib, minify, sourcemap).await;
+    }
+
     let html_path = root.join("index.html");
     let html = fs::read_to_string(&html_path)
         .with_context(|| format!("no index.html in {}", root.display()))?;
@@ -92,20 +113,8 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>) -> anyhow::Result<()> {
         bail!("index.html has no <script type=\"module\" src=...> entry");
     }
 
-    let config = oj_config::load(&root).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let build_cfg = config.build.clone().unwrap_or_default();
-    // Precedence: CLI --out > config build.outDir > "dist".
-    let out = out
-        .or_else(|| build_cfg.out_dir.as_ref().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("dist"));
     let base = normalize_base(config.base.as_deref().unwrap_or("/"));
-    let minify = build_cfg.minify.unwrap_or(true);
-    let sourcemap = build_cfg.sourcemap.unwrap_or(true);
-    if build_cfg.target.is_some() {
-        eprintln!("oj build: note: build.target is accepted but not yet applied");
-    }
 
-    let out_dir = if out.is_absolute() { out } else { root.join(out) };
     let _ = fs::remove_dir_all(&out_dir);
     fs::create_dir_all(&out_dir)?;
 
@@ -316,6 +325,115 @@ fn scan_attrs(html: &str, tag_prefix: &str, attr_prefix: &str) -> Vec<String> {
     values
 }
 
+/// Build a library (`build.lib`): one Rolldown pass per output format,
+/// emitting `<fileName>.<ext>` files plus a single stylesheet for any
+/// imported CSS. No HTML, no manifest.
+async fn build_library(
+    root: &Path,
+    out_dir: &Path,
+    lib: oj_config::LibConfig,
+    minify: bool,
+    sourcemap: bool,
+) -> anyhow::Result<()> {
+    let entry_import = if lib.entry.starts_with('.') {
+        lib.entry.clone()
+    } else {
+        format!("./{}", lib.entry)
+    };
+    let file_name = lib.file_name.clone().unwrap_or_else(|| {
+        Path::new(&lib.entry)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("index")
+            .to_string()
+    });
+    let formats = lib.formats.clone().unwrap_or_else(|| vec!["es".into()]);
+
+    let _ = fs::remove_dir_all(out_dir);
+    fs::create_dir_all(out_dir)?;
+    let started = Instant::now();
+    let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut emitted: Vec<(String, usize)> = Vec::new();
+
+    for fmt in &formats {
+        let (ext, needs_name) = lib_format(fmt)
+            .ok_or_else(|| anyhow::anyhow!("unknown lib format: {fmt} (es, cjs, umd, iife)"))?;
+        let format = match fmt.as_str() {
+            "es" | "esm" => OutputFormat::Esm,
+            "cjs" => OutputFormat::Cjs,
+            "umd" => OutputFormat::Umd,
+            _ => OutputFormat::Iife,
+        };
+        if needs_name && lib.name.is_none() {
+            bail!("build.lib.name is required for the '{fmt}' format");
+        }
+
+        let mut bundler = BundlerBuilder::default()
+            .with_plugins(vec![Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css) })])
+            .with_options(BundlerOptions {
+                input: Some(vec![InputItem {
+                    name: Some(file_name.clone()),
+                    import: entry_import.clone(),
+                    ..Default::default()
+                }]),
+                cwd: Some(root.to_path_buf()),
+                dir: Some(out_dir.display().to_string()),
+                format: Some(format),
+                name: lib.name.clone(),
+                entry_filenames: Some(format!("{file_name}.{ext}").into()),
+                chunk_filenames: Some(format!("{file_name}-[hash].{ext}").into()),
+                minify: Some(RawMinifyOptions::Bool(minify)),
+                sourcemap: sourcemap.then_some(SourceMapType::File),
+                define: Some(
+                    std::iter::once(("process.env.NODE_ENV".to_string(), "'production'".to_string()))
+                        .collect(),
+                ),
+                ..Default::default()
+            })
+            .build()
+            .map_err(|errs| anyhow::anyhow!("rolldown init failed: {errs:?}"))?;
+
+        let output = bundler
+            .write()
+            .await
+            .map_err(|errs| anyhow::anyhow!("lib build ({fmt}) failed:\n{errs:?}"))?;
+        for asset in &output.assets {
+            if let rolldown_common::Output::Chunk(c) = asset {
+                emitted.push((c.filename.to_string(), c.code.len()));
+            }
+        }
+    }
+
+    // One stylesheet for any CSS the library imported.
+    let css_entries = collected_css.lock().unwrap().clone();
+    if !css_entries.is_empty() {
+        let combined: String =
+            css_entries.into_iter().map(|(_, css)| css).collect::<Vec<_>>().join("\n");
+        let css_name = format!("{file_name}.css");
+        fs::write(out_dir.join(&css_name), &combined)?;
+        emitted.push((css_name, combined.len()));
+    }
+
+    println!("oj build (library): {} in {:?}", out_dir.display(), started.elapsed());
+    emitted.sort_by(|a, b| b.1.cmp(&a.1));
+    emitted.dedup();
+    for (name, bytes) in &emitted {
+        println!("  {:>9}  {}", human_bytes(*bytes), name);
+    }
+    Ok(())
+}
+
+/// Map a lib format name to its (file extension, needs-a-global-name) pair.
+fn lib_format(fmt: &str) -> Option<(&'static str, bool)> {
+    match fmt {
+        "es" | "esm" => Some(("js", false)),
+        "cjs" => Some(("cjs", false)),
+        "umd" => Some(("umd.js", true)),
+        "iife" => Some(("iife.js", true)),
+        _ => None,
+    }
+}
+
 /// Normalize a public base path to a leading+trailing-slash form
 /// (`"/"`, `"/app/"`). Empty/relative bases fall back to `"/"`.
 fn normalize_base(base: &str) -> String {
@@ -408,6 +526,16 @@ mod tests {
         assert!(!row.contains_key("isEntry"));
         assert!(!row.contains_key("imports"));
         assert!(!row.contains_key("css"));
+    }
+
+    #[test]
+    fn lib_format_mapping() {
+        assert_eq!(lib_format("es"), Some(("js", false)));
+        assert_eq!(lib_format("esm"), Some(("js", false)));
+        assert_eq!(lib_format("cjs"), Some(("cjs", false)));
+        assert_eq!(lib_format("umd"), Some(("umd.js", true)));
+        assert_eq!(lib_format("iife"), Some(("iife.js", true)));
+        assert_eq!(lib_format("amd"), None);
     }
 
     #[test]
