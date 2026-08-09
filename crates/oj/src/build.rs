@@ -461,10 +461,6 @@ const root = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 5180;
 const CLIENT_JS = "__CLIENT_JS__";
 const CLIENT_CSS = "__CLIENT_CSS__";
-const HEAD =
-  '<!doctype html><html><head><meta charset="utf-8">' +
-  (CLIENT_CSS ? `<link rel="stylesheet" href="${CLIENT_CSS}">` : "") +
-  `<script type="module" src="${CLIENT_JS}"></script></head><body><div id="app">`;
 const TAIL = "</div></body></html>";
 const TYPES = { ".js": "text/javascript", ".css": "text/css", ".map": "application/json" };
 
@@ -482,7 +478,14 @@ createServer(async (req, res) => {
     }
   }
   try {
-    const stream = await entry.renderStream(url);
+    const data = typeof entry.load === "function" ? await entry.load(url) : null;
+    const json = JSON.stringify(data ?? null).replace(/</g, "\\u003c");
+    const HEAD =
+      '<!doctype html><html><head><meta charset="utf-8">' +
+      `<script>window.__OJ_DATA__=${json}</script>` +
+      (CLIENT_CSS ? `<link rel="stylesheet" href="${CLIENT_CSS}">` : "") +
+      `<script type="module" src="${CLIENT_JS}"></script></head><body><div id="app">`;
+    const stream = await entry.renderStream(url, data);
     res.writeHead(200, { "content-type": "text/html; charset=utf-8", "transfer-encoding": "chunked" });
     res.write(HEAD);
     const reader = stream.getReader();

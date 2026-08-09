@@ -158,13 +158,16 @@ async function entryNamespace() {
   return rec.mod.namespace;
 }
 
-// Produce the render for `url`, calling `emit` with one framed message per
-// line: `{chunk}` (repeated) then `{end}` for a streaming entry (renderStream
-// -> a web ReadableStream), or a single `{html}` for a buffered entry (render).
+// Produce the render for `url`. First runs the route loader (if any) and emits
+// `{data}` (JSON, `<` escaped so it can't close the inline <script>) for the
+// transport to serialize into the document; then the render output — `{chunk}`…
+// `{end}` for a streaming entry (renderStream), or a single `{html}`.
 async function handleRender(emit, url) {
   const ns = await entryNamespace();
+  const data = typeof ns.load === "function" ? await ns.load(url) : null;
+  emit({ data: JSON.stringify(data ?? null).replace(/</g, "\\u003c") });
   if (typeof ns.renderStream === "function") {
-    const stream = await ns.renderStream(url);
+    const stream = await ns.renderStream(url, data);
     const reader = stream.getReader();
     const decoder = new TextDecoder();
     for (;;) {
@@ -177,7 +180,7 @@ async function handleRender(emit, url) {
     if (tail) emit({ chunk: tail });
     emit({ end: true });
   } else if (typeof ns.render === "function") {
-    emit({ html: String(await ns.render(url)) });
+    emit({ html: String(await ns.render(url, data)) });
   } else {
     throw new Error(`SSR entry ${ENTRY} exports neither render() nor renderStream()`);
   }

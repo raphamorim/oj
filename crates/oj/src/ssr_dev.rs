@@ -157,24 +157,32 @@ async fn render_route(state: &SsrState, path: &str) -> Response {
     if guard.stdin.write_all(cmd.as_bytes()).await.is_err() || guard.stdin.flush().await.is_err() {
         return error_page("SSR runner is not accepting input (did it crash?)");
     }
-    let first = match guard.lines.next_line().await {
-        Ok(Some(line)) => line,
-        _ => return error_page("SSR runner did not respond"),
+    // The runner sends the route loader's serialized data first, then the
+    // render output. The data is embedded in the shell so the client hydrates
+    // with it (no refetch).
+    let data_json = match read_message(&mut guard.lines).await {
+        Some(v) if v.get("data").and_then(|d| d.as_str()).is_some() => {
+            v["data"].as_str().unwrap().to_owned()
+        }
+        Some(v) if v.get("error").and_then(|e| e.as_str()).is_some() => {
+            return error_page(v["error"].as_str().unwrap());
+        }
+        _ => "null".to_string(),
     };
-    let v: serde_json::Value = match serde_json::from_str(&first) {
-        Ok(v) => v,
-        Err(_) => return error_page(&format!("SSR runner sent malformed output:\n{first}")),
+    let v = match read_message(&mut guard.lines).await {
+        Some(v) => v,
+        None => return error_page("SSR runner did not respond"),
     };
 
     // Buffered entry (render): one `{html}` message.
     if let Some(html) = v.get("html").and_then(|h| h.as_str()) {
-        return Html(page(state, html)).into_response();
+        return Html(page(state, html, &data_json)).into_response();
     }
     // Streaming entry (renderStream): `{chunk}`… then `{end}`. Flush the shell
     // immediately, forward each chunk as React produces it, close with the tail.
     if let Some(first_chunk) = v.get("chunk").and_then(|c| c.as_str()).map(str::to_owned) {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
-        let head = page_head();
+        let head = page_head(&data_json);
         let tail = page_tail(state);
         tokio::spawn(async move {
             let mut guard = guard; // hold the runner lock for the whole stream
@@ -204,15 +212,27 @@ async fn render_route(state: &SsrState, path: &str) -> Response {
     error_page(v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown SSR error"))
 }
 
-/// The document head + open of `#app`: charset, then the Fast Refresh preamble
-/// (must be the first module script, so the refresh hook installs before any
-/// module pulls in React) and the dev HMR client.
-fn page_head() -> String {
-    "<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n\
-     <script type=\"module\" src=\"/@oj/refresh-preamble.js\"></script>\n\
-     <script type=\"module\" src=\"/@oj/client.js\"></script>\n</head>\n\
-     <body><div id=\"app\">"
-        .to_string()
+/// Read and parse one JSON-lines message from the runner (None if it closed or
+/// sent malformed output).
+async fn read_message(
+    lines: &mut Lines<BufReader<ChildStdout>>,
+) -> Option<serde_json::Value> {
+    let line = lines.next_line().await.ok().flatten()?;
+    serde_json::from_str(&line).ok()
+}
+
+/// The document head + open of `#app`: charset, the route loader's data (so the
+/// client hydrates without refetching), then the Fast Refresh preamble (must be
+/// the first module script, so the refresh hook installs before any module
+/// pulls in React) and the dev HMR client.
+fn page_head(data_json: &str) -> String {
+    format!(
+        "<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n\
+         <script>window.__OJ_DATA__={data_json}</script>\n\
+         <script type=\"module\" src=\"/@oj/refresh-preamble.js\"></script>\n\
+         <script type=\"module\" src=\"/@oj/client.js\"></script>\n</head>\n\
+         <body><div id=\"app\">"
+    )
 }
 
 /// Close `#app`, then the hydration entry (served by the dev router), then the
@@ -226,8 +246,8 @@ fn page_tail(state: &SsrState) -> String {
 }
 
 /// The full document for a buffered render.
-fn page(state: &SsrState, body: &str) -> String {
-    format!("{}{}{}", page_head(), body, page_tail(state))
+fn page(state: &SsrState, body: &str, data_json: &str) -> String {
+    format!("{}{}{}", page_head(data_json), body, page_tail(state))
 }
 
 fn error_page(msg: &str) -> Response {

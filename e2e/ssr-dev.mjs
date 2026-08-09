@@ -93,6 +93,14 @@ try {
   if (!first.includes('data-page="home"')) throw new Error("/ did not render the home route");
   console.log("ssr-dev: per-route ok (/ -> home, /about -> about)");
 
+  // 1d. Route data loading: the loader ran on the server, its data is
+  //     serialized into the document, and the route rendered with it.
+  if (!first.includes("window.__OJ_DATA__=") || !first.includes('"loadedOn":"server"')) {
+    throw new Error(`route data not serialized into the document:\n${first}`);
+  }
+  if (!first.includes('data-loaded="server"')) throw new Error("home not rendered with server data");
+  console.log("ssr-dev: route data loaded server-side + serialized");
+
   // 2. The persistent module runner re-evaluates changed modules on the next
   //    load — two consecutive edits both show up, with no Rolldown SSR bundle.
   fs.writeFileSync(counter, baseline.replace("useState<number>(0)", "useState<number>(41)"));
@@ -159,10 +167,12 @@ try {
       await page.locator('a[href="/about"]').click();
       await page.waitForSelector('[data-page="about"]');
       if ((await page.evaluate(() => location.pathname)) !== "/about") throw new Error("pushState did not update the URL");
+      // The client loader ran for the navigated route (server data was for /).
+      await page.waitForSelector('[data-loaded="client"]', { timeout: 5000 });
       await page.goBack();
       await page.waitForSelector('[data-page="home"]');
       if ((await page.evaluate(() => window.__marker)) !== 7) throw new Error("SPA navigation caused a full reload");
-      console.log("ssr-dev: SPA routing ok (link -> /about, back -> /, no reload)");
+      console.log("ssr-dev: SPA routing + client loader ok (link -> /about, back -> /, no reload)");
 
       for (let i = 0; i < 3; i++) await page.locator("button").click();
       const clicked = (await page.locator("button").textContent()).trim();

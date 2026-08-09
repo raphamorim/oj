@@ -86,7 +86,10 @@ try {
   if (!html.includes('data-page="home"')) throw new Error("/ did not render the home route");
   const about = await (await fetch(`${base}/about`)).text();
   if (!about.includes('data-page="about"')) throw new Error("/about did not render the about route");
-  console.log("ssr-prod: streaming + per-route ok (/ -> home, /about -> about)");
+  if (!html.includes("window.__OJ_DATA__=") || !html.includes('"loadedOn":"server"') || !html.includes('data-loaded="server"')) {
+    throw new Error(`route data not loaded/serialized server-side:\n${html}`);
+  }
+  console.log("ssr-prod: streaming + per-route + data loading ok (/ -> home, /about -> about)");
 
   // 3. Hydration.
   let pw = null;
@@ -111,10 +114,11 @@ try {
       await page.evaluate(() => (window.__spa = 1));
       await page.locator('a[href="/about"]').click();
       await page.waitForSelector('[data-page="about"]');
+      await page.waitForSelector('[data-loaded="client"]', { timeout: 5000 }); // client loader ran
       if ((await page.evaluate(() => window.__spa)) !== 1) throw new Error("SPA navigation caused a full reload");
       if ((await page.evaluate(() => location.pathname)) !== "/about") throw new Error("URL did not update to /about");
       if (errors.length) throw new Error(`console errors: ${errors.join("; ")}`);
-      console.log("ssr-prod: hydration + SPA routing ok (home interactive, link -> /about, no reload)");
+      console.log("ssr-prod: hydration + SPA + client loader ok (home interactive, link -> /about, no reload)");
     } finally {
       await browser.close();
     }

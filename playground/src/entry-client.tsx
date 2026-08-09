@@ -1,37 +1,46 @@
 import { useEffect, useState } from "react";
 import { hydrateRoot } from "react-dom/client";
-import { App } from "@/routes";
+import { App, loadRoute, type RouteData } from "@/routes";
 
-// Client-side SPA routing over the SSR-rendered initial page: track the path in
-// state (seeded from the URL the server rendered, so hydration matches),
-// intercept plain internal-link clicks into history.pushState, and follow
-// back/forward via popstate — all without a full reload. The server still
-// renders each route for the initial load and no-JS.
+declare global {
+  interface Window {
+    __OJ_DATA__?: RouteData;
+  }
+}
+
+// Client-side SPA routing with route-level data loading over the SSR page. The
+// initial render reuses the server-loaded data serialized into the document
+// (so hydration matches, no refetch); each SPA navigation runs the loader on
+// the client before rendering the new route.
 function Router() {
-  const [path, setPath] = useState(() => location.pathname);
+  const [route, setRoute] = useState<{ path: string; data: RouteData }>(() => ({
+    path: location.pathname,
+    data: window.__OJ_DATA__ ?? null,
+  }));
   useEffect(() => {
-    const sync = () => setPath(location.pathname);
+    const navigate = async (path: string) => setRoute({ path, data: await loadRoute(path) });
+    const onPop = () => navigate(location.pathname);
     const onClick = (e: MouseEvent) => {
       if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) {
         return;
       }
       const anchor = (e.target as Element).closest?.("a");
       const href = anchor?.getAttribute("href");
-      if (!anchor || anchor.target || !href || !href.startsWith("/")) return; // external / new-tab
+      if (!anchor || anchor.target || !href || !href.startsWith("/")) return;
       e.preventDefault();
       if (href !== location.pathname + location.search) {
         history.pushState(null, "", href);
-        sync();
+        void navigate(location.pathname);
       }
     };
-    addEventListener("popstate", sync);
+    addEventListener("popstate", onPop);
     document.addEventListener("click", onClick);
     return () => {
-      removeEventListener("popstate", sync);
+      removeEventListener("popstate", onPop);
       document.removeEventListener("click", onClick);
     };
   }, []);
-  return <App url={path} />;
+  return <App url={route.path} data={route.data} />;
 }
 
 hydrateRoot(document.getElementById("app")!, <Router />);

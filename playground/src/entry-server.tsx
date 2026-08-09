@@ -1,13 +1,16 @@
 import { renderToReadableStream, renderToString } from "react-dom/server";
-import { App } from "@/routes";
+import { App, loadRoute, type RouteData } from "@/routes";
 
-// Streaming SSR, per route: the dev server and the production server pass the
-// request path so each URL renders its own tree.
-export function renderStream(url = "/"): Promise<ReadableStream<Uint8Array>> {
-  return renderToReadableStream(<App url={url} />);
+// The runner calls load() first, then passes the data to the render so the
+// route renders with it and the transport can serialize it for the client.
+export function load(url = "/"): Promise<RouteData> {
+  return loadRoute(url);
 }
 
-// Buffered fallback, also used by the production `oj build --ssr` bundle.
-export function render(url = "/"): string {
-  return renderToString(<App url={url} />);
+export function renderStream(url = "/", data: RouteData = null): Promise<ReadableStream<Uint8Array>> {
+  return renderToReadableStream(<App url={url} data={data} />);
+}
+
+export function render(url = "/", data: RouteData = null): string {
+  return renderToString(<App url={url} data={data} />);
 }
