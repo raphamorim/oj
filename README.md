@@ -1,5 +1,10 @@
 # oj
 
+0. If you like the idea and project please consider sponsor, working on it in my free timr.
+1. This is a research project, use on your own risk.
+2. It was created out of frustration with agents running vite build when I was working on rioterm-js repository. Each build process was carrying 2gb.
+3. If anyone want to move the project upstream, please contact me via email. Currently working mostly to fix my own problems.
+
 A Rust-native build tool for React apps: an opinionated, zero-config,
 low-memory toolchain. Fused oxc compile pipeline (one parse: TS strip, JSX,
 Fast Refresh instrumentation), real React Fast Refresh, CJS to ESM interop,
