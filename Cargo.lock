@@ -1632,6 +1632,7 @@ dependencies = [
  "arcstr",
  "clap",
  "oj_compiler",
+ "oj_config",
  "oj_css",
  "oj_env",
  "oj_server",

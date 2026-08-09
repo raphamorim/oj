@@ -40,9 +40,9 @@ enum Command {
     Build {
         /// App root containing index.html (defaults to ./playground when present)
         root: Option<PathBuf>,
-        /// Output directory, relative to the app root
-        #[arg(long, default_value = "dist")]
-        out: PathBuf,
+        /// Output directory (overrides oj.config build.outDir; default dist)
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 

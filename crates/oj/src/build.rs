@@ -47,11 +47,16 @@ impl Plugin for OjCssPlugin {
         let collected = Arc::clone(&self.collected);
         async move {
             let path = id.split('?').next().unwrap_or(&id);
-            if !path.ends_with(".css") {
+            if !(path.ends_with(".css") || oj_css::is_sass(path)) {
                 return Ok(None);
             }
-            let source = std::fs::read_to_string(path)
+            let mut source = std::fs::read_to_string(path)
                 .map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+            // Sass/SCSS -> CSS first (sibling @use/@import resolve from dir).
+            if oj_css::is_sass(path) {
+                let dir = std::path::Path::new(path).parent();
+                source = oj_css::compile_sass(&source, dir).map_err(|e| anyhow::anyhow!(e))?;
+            }
             let output = oj_css::compile_css(path, &source, true)
                 .map_err(|e| anyhow::anyhow!(e))?;
             let js = match &output.exports {
@@ -74,7 +79,7 @@ impl Plugin for OjCssPlugin {
     }
 }
 
-pub async fn build(root: PathBuf, out: PathBuf) -> anyhow::Result<()> {
+pub async fn build(root: PathBuf, out: Option<PathBuf>) -> anyhow::Result<()> {
     let root = root
         .canonicalize()
         .with_context(|| format!("app root not found: {}", root.display()))?;
@@ -85,6 +90,19 @@ pub async fn build(root: PathBuf, out: PathBuf) -> anyhow::Result<()> {
     let entries = module_script_srcs(&html);
     if entries.is_empty() {
         bail!("index.html has no <script type=\"module\" src=...> entry");
+    }
+
+    let config = oj_config::load(&root).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let build_cfg = config.build.clone().unwrap_or_default();
+    // Precedence: CLI --out > config build.outDir > "dist".
+    let out = out
+        .or_else(|| build_cfg.out_dir.as_ref().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("dist"));
+    let base = normalize_base(config.base.as_deref().unwrap_or("/"));
+    let minify = build_cfg.minify.unwrap_or(true);
+    let sourcemap = build_cfg.sourcemap.unwrap_or(true);
+    if build_cfg.target.is_some() {
+        eprintln!("oj build: note: build.target is accepted but not yet applied");
     }
 
     let out_dir = if out.is_absolute() { out } else { root.join(out) };
@@ -116,15 +134,15 @@ pub async fn build(root: PathBuf, out: PathBuf) -> anyhow::Result<()> {
         dir: Some(out_dir.display().to_string()),
         entry_filenames: Some("assets/[name]-[hash].js".to_string().into()),
         chunk_filenames: Some("assets/[name]-[hash].js".to_string().into()),
-        minify: Some(RawMinifyOptions::Bool(true)),
-        sourcemap: Some(SourceMapType::File),
+        minify: Some(RawMinifyOptions::Bool(minify)),
+        sourcemap: sourcemap.then_some(SourceMapType::File),
         define: Some({
             // NODE_ENV plus the app's .env-derived import.meta.env.* values,
-            // loaded in production mode.
+            // loaded in production mode. BASE_URL reflects the configured base.
             let env = oj_env::load(&root, "production");
             let mut pairs: Vec<(String, String)> =
                 vec![("process.env.NODE_ENV".into(), "'production'".into())];
-            pairs.extend(oj_env::import_meta_env_defines(&env, "production", false, "/", "VITE_"));
+            pairs.extend(oj_env::import_meta_env_defines(&env, "production", false, &base, "VITE_"));
             pairs.into_iter().collect()
         }),
             ..Default::default()
@@ -169,7 +187,7 @@ pub async fn build(root: PathBuf, out: PathBuf) -> anyhow::Result<()> {
                 let entry_abs = root.join(entry.trim_start_matches('/'));
                 if Path::new(facade.as_ref()) == entry_abs.as_path() {
                     rewritten_html =
-                        rewritten_html.replace(entry.as_str(), &format!("/{}", chunk.filename));
+                        rewritten_html.replace(entry.as_str(), &with_base(&chunk.filename, &base));
                 }
             }
         } else if let rolldown_common::Output::Asset(asset) = asset {
@@ -224,7 +242,7 @@ pub async fn build(root: PathBuf, out: PathBuf) -> anyhow::Result<()> {
         fs::create_dir_all(out_dir.join("assets"))?;
         fs::write(out_dir.join(&css_name), &combined)?;
         emitted.push((css_name.clone(), combined.len()));
-        let link = format!("<link rel=\"stylesheet\" href=\"/{css_name}\" />");
+        let link = format!("<link rel=\"stylesheet\" href=\"{}\" />", with_base(&css_name, &base));
         rewritten_html = match rewritten_html.find("</head>") {
             Some(idx) => format!("{}{}\n{}", &rewritten_html[..idx], link, &rewritten_html[idx..]),
             None => format!("{link}\n{rewritten_html}"),
@@ -298,6 +316,27 @@ fn scan_attrs(html: &str, tag_prefix: &str, attr_prefix: &str) -> Vec<String> {
     values
 }
 
+/// Normalize a public base path to a leading+trailing-slash form
+/// (`"/"`, `"/app/"`). Empty/relative bases fall back to `"/"`.
+fn normalize_base(base: &str) -> String {
+    if base.is_empty() || base == "./" {
+        return "/".to_string();
+    }
+    let mut b = base.to_string();
+    if !b.starts_with('/') {
+        b.insert(0, '/');
+    }
+    if !b.ends_with('/') {
+        b.push('/');
+    }
+    b
+}
+
+/// Prefix an emitted asset filename (e.g. `assets/x-hash.js`) with the base.
+fn with_base(filename: &str, base: &str) -> String {
+    format!("{base}{}", filename.trim_start_matches('/'))
+}
+
 /// One entry in the Vite-compatible build manifest.
 struct ManifestEntry {
     name: String,
@@ -369,6 +408,18 @@ mod tests {
         assert!(!row.contains_key("isEntry"));
         assert!(!row.contains_key("imports"));
         assert!(!row.contains_key("css"));
+    }
+
+    #[test]
+    fn base_normalization_and_application() {
+        assert_eq!(normalize_base("/"), "/");
+        assert_eq!(normalize_base(""), "/");
+        assert_eq!(normalize_base("./"), "/");
+        assert_eq!(normalize_base("app"), "/app/");
+        assert_eq!(normalize_base("/app"), "/app/");
+        assert_eq!(normalize_base("/app/"), "/app/");
+        assert_eq!(with_base("assets/x-h.js", "/"), "/assets/x-h.js");
+        assert_eq!(with_base("assets/x-h.js", "/app/"), "/app/assets/x-h.js");
     }
 
     #[test]
