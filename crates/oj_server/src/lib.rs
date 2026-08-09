@@ -94,6 +94,9 @@ struct ServerState {
     proxy: Vec<(String, oj_config::ProxyEntry)>,
     /// Client for forwarding proxied requests.
     http: reqwest::Client,
+    /// Author-provided virtual modules: import id -> module source, served
+    /// at `/@virtual/<id>`. The first slice of the plugin pipeline.
+    virtual_modules: std::collections::BTreeMap<String, String>,
 }
 
 impl DevServer {
@@ -158,6 +161,7 @@ impl DevServer {
             preload_snapshot: load_graph_snapshot(&root),
             proxy,
             http: reqwest::Client::new(),
+            virtual_modules: config.virtual_modules.clone().unwrap_or_default(),
         });
         {
             let state = Arc::clone(&state);
@@ -379,6 +383,18 @@ async fn serve_path(
     let rel = uri.path().trim_start_matches('/');
     let rel = if rel.is_empty() { "index.html" } else { rel };
 
+    // Virtual modules: serve author-provided source at /@virtual/<id>.
+    if let Some(id) = uri.path().strip_prefix("/@virtual/") {
+        return match state.virtual_modules.get(id) {
+            Some(code) => (
+                [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
+                code.clone(),
+            )
+                .into_response(),
+            None => (StatusCode::NOT_FOUND, format!("oj: no virtual module {id}")).into_response(),
+        };
+    }
+
     let file = if let Some(abs) = uri.path().strip_prefix("/@fs") {
         let candidate = PathBuf::from(abs);
         let allowed = {
@@ -598,6 +614,8 @@ async fn ensure_module(
     let root = state.root.clone();
     let resolver = Arc::clone(&state.resolver);
     let fs_allow = Arc::clone(&state.fs_allow);
+    let virtual_ids: std::collections::BTreeSet<String> =
+        state.virtual_modules.keys().cloned().collect();
     let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
     let file_owned = file.to_path_buf();
     let url_owned = url.to_string();
@@ -645,8 +663,13 @@ async fn ensure_module(
                 fs_allow: Vec::new(),
             });
         }
-        let mut rewrite =
-            |spec: &str| rewrite_specifier(&root, &dir, &resolver, &fs_allow, spec, !bundle);
+        let mut rewrite = |spec: &str| {
+            // Virtual modules resolve to /@virtual/<id> instead of the FS.
+            if virtual_ids.contains(spec) {
+                return Some(format!("/@virtual/{spec}"));
+            }
+            rewrite_specifier(&root, &dir, &resolver, &fs_allow, spec, !bundle)
+        };
         if bundle {
             let factory =
                 oj_compiler::bundle::compile_factory(&file_owned, &url_owned, &source, &mut rewrite)

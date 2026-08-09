@@ -23,6 +23,10 @@ pub struct OjConfig {
     pub env_dir: Option<String>,
     pub build: Option<BuildConfig>,
     pub preview: Option<PreviewConfig>,
+    /// Virtual modules: import id -> module source. `import x from "virtual:id"`
+    /// resolves here instead of the filesystem (the first slice of plugin
+    /// support — resolve+load for author-provided modules).
+    pub virtual_modules: Option<BTreeMap<String, String>>,
     /// oj-specific: default the dev server to registry bundle mode.
     pub bundle: Option<bool>,
 }
