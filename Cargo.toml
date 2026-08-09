@@ -4,6 +4,7 @@ members = [
     "crates/oj_compiler",
     "crates/oj_css",
     "crates/oj_env",
+    "crates/oj_config",
     "crates/oj_resolver",
     "crates/oj_graph",
     "crates/oj_cache",
@@ -23,6 +24,7 @@ oj_graph = { version = "0.0.1", path = "crates/oj_graph" }
 oj_cache = { version = "0.0.1", path = "crates/oj_cache" }
 oj_css = { version = "0.0.1", path = "crates/oj_css" }
 oj_env = { version = "0.0.1", path = "crates/oj_env" }
+oj_config = { version = "0.0.1", path = "crates/oj_config" }
 oj_server = { version = "0.0.1", path = "crates/oj_server" }
 
 oxc_allocator = "0.143.0"

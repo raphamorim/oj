@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Raphael Amorim
+[package]
+name = "oj_config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "oj.config.{ts,js,mjs,json} loading: TS strip via oxc, evaluation via embedded QuickJS"
+
+[dependencies]
+oxc_allocator.workspace = true
+oxc_parser.workspace = true
+oxc_span.workspace = true
+oxc_semantic.workspace = true
+oxc_transformer.workspace = true
+oxc_codegen.workspace = true
+rquickjs = { version = "0.9", features = ["loader"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
