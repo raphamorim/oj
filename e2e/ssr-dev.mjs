@@ -12,6 +12,7 @@
 //      page with React state preserved and no full reload — SSR HMR.
 import { spawn, execSync } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -68,6 +69,20 @@ try {
   if (!/ssr[^0-9]*0/.test(stripTags(first))) throw new Error(`first render missing "ssr: 0":\n${first}`);
   console.log("ssr-dev: first render ok (ssr: 0)");
 
+  // 1b. Streaming: the response is chunked (not a buffered Content-Length body),
+  //     and the deferred Suspense content resolved and streamed in — proof the
+  //     renderToReadableStream path ran, not buffered renderToString.
+  const headers = await new Promise((resolve, reject) => {
+    http.get(`${base}/`, (res) => (res.resume(), resolve(res.headers))).on("error", reject);
+  });
+  if (headers["transfer-encoding"] !== "chunked" || headers["content-length"]) {
+    throw new Error(`SSR response was not streamed (chunked): ${JSON.stringify(headers)}`);
+  }
+  if (!first.includes("deferred-streamed")) {
+    throw new Error(`streamed Suspense content missing:\n${first}`);
+  }
+  console.log("ssr-dev: streaming ok (chunked transfer + deferred Suspense content)");
+
   // 2. The persistent module runner re-evaluates changed modules on the next
   //    load — two consecutive edits both show up, with no Rolldown SSR bundle.
   fs.writeFileSync(counter, baseline.replace("useState<number>(0)", "useState<number>(41)"));
@@ -122,6 +137,9 @@ try {
     try {
       await page.goto(`${base}/`, { waitUntil: "networkidle" });
       await page.waitForSelector("button");
+      // The streamed Suspense content survived hydration (no mismatch).
+      const deferred = await page.locator("[data-deferred]").textContent();
+      if (!deferred.includes("deferred-streamed")) throw new Error(`deferred content lost: ${deferred}`);
       await page.evaluate(() => (window.__marker = 7));
       for (let i = 0; i < 3; i++) await page.locator("button").click();
       const clicked = (await page.locator("button").textContent()).trim();

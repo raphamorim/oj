@@ -1,4 +1,4 @@
 import { hydrateRoot } from "react-dom/client";
-import { Counter } from "@/Counter";
+import { SsrApp } from "@/ssr-app";
 
-hydrateRoot(document.getElementById("app")!, <Counter label="ssr" />);
+hydrateRoot(document.getElementById("app")!, <SsrApp />);

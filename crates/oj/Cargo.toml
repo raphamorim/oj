@@ -25,3 +25,4 @@ serde_json.workspace = true
 oj_css.workspace = true
 axum.workspace = true
 notify.workspace = true
+tokio-stream = "0.1"

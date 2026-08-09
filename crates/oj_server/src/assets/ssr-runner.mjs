@@ -146,7 +146,7 @@ function invalidate() {
   return dirty.size;
 }
 
-async function render() {
+async function entryNamespace() {
   invalidate();
   let rec = registry.get(ENTRY);
   if (!rec || !rec.evaluated) {
@@ -155,11 +155,32 @@ async function render() {
     rec = registry.get(ENTRY);
     rec.evaluated = true;
   }
-  const render = rec.mod.namespace.render;
-  if (typeof render !== "function") {
-    throw new Error(`SSR entry ${ENTRY} does not export a render() function`);
+  return rec.mod.namespace;
+}
+
+// Produce the render, calling `emit` with one framed message per line:
+// `{chunk}` (repeated) then `{end}` for a streaming entry (renderStream ->
+// a web ReadableStream), or a single `{html}` for a buffered entry (render).
+async function handleRender(emit) {
+  const ns = await entryNamespace();
+  if (typeof ns.renderStream === "function") {
+    const stream = await ns.renderStream();
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      if (chunk) emit({ chunk });
+    }
+    const tail = decoder.decode();
+    if (tail) emit({ chunk: tail });
+    emit({ end: true });
+  } else if (typeof ns.render === "function") {
+    emit({ html: String(await ns.render()) });
+  } else {
+    throw new Error(`SSR entry ${ENTRY} exports neither render() nor renderStream()`);
   }
-  return String(await render());
 }
 
 // Serialize renders and push-invalidations so a change event can't delete a
@@ -213,9 +234,9 @@ rl.on("line", (line) => {
     return;
   }
   if (msg.cmd === "render") {
-    withLock(render).then(
-      (html) => process.stdout.write(JSON.stringify({ html }) + "\n"),
-      (e) => process.stdout.write(JSON.stringify({ error: String((e && e.stack) || e) }) + "\n"),
+    const emit = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
+    withLock(() => handleRender(emit)).catch((e) =>
+      emit({ error: String((e && e.stack) || e) }),
     );
   }
 });

@@ -29,12 +29,15 @@ use std::sync::Arc;
 
 use axum::{
     Router,
+    body::{Body, Bytes},
     extract::State,
+    http::header,
     response::{Html, IntoResponse, Response},
     routing::get,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio_stream::wrappers::ReceiverStream;
 
 /// A live handle to the spawned Node module runner.
 struct Runner {
@@ -47,7 +50,7 @@ struct SsrState {
     /// URL of the client hydration entry (`/src/entry-client.tsx`), served by
     /// the dev pipeline. `None` => SSR-only, inert page.
     client_url: Option<String>,
-    runner: tokio::sync::Mutex<Runner>,
+    runner: Arc<tokio::sync::Mutex<Runner>>,
 }
 
 pub async fn ssr_dev(root: PathBuf, entry: String, port: Option<u16>) -> anyhow::Result<()> {
@@ -63,7 +66,7 @@ pub async fn ssr_dev(root: PathBuf, entry: String, port: Option<u16>) -> anyhow:
 
     let ssr_state = Arc::new(SsrState {
         client_url: client_url.clone(),
-        runner: tokio::sync::Mutex::new(runner),
+        runner: Arc::new(tokio::sync::Mutex::new(runner)),
     });
 
     // The explicit `/` route overrides the dev server's index.html fallback;
@@ -116,39 +119,83 @@ async fn spawn_runner(root: &Path, base: &str, entry_abs: &Path) -> anyhow::Resu
 }
 
 async fn render(State(state): State<Arc<SsrState>>) -> Response {
-    let mut runner = state.runner.lock().await;
-    if runner.stdin.write_all(b"{\"cmd\":\"render\"}\n").await.is_err()
-        || runner.stdin.flush().await.is_err()
+    let mut guard = Arc::clone(&state.runner).lock_owned().await;
+    if guard.stdin.write_all(b"{\"cmd\":\"render\"}\n").await.is_err()
+        || guard.stdin.flush().await.is_err()
     {
         return error_page("SSR runner is not accepting input (did it crash?)");
     }
-    match runner.lines.next_line().await {
-        Ok(Some(line)) => match serde_json::from_str::<serde_json::Value>(&line) {
-            Ok(v) if v.get("html").and_then(|h| h.as_str()).is_some() => {
-                Html(page(&state, v["html"].as_str().unwrap())).into_response()
-            }
-            Ok(v) => error_page(v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown SSR error")),
-            Err(_) => error_page(&format!("SSR runner sent malformed output:\n{line}")),
-        },
-        _ => error_page("SSR runner did not respond"),
+    let first = match guard.lines.next_line().await {
+        Ok(Some(line)) => line,
+        _ => return error_page("SSR runner did not respond"),
+    };
+    let v: serde_json::Value = match serde_json::from_str(&first) {
+        Ok(v) => v,
+        Err(_) => return error_page(&format!("SSR runner sent malformed output:\n{first}")),
+    };
+
+    // Buffered entry (render): one `{html}` message.
+    if let Some(html) = v.get("html").and_then(|h| h.as_str()) {
+        return Html(page(&state, html)).into_response();
     }
+    // Streaming entry (renderStream): `{chunk}`… then `{end}`. Flush the shell
+    // immediately, forward each chunk as React produces it, close with the tail.
+    if let Some(first_chunk) = v.get("chunk").and_then(|c| c.as_str()).map(str::to_owned) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+        let head = page_head();
+        let tail = page_tail(&state);
+        tokio::spawn(async move {
+            let mut guard = guard; // hold the runner lock for the whole stream
+            let _ = tx.send(Ok(Bytes::from(head))).await;
+            let _ = tx.send(Ok(Bytes::from(first_chunk))).await;
+            while let Ok(Some(line)) = guard.lines.next_line().await {
+                match serde_json::from_str::<serde_json::Value>(&line) {
+                    Ok(v) if v.get("chunk").and_then(|c| c.as_str()).is_some() => {
+                        let _ = tx.send(Ok(Bytes::from(v["chunk"].as_str().unwrap().to_owned()))).await;
+                    }
+                    Ok(v) if v.get("error").and_then(|e| e.as_str()).is_some() => {
+                        let msg = html_escape(v["error"].as_str().unwrap());
+                        let _ = tx.send(Ok(Bytes::from(format!("<pre>[oj ssr] {msg}</pre>")))).await;
+                        break;
+                    }
+                    _ => break, // {end} or anything else closes the stream
+                }
+            }
+            let _ = tx.send(Ok(Bytes::from(tail))).await;
+        });
+        return (
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            Body::from_stream(ReceiverStream::new(rx)),
+        )
+            .into_response();
+    }
+    error_page(v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown SSR error"))
 }
 
-/// Wrap the server-rendered `body` in an HTML document. The Fast Refresh
-/// preamble must be the first module script (it installs the React refresh
-/// hook before any module pulls in React); the dev HMR client comes next, then
-/// the hydration entry — all served by the merged dev router.
-fn page(state: &SsrState, body: &str) -> String {
-    let head = "<script type=\"module\" src=\"/@oj/refresh-preamble.js\"></script>\n\
-                <script type=\"module\" src=\"/@oj/client.js\"></script>";
+/// The document head + open of `#app`: charset, then the Fast Refresh preamble
+/// (must be the first module script, so the refresh hook installs before any
+/// module pulls in React) and the dev HMR client.
+fn page_head() -> String {
+    "<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n\
+     <script type=\"module\" src=\"/@oj/refresh-preamble.js\"></script>\n\
+     <script type=\"module\" src=\"/@oj/client.js\"></script>\n</head>\n\
+     <body><div id=\"app\">"
+        .to_string()
+}
+
+/// Close `#app`, then the hydration entry (served by the dev router), then the
+/// document.
+fn page_tail(state: &SsrState) -> String {
     let entry = match &state.client_url {
         Some(u) => format!("<script type=\"module\" src=\"{u}\"></script>"),
         None => String::new(),
     };
-    format!(
-        "<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n{head}\n</head>\n\
-         <body><div id=\"app\">{body}</div>\n{entry}\n</body>\n</html>\n"
-    )
+    format!("</div>\n{entry}\n</body>\n</html>\n")
+}
+
+/// The full document for a buffered render.
+fn page(state: &SsrState, body: &str) -> String {
+    format!("{}{}{}", page_head(), body, page_tail(state))
 }
 
 fn error_page(msg: &str) -> Response {
