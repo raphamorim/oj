@@ -35,7 +35,11 @@ let failed = 0;
 for (const file of fs.readdirSync(here).filter((f) => f.endsWith(".test.js")).sort()) {
   process.stdout.write(`\n${file} (${bundle ? "bundle" : "unbundled"})\n`);
   try {
-    execSync(`node ${path.join(here, file)}`, { stdio: "inherit", cwd: here });
+    execSync(`node ${path.join(here, file)}`, {
+      stdio: "inherit",
+      cwd: here,
+      env: { ...process.env, OJ_E2E_MODE: bundle ? "bundle" : "unbundled" },
+    });
   } catch {
     failed++;
   }

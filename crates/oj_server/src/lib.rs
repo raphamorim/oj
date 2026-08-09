@@ -342,13 +342,16 @@ async fn serve_path(
     };
 
     let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
-    if uri.query().is_some_and(|q| q.split('&').any(|kv| kv == "url")) {
+    if let Some(kind) = query_asset_kind(uri.query()) {
         let url = url_of(&state.root, &file);
-        return (
-            [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
-            format!("export default {url:?};\n"),
-        )
-            .into_response();
+        return match asset_module(&file, &url, kind).await {
+            Ok(js) => (
+                [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
+                js,
+            )
+                .into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {e}")).into_response(),
+        };
     }
     if matches!(ext, "css" | "scss" | "sass")
         && uri.query().is_some_and(|q| q.contains("import"))
@@ -843,15 +846,20 @@ fn rewrite_specifier(
         return None;
     }
 
-    // `import x from "./file.wasm?url"` (vite-ism): resolve the file, keep
-    // the ?url marker; the server answers with a JS module exporting the url.
-    if let Some(base) = spec.strip_suffix("?url") {
-        let resolved = rewrite_specifier(root, dir, resolver, fs_allow, base, false)
-            .or_else(|| resolver.resolve(dir, base).ok().map(|p| {
-                fs_allow.lock().unwrap().insert(package_root(&p));
-                url_of(root, &p)
-            }))?;
-        return Some(format!("{resolved}?url"));
+    // Query-suffixed asset imports (`./x.wasm?url`, `./x.txt?raw`,
+    // `./x.png?inline`): resolve the base file, keep the marker; the server
+    // answers with a JS module (a url string / file contents / data URI).
+    for suffix in ["?url", "?raw", "?inline"] {
+        if let Some(base) = spec.strip_suffix(suffix) {
+            let resolved = rewrite_specifier(root, dir, resolver, fs_allow, base, false)
+                .or_else(|| {
+                    resolver.resolve(dir, base).ok().map(|p| {
+                        fs_allow.lock().unwrap().insert(package_root(&p));
+                        url_of(root, &p)
+                    })
+                })?;
+            return Some(format!("{resolved}{suffix}"));
+        }
     }
 
     if spec.starts_with("./") || spec.starts_with("../") {
@@ -954,6 +962,53 @@ fn locate(root: &Path, rel: &str) -> Option<PathBuf> {
         return Some(public);
     }
     None
+}
+
+/// Which query-suffix asset module a request wants, if any.
+fn query_asset_kind(query: Option<&str>) -> Option<&'static str> {
+    let q = query?;
+    for kind in ["url", "raw", "inline"] {
+        if q.split('&').any(|kv| kv == kind) {
+            return Some(kind);
+        }
+    }
+    None
+}
+
+/// Build the JS module for a `?url` / `?raw` / `?inline` asset import.
+async fn asset_module(file: &Path, url: &str, kind: &str) -> Result<String, String> {
+    let clean_url = url.split('?').next().unwrap_or(url);
+    match kind {
+        "url" => Ok(format!("export default {clean_url:?};\n")),
+        "raw" => {
+            let text = tokio::fs::read_to_string(file)
+                .await
+                .map_err(|e| format!("read {}: {e}", file.display()))?;
+            Ok(format!("export default {};\n", serde_json::Value::String(text)))
+        }
+        "inline" => {
+            let bytes = tokio::fs::read(file).await.map_err(|e| format!("read: {e}"))?;
+            let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let mime = content_type(ext).split(';').next().unwrap_or("application/octet-stream");
+            let data_uri = format!("data:{mime};base64,{}", base64_encode(&bytes));
+            Ok(format!("export default {data_uri:?};\n"))
+        }
+        _ => Err(format!("unknown asset query: {kind}")),
+    }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
 }
 
 fn content_type(ext: &str) -> &'static str {
