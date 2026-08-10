@@ -123,6 +123,9 @@ pub struct BuildConfig {
     pub lib: Option<LibConfig>,
     /// SSR mode: build a Node-runnable server bundle from this entry.
     pub ssr: Option<String>,
+    /// Prerender (SSG): route paths to render to static HTML at build time,
+    /// e.g. `["/", "/about"]`. Requires an SSR entry.
+    pub prerender: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

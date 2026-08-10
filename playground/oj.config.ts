@@ -8,6 +8,11 @@ export default defineConfig({
   define: {
     __OJ_DEFINE_GLOBAL__: JSON.stringify("global-define"),
   },
+  // Prerender (SSG): these routes are rendered to static HTML at build time
+  // (hydrated by the client bundle). Applies to `oj build --ssr`.
+  build: {
+    prerender: ["/", "/about"],
+  },
   environments: {
     client: { define: { __OJ_DEFINE_CLIENT__: JSON.stringify("client-define") } },
     ssr: {

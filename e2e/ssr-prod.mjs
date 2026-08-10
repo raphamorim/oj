@@ -34,6 +34,20 @@ execSync(`${path.join(repo, "target", "debug", "oj")} build playground --ssr src
 const serverJs = path.join(out, "server.mjs");
 if (!fs.existsSync(path.join(out, "entry-server.mjs"))) throw new Error("no server bundle emitted");
 if (!fs.existsSync(serverJs)) throw new Error("no server.mjs emitted");
+// Prerender (SSG): build.prerender = ["/", "/about"] -> static HTML with the
+// route content, the client hydration script, and (for "/") the resolved
+// Suspense boundary so it hydrates without a mismatch.
+{
+  const home = path.join(out, "index.html");
+  const about = path.join(out, "about", "index.html");
+  if (!fs.existsSync(home) || !fs.existsSync(about)) throw new Error("prerender did not emit static HTML");
+  const homeHtml = fs.readFileSync(home, "utf8");
+  if (!homeHtml.includes('data-page="home"')) throw new Error("prerendered / missing home route content");
+  if (!homeHtml.includes("deferred-streamed")) throw new Error("prerendered / did not resolve the Suspense boundary");
+  if (!/src="\/assets\/entry-client[^"]*\.js"/.test(homeHtml)) throw new Error("prerendered / missing client hydration script");
+  if (!fs.readFileSync(about, "utf8").includes('data-page="about"')) throw new Error("prerendered /about missing about content");
+  console.log("ssr-prod: prerender (SSG) ok (/ and /about static HTML, Suspense resolved, hydration wired)");
+}
 // User plugins run in BOTH SSR-build environments: entry-server (ssr) and
 // entry-client (client) each import a plugin virtual module, so its source must
 // be bundled into both the server bundle and a client asset.
