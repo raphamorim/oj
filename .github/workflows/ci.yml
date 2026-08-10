@@ -94,6 +94,10 @@ jobs:
           # Environment API: client-gated plugin ran, ssr-gated plugin did not
           grep -rq 'client-ran' playground/dist/assets/*.js
           ! grep -rq 'ssr-ran' playground/dist/assets/*.js
+          # generateBundle: emitted a report asset (read bundle + emitFile) and
+          # mutated the entry chunk (banner prepended)
+          grep -q 'chunks:' playground/dist/oj-build-report.txt
+          grep -rq 'oj-gb-banner' playground/dist/assets/*.js
       - name: library build
         run: |
           mkdir -p /tmp/lib/src

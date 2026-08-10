@@ -252,6 +252,20 @@ impl PluginHost {
         serde_json::from_str(&json).map_err(|e| e.to_string())
     }
 
+    /// Whether any active plugin defines a `generateBundle` hook — lets the
+    /// build skip serializing the whole output bundle when nothing uses it.
+    pub async fn has_generate_bundle(&self) -> bool {
+        matches!(self.call("hasGenerateBundle", &[]).await, Ok(Some(s)) if s == "true")
+    }
+
+    /// Run `generateBundle`: hand the output bundle (JSON keyed by fileName) to
+    /// the plugins' generateBundle hooks and return the possibly-mutated bundle
+    /// JSON (chunk `code` / asset `source` edits). Plugins may also `emitFile`
+    /// here — those are collected via [`Self::emitted_files`].
+    pub async fn generate_bundle(&self, bundle_json: &str, is_write: bool) -> Result<Option<String>, String> {
+        self.call("generateBundle", &[bundle_json, if is_write { "true" } else { "false" }]).await
+    }
+
     /// The port of the `configureServer` middleware HTTP server, if any plugin
     /// registered dev-server middleware. `None` means no middleware to consult.
     pub async fn middleware_port(&self) -> Option<u16> {

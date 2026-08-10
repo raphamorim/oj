@@ -193,6 +193,7 @@ impl Plugin for OjUserPlugin {
         rolldown_plugin::HookUsage::ResolveId
             | rolldown_plugin::HookUsage::Load
             | rolldown_plugin::HookUsage::Transform
+            | rolldown_plugin::HookUsage::GenerateBundle
     }
 
     fn resolve_id(
@@ -244,6 +245,96 @@ impl Plugin for OjUserPlugin {
                     ..Default::default()
                 })),
                 _ => Ok(None),
+            }
+        }
+    }
+
+    // Output-phase hook: the plugins see the finished bundle (keyed by
+    // fileName), may read it, mutate chunk `code` / asset `source`, or emitFile
+    // new assets (collected separately). Skipped entirely when no plugin
+    // defines generateBundle, so builds that don't use it pay nothing.
+    async fn generate_bundle(
+        &self,
+        _ctx: &PluginContext,
+        args: &mut rolldown_plugin::HookGenerateBundleArgs<'_>,
+    ) -> rolldown_plugin::HookNoopReturn {
+        if !self.host.has_generate_bundle().await {
+            return Ok(());
+        }
+        let bundle_json = serialize_bundle(args.bundle);
+        if let Ok(Some(mutated)) = self.host.generate_bundle(&bundle_json, args.is_write).await {
+            apply_bundle_mutations(args.bundle, &mutated);
+        }
+        Ok(())
+    }
+}
+
+/// Serialize the Rolldown output bundle to a Rollup-shaped `bundle` object
+/// (JSON keyed by fileName) for the plugin host. Binary asset sources are sent
+/// as null (readable metadata only; not mutable through this bridge).
+fn serialize_bundle(bundle: &[rolldown_common::Output]) -> String {
+    use rolldown_common::{Output, StrOrBytes};
+    let mut map = serde_json::Map::new();
+    for out in bundle {
+        match out {
+            Output::Chunk(c) => {
+                map.insert(
+                    c.filename.to_string(),
+                    serde_json::json!({
+                        "type": "chunk",
+                        "fileName": c.filename.to_string(),
+                        "name": c.name.to_string(),
+                        "isEntry": c.is_entry,
+                        "code": c.code,
+                    }),
+                );
+            }
+            Output::Asset(a) => {
+                let source = match &a.source {
+                    StrOrBytes::Str(s) => Some(s.as_str()),
+                    StrOrBytes::Bytes(_) => None,
+                };
+                map.insert(
+                    a.filename.to_string(),
+                    serde_json::json!({
+                        "type": "asset",
+                        "fileName": a.filename.to_string(),
+                        "source": source,
+                    }),
+                );
+            }
+        }
+    }
+    serde_json::Value::Object(map).to_string()
+}
+
+/// Apply a plugin's `generateBundle` edits back onto the Rolldown output: only
+/// `code`/`source` changes to existing entries (COW via `Arc::make_mut`). New
+/// entries (use `this.emitFile`) and deletions are not applied.
+fn apply_bundle_mutations(bundle: &mut [rolldown_common::Output], json: &str) {
+    use rolldown_common::{Output, StrOrBytes};
+    let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(json) else {
+        return;
+    };
+    for out in bundle.iter_mut() {
+        match out {
+            Output::Chunk(c) => {
+                if let Some(code) =
+                    map.get(c.filename.as_str()).and_then(|v| v.get("code")).and_then(|x| x.as_str())
+                {
+                    if c.code != code {
+                        Arc::make_mut(c).code = code.to_string();
+                    }
+                }
+            }
+            Output::Asset(a) => {
+                if let Some(src) =
+                    map.get(a.filename.as_str()).and_then(|v| v.get("source")).and_then(|x| x.as_str())
+                {
+                    if a.source.as_bytes() != src.as_bytes() {
+                        Arc::make_mut(a).source = StrOrBytes::Str(src.to_string());
+                    }
+                }
             }
         }
     }

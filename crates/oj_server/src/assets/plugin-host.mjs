@@ -339,6 +339,21 @@ async function runLifecycle(hook) {
   return null;
 }
 
+// generateBundle: hand the output bundle (fileName -> chunk|asset) to each
+// plugin's generateBundle(outputOptions, bundle, isWrite). Plugins may read it,
+// mutate chunk.code / asset.source, or this.emitFile new assets. Returns the
+// possibly-mutated bundle as JSON.
+async function generateBundle(bundleJson, isWrite) {
+  const bundle = JSON.parse(bundleJson || "{}");
+  const outputOptions = environment.config?.build ?? {};
+  for (const p of plugins) {
+    const fn = typeof p.generateBundle === "function" ? p.generateBundle : p.generateBundle?.handler;
+    if (typeof fn !== "function") continue;
+    await fn.call(ctx, outputOptions, bundle, isWrite);
+  }
+  return JSON.stringify(bundle);
+}
+
 async function run(hook, args) {
   if (hook === "transform") return transform(args[0], args[1]);
   if (hook === "resolveId") return resolveId(args[0], args[1]);
@@ -352,6 +367,10 @@ async function run(hook, args) {
   }
   // Files registered via this.addWatchFile, for the dev watcher.
   if (hook === "getWatchFiles") return JSON.stringify([...watchedFiles]);
+  if (hook === "hasGenerateBundle") {
+    return String(plugins.some((p) => typeof (p.generateBundle?.handler ?? p.generateBundle) === "function"));
+  }
+  if (hook === "generateBundle") return generateBundle(args[0], args[1] === "true");
   // The configureServer middleware port (null if no plugin added middleware).
   if (hook === "getMiddlewarePort") return middlewarePort == null ? null : String(middlewarePort);
   return null;

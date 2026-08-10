@@ -127,6 +127,22 @@ function envPlugin(name, marker) {
   };
 }
 
+// Uses the output-phase generateBundle hook: reads the finished bundle (emits a
+// report asset counting the JS chunks) and mutates it (prepends a banner to the
+// entry chunk). Exercises read + this.emitFile + mutation in one hook.
+function reportPlugin() {
+  return {
+    name: "oj-report",
+    generateBundle(_options, bundle) {
+      const chunks = Object.keys(bundle).filter((f) => bundle[f].type === "chunk");
+      this.emitFile({ type: "asset", fileName: "oj-build-report.txt", source: `chunks:${chunks.length}` });
+      for (const f of chunks) {
+        if (bundle[f].isEntry) bundle[f].code = "/*oj-gb-banner*/" + bundle[f].code;
+      }
+    },
+  };
+}
+
 // A Vite/Rollup-style plugin: a factory returning a `{ name, transform }`
 // object, exactly the shape npm plugins use. oj's plugin host loads this and
 // runs the transform hook against the compile pipeline.
@@ -240,6 +256,7 @@ export default [
   envNamePlugin(),
   envPlugin("client", "__ENV_CLIENT__"),
   envPlugin("ssr", "__ENV_SSR__"),
+  reportPlugin(),
   markerPlugin(),
   virtualPlugin(),
   configPlugin(),

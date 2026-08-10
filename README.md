@@ -33,13 +33,38 @@ itself. It is there to show the primitives compose, not to be a framework.
 
 ## Plugins
 
-Vite/Rollup-style plugins run through a Node plugin host. Drop an
-`oj.plugins.mjs` at the app root that default-exports a plugin array, and their
-`transform`, `resolveId`, `load`, `config`, and `configResolved` hooks run both
-in the dev server and in `oj build`. This is not the full hook surface. There
-is no `buildStart`, `handleHotUpdate`, or `transformIndexHtml` yet, and the
-plugin context is minimal, so a plugin that transforms code or serves a virtual
-module will work while one that reaches deeper into Rollup internals will not.
+Vite/Rollup-style plugins run through a persistent Node plugin host. Drop an
+`oj.plugins.mjs` at the app root that default-exports a plugin array. The dev
+server and `oj build` run `transform`, `resolveId`, `load`, `config`,
+`configResolved`, `transformIndexHtml`, `handleHotUpdate`, `buildStart`,
+`buildEnd`, `generateBundle`, and `configureServer`; honor `enforce`,
+`apply`, and `applyToEnvironment` ordering; and give hooks a plugin context with
+`this.resolve`, `this.load`, `this.emitFile`, `this.getModuleInfo`,
+`this.getModuleIds`, and `this.addWatchFile`. Plugins run in both the client and
+SSR environments, in dev and in the production build. Still missing are the
+later output hooks (`renderChunk`, `writeBundle`), whole-graph module info, and
+per-environment build outputs, so a plugin that rewrites chunks late in the
+pipeline or drives several build environments at once will not work yet.
+
+## Goals
+
+oj is meant to run real production React apps without changes to their source.
+The work ahead, roughly in priority order:
+
+- The rest of the Rollup output phase (`renderStart`, `renderChunk`,
+  `writeBundle`, `closeBundle`) so chunk-rewriting and reporting plugins run end
+  to end.
+- Arbitrary PostCSS pipelines driven by the app's own `postcss.config`, beyond
+  the Tailwind and autoprefixer path that works today.
+- The multi-environment build model: independent client and server module
+  graphs, shared plugins, and per-environment output, which modern
+  meta-frameworks build on.
+- A router-driven framework layer on top of the streaming SSR that already
+  exists: file or config routing, server functions, and prerendering.
+- Edge and serverless server targets, so one app can build for a Node server or
+  a worker runtime.
+- A whole-graph module API (`getModuleInfo` across the full graph,
+  `moduleParsed`, `watchChange`) for plugins that inspect the dependency graph.
 
 ## Quickstart
 
