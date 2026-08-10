@@ -26,8 +26,14 @@ const { chromium } = require("playwright");
     const title = await page.title();
     if (injected !== "yes") throw new Error("transformIndexHtml did not inject the meta tag");
     if (!title.includes("(plugin)")) throw new Error("transformIndexHtml did not rewrite the title: " + title);
+    // enforce: two plugins listed post-then-pre append in pre->post order.
+    const order = await page.getAttribute("[data-order]", "data-order");
+    if (order !== "base-pre-post") throw new Error("enforce ordering wrong: " + order);
+    // apply: only the serve-gated plugin runs in dev.
+    const apply = await page.getAttribute("[data-apply]", "data-apply");
+    if (apply !== "serve-only") throw new Error("apply gating wrong (expected serve-only): " + apply);
     if (errors.length) throw new Error("console errors");
-    console.log("PLUGIN transform + config + transformIndexHtml HOOKS VERIFIED");
+    console.log("PLUGIN transform + config + transformIndexHtml + enforce/apply HOOKS VERIFIED");
   } finally {
     await browser.close();
   }

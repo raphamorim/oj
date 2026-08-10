@@ -9,12 +9,27 @@ import { pathToFileURL } from "node:url";
 import readline from "node:readline";
 
 const pluginsPath = process.argv[2];
+const initial = JSON.parse(process.argv[3] ?? "{}");
+const env = initial.env ?? { command: "serve", mode: "development" };
+
 let plugins = [];
 try {
   const mod = await import(pathToFileURL(pluginsPath).href);
   const list = mod.default ?? mod.plugins ?? [];
   plugins = (Array.isArray(list) ? list : [list]).filter(Boolean);
-  process.stderr.write(`oj plugin host: loaded ${plugins.length} plugin(s) from ${pluginsPath}\n`);
+  // `apply`: keep plugins active for this command ("serve"/"build" or a fn).
+  plugins = plugins.filter((p) => {
+    if (p.apply == null) return true;
+    if (typeof p.apply === "function") return !!p.apply(initial.config ?? {}, env);
+    return p.apply === env.command;
+  });
+  // `enforce`: pre plugins run first, post last, others keep array order
+  // (Array.prototype.sort is stable).
+  const rank = (p) => (p.enforce === "pre" ? -1 : p.enforce === "post" ? 1 : 0);
+  plugins.sort((a, b) => rank(a) - rank(b));
+  process.stderr.write(
+    `oj plugin host: ${plugins.length} plugin(s) active for ${env.command}: ${plugins.map((p) => `${p.name}[${p.enforce ?? "-"}]`).join(",")}\n`,
+  );
 } catch (e) {
   process.stderr.write(`oj plugin host: failed to load ${pluginsPath}: ${(e && e.stack) || e}\n`);
 }
@@ -43,9 +58,7 @@ function deepMerge(a, b) {
 }
 
 async function runConfigHooks() {
-  const initial = JSON.parse(process.argv[3] ?? "{}");
   let config = initial.config ?? {};
-  const env = initial.env ?? { command: "serve", mode: "development" };
   for (const p of plugins) {
     if (typeof p.config !== "function") continue;
     const partial = await p.config.call(ctx, config, env);

@@ -77,5 +77,41 @@ function htmlPlugin() {
   };
 }
 
-export default [markerPlugin(), virtualPlugin(), configPlugin(), hmrPlugin(), htmlPlugin()];
+// enforce ordering: appends to data-order. Listed post-then-pre below, but
+// enforce sorts them pre -> post, so the result is "base-pre-post".
+function orderPlugin(tag, enforce) {
+  return {
+    name: `oj-order-${tag}`,
+    enforce,
+    transform(code, id) {
+      if (!id.endsWith("App.tsx") || !code.includes('data-order="')) return null;
+      return code.replace(/(data-order="[^"]*)/, `$1-${tag}`);
+    },
+  };
+}
+
+// apply gating: only the plugin matching the command ("serve"/"build") runs, so
+// data-apply is "serve-only" in dev and "build-only" in the prod build.
+function applyPlugin(tag, apply) {
+  return {
+    name: `oj-apply-${tag}`,
+    apply,
+    transform(code, id) {
+      if (!id.endsWith("App.tsx")) return null;
+      return code.replace("__APPLY__", tag);
+    },
+  };
+}
+
+export default [
+  markerPlugin(),
+  virtualPlugin(),
+  configPlugin(),
+  hmrPlugin(),
+  htmlPlugin(),
+  orderPlugin("post", "post"),
+  orderPlugin("pre", "pre"),
+  applyPlugin("serve-only", "serve"),
+  applyPlugin("build-only", "build"),
+];
 

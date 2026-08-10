@@ -27,6 +27,10 @@ export function App() {
       <div data-plugin="__OJ_PLUGIN_UNTRANSFORMED__" hidden />
       {/* Filled by a plugin from the config()/configResolved() handshake. */}
       <div data-plugin-config="__OJ_CONFIG_MARKER__" hidden />
+      {/* Appended to by enforce-ordered plugins: expect base-pre-post. */}
+      <div data-order="base" hidden />
+      {/* Filled by whichever apply-gated plugin is active (serve vs build). */}
+      <div data-apply="__APPLY__" hidden />
       <HmrDemo />
     </main>
   );

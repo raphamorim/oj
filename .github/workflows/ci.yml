@@ -71,6 +71,10 @@ jobs:
           grep -rq production:oj-plugin playground/dist/assets/*.js
           ! grep -rq __OJ_PLUGIN_UNTRANSFORMED__ playground/dist/assets/*.js
           grep -q 'oj-plugin-injected' playground/dist/index.html
+          # enforce ordering holds and apply gating flips to build in prod
+          grep -rq base-pre-post playground/dist/assets/*.js
+          grep -rq build-only playground/dist/assets/*.js
+          ! grep -rq serve-only playground/dist/assets/*.js
       - name: library build
         run: |
           mkdir -p /tmp/lib/src
