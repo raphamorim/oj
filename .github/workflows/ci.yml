@@ -75,6 +75,9 @@ jobs:
           grep -rq base-pre-post playground/dist/assets/*.js
           grep -rq build-only playground/dist/assets/*.js
           ! grep -rq serve-only playground/dist/assets/*.js
+          # buildStart + buildEnd lifecycle hooks fired during the build
+          test "$(cat playground/.oj-cache/plugin-buildstart)" = build
+          test "$(cat playground/.oj-cache/plugin-buildend)" = build
       - name: library build
         run: |
           mkdir -p /tmp/lib/src

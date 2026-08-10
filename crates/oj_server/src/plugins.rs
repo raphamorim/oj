@@ -138,4 +138,15 @@ impl PluginHost {
     pub async fn transform_index_html(&self, html: &str) -> Result<String, String> {
         Ok(self.call("transformIndexHtml", &[html]).await?.unwrap_or_else(|| html.to_string()))
     }
+
+    /// Run `buildStart` — the build lifecycle is starting. Side-effect hook
+    /// (plugins init state / clean output); the return value is ignored.
+    pub async fn build_start(&self) -> Result<(), String> {
+        self.call("buildStart", &[]).await.map(|_| ())
+    }
+
+    /// Run `buildEnd` — the module graph is complete. Side-effect hook; ignored.
+    pub async fn build_end(&self) -> Result<(), String> {
+        self.call("buildEnd", &[]).await.map(|_| ())
+    }
 }

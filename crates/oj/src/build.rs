@@ -275,6 +275,9 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
     let plugin_host = user_plugin_host(&root, &base, &serde_json::json!(config.define)).await;
     let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
     if let Some(host) = &plugin_host {
+        if let Err(e) = host.build_start().await {
+            eprintln!("oj build: plugin buildStart failed: {e}");
+        }
         oj_plugins.push(Arc::new(OjUserPlugin { host: Arc::clone(host) })); // before oj:build
     }
     oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf() }));
@@ -306,6 +309,13 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         .write()
         .await
         .map_err(|errs| anyhow::anyhow!("build failed:\n{errs:?}"))?;
+
+    // The module graph is complete: buildEnd fires before we emit HTML/manifest.
+    if let Some(host) = &plugin_host {
+        if let Err(e) = host.build_end().await {
+            eprintln!("oj build: plugin buildEnd failed: {e}");
+        }
+    }
 
     for warning in &output.warnings {
         // oj's transform plugins intentionally don't emit sourcemaps yet.

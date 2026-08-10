@@ -195,6 +195,12 @@ impl DevServer {
             Some(file) => match PluginHost::spawn(&root, &file, &plugin_config).await {
                 Ok(host) => {
                     println!("  plugins: {}", file.file_name().unwrap().to_string_lossy());
+                    // buildStart fires once when the dev server starts (Vite
+                    // semantics; buildEnd is a prod-build hook — the dev server
+                    // has no close lifecycle to fire it on).
+                    if let Err(e) = host.build_start().await {
+                        eprintln!("oj: plugin buildStart failed: {e}");
+                    }
                     Some(host)
                 }
                 Err(e) => {

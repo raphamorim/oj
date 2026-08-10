@@ -163,12 +163,22 @@ async function transformIndexHtml(html) {
   return current;
 }
 
+// buildStart / buildEnd: side-effect lifecycle hooks run once per build in
+// declaration order. No return value (like Rollup); errors propagate.
+async function runLifecycle(hook) {
+  for (const p of plugins) {
+    if (typeof p[hook] === "function") await p[hook].call(ctx);
+  }
+  return null;
+}
+
 async function run(hook, args) {
   if (hook === "transform") return transform(args[0], args[1]);
   if (hook === "resolveId") return resolveId(args[0], args[1]);
   if (hook === "load") return load(args[0]);
   if (hook === "handleHotUpdate") return handleHotUpdate(args[0], args[1]);
   if (hook === "transformIndexHtml") return transformIndexHtml(args[0]);
+  if (hook === "buildStart" || hook === "buildEnd") return runLifecycle(hook);
   return null;
 }
 

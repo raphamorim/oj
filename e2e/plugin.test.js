@@ -6,6 +6,8 @@
 // The dev server runs it (via the Node plugin host) before compiling, so the
 // rendered page shows the transformed value.
 const { chromium } = require("playwright");
+const fs = require("node:fs");
+const path = require("node:path");
 (async () => {
   const browser = await chromium.launch();
   const page = await browser.newPage();
@@ -32,8 +34,12 @@ const { chromium } = require("playwright");
     // apply: only the serve-gated plugin runs in dev.
     const apply = await page.getAttribute("[data-apply]", "data-apply");
     if (apply !== "serve-only") throw new Error("apply gating wrong (expected serve-only): " + apply);
+    // buildStart fired at dev-server startup, writing the command ("serve").
+    const marker = path.join(__dirname, "..", "playground", ".oj-cache", "plugin-buildstart");
+    const buildStart = fs.existsSync(marker) ? fs.readFileSync(marker, "utf8").trim() : "MISSING";
+    if (buildStart !== "serve") throw new Error("buildStart marker wrong (expected serve): " + buildStart);
     if (errors.length) throw new Error("console errors");
-    console.log("PLUGIN transform + config + transformIndexHtml + enforce/apply HOOKS VERIFIED");
+    console.log("PLUGIN transform + config + transformIndexHtml + enforce/apply + buildStart HOOKS VERIFIED");
   } finally {
     await browser.close();
   }

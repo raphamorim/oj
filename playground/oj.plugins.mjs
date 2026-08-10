@@ -1,3 +1,26 @@
+import { writeFileSync } from "node:fs";
+
+// buildStart / buildEnd lifecycle hooks. Captures the command from the resolved
+// config, then drops marker files at each phase so the runtime can prove they
+// fired: buildStart at dev-server start and at the top of the prod build,
+// buildEnd once the prod build's module graph is complete. The host runs with
+// the app root as its cwd, so .oj-cache/ (created for the host script) is here.
+function lifecyclePlugin() {
+  let command = "";
+  return {
+    name: "oj-lifecycle",
+    configResolved(config) {
+      command = config.command;
+    },
+    buildStart() {
+      writeFileSync(".oj-cache/plugin-buildstart", command);
+    },
+    buildEnd() {
+      writeFileSync(".oj-cache/plugin-buildend", command);
+    },
+  };
+}
+
 // A Vite/Rollup-style plugin: a factory returning a `{ name, transform }`
 // object, exactly the shape npm plugins use. oj's plugin host loads this and
 // runs the transform hook against the compile pipeline.
@@ -104,6 +127,7 @@ function applyPlugin(tag, apply) {
 }
 
 export default [
+  lifecyclePlugin(),
   markerPlugin(),
   virtualPlugin(),
   configPlugin(),
