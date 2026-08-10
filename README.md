@@ -56,8 +56,10 @@ The work ahead, roughly in priority order:
   `sourcemap`), and plugin gating (`applyToEnvironment`) work today; still
   missing are per-environment `outDir`/`target`/rollup options and
   `builder.sharedPlugins`, which modern meta-frameworks build on.
-- A router-driven framework layer on top of the streaming SSR that already
-  exists: file or config routing, server functions, and prerendering.
+- More of the router-driven framework layer on top of the streaming SSR that
+  already exists. File-based route discovery ships today as `virtual:oj-routes`
+  (a `src/routes/` manifest with the index/`$param`/layout conventions); still
+  ahead are server functions and prerendering as first-class primitives.
 - Edge and serverless server targets, so one app can build for a Node server or
   a worker runtime.
 - A whole-graph module API (`getModuleInfo` across the full graph,

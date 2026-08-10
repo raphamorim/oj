@@ -51,7 +51,24 @@ impl Plugin for OjCssPlugin {
     }
 
     fn register_hook_usage(&self) -> rolldown_plugin::HookUsage {
-        rolldown_plugin::HookUsage::Load | rolldown_plugin::HookUsage::Transform
+        rolldown_plugin::HookUsage::ResolveId
+            | rolldown_plugin::HookUsage::Load
+            | rolldown_plugin::HookUsage::Transform
+    }
+
+    // Built-in `virtual:oj-routes` -> a synthetic module at the app root (so its
+    // `./src/routes/**` glob resolves there); `load` returns the manifest source
+    // and `transform` (below) expands the glob.
+    fn resolve_id(
+        &self,
+        _ctx: &PluginContext,
+        args: &HookResolveIdArgs<'_>,
+    ) -> impl std::future::Future<Output = HookResolveIdReturn> + Send {
+        let is_routes = args.specifier == "virtual:oj-routes";
+        let id = self.root.join("oj-routes.tsx").to_string_lossy().into_owned();
+        async move {
+            Ok(is_routes.then(|| HookResolveIdOutput::from_id(id)))
+        }
     }
 
     fn transform(
@@ -81,8 +98,17 @@ impl Plugin for OjCssPlugin {
         let id = args.id.to_string();
         let collected = Arc::clone(&self.collected);
         let root = self.root.clone();
+        let routes_id = root.join("oj-routes.tsx").to_string_lossy().into_owned();
         async move {
             let path = id.split('?').next().unwrap_or(&id);
+            // Built-in route manifest (transform expands its glob afterwards).
+            if path == routes_id {
+                return Ok(Some(rolldown_plugin::HookLoadOutput {
+                    code: arcstr::ArcStr::from(oj_server::OJ_ROUTES_JS),
+                    module_type: Some(rolldown_common::ModuleType::Js),
+                    ..Default::default()
+                }));
+            }
             if !(path.ends_with(".css") || oj_css::is_sass(path)) {
                 return Ok(None);
             }
