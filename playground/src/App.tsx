@@ -42,6 +42,8 @@ export function App() {
       {/* applyToEnvironment gating: client plugin runs, ssr plugin is dropped. */}
       <div data-env-client="__ENV_CLIENT__" hidden />
       <div data-env-ssr="__ENV_SSR__" hidden />
+      {/* Config define (global) + client environment define. */}
+      <div data-define={`${__OJ_DEFINE_GLOBAL__}|${__OJ_DEFINE_CLIENT__}`} hidden />
       <HmrDemo />
     </main>
   );

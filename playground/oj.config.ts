@@ -3,6 +3,15 @@ export default defineConfig({
   virtualModules: {
     "virtual:oj-info": "export const tool = \"oj\"; export default { version: 9 };",
   },
+  // Config-driven define: the top-level applies to every environment; the
+  // per-environment overrides (Vite Environment API) apply only to that build.
+  define: {
+    __OJ_DEFINE_GLOBAL__: JSON.stringify("global-define"),
+  },
+  environments: {
+    client: { define: { __OJ_DEFINE_CLIENT__: JSON.stringify("client-define") } },
+    ssr: { define: { __OJ_DEFINE_SSR__: JSON.stringify("ssr-define") } },
+  },
   server: {
     proxy: {
       "/api": { target: "http://localhost:8899", changeOrigin: true, rewrite: { from: "^/api", to: "" } },

@@ -554,10 +554,13 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         define: Some({
             // NODE_ENV plus the app's .env-derived import.meta.env.* values,
             // loaded in production mode. BASE_URL reflects the configured base.
+            // Then config `define` + the "client" environment's define overrides.
             let env = oj_env::load(&root, "production");
             let mut pairs: Vec<(String, String)> =
                 vec![("process.env.NODE_ENV".into(), "'production'".into())];
             pairs.extend(oj_env::import_meta_env_defines(&env, "production", false, &base, "VITE_"));
+            pairs.extend(oj_config::config_defines(&config));
+            pairs.extend(oj_config::environment_defines(&config, "client"));
             pairs.into_iter().collect()
         }),
             ..Default::default()
@@ -827,18 +830,20 @@ pub(crate) async fn build_ssr(
             chunk_filenames: Some(format!("{stem}-[hash].mjs").into()),
             minify: Some(RawMinifyOptions::Bool(false)),
             sourcemap: sourcemap.then_some(SourceMapType::File),
-            define: Some(
-                vec![
+            define: Some({
+                let mut pairs = vec![
                     ("process.env.NODE_ENV".to_string(), "'production'".to_string()),
                     ("import.meta.env.SSR".to_string(), "true".to_string()),
                     ("import.meta.env.PROD".to_string(), "true".to_string()),
                     ("import.meta.env.DEV".to_string(), "false".to_string()),
                     ("import.meta.env.MODE".to_string(), "\"production\"".to_string()),
                     ("import.meta.env.BASE_URL".to_string(), "\"/\"".to_string()),
-                ]
-                .into_iter()
-                .collect(),
-            ),
+                ];
+                // config define + the "ssr" environment's define overrides.
+                pairs.extend(oj_config::config_defines(&config));
+                pairs.extend(oj_config::environment_defines(&config, "ssr"));
+                pairs.into_iter().collect()
+            }),
             ..Default::default()
         })
         .build()
@@ -1054,6 +1059,9 @@ async fn build_client_entry(
                 let mut pairs =
                     vec![("process.env.NODE_ENV".to_string(), "'production'".to_string())];
                 pairs.extend(oj_env::import_meta_env_defines(&env, "production", false, "/", "VITE_"));
+                // client hydration bundle: config + "client" environment define.
+                pairs.extend(oj_config::config_defines(&config));
+                pairs.extend(oj_config::environment_defines(&config, "client"));
                 pairs.into_iter().collect()
             }),
             ..Default::default()

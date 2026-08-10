@@ -47,6 +47,10 @@ const clientHasVirtual = fs
 if (!clientHasVirtual) {
   throw new Error("ssr build (client env) did not run plugin resolveId/load (virtual module absent from client bundle)");
 }
+// Per-environment define: the ssr build applies config + ssr-environment define.
+if (!fs.readFileSync(path.join(out, "entry-server.mjs"), "utf8").includes("global-define|ssr-define")) {
+  throw new Error("ssr build did not apply the ssr-environment define");
+}
 const assetFiles = fs.readdirSync(path.join(out, "assets"));
 const clientAsset = assetFiles.find((f) => /^entry-client-.*\.js$/.test(f));
 if (!clientAsset) throw new Error("no hashed client hydration bundle emitted");

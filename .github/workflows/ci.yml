@@ -104,6 +104,9 @@ jobs:
           # renderStart + closeBundle lifecycle bookends fired
           test -f playground/.oj-cache/plugin-renderstart
           test -f playground/.oj-cache/plugin-closebundle
+          # config define + client-environment define applied to the client build
+          grep -rq 'global-define|client-define' playground/dist/assets/*.js
+          ! grep -rq __OJ_DEFINE_ playground/dist/assets/*.js
       - name: library build
         run: |
           mkdir -p /tmp/lib/src

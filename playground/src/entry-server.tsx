@@ -5,6 +5,8 @@ import { App, actionRoute, loadRouteData, metaToHtml, preloadRoute, resolveMeta,
 // hydration concern. The globalThis assignment is a side effect (not tree-shaken).
 import { info as pluginInfo } from "virtual:plugin-greeting";
 (globalThis as Record<string, unknown>).__OJ_SSR_PLUGIN = pluginInfo;
+// Config define (global) + ssr environment define, applied by build_ssr.
+(globalThis as Record<string, unknown>).__OJ_SSR_DEFINE = `${__OJ_DEFINE_GLOBAL__}|${__OJ_DEFINE_SSR__}`;
 
 // Loader: preloads the matched chunks, then runs every loader in the chain.
 export function load(url = "/"): Promise<DataMap> {

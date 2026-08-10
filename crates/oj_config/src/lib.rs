@@ -27,6 +27,39 @@ pub enum ConfigError {
 
 const CANDIDATES: &[&str] = &["oj.config.ts", "oj.config.mjs", "oj.config.js", "oj.config.json"];
 
+/// A `define` value as a JS-expression string. A JSON string is already the
+/// expression the user wrote (e.g. `JSON.stringify("x")` -> `"x"`); anything
+/// else is JSON-serialized (numbers/bools/objects are valid JS as-is).
+fn define_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Top-level `config.define` as `(name, js-expression)` pairs, applied in every
+/// environment.
+pub fn config_defines(config: &OjConfig) -> Vec<(String, String)> {
+    config
+        .define
+        .as_ref()
+        .map(|d| d.iter().map(|(k, v)| (k.clone(), define_value(v))).collect())
+        .unwrap_or_default()
+}
+
+/// `config.environments.<name>.define` as `(name, js-expression)` pairs — the
+/// per-environment overrides of the Vite Environment API.
+pub fn environment_defines(config: &OjConfig, env_name: &str) -> Vec<(String, String)> {
+    config
+        .environments
+        .as_ref()
+        .and_then(|envs| envs.get(env_name))
+        .and_then(|env| env.get("define"))
+        .and_then(|d| d.as_object())
+        .map(|d| d.iter().map(|(k, v)| (k.clone(), define_value(v))).collect())
+        .unwrap_or_default()
+}
+
 /// Load the config from `root`, or `OjConfig::default()` if none exists.
 pub fn load(root: &Path) -> Result<OjConfig, ConfigError> {
     let Some(path) = CANDIDATES.iter().map(|c| root.join(c)).find(|p| p.is_file()) else {

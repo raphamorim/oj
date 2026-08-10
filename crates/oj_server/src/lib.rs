@@ -173,13 +173,21 @@ impl DevServer {
         let env_prefix = config.env_prefix.as_deref().unwrap_or("VITE_");
         let env_dir = config.env_dir.as_deref().map(|d| root.join(d)).unwrap_or_else(|| root.clone());
         let env = oj_env::load(&env_dir, "development");
-        oj_compiler::set_import_meta_env(oj_env::import_meta_env_defines(
+        let mut defines = oj_env::import_meta_env_defines(
             &env,
             "development",
             true,
             config.base.as_deref().unwrap_or("/"),
             env_prefix,
-        ));
+        );
+        // Config-driven `define`: the top-level `define` plus per-environment
+        // overrides (Vite Environment API). The dev server has a single compiler
+        // define table, so it holds the UNION of client + ssr defines; distinct
+        // keys coexist (same key across environments resolves to the last).
+        defines.extend(oj_config::config_defines(&config));
+        defines.extend(oj_config::environment_defines(&config, "client"));
+        defines.extend(oj_config::environment_defines(&config, "ssr"));
+        oj_compiler::set_import_meta_env(defines);
 
         // Precedence: CLI flag > config > built-in default.
         let server_cfg = config.server.clone().unwrap_or_default();

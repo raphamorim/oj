@@ -176,11 +176,17 @@ pub fn compile_module(
         return Err(CompileError::Transform { path: path.to_path_buf(), message });
     }
 
-    // Vite-compatible import.meta.env static replacement. Gated on a cheap
-    // substring test so the common module pays nothing.
-    if source_text.contains("import.meta.env") {
+    // Vite-compatible static define replacement (import.meta.env plus any
+    // config/environment `define`). Gated on a cheap substring test so the
+    // common module pays nothing: run if the source references import.meta.env
+    // or any non-import.meta defined name (e.g. a `__FLAG__` global define).
+    let defines = import_meta_env_defines(opts.dev);
+    let needs_defines = source_text.contains("import.meta.env")
+        || defines
+            .iter()
+            .any(|(k, _)| !k.starts_with("import.meta") && source_text.contains(k.as_str()));
+    if needs_defines {
         let scoping = SemanticBuilder::new().build(&program).semantic.into_scoping();
-        let defines = import_meta_env_defines(opts.dev);
         if let Ok(config) = ReplaceGlobalDefinesConfig::new(&defines) {
             let _ = ReplaceGlobalDefines::new(&allocator, config).build(scoping, &mut program);
         }

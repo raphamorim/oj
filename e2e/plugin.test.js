@@ -56,12 +56,15 @@ const path = require("node:path");
     if (envClient !== "client-ran") throw new Error("applyToEnvironment client gate wrong: " + envClient);
     const envSsr = await page.getAttribute("[data-env-ssr]", "data-env-ssr");
     if (envSsr !== "__ENV_SSR__") throw new Error("applyToEnvironment ssr plugin should NOT run in client: " + envSsr);
+    // Config define (global) + client-environment define, applied in dev too.
+    const define = await page.getAttribute("[data-define]", "data-define");
+    if (define !== "global-define|client-define") throw new Error("per-environment define wrong (expected global-define|client-define): " + define);
     // configureServer added a dev-server middleware owning /__oj_health.
     const health = await page.request.get("http://localhost:5199/__oj_health");
     const healthText = (await health.text()).trim();
     if (healthText !== "oj-plugin-mw-ok") throw new Error("configureServer middleware wrong: " + healthText);
     if (errors.length) throw new Error("console errors");
-    console.log("PLUGIN transform + config + transformIndexHtml + enforce/apply + buildStart + this.resolve + getModuleInfo + getModuleIds + configureServer + Environment API HOOKS VERIFIED");
+    console.log("PLUGIN transform + config + transformIndexHtml + enforce/apply + buildStart + this.resolve + getModuleInfo + getModuleIds + configureServer + Environment API + per-env define HOOKS VERIFIED");
   } finally {
     await browser.close();
   }
