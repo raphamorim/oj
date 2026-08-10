@@ -64,6 +64,9 @@ struct ServerState {
     reload_tx: broadcast::Sender<String>,
     graph: Mutex<ModuleGraph>,
     resolver: Arc<OjResolver>,
+    /// Resolver for the "ssr" environment (node conditions), used by the
+    /// module-runner endpoint so server modules resolve their node variants.
+    ssr_resolver: Arc<OjResolver>,
     cache: PersistentCache,
     /// url -> (content key, output). Content key re-checked per request, so
     /// this needs no watcher-driven invalidation to stay correct.
@@ -272,7 +275,14 @@ impl DevServer {
             bundle,
             reload_tx,
             graph: Mutex::new(ModuleGraph::new()),
-            resolver: Arc::new(OjResolver::new(&root)),
+            resolver: Arc::new(OjResolver::with_conditions(
+                &root,
+                &oj_config::resolve_conditions(&config, "client"),
+            )),
+            ssr_resolver: Arc::new(OjResolver::with_conditions(
+                &root,
+                &oj_config::resolve_conditions(&config, "ssr"),
+            )),
             cache: PersistentCache::new(
                 root.join(".oj-cache"),
                 env!("CARGO_PKG_VERSION"),
@@ -357,7 +367,8 @@ async fn ssr_resolve(
         return (StatusCode::BAD_REQUEST, "importer and spec required").into_response();
     };
     let importer_dir = Path::new(importer).parent().unwrap_or(&state.root);
-    match state.resolver.resolve(importer_dir, spec) {
+    // Resolve with the "ssr" environment's conditions (node), not the client's.
+    match state.ssr_resolver.resolve(importer_dir, spec) {
         Ok(p) => {
             let s = p.to_string_lossy();
             let body = if s.contains("/node_modules/") {

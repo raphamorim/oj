@@ -51,10 +51,10 @@ drives several build environments at once will not work yet.
 oj is meant to run real production React apps without changes to their source.
 The work ahead, roughly in priority order:
 
-- More of the multi-environment build model. Per-environment `define` and
-  plugin gating (`applyToEnvironment`) work today; still missing are
-  per-environment build output (outDir, target, rollup options) and resolve
-  conditions, which modern meta-frameworks build on.
+- More of the multi-environment build model. Per-environment `define`, resolve
+  conditions (browser for the client, node for SSR), and plugin gating
+  (`applyToEnvironment`) work today; still missing is per-environment build
+  output (outDir, target, rollup options), which modern meta-frameworks build on.
 - A router-driven framework layer on top of the streaming SSR that already
   exists: file or config routing, server functions, and prerendering.
 - Edge and serverless server targets, so one app can build for a Node server or

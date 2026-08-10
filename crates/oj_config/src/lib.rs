@@ -47,6 +47,27 @@ pub fn config_defines(config: &OjConfig) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// Package `exports`/`imports` condition names for an environment. Precedence:
+/// `environments.<name>.resolve.conditions` > top-level `resolve.conditions` >
+/// the built-in default (browser for `client`, node for `ssr`).
+pub fn resolve_conditions(config: &OjConfig, env_name: &str) -> Vec<String> {
+    if let Some(c) = config
+        .environments
+        .as_ref()
+        .and_then(|e| e.get(env_name))
+        .and_then(|e| e.get("resolve"))
+        .and_then(|r| r.get("conditions"))
+        .and_then(|c| c.as_array())
+    {
+        return c.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+    }
+    if let Some(c) = config.resolve.as_ref().and_then(|r| r.conditions.as_ref()) {
+        return c.clone();
+    }
+    let base = if env_name == "ssr" { "node" } else { "browser" };
+    [base, "import", "module", "default"].map(String::from).to_vec()
+}
+
 /// `config.environments.<name>.define` as `(name, js-expression)` pairs — the
 /// per-environment overrides of the Vite Environment API.
 pub fn environment_defines(config: &OjConfig, env_name: &str) -> Vec<(String, String)> {

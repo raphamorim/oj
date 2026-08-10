@@ -32,14 +32,20 @@ impl OjResolver {
     /// via oxc_resolver's tsconfig support — this IS resolve.alias for the
     /// TS+Vite apps that make up almost all of the target.
     pub fn new(root: &Path) -> Self {
+        Self::with_conditions(root, &["browser", "import", "module", "default"].map(String::from))
+    }
+
+    /// Build a resolver with explicit `exports`/`imports` condition names. The
+    /// client environment uses browser conditions; the SSR environment uses
+    /// node conditions, so packages with conditional `exports` resolve their
+    /// correct per-environment variant (Vite Environment API `resolve.conditions`).
+    pub fn with_conditions(root: &Path, conditions: &[String]) -> Self {
         let tsconfig = root.join("tsconfig.json");
         let options = ResolveOptions {
             extensions: [".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs", ".json"]
                 .map(String::from)
                 .to_vec(),
-            condition_names: ["browser", "import", "module", "default"]
-                .map(String::from)
-                .to_vec(),
+            condition_names: conditions.to_vec(),
             tsconfig: tsconfig.is_file().then(|| {
                 TsconfigDiscovery::Manual(TsconfigOptions {
                     config_file: tsconfig,
@@ -100,5 +106,20 @@ mod tests {
         let resolver = OjResolver::new(&playground_root());
         let err = resolver.resolve(&playground_src(), "./does-not-exist").unwrap_err();
         assert_eq!(err.specifier, "./does-not-exist");
+    }
+
+    #[test]
+    fn resolves_exports_per_condition() {
+        // A package with conditional `exports`: the browser and node condition
+        // sets resolve to different files (Vite Environment API resolve.conditions).
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/dual");
+        let browser = OjResolver::with_conditions(
+            &dir,
+            &["browser", "import", "default"].map(String::from),
+        );
+        let node =
+            OjResolver::with_conditions(&dir, &["node", "import", "default"].map(String::from));
+        assert!(browser.resolve(&dir, "dual-pkg").unwrap().ends_with("browser.js"));
+        assert!(node.resolve(&dir, "dual-pkg").unwrap().ends_with("node.js"));
     }
 }

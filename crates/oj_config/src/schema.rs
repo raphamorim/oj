@@ -107,6 +107,9 @@ pub struct ResolveConfig {
     pub alias: Option<BTreeMap<String, String>>,
     pub dedupe: Option<Vec<String>>,
     pub extensions: Option<Vec<String>>,
+    /// Package `exports`/`imports` condition names (e.g. `["browser","import"]`).
+    /// Per-environment overrides live under `environments.<name>.resolve`.
+    pub conditions: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
