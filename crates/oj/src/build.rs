@@ -89,6 +89,13 @@ impl Plugin for OjCssPlugin {
                 let dir = std::path::Path::new(path).parent();
                 source = oj_css::compile_sass(&source, dir).map_err(|e| anyhow::anyhow!(e))?;
             }
+            // `@tailwind` / `@import "tailwindcss"`: expand via the CSS sidecar
+            // (the app's postcss.config, or the Tailwind v4 API) exactly like the
+            // dev server, so JS-imported Tailwind entries build correctly. Plain
+            // CSS skips this and goes straight to Lightning below.
+            if oj_server::sidecar::is_tailwind_css(&source) {
+                source = expand_css_via_sidecar(&root, std::path::Path::new(path))?;
+            }
             // Hash class names from the dev server's root-relative id form.
             let css_id = match std::path::Path::new(path).strip_prefix(&root) {
                 Ok(rel) => format!("/{}", rel.display()),
@@ -114,6 +121,34 @@ impl Plugin for OjCssPlugin {
             }))
         }
     }
+}
+
+/// Expand `@tailwind`/`@apply` (and any `postcss.config.*` plugins) in a CSS
+/// file via oj's one-shot CSS sidecar — the same sidecar the dev server runs,
+/// so `oj dev` and `oj build` produce identical Tailwind output. Returns the
+/// fully-expanded CSS.
+fn expand_css_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String> {
+    let script = root.join(".oj-cache").join("css-sidecar.mjs");
+    if let Some(parent) = script.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&script, oj_server::sidecar::SIDECAR_JS)?;
+    let out = std::process::Command::new("node")
+        .args([
+            script.to_str().unwrap(),
+            "--once",
+            css_file.to_str().unwrap(),
+            root.to_str().unwrap(),
+        ])
+        // cwd = app root so Tailwind v3 finds tailwind.config.* + content globs
+        // (matches the persistent dev sidecar's current_dir(root)).
+        .current_dir(root)
+        .output()
+        .context("node not found for tailwind/postcss build")?;
+    if !out.status.success() {
+        bail!("css build failed for {}: {}", css_file.display(), String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Bridges the Node plugin host into the Rolldown build, so the same
@@ -384,19 +419,9 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
                 fs::create_dir_all(parent)?;
             }
             let source = fs::read_to_string(&src)?;
-            if source.contains("@import \"tailwindcss\"") || source.contains("@tailwind ") {
-                // One-shot sidecar run with the app's own tailwind install.
-                let script = out_dir.join(".tailwind-sidecar.mjs");
-                fs::write(&script, oj_server::sidecar::SIDECAR_JS)?;
-                let out = std::process::Command::new("node")
-                    .args([script.to_str().unwrap(), "--once", src.to_str().unwrap(), root.to_str().unwrap()])
-                    .output()
-                    .context("node not found for tailwind build")?;
-                let _ = fs::remove_file(&script);
-                if !out.status.success() {
-                    bail!("tailwind build failed: {}", String::from_utf8_lossy(&out.stderr));
-                }
-                let css = String::from_utf8_lossy(&out.stdout).into_owned();
+            if oj_server::sidecar::is_tailwind_css(&source) {
+                // Expand via the CSS sidecar (postcss config / Tailwind v4).
+                let css = expand_css_via_sidecar(&root, &src)?;
                 let minified = oj_css::compile_css(href.as_str(), &css, true).map_err(|e| anyhow::anyhow!(e))?;
                 fs::write(&dest, minified.css)?;
                 continue;
