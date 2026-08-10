@@ -65,33 +65,44 @@ function Router() {
       if (!anchor || anchor.target || !href || !href.startsWith("/")) return null;
       return href === location.pathname + location.search ? null : href;
     };
-    const prefetch = (target: EventTarget | null) => {
-      if (!okToPrefetch()) return;
+    // Returns whether it actually prefetched (false = gated/opted-out/done), so
+    // the viewport observer only stops watching links it has warmed.
+    const prefetch = (target: EventTarget | null): boolean => {
+      if (!okToPrefetch()) return false;
       const anchor = (target as Element)?.closest?.("a");
-      if (anchor?.hasAttribute("data-no-prefetch")) return; // opt out (prefetch="none")
+      if (anchor?.hasAttribute("data-no-prefetch")) return false; // opt out
       const href = hrefOf(anchor ?? null);
-      if (!href || prefetchedData.has(href)) return;
+      if (!href || prefetchedData.has(href)) return false;
       void preloadRoute(href).catch(() => {}); // chunk
       prefetchedData.set(href, fetchData(href)); // data
+      return true;
     };
     const onOver = (e: Event) => prefetch(e.target);
 
     // Viewport prefetch: warm links as they scroll into view (a little early
-    // via rootMargin). One-shot per link; re-scan on DOM changes so links added
-    // by a navigation get observed too.
+    // via rootMargin). Stop watching a link once warmed; keep watching ones
+    // skipped by connection gating so they can be warmed later.
     const io = new IntersectionObserver(
       (entries) => {
         for (const e of entries) {
-          if (e.isIntersecting) {
-            prefetch(e.target);
-            io.unobserve(e.target);
-          }
+          if (e.isIntersecting && prefetch(e.target)) io.unobserve(e.target);
         }
       },
       { rootMargin: "200px" },
     );
     const observeLinks = () => document.querySelectorAll('a[href^="/"]').forEach((a) => io.observe(a));
     const mo = new MutationObserver(observeLinks);
+
+    // React to a connection change: when it improves (Data Saver off / off 2g),
+    // warm links currently in view that gating had skipped.
+    const onConnectionChange = () => {
+      if (!okToPrefetch()) return;
+      for (const a of document.querySelectorAll('a[href^="/"]')) {
+        const r = a.getBoundingClientRect();
+        if (r.bottom > -200 && r.top < innerHeight + 200 && prefetch(a)) io.unobserve(a);
+      }
+    };
+    const conn = (navigator as unknown as { connection?: EventTarget }).connection;
 
     const onClick = (e: MouseEvent) => {
       if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) {
@@ -130,6 +141,7 @@ function Router() {
     document.addEventListener("focusin", onOver);
     observeLinks();
     mo.observe(document.body, { childList: true, subtree: true });
+    conn?.addEventListener("change", onConnectionChange);
     return () => {
       removeEventListener("popstate", onPop);
       document.removeEventListener("click", onClick);
@@ -138,6 +150,7 @@ function Router() {
       document.removeEventListener("focusin", onOver);
       io.disconnect();
       mo.disconnect();
+      conn?.removeEventListener("change", onConnectionChange);
     };
   }, []);
 

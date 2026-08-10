@@ -253,28 +253,44 @@ try {
       await pf.close();
       console.log("ssr-dev: prefetch ok (viewport warms visible, hover warms below-fold, opt-out respected)");
 
-      // 4a4. Connection-aware gating: with Data Saver on, speculative prefetch
-      //      is suppressed (viewport + hover), but an explicit click still
-      //      navigates.
+      // 4a4. Connection-aware gating + change events: under Data Saver,
+      //      speculative prefetch is suppressed (an explicit click still
+      //      navigates); when the connection improves and fires `change`,
+      //      links in view are warmed.
       const cg = await browser.newPage();
       await cg.addInitScript(() => {
-        Object.defineProperty(navigator, "connection", {
-          configurable: true,
-          get: () => ({ saveData: true, effectiveType: "4g" }),
-        });
+        const listeners = new Set();
+        const conn = {
+          saveData: true,
+          effectiveType: "4g",
+          addEventListener: (t, cb) => t === "change" && listeners.add(cb),
+          removeEventListener: (t, cb) => listeners.delete(cb),
+        };
+        window.__conn = conn;
+        window.__fireConn = () => listeners.forEach((cb) => cb());
+        Object.defineProperty(navigator, "connection", { configurable: true, get: () => conn });
       });
       const cgReqs = [];
       cg.on("request", (r) => cgReqs.push(r.url()));
       await cg.goto(`${base}/`, { waitUntil: "networkidle" });
+      const crashChunk = () => cgReqs.some((u) => u.includes("routes/crash.tsx"));
       await cg.locator('a[href="/crash"]').hover();
       await cg.waitForTimeout(400);
-      if (cgReqs.some((u) => u.includes("routes/crash.tsx"))) {
-        throw new Error("prefetch was not gated under Data Saver");
-      }
-      await cg.locator('a[href="/about"]').click(); // explicit nav still works
+      if (crashChunk()) throw new Error("prefetch was not gated under Data Saver");
+      // Connection improves -> warm in-view links.
+      await cg.evaluate(() => {
+        window.__conn.saveData = false;
+        window.__fireConn();
+      });
+      await cg.waitForFunction(
+        () => performance.getEntriesByType("resource").some((e) => e.name.includes("routes/crash.tsx")),
+        { timeout: 3000 },
+      );
+      if (!crashChunk()) throw new Error("prefetch did not resume after the connection improved");
+      await cg.locator('a[href="/about"]').click(); // explicit nav always works
       await cg.waitForSelector('[data-page="about"]');
       await cg.close();
-      console.log("ssr-dev: connection-aware gating ok (Data Saver suppresses prefetch, click still navigates)");
+      console.log("ssr-dev: connection gating + change ok (Data Saver suppresses, improve resumes, click navigates)");
 
       // 4b. Action + SPA + HMR, all in place, on a clean page (asserts no
       //     unexpected console errors).
