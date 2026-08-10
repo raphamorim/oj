@@ -206,6 +206,8 @@ impl Plugin for OjUserPlugin {
             | rolldown_plugin::HookUsage::GenerateBundle
             | rolldown_plugin::HookUsage::RenderChunk
             | rolldown_plugin::HookUsage::WriteBundle
+            | rolldown_plugin::HookUsage::RenderStart
+            | rolldown_plugin::HookUsage::CloseBundle
     }
 
     fn resolve_id(
@@ -318,6 +320,26 @@ impl Plugin for OjUserPlugin {
         }
         let bundle_json = serialize_bundle(args.bundle);
         let _ = self.host.write_bundle(&bundle_json, true).await;
+        Ok(())
+    }
+
+    // Output phase begins (after buildEnd, before renderChunk). Side effect.
+    async fn render_start(
+        &self,
+        _ctx: &PluginContext,
+        _args: &rolldown_plugin::HookRenderStartArgs<'_>,
+    ) -> rolldown_plugin::HookNoopReturn {
+        let _ = self.host.render_start().await;
+        Ok(())
+    }
+
+    // The very last hook, after everything is written. Side effect.
+    async fn close_bundle(
+        &self,
+        _ctx: &PluginContext,
+        _args: Option<&rolldown_plugin::HookCloseBundleArgs<'_>>,
+    ) -> rolldown_plugin::HookNoopReturn {
+        let _ = self.host.close_bundle().await;
         Ok(())
     }
 }
@@ -541,6 +563,8 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         .write()
         .await
         .map_err(|errs| anyhow::anyhow!("build failed:\n{errs:?}"))?;
+    // Fire the closeBundle hook (the last output hook; write() alone doesn't).
+    bundler.close().await.map_err(|errs| anyhow::anyhow!("close failed:\n{errs:?}"))?;
 
     // The module graph is complete: buildEnd fires before we emit HTML/manifest.
     if let Some(host) = &plugin_host {
@@ -818,6 +842,7 @@ pub(crate) async fn build_ssr(
         .write()
         .await
         .map_err(|errs| anyhow::anyhow!("ssr build failed:\n{errs:?}"))?;
+    bundler.close().await.map_err(|errs| anyhow::anyhow!("ssr close failed:\n{errs:?}"))?;
 
     if let Some(host) = &plugin_host {
         if let Err(e) = host.build_end().await {
@@ -1034,6 +1059,7 @@ async fn build_client_entry(
         .write()
         .await
         .map_err(|errs| anyhow::anyhow!("client build failed:\n{errs:?}"))?;
+    bundler.close().await.map_err(|errs| anyhow::anyhow!("client close failed:\n{errs:?}"))?;
 
     if let Some(host) = &plugin_host {
         if let Err(e) = host.build_end().await {

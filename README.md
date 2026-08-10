@@ -37,23 +37,20 @@ Vite/Rollup-style plugins run through a persistent Node plugin host. Drop an
 `oj.plugins.mjs` at the app root that default-exports a plugin array. The dev
 server and `oj build` run `transform`, `resolveId`, `load`, `config`,
 `configResolved`, `transformIndexHtml`, `handleHotUpdate`, `buildStart`,
-`buildEnd`, `renderChunk`, `generateBundle`, `writeBundle`, and
-`configureServer`; honor `enforce`,
+`buildEnd`, `renderStart`, `renderChunk`, `generateBundle`, `writeBundle`,
+`closeBundle`, and `configureServer`; honor `enforce`,
 `apply`, and `applyToEnvironment` ordering; and give hooks a plugin context with
 `this.resolve`, `this.load`, `this.emitFile`, `this.getModuleInfo`,
 `this.getModuleIds`, and `this.addWatchFile`. Plugins run in both the client and
 SSR environments, in dev and in the production build. Still missing are
-`renderStart`/`closeBundle`, whole-graph module info, and per-environment build
-outputs, so a plugin that drives several build environments at once will not
-work yet.
+whole-graph module info and per-environment build outputs, so a plugin that
+drives several build environments at once will not work yet.
 
 ## Goals
 
 oj is meant to run real production React apps without changes to their source.
 The work ahead, roughly in priority order:
 
-- The remaining output-phase hooks (`renderStart`, `closeBundle`) to round out
-  the Rollup output surface.
 - Arbitrary PostCSS pipelines driven by the app's own `postcss.config`, beyond
   the Tailwind and autoprefixer path that works today.
 - The multi-environment build model: independent client and server module

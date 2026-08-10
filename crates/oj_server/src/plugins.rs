@@ -242,6 +242,16 @@ impl PluginHost {
         self.call("buildEnd", &[]).await.map(|_| ())
     }
 
+    /// Run `renderStart` — the output phase is beginning. Side-effect hook.
+    pub async fn render_start(&self) -> Result<(), String> {
+        self.call("renderStart", &[]).await.map(|_| ())
+    }
+
+    /// Run `closeBundle` — the very last hook, after everything is written.
+    pub async fn close_bundle(&self) -> Result<(), String> {
+        self.call("closeBundle", &[]).await.map(|_| ())
+    }
+
     /// Files plugins registered via `this.addWatchFile`. The dev watcher forces
     /// a full reload when one of these changes (even a non-source file oj would
     /// otherwise ignore). Absolute paths as the plugin passed them.

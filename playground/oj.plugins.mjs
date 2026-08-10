@@ -147,10 +147,18 @@ function reportPlugin() {
         if (bundle[f].isEntry) bundle[f].code = "/*oj-gb-banner*/" + bundle[f].code;
       }
     },
+    // renderStart / closeBundle: output-phase lifecycle bookends. Each drops a
+    // marker so the runtime can prove they fired (and in order).
+    renderStart() {
+      writeFileSync(".oj-cache/plugin-renderstart", "render-start");
+    },
     // writeBundle: post-write side effect. Files are on disk; write a sibling
     // marker with the emitted file names (proves the hook ran after write).
     writeBundle(_options, bundle) {
       writeFileSync(".oj-cache/plugin-writebundle", Object.keys(bundle).sort().join(","));
+    },
+    closeBundle() {
+      writeFileSync(".oj-cache/plugin-closebundle", "close-bundle");
     },
   };
 }

@@ -388,7 +388,9 @@ async function run(hook, args) {
   if (hook === "load") return load(args[0]);
   if (hook === "handleHotUpdate") return handleHotUpdate(args[0], args[1]);
   if (hook === "transformIndexHtml") return transformIndexHtml(args[0]);
-  if (hook === "buildStart" || hook === "buildEnd") return runLifecycle(hook);
+  if (hook === "buildStart" || hook === "buildEnd" || hook === "renderStart" || hook === "closeBundle") {
+    return runLifecycle(hook);
+  }
   // Assets emitted via this.emitFile, as a JSON string for the Rust build.
   if (hook === "getEmittedFiles") {
     return JSON.stringify(emitted.map(({ fileName, source }) => ({ fileName, source })));
