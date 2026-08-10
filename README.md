@@ -57,9 +57,11 @@ The work ahead, roughly in priority order:
   missing are per-environment `outDir`/`target`/rollup options and
   `builder.sharedPlugins`, which modern meta-frameworks build on.
 - More of the router-driven framework layer on top of the streaming SSR that
-  already exists. File-based route discovery ships today as `virtual:oj-routes`
-  (a `src/routes/` manifest with the index/`$param`/layout conventions); still
-  ahead are server functions and prerendering as first-class primitives.
+  already exists. File-based route discovery ships as `virtual:oj-routes` (a
+  `src/routes/` manifest with the index/`$param`/layout conventions), and
+  `oj build --ssr` prerenders configured routes to static HTML (`build.prerender`,
+  hydrated). Still ahead: server functions (client-callable RPC with server-only
+  code extraction).
 - Edge and serverless server targets, so one app can build for a Node server or
   a worker runtime.
 - A whole-graph module API (`getModuleInfo` across the full graph,
