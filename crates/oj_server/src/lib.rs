@@ -34,7 +34,9 @@ use axum::{
 use oj_cache::{CachedModule, PersistentCache};
 
 pub mod sidecar;
+pub mod plugins;
 use sidecar::{Sidecar, is_tailwind_css};
+use plugins::PluginHost;
 use oj_graph::{HmrDecision, ModuleGraph};
 use oj_resolver::OjResolver;
 use tokio::sync::broadcast;
@@ -100,6 +102,9 @@ struct ServerState {
     /// Author-provided virtual modules: import id -> module source, served
     /// at `/@virtual/<id>`. The first slice of the plugin pipeline.
     virtual_modules: std::collections::BTreeMap<String, String>,
+    /// Node plugin host running Vite/Rollup `transform` hooks (present when the
+    /// app has an `oj.plugins.*`).
+    plugins: Option<std::sync::Arc<PluginHost>>,
 }
 
 /// A fully-configured dev server that hasn't been bound to a socket yet.
@@ -169,6 +174,21 @@ impl DevServer {
         let proxy: Vec<(String, oj_config::ProxyEntry)> =
             server_cfg.proxy.clone().unwrap_or_default().into_iter().collect();
 
+        // Spawn the plugin host up front if the app declares plugins.
+        let plugin_host = match plugins::plugins_file(&root) {
+            Some(file) => match PluginHost::spawn(&root, &file).await {
+                Ok(host) => {
+                    println!("  plugins: {}", file.file_name().unwrap().to_string_lossy());
+                    Some(host)
+                }
+                Err(e) => {
+                    eprintln!("oj: plugin host failed to start: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+
         let started = Instant::now();
         let (reload_tx, _) = broadcast::channel::<String>(64);
         let (crawl_tx, crawl_rx) = tokio::sync::watch::channel(false);
@@ -197,6 +217,7 @@ impl DevServer {
             proxy,
             http: reqwest::Client::new(),
             virtual_modules: config.virtual_modules.clone().unwrap_or_default(),
+            plugins: plugin_host,
         });
         {
             let state = Arc::clone(&state);
@@ -736,6 +757,14 @@ async fn ensure_module(
         return Ok((key, module));
     }
 
+    let is_dep = url.contains("/node_modules/") || url.starts_with("/@fs/");
+    // Plugin `transform` hooks run on app source before oj compiles it (deps
+    // are skipped to avoid a per-node_modules-module round trip).
+    let source = match &state.plugins {
+        Some(host) if !is_dep => host.transform(&source, url).await.unwrap_or(source),
+        _ => source,
+    };
+
     let root = state.root.clone();
     let resolver = Arc::clone(&state.resolver);
     let fs_allow = Arc::clone(&state.fs_allow);
@@ -744,7 +773,6 @@ async fn ensure_module(
     let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
     let file_owned = file.to_path_buf();
     let url_owned = url.to_string();
-    let is_dep = url.contains("/node_modules/") || url.starts_with("/@fs/");
     let bundle = state.bundle;
     let ext = file.extension().and_then(|e| e.to_str());
     let is_css = matches!(ext, Some("css") | Some("scss") | Some("sass"));
