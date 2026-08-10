@@ -94,7 +94,11 @@ try {
   if (acted.likes !== 1) throw new Error(`action did not mutate server state: ${JSON.stringify(acted)}`);
   const reloaded = await (await fetch(`${base}/about`, { headers: { "oj-loader": "1" } })).json();
   if (reloaded.likes !== 1) throw new Error("mutation not visible via server-authoritative loader");
-  console.log("ssr-prod: streaming + per-route + data loading + action ok");
+  // A failing loader returns an error status (surfaced as route-error UI on the client).
+  if ((await fetch(`${base}/boom`, { headers: { "oj-loader": "1" } })).status !== 500) {
+    throw new Error("failing loader did not return an error status");
+  }
+  console.log("ssr-prod: streaming + per-route + data loading + action + loader error ok");
 
   // 3. Hydration.
   let pw = null;
@@ -106,11 +110,20 @@ try {
     const page = await browser.newPage();
     const errors = [];
     page.on("pageerror", (e) => errors.push(String(e)));
-    page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
+    page.on("console", (m) => {
+      // The intentional /boom loader returns 500; the browser logs that failed
+      // response as a console error — expected, not a bug.
+      if (m.type() === "error" && !m.text().includes("Failed to load resource")) errors.push(m.text());
+    });
     try {
       await page.goto(`${base}/`, { waitUntil: "networkidle" });
       const deferred = await page.locator("[data-deferred]").textContent();
       if (!deferred.includes("deferred-streamed")) throw new Error(`deferred content lost: ${deferred}`);
+      // A failing loader renders the route-error UI (no crash), then recovers.
+      await page.locator('a[href="/boom"]').click();
+      await page.waitForSelector('[data-error]', { timeout: 5000 });
+      await page.locator('[data-error] a[href="/"]').click();
+      await page.waitForSelector('[data-page="home"]');
       await page.locator("button", { hasText: "ssr" }).click(); // counter is interactive
       await page.waitForFunction(
         () => document.querySelector("button").textContent.includes(": 1"),

@@ -154,11 +154,42 @@ try {
   } catch {} // not installed in this environment
   if (pw) {
     const browser = await pw.chromium.launch();
-    const page = await browser.newPage();
-    const errors = [];
-    page.on("pageerror", (e) => errors.push(String(e)));
-    page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
     try {
+      // 4a. Pending + error UI states. A slow loader shows a "loading" state; a
+      //     failing loader (/boom) and a render throw (/crash) both render the
+      //     route error UI without crashing the app. (A caught render error
+      //     logs to the console by design, so this page doesn't assert clean.)
+      const sp = await browser.newPage();
+      await sp.goto(`${base}/`, { waitUntil: "networkidle" });
+      await sp.evaluate(() => (window.__marker = 5));
+      await sp.locator('a[href="/about"]').click();
+      await sp.waitForSelector('[data-pending="loading"]', { timeout: 3000 });
+      await sp.waitForSelector('[data-page="about"]');
+      if ((await sp.locator("[data-pending]").count()) !== 0) throw new Error("pending state did not clear");
+      await sp.goBack();
+      await sp.waitForSelector('[data-page="home"]');
+      await sp.locator('a[href="/boom"]').click(); // loader throws -> 500 -> error UI
+      await sp.waitForSelector('[data-error]', { timeout: 3000 });
+      if (!(await sp.locator("[data-error] p").textContent()).includes("request failed")) {
+        throw new Error("loader error not shown as route error");
+      }
+      await sp.locator('[data-error] a[href="/"]').click(); // recover
+      await sp.waitForSelector('[data-page="home"]');
+      await sp.locator('a[href="/crash"]').click(); // render throws -> ErrorBoundary
+      await sp.waitForSelector('[data-error]', { timeout: 3000 });
+      if (!(await sp.locator("[data-error] p").textContent()).includes("render threw")) {
+        throw new Error("render error not caught by ErrorBoundary");
+      }
+      if ((await sp.evaluate(() => window.__marker)) !== 5) throw new Error("an error state caused a full reload");
+      await sp.close();
+      console.log("ssr-dev: pending + error UI states ok (loading, loader error, render error, no reload)");
+
+      // 4b. Action + SPA + HMR, all in place, on a clean page (asserts no
+      //     unexpected console errors).
+      const page = await browser.newPage();
+      const errors = [];
+      page.on("pageerror", (e) => errors.push(String(e)));
+      page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
       await page.goto(`${base}/`, { waitUntil: "networkidle" });
       await page.waitForSelector("button");
       const counterBtn = page.locator("button", { hasText: "ssr" });
@@ -174,8 +205,9 @@ try {
       // revalidates the loader, in place (no reload).
       if ((await page.locator("[data-likes]").getAttribute("data-likes")) !== "0") throw new Error("likes did not start at 0");
       await likeBtn.click();
+      await page.waitForSelector('[data-pending="submitting"]', { timeout: 3000 }); // pending during the action
       await page.waitForSelector('[data-likes="1"]', { timeout: 5000 });
-      console.log("ssr-dev: action ok (form submit mutated server state -> likes 1, no reload)");
+      console.log("ssr-dev: action ok (pending 'submitting' -> likes 1, no reload)");
 
       // Client-side SPA routing: a link click navigates without a reload, the
       // navigated route's data comes from the server (shared store shows the

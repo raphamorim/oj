@@ -486,22 +486,26 @@ createServer(async (req, res) => {
   }
   try {
     const wantsData = Boolean(req.headers["oj-loader"]);
-    // Action (mutation): run it server-side, then revalidate.
+    const load = () => (typeof entry.load === "function" ? entry.load(url) : null);
+    // Action (mutation): run it server-side, then revalidate. Compute before
+    // writing headers so a throwing loader/action falls to the catch cleanly.
     if (req.method === "POST") {
       if (typeof entry.action === "function") await entry.action(url, await readBody(req));
       if (wantsData) {
+        const body = serialize(await load());
         res.writeHead(200, { "content-type": "application/json" });
-        return void res.end(serialize(typeof entry.load === "function" ? await entry.load(url) : null));
+        return void res.end(body);
       }
       // No-JS form: redirect so the browser re-GETs the updated document.
       return void res.writeHead(303, { location: url }).end();
     }
     // Client data fetch for a navigation.
     if (wantsData) {
+      const body = serialize(await load());
       res.writeHead(200, { "content-type": "application/json" });
-      return void res.end(serialize(typeof entry.load === "function" ? await entry.load(url) : null));
+      return void res.end(body);
     }
-    const data = typeof entry.load === "function" ? await entry.load(url) : null;
+    const data = await load();
     const json = serialize(data);
     const HEAD =
       '<!doctype html><html><head><meta charset="utf-8">' +
