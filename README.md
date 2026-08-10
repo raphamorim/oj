@@ -15,16 +15,44 @@ Modules on Lightning CSS, and a Tailwind v4 sidecar.
 Aimed at the workloads where Vite 8 is still weak: memory, cold start, and
 multi-tenant / agent-driven builds at scale.
 
+## Server rendering
+
+There is an SSR mode: `oj dev --ssr src/entry-server.tsx` in dev, and
+`oj build --ssr` for production. It streams the HTML out with
+`renderToReadableStream` instead of buffering, and the client hydrates through
+the normal dev pipeline, so Fast Refresh and HMR keep working over a
+server-rendered page. In dev the server modules run in a small persistent Node
+process (a module runner using `vm.SourceTextModule`) that re-evaluates only
+what changed, instead of rebuilding a bundle per request.
+
+The playground app also carries a small file-based router built on top of all
+this: a `src/routes/` directory, nested `layout.tsx` files, `$param` segments,
+per-route data loaders and form actions, error and pending states, route code
+splitting, and link prefetching. Most of that is example-app code, not the tool
+itself. It is there to show the primitives compose, not to be a framework.
+
+## Plugins
+
+Vite/Rollup-style plugins run through a Node plugin host. Drop an
+`oj.plugins.mjs` at the app root that default-exports a plugin array, and their
+`transform`, `resolveId`, `load`, `config`, and `configResolved` hooks run both
+in the dev server and in `oj build`. This is not the full hook surface. There
+is no `buildStart`, `handleHotUpdate`, or `transformIndexHtml` yet, and the
+plugin context is minimal, so a plugin that transforms code or serves a virtual
+module will work while one that reaches deeper into Rollup internals will not.
+
 ## Quickstart
 
 ```sh
-cargo run -p oj -- dev              # dev server for ./playground on :5199
-cargo run -p oj -- dev --bundle     # registry-runtime bundle mode
-cargo run -p oj -- build playground # production build -> playground/dist
-cargo test --workspace                  # 38 unit tests
-node e2e/run.mjs                        # browser e2e suite (add --bundle for bundle mode)
-node bench/generate.mjs 1000            # generate a benchmark app (then npm i inside it)
-node bench/run.mjs 1000                 # p50/p95 benchmark vs vite
+cargo run -p oj -- dev                          # dev server for ./playground on :5199
+cargo run -p oj -- dev --bundle                 # registry-runtime bundle mode
+cargo run -p oj -- dev --ssr src/entry-server.tsx  # streaming SSR + hydration
+cargo run -p oj -- build playground             # production build into playground/dist
+cargo test --workspace                          # unit tests
+node e2e/run.mjs                                # browser e2e suite (add --bundle for bundle mode)
+node e2e/ssr-dev.mjs                            # SSR dev e2e; e2e/ssr-prod.mjs for the built server
+node bench/generate.mjs 1000                    # generate a benchmark app (then npm i inside it)
+node bench/run.mjs 1000                         # p50/p95 benchmark vs vite
 ```
 
 ## Benchmarks
