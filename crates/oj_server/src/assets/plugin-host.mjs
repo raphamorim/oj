@@ -5,6 +5,7 @@
 // plugins module and runs their hooks (transform / resolveId / load) against
 // oj's pipeline. JSON-lines over stdio with correlation ids (many calls can be
 // in flight; a cancelled caller just drops its response).
+import http from "node:http";
 import { pathToFileURL } from "node:url";
 import readline from "node:readline";
 
@@ -146,6 +147,74 @@ async function runConfigHooks() {
 }
 await runConfigHooks();
 
+// configureServer: plugins add dev-server middleware (Connect-style
+// `(req, res, next)`). oj forwards requests it can't serve to this middleware
+// HTTP server (see getMiddlewarePort); a middleware that calls next() past the
+// end falls through (x-oj-fallthrough header) so oj resumes its own handling.
+let middlewarePort = null;
+async function setupConfigureServer() {
+  const stack = []; // { path, fn }
+  const middlewares = {
+    use(a, b) {
+      if (typeof a === "function") stack.push({ path: null, fn: a });
+      else stack.push({ path: a, fn: b });
+    },
+  };
+  // A minimal Vite ViteDevServer shim: enough for middleware-registering
+  // plugins. Deep APIs (moduleGraph/ssrLoadModule/ws.send/watcher) are stubbed
+  // so plugins that merely reference them in configureServer don't crash.
+  const noop = () => {};
+  const server = {
+    config: initial.config ?? {},
+    middlewares,
+    httpServer: null,
+    ws: { on: noop, off: noop, send: noop },
+    watcher: { on: noop, add: noop, close: noop },
+    moduleGraph: { getModuleById: () => null, invalidateModule: noop },
+    transformRequest: async () => null,
+    ssrLoadModule: async () => {
+      throw new Error("oj: server.ssrLoadModule is not available in configureServer");
+    },
+  };
+  const post = [];
+  for (const p of plugins) {
+    if (typeof p.configureServer !== "function") continue;
+    const r = await p.configureServer(server);
+    if (typeof r === "function") post.push(r);
+  }
+  for (const fn of post) await fn(); // post hooks run after "internal" middleware
+  if (stack.length === 0) return;
+
+  const srv = http.createServer((req, res) => {
+    let i = 0;
+    const next = (err) => {
+      if (err) {
+        res.statusCode = 500;
+        res.end(String((err && err.stack) || err));
+        return;
+      }
+      while (i < stack.length) {
+        const { path, fn } = stack[i++];
+        if (path && !req.url.startsWith(path)) continue;
+        try {
+          return fn(req, res, next);
+        } catch (e) {
+          return next(e);
+        }
+      }
+      // Nothing handled it: tell oj to resume its own routing.
+      res.setHeader("x-oj-fallthrough", "1");
+      res.statusCode = 404;
+      res.end();
+    };
+    next();
+  });
+  await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+  middlewarePort = srv.address().port;
+  process.stderr.write(`oj plugin host: configureServer middleware on :${middlewarePort}\n`);
+}
+await setupConfigureServer();
+
 // transform chains through all plugins (Rollup semantics); returns the final code.
 async function transform(code, id) {
   if (id) seenIds.add(id);
@@ -262,6 +331,8 @@ async function run(hook, args) {
   }
   // Files registered via this.addWatchFile, for the dev watcher.
   if (hook === "getWatchFiles") return JSON.stringify([...watchedFiles]);
+  // The configureServer middleware port (null if no plugin added middleware).
+  if (hook === "getMiddlewarePort") return middlewarePort == null ? null : String(middlewarePort);
   return null;
 }
 

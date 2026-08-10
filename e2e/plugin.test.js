@@ -48,8 +48,12 @@ const path = require("node:path");
     const marker = path.join(__dirname, "..", "playground", ".oj-cache", "plugin-buildstart");
     const buildStart = fs.existsSync(marker) ? fs.readFileSync(marker, "utf8").trim() : "MISSING";
     if (buildStart !== "serve") throw new Error("buildStart marker wrong (expected serve): " + buildStart);
+    // configureServer added a dev-server middleware owning /__oj_health.
+    const health = await page.request.get("http://localhost:5199/__oj_health");
+    const healthText = (await health.text()).trim();
+    if (healthText !== "oj-plugin-mw-ok") throw new Error("configureServer middleware wrong: " + healthText);
     if (errors.length) throw new Error("console errors");
-    console.log("PLUGIN transform + config + transformIndexHtml + enforce/apply + buildStart + this.resolve + getModuleInfo + getModuleIds HOOKS VERIFIED");
+    console.log("PLUGIN transform + config + transformIndexHtml + enforce/apply + buildStart + this.resolve + getModuleInfo + getModuleIds + configureServer HOOKS VERIFIED");
   } finally {
     await browser.close();
   }

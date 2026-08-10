@@ -80,6 +80,26 @@ function watchPlugin() {
   };
 }
 
+// Uses configureServer to add dev-server middleware: a Connect-style
+// (req, res, next) handler that owns a route oj doesn't serve. Requests oj
+// can't resolve are forwarded to this middleware; unhandled ones call next()
+// and fall back through to oj.
+function middlewarePlugin() {
+  return {
+    name: "oj-middleware",
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        if (req.url === "/__oj_health") {
+          res.setHeader("content-type", "text/plain");
+          res.end("oj-plugin-mw-ok");
+          return;
+        }
+        next();
+      });
+    },
+  };
+}
+
 // A Vite/Rollup-style plugin: a factory returning a `{ name, transform }`
 // object, exactly the shape npm plugins use. oj's plugin host loads this and
 // runs the transform hook against the compile pipeline.
@@ -189,6 +209,7 @@ export default [
   lifecyclePlugin(),
   ctxPlugin(),
   watchPlugin(),
+  middlewarePlugin(),
   markerPlugin(),
   virtualPlugin(),
   configPlugin(),

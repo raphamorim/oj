@@ -105,6 +105,10 @@ struct ServerState {
     /// Node plugin host running Vite/Rollup `transform` hooks (present when the
     /// app has an `oj.plugins.*`).
     plugins: Option<std::sync::Arc<PluginHost>>,
+    /// Port of the plugin host's `configureServer` middleware server, if any
+    /// plugin registered dev-server middleware. Requests oj can't serve are
+    /// forwarded here before the SPA fallback / 404.
+    plugin_mw_port: Option<u16>,
     /// Runtime handle so the sync file-watcher thread can call async plugin
     /// hooks (handleHotUpdate).
     rt: tokio::runtime::Handle,
@@ -210,6 +214,14 @@ impl DevServer {
             },
             None => None,
         };
+        // Ask the host whether any plugin registered configureServer middleware.
+        let plugin_mw_port = match &plugin_host {
+            Some(host) => host.middleware_port().await,
+            None => None,
+        };
+        if let Some(p) = plugin_mw_port {
+            println!("  plugin middleware: forwarding unmatched requests to :{p}");
+        }
 
         let started = Instant::now();
         let (reload_tx, _) = broadcast::channel::<String>(64);
@@ -240,6 +252,7 @@ impl DevServer {
             http: reqwest::Client::new(),
             virtual_modules: config.virtual_modules.clone().unwrap_or_default(),
             plugins: plugin_host,
+            plugin_mw_port,
             rt: tokio::runtime::Handle::current(),
         });
         {
@@ -590,6 +603,43 @@ fn is_spa_navigation(rel: &str, headers: &HeaderMap) -> bool {
     no_extension || accepts_html
 }
 
+/// Forward an unmatched GET to the plugin `configureServer` middleware server.
+/// Returns `Some(response)` if a middleware handled it, `None` if there's no
+/// middleware or it fell through (so oj resumes its own SPA-fallback / 404).
+async fn forward_to_plugin_middleware(
+    state: &ServerState,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Option<Response> {
+    let port = state.plugin_mw_port?;
+    let pq = uri.path_and_query().map(|p| p.as_str()).unwrap_or(uri.path());
+    let target = format!("http://127.0.0.1:{port}{pq}");
+    let mut out = state.http.get(&target);
+    for (name, value) in headers.iter() {
+        if name == header::HOST {
+            continue;
+        }
+        out = out.header(name, value);
+    }
+    let resp = out.send().await.ok()?;
+    // The sentinel means no middleware claimed the request: fall through.
+    if resp.headers().contains_key("x-oj-fallthrough") {
+        return None;
+    }
+    let status = resp.status();
+    let resp_headers = resp.headers().clone();
+    let bytes = resp.bytes().await.unwrap_or_default();
+    let mut response = Response::new(Body::from(bytes));
+    *response.status_mut() = status;
+    for (name, value) in resp_headers.iter() {
+        if name == header::TRANSFER_ENCODING || name == header::CONTENT_LENGTH {
+            continue;
+        }
+        response.headers_mut().insert(name, value.clone());
+    }
+    Some(response)
+}
+
 async fn serve_path(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -636,6 +686,12 @@ async fn serve_path(
         match locate(&state.root, rel) {
             Some(file) => file,
             None => {
+                // A plugin's configureServer middleware may own this route
+                // (dev endpoints: health checks, secrets, api stubs). Consulted
+                // only on a miss, so served modules/assets pay no round-trip.
+                if let Some(resp) = forward_to_plugin_middleware(&state, &uri, &headers).await {
+                    return resp;
+                }
                 // SPA history fallback: a navigation to a client-router path
                 // (no file extension, or an HTML navigation) serves index.html
                 // so BrowserRouter/etc. can take over. Missing assets and

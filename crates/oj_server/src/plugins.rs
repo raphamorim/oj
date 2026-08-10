@@ -249,6 +249,12 @@ impl PluginHost {
         serde_json::from_str(&json).map_err(|e| e.to_string())
     }
 
+    /// The port of the `configureServer` middleware HTTP server, if any plugin
+    /// registered dev-server middleware. `None` means no middleware to consult.
+    pub async fn middleware_port(&self) -> Option<u16> {
+        self.call("getMiddlewarePort", &[]).await.ok().flatten().and_then(|s| s.parse().ok())
+    }
+
     /// Collect the assets plugins emitted via `this.emitFile` during the build,
     /// so the build can write them to the output dir.
     pub async fn emitted_files(&self) -> Result<Vec<EmittedFile>, String> {
