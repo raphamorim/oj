@@ -34,7 +34,11 @@ pub struct PluginHost {
 }
 
 impl PluginHost {
-    pub async fn spawn(root: &Path, plugins_file: &Path) -> anyhow::Result<std::sync::Arc<PluginHost>> {
+    pub async fn spawn(
+        root: &Path,
+        plugins_file: &Path,
+        config_json: &str,
+    ) -> anyhow::Result<std::sync::Arc<PluginHost>> {
         let script = root.join(".oj-cache").join("plugin-host.mjs");
         if let Some(parent) = script.parent() {
             std::fs::create_dir_all(parent)?;
@@ -44,6 +48,7 @@ impl PluginHost {
         let mut child = tokio::process::Command::new("node")
             .arg(&script)
             .arg(plugins_file)
+            .arg(config_json)
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

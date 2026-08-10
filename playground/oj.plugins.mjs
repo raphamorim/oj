@@ -29,5 +29,27 @@ function virtualPlugin() {
   };
 }
 
-export default [markerPlugin(), virtualPlugin()];
+// Uses config() to contribute a value and configResolved() to capture the
+// merged config, then injects a config-derived string via transform — the
+// standard "capture config for later hooks" pattern.
+function configPlugin() {
+  let resolved = null;
+  return {
+    name: "oj-config",
+    config(_config, env) {
+      // Contribute to the config; the merged result is what configResolved sees.
+      return { define: { __OJ_BUILT_BY__: "oj-plugin" } };
+    },
+    configResolved(config) {
+      resolved = config; // { root, base, mode, command, define, server }
+    },
+    transform(code, id) {
+      if (!id.endsWith(".tsx") || !code.includes("__OJ_CONFIG_MARKER__")) return null;
+      const value = `${resolved.mode}:${resolved.define.__OJ_BUILT_BY__}`;
+      return code.replace("__OJ_CONFIG_MARKER__", value);
+    },
+  };
+}
+
+export default [markerPlugin(), virtualPlugin(), configPlugin()];
 

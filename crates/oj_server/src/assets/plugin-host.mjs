@@ -28,6 +28,35 @@ const ctx = {
   },
 };
 
+// config() / configResolved() handshake, once at startup. Each plugin's
+// config(config, env) may return a partial that is deep-merged into the
+// resolved config; then every plugin's configResolved(finalConfig) runs so it
+// can capture what it needs for later hooks.
+function deepMerge(a, b) {
+  if (Array.isArray(a) && Array.isArray(b)) return [...a, ...b];
+  if (a && b && typeof a === "object" && typeof b === "object") {
+    const out = { ...a };
+    for (const k of Object.keys(b)) out[k] = k in a ? deepMerge(a[k], b[k]) : b[k];
+    return out;
+  }
+  return b === undefined ? a : b;
+}
+
+async function runConfigHooks() {
+  const initial = JSON.parse(process.argv[3] ?? "{}");
+  let config = initial.config ?? {};
+  const env = initial.env ?? { command: "serve", mode: "development" };
+  for (const p of plugins) {
+    if (typeof p.config !== "function") continue;
+    const partial = await p.config.call(ctx, config, env);
+    if (partial) config = deepMerge(config, partial);
+  }
+  for (const p of plugins) {
+    if (typeof p.configResolved === "function") await p.configResolved.call(ctx, config);
+  }
+}
+await runConfigHooks();
+
 // transform chains through all plugins (Rollup semantics); returns the final code.
 async function transform(code, id) {
   let current = code;

@@ -15,10 +15,14 @@ const { chromium } = require("playwright");
     await page.goto("http://localhost:5199/", { waitUntil: "networkidle" });
     await page.waitForSelector("[data-plugin]", { state: "attached" });
     const v = await page.getAttribute("[data-plugin]", "data-plugin");
-    console.log("data-plugin:", v, "| errors:", errors.length ? errors : "none");
+    // config() contributed a define; configResolved() captured mode; transform
+    // injected "<mode>:<define>".
+    const cfg = await page.getAttribute("[data-plugin-config]", "data-plugin-config");
+    console.log("data-plugin:", v, "| data-plugin-config:", cfg, "| errors:", errors.length ? errors : "none");
     if (v !== "transformed-by-plugin") throw new Error("plugin transform did not run: " + v);
+    if (cfg !== "development:oj-plugin") throw new Error("config/configResolved handshake failed: " + cfg);
     if (errors.length) throw new Error("console errors");
-    console.log("PLUGIN TRANSFORM HOOK VERIFIED");
+    console.log("PLUGIN transform + config/configResolved HOOKS VERIFIED");
   } finally {
     await browser.close();
   }

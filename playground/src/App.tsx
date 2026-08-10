@@ -24,6 +24,8 @@ export function App() {
       <div data-json={`${appName}|${meta.version}`} hidden />
       {/* Replaced by a Vite-style transform plugin (oj.plugins.mjs). */}
       <div data-plugin="__OJ_PLUGIN_UNTRANSFORMED__" hidden />
+      {/* Filled by a plugin from the config()/configResolved() handshake. */}
+      <div data-plugin-config="__OJ_CONFIG_MARKER__" hidden />
     </main>
   );
 }

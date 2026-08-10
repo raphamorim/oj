@@ -174,9 +174,22 @@ impl DevServer {
         let proxy: Vec<(String, oj_config::ProxyEntry)> =
             server_cfg.proxy.clone().unwrap_or_default().into_iter().collect();
 
-        // Spawn the plugin host up front if the app declares plugins.
+        // Spawn the plugin host up front if the app declares plugins. Plugins'
+        // config()/configResolved() hooks receive this resolved config + env.
+        let plugin_config = serde_json::json!({
+            "config": {
+                "root": root.display().to_string(),
+                "base": config.base.clone().unwrap_or_else(|| "/".into()),
+                "mode": "development",
+                "command": "serve",
+                "define": config.define,
+                "server": { "port": port, "host": server_cfg.host },
+            },
+            "env": { "command": "serve", "mode": "development" },
+        })
+        .to_string();
         let plugin_host = match plugins::plugins_file(&root) {
-            Some(file) => match PluginHost::spawn(&root, &file).await {
+            Some(file) => match PluginHost::spawn(&root, &file, &plugin_config).await {
                 Ok(host) => {
                     println!("  plugins: {}", file.file_name().unwrap().to_string_lossy());
                     Some(host)
