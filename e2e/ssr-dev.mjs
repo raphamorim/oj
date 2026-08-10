@@ -91,7 +91,13 @@ try {
   }
   if (about.includes("deferred-streamed")) throw new Error("/about leaked home-route content");
   if (!first.includes('data-page="home"')) throw new Error("/ did not render the home route");
-  console.log("ssr-dev: per-route ok (/ -> home, /about -> about)");
+  // File-based routing: routes come from src/routes/**; a `$id` file segment is
+  // a dynamic param passed to the loader and component.
+  const user = await (await fetch(`${base}/users/42`)).text();
+  if (!user.includes('data-page="user"') || !user.includes('data-user-id="42"')) {
+    throw new Error(`dynamic file-based route /users/42 did not render:\n${user}`);
+  }
+  console.log("ssr-dev: per-route ok (/, /about, dynamic /users/42 from src/routes/**)");
 
   // 1d. Route data loading: the server-authoritative loader ran, its data is
   //     serialized into the document, and the route rendered with it.

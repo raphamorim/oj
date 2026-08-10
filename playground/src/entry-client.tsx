@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { hydrateRoot } from "react-dom/client";
-import { App, ErrorBoundary, NavContext, type NavState, type RouteData } from "@/routes";
+import { App, ErrorBoundary, NavContext, type NavState, type RouteData } from "@/router";
 
 declare global {
   interface Window {

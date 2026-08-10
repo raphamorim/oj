@@ -107,21 +107,37 @@ async function linker(spec, referencing) {
   return dep;
 }
 
+// Single-flight per id: concurrent importers (e.g. several routes importing the
+// same module via an eager glob) must share ONE instance. Without this, each
+// caller checks the registry before the first `await` registers the module, and
+// they all create duplicates — a subtle correctness bug (shared module state
+// would diverge).
+const building = new Map();
 async function build(id) {
   const existing = registry.get(id);
   if (existing) return existing.mod;
-  const code = await fetchText(`${BASE}/@ssr-module?id=${enc(id)}`);
-  const mod = new vm.SourceTextModule(code, {
-    context,
-    identifier: id,
-    initializeImportMeta(meta) {
-      meta.url = `file://${id}`;
-    },
-  });
-  // Register before linking so import cycles resolve to this instance.
-  registry.set(id, { mod, mtime: mtimeOf(id), importers: new Set(), evaluated: false });
-  await mod.link(linker);
-  return mod;
+  const inflight = building.get(id);
+  if (inflight) return inflight;
+  const p = (async () => {
+    const code = await fetchText(`${BASE}/@ssr-module?id=${enc(id)}`);
+    const mod = new vm.SourceTextModule(code, {
+      context,
+      identifier: id,
+      initializeImportMeta(meta) {
+        meta.url = `file://${id}`;
+      },
+    });
+    // Register before linking so import cycles resolve to this instance.
+    registry.set(id, { mod, mtime: mtimeOf(id), importers: new Set(), evaluated: false });
+    await mod.link(linker);
+    return mod;
+  })();
+  building.set(id, p);
+  try {
+    return await p;
+  } finally {
+    building.delete(id);
+  }
 }
 
 // Drop every module whose file changed, plus everything that transitively
