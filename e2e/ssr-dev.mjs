@@ -227,22 +227,31 @@ try {
       await lp.close();
       console.log("ssr-dev: nested-layout persistence ok (section state kept, unmounts on leave, root persists)");
 
-      // 4a3. Link prefetch on hover: hovering an internal link warms the target
-      //      route's chunk (and loader data) before any click.
+      // 4a3. Prefetch: links in the viewport warm on load; a below-the-fold
+      //      link warms only on hover.
       const pf = await browser.newPage();
       const reqs = [];
       pf.on("request", (r) => reqs.push(r.url()));
       await pf.goto(`${base}/`, { waitUntil: "networkidle" });
-      const aboutChunk = () => reqs.some((u) => /routes\/about\.tsx/.test(u));
-      if (aboutChunk()) throw new Error("about route was fetched before hover");
-      await pf.locator('a[href="/about"]').hover();
+      const hasChunk = (name) => reqs.some((u) => u.includes(`routes/${name}.tsx`));
+      // Viewport: the visible /crash link is prefetched without any interaction.
       await pf.waitForFunction(
-        () => performance.getEntriesByType("resource").some((e) => /routes\/about\.tsx/.test(e.name)),
+        () => performance.getEntriesByType("resource").some((e) => e.name.includes("routes/crash.tsx")),
         { timeout: 3000 },
       );
-      if (!aboutChunk()) throw new Error("hovering the link did not prefetch the route chunk");
+      if (!hasChunk("crash")) throw new Error("visible link was not viewport-prefetched");
+      // Opt-out: the /about link (data-no-prefetch) is NOT prefetched.
+      if (hasChunk("about")) throw new Error("data-no-prefetch link was prefetched");
+      // Below the fold: /deep isn't prefetched on load, only on hover.
+      if (hasChunk("deep")) throw new Error("below-fold link was prefetched before entering the viewport");
+      await pf.locator("[data-deep-link]").hover();
+      await pf.waitForFunction(
+        () => performance.getEntriesByType("resource").some((e) => e.name.includes("routes/deep.tsx")),
+        { timeout: 3000 },
+      );
+      if (!hasChunk("deep")) throw new Error("hovering the below-fold link did not prefetch it");
       await pf.close();
-      console.log("ssr-dev: link prefetch on hover ok (route chunk warmed before click)");
+      console.log("ssr-dev: prefetch ok (viewport warms visible, hover warms below-fold, opt-out respected)");
 
       // 4b. Action + SPA + HMR, all in place, on a clean page (asserts no
       //     unexpected console errors).

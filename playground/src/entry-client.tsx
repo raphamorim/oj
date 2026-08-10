@@ -57,12 +57,31 @@ function Router() {
       return href === location.pathname + location.search ? null : href;
     };
     const prefetch = (target: EventTarget | null) => {
-      const href = hrefOf(target);
+      const anchor = (target as Element)?.closest?.("a");
+      if (anchor?.hasAttribute("data-no-prefetch")) return; // opt out (prefetch="none")
+      const href = hrefOf(anchor ?? null);
       if (!href || prefetchedData.has(href)) return;
       void preloadRoute(href).catch(() => {}); // chunk
       prefetchedData.set(href, fetchData(href)); // data
     };
     const onOver = (e: Event) => prefetch(e.target);
+
+    // Viewport prefetch: warm links as they scroll into view (a little early
+    // via rootMargin). One-shot per link; re-scan on DOM changes so links added
+    // by a navigation get observed too.
+    const io = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          if (e.isIntersecting) {
+            prefetch(e.target);
+            io.unobserve(e.target);
+          }
+        }
+      },
+      { rootMargin: "200px" },
+    );
+    const observeLinks = () => document.querySelectorAll('a[href^="/"]').forEach((a) => io.observe(a));
+    const mo = new MutationObserver(observeLinks);
 
     const onClick = (e: MouseEvent) => {
       if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) {
@@ -99,12 +118,16 @@ function Router() {
     document.addEventListener("submit", onSubmit);
     document.addEventListener("pointerover", onOver);
     document.addEventListener("focusin", onOver);
+    observeLinks();
+    mo.observe(document.body, { childList: true, subtree: true });
     return () => {
       removeEventListener("popstate", onPop);
       document.removeEventListener("click", onClick);
       document.removeEventListener("submit", onSubmit);
       document.removeEventListener("pointerover", onOver);
       document.removeEventListener("focusin", onOver);
+      io.disconnect();
+      mo.disconnect();
     };
   }, []);
 
