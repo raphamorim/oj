@@ -43,6 +43,10 @@ struct OjCssPlugin {
     /// App has a postcss.config — run all .css through the sidecar (PostCSS),
     /// not just Tailwind-flagged css (parity with the dev server).
     has_postcss: bool,
+    /// This is a client (browser) build: replace `*.server.*` modules with RPC
+    /// stubs so server-only code never ships to the browser. The server build
+    /// (`false`) keeps the real implementations.
+    client: bool,
 }
 
 impl Plugin for OjCssPlugin {
@@ -99,8 +103,25 @@ impl Plugin for OjCssPlugin {
         let collected = Arc::clone(&self.collected);
         let root = self.root.clone();
         let routes_id = root.join("oj-routes.tsx").to_string_lossy().into_owned();
+        let client = self.client;
         async move {
             let path = id.split('?').next().unwrap_or(&id);
+            // Server functions: in the client build, a `*.server.*` module is
+            // replaced by RPC stubs so its real code never reaches the browser.
+            if client && is_server_module_path(path) {
+                let source = std::fs::read_to_string(path)
+                    .map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+                let url = match std::path::Path::new(path).strip_prefix(&root) {
+                    Ok(rel) => format!("/{}", rel.display()),
+                    Err(_) => path.to_string(),
+                };
+                let stub = server_fn_prod_stub(&oj_compiler::exports(&source, std::path::Path::new(path)), &url);
+                return Ok(Some(rolldown_plugin::HookLoadOutput {
+                    code: arcstr::ArcStr::from(stub),
+                    module_type: Some(rolldown_common::ModuleType::Js),
+                    ..Default::default()
+                }));
+            }
             // Built-in route manifest (transform expands its glob afterwards).
             if path == routes_id {
                 return Ok(Some(rolldown_plugin::HookLoadOutput {
@@ -182,6 +203,30 @@ fn expand_css_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String
         bail!("css build failed for {}: {}", css_file.display(), String::from_utf8_lossy(&out.stderr));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Whether a module path is a server-function module (`*.server.{ts,tsx,js,jsx}`).
+fn is_server_module_path(path: &str) -> bool {
+    [".server.ts", ".server.tsx", ".server.js", ".server.jsx"].iter().any(|s| path.ends_with(s))
+}
+
+/// Client-build stub for a server-function module: each export RPCs to /__oj_fn
+/// (the helper is inlined so the stub needs no runtime import in the bundle).
+fn server_fn_prod_stub(exports: &[String], url: &str) -> String {
+    let mut out = String::from(
+        "const __ojCall = (m, n, a) => fetch(\"/__oj_fn\", { method: \"POST\", \
+         headers: { \"content-type\": \"application/json\" }, \
+         body: JSON.stringify({ module: m, name: n, args: a }) })\
+         .then((r) => { if (!r.ok) throw new Error(\"oj server fn \" + n + \": \" + r.status); return r.json(); });\n",
+    );
+    for name in exports {
+        if name == "default" {
+            out.push_str(&format!("export default (...a) => __ojCall({url:?}, \"default\", a);\n"));
+        } else {
+            out.push_str(&format!("export const {name} = (...a) => __ojCall({url:?}, {name:?}, a);\n"));
+        }
+    }
+    out
 }
 
 /// Recursively copy the contents of `src` into `dest` (Vite's publicDir copy).
@@ -567,7 +612,7 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         }
         oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host)))); // before oj:build
     }
-    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(&root) }));
+    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(&root), client: true }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
         .with_options(BundlerOptions {
@@ -845,7 +890,7 @@ pub(crate) async fn build_ssr(
         }
         oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host))));
     }
-    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root) }));
+    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root), client: false }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
         .with_options(BundlerOptions {
@@ -918,6 +963,98 @@ pub(crate) async fn build_ssr(
 /// streams `renderToReadableStream` over a chunked HTTP response with the
 /// hashed client script/stylesheet injected, and serves the client assets.
 /// `__CLIENT_JS__` / `__CLIENT_CSS__` are filled in at build time.
+/// Server-function dispatch module: globs the app's `*.server.*` modules (real
+/// implementations) and calls the requested export. Bundled to
+/// `<out>/_oj_server_fns.mjs` and imported by the production server.
+const OJ_SERVER_FNS_JS: &str = r#"const mods = import.meta.glob("./src/**/*.server.*");
+const norm = (s) => String(s).replace(/^\.?\/+/, "");
+export async function dispatch(url, name, args) {
+  const want = norm(url);
+  const key = Object.keys(mods).find((k) => norm(k) === want);
+  if (!key) throw new Error("oj: no server module " + url);
+  const m = await mods[key]();
+  const fn = name === "default" ? m.default : m[name];
+  if (typeof fn !== "function") throw new Error("oj: no server function " + name + " in " + url);
+  return fn(...(Array.isArray(args) ? args : []));
+}
+"#;
+
+/// Whether the app has any `*.server.*` module under `src/` (so the production
+/// build wires the server-function dispatch + client stubs).
+fn has_server_modules(root: &Path) -> bool {
+    fn walk(dir: &Path) -> bool {
+        let Ok(entries) = fs::read_dir(dir) else { return false };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if walk(&p) {
+                    return true;
+                }
+            } else if p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                [".server.ts", ".server.tsx", ".server.js", ".server.jsx"].iter().any(|s| n.ends_with(s))
+            }) {
+                return true;
+            }
+        }
+        false
+    }
+    walk(&root.join("src"))
+}
+
+/// Build the server-function dispatch bundle to `<out>/_oj_server_fns.mjs`
+/// (node platform, node_modules external, real server code — not stubbed).
+async fn build_server_fns(root: &Path, out_dir: &Path) -> anyhow::Result<()> {
+    use rolldown::{IsExternal, Platform};
+    let entry_path = root.join("_oj_server_fns_entry.tsx");
+    fs::write(&entry_path, OJ_SERVER_FNS_JS)?;
+    let collected: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let external = IsExternal::Fn(Some(Arc::new(|spec: &str, _i, resolved: bool| {
+        let ext = resolved && spec.contains("node_modules");
+        Box::pin(async move { Ok(ext) })
+    })));
+    let result = async {
+        let mut bundler = BundlerBuilder::default()
+            .with_plugins(vec![Arc::new(OjCssPlugin {
+                collected: Arc::clone(&collected),
+                root: root.to_path_buf(),
+                has_postcss: oj_server::has_postcss_config(root),
+                client: false, // server build: keep real server code
+            })])
+            .with_options(BundlerOptions {
+                input: Some(vec![InputItem {
+                    name: Some("_oj_server_fns".to_string()),
+                    import: "./_oj_server_fns_entry.tsx".to_string(),
+                    ..Default::default()
+                }]),
+                cwd: Some(root.to_path_buf()),
+                dir: Some(out_dir.display().to_string()),
+                platform: Some(Platform::Node),
+                external: Some(external),
+                format: Some(OutputFormat::Esm),
+                entry_filenames: Some("_oj_server_fns.mjs".to_string().into()),
+                chunk_filenames: Some("_oj_server_fns-[hash].mjs".to_string().into()),
+                minify: Some(RawMinifyOptions::Bool(false)),
+                define: Some(
+                    vec![
+                        ("process.env.NODE_ENV".to_string(), "'production'".to_string()),
+                        ("import.meta.env.SSR".to_string(), "true".to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..Default::default()
+            })
+            .build()
+            .map_err(|errs| anyhow::anyhow!("server-fns init failed: {errs:?}"))?;
+        bundler.write().await.map_err(|errs| anyhow::anyhow!("server-fns build failed:\n{errs:?}"))?;
+        bundler.close().await.map_err(|errs| anyhow::anyhow!("server-fns close failed:\n{errs:?}"))?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let _ = fs::remove_file(&entry_path);
+    result
+}
+
 /// One-shot prerender (SSG) script: render each configured path to static HTML
 /// with the same shell the SSR server emits, so it hydrates. `__CLIENT_JS__` /
 /// `__CLIENT_CSS__` are filled at build time; paths arrive as argv JSON. Run
@@ -977,6 +1114,7 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join, normalize } from "node:path";
 import * as entry from "./entry-server.mjs";
+import { dispatch as __ojDispatch } from "./_oj_server_fns.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 5180;
@@ -994,6 +1132,18 @@ const readBody = (req) =>
 
 createServer(async (req, res) => {
   const url = req.url.split("?")[0];
+  // Server functions: run the requested export server-side and return JSON.
+  if (req.method === "POST" && url === "/__oj_fn") {
+    try {
+      const { module, name, args } = JSON.parse(await readBody(req));
+      const result = await __ojDispatch(module, name, args);
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify(result ?? null));
+    } catch (e) {
+      res.writeHead(500, { "content-type": "text/plain" });
+      return void res.end(String((e && e.stack) || e));
+    }
+  }
   if (url.startsWith("/assets/")) {
     const file = normalize(join(root, url));
     if (!file.startsWith(root)) return void res.writeHead(403).end();
@@ -1091,6 +1241,14 @@ pub(crate) async fn build_ssr_app(
     };
     let (js, css) = build_client_entry(root, out_dir, &client_entry, minify, sourcemap).await?;
 
+    // Server functions: the client bundle above stubbed `*.server.*` modules;
+    // this bundles their real implementations into a dispatch the server runs.
+    // Always built so server.mjs's import resolves (an empty dispatch is inert).
+    build_server_fns(root, out_dir).await?;
+    if has_server_modules(root) {
+        println!("  {:>9}  _oj_server_fns.mjs", human_bytes(OJ_SERVER_FNS_JS.len()));
+    }
+
     let server = SSR_PROD_SERVER
         .replace("__CLIENT_JS__", &js)
         .replace("__CLIENT_CSS__", css.as_deref().unwrap_or(""));
@@ -1158,7 +1316,7 @@ async fn build_client_entry(
         }
         oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host))));
     }
-    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root) }));
+    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root), client: true }));
 
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
@@ -1277,7 +1435,7 @@ async fn build_library(
         }
 
         let mut bundler = BundlerBuilder::default()
-            .with_plugins(vec![Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root) })])
+            .with_plugins(vec![Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root), client: true })])
             .with_options(BundlerOptions {
                 input: Some(vec![InputItem {
                     name: Some(file_name.clone()),

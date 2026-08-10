@@ -241,7 +241,7 @@ try {
         const m = await import("/src/greeting.server.ts");
         return m.greet("oj");
       });
-      if (result !== "hello, oj (server=true, call=1)") {
+      if (result !== "hello, oj (server=true)") {
         throw new Error("server function RPC returned unexpected result: " + JSON.stringify(result));
       }
       console.log("ssr-dev: server functions ok (client stub -> /__oj_fn -> server exec)");

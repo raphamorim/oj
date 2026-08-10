@@ -48,6 +48,24 @@ if (!fs.existsSync(serverJs)) throw new Error("no server.mjs emitted");
   if (!fs.readFileSync(about, "utf8").includes('data-page="about"')) throw new Error("prerendered /about missing about content");
   console.log("ssr-prod: prerender (SSG) ok (/ and /about static HTML, Suspense resolved, hydration wired)");
 }
+// Server functions: the dispatch bundle carries the real server code; the
+// client bundle carries only stubs (the server-only marker must not leak).
+{
+  if (!fs.existsSync(path.join(out, "_oj_server_fns.mjs"))) throw new Error("no server-fn dispatch bundle emitted");
+  // The real server code is code-split into a sibling _oj_server_fns-*.mjs
+  // (the glob produces lazy imports); it must carry the server-only marker.
+  const serverHasReal = fs
+    .readdirSync(out)
+    .filter((f) => f.startsWith("_oj_server_fns") && f.endsWith(".mjs"))
+    .some((f) => fs.readFileSync(path.join(out, f), "utf8").includes("process.versions"));
+  if (!serverHasReal) throw new Error("server-fn dispatch bundle missing the real implementation");
+  const clientLeak = fs
+    .readdirSync(path.join(out, "assets"))
+    .filter((f) => f.endsWith(".js"))
+    .some((f) => fs.readFileSync(path.join(out, "assets", f), "utf8").includes("process.versions"));
+  if (clientLeak) throw new Error("server-only code leaked into the client bundle");
+  console.log("ssr-prod: server functions ok (dispatch bundle has real code, client has only stubs)");
+}
 // User plugins run in BOTH SSR-build environments: entry-server (ssr) and
 // entry-client (client) each import a plugin virtual module, so its source must
 // be bundled into both the server bundle and a client asset.
@@ -192,6 +210,10 @@ try {
       await page.goto(`${base}/`, { waitUntil: "networkidle" });
       const deferred = await page.locator("[data-deferred]").textContent();
       if (!deferred.includes("deferred-streamed")) throw new Error(`deferred content lost: ${deferred}`);
+      // Server function: entry-client called a `*.server.ts` export on hydrate;
+      // its RPC hit /__oj_fn and ran the real function server-side.
+      const sfn = await page.waitForFunction(() => globalThis.__OJ_SFN, { timeout: 8000 }).then((h) => h.jsonValue());
+      if (sfn !== "hello, prod (server=true)") throw new Error("server function RPC failed in prod: " + JSON.stringify(sfn));
       // A failing loader renders the route-error UI (no crash), then recovers.
       await page.locator('a[href="/boom"]').click();
       await page.waitForSelector('[data-error]', { timeout: 5000 });

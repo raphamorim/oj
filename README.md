@@ -60,9 +60,10 @@ The work ahead, roughly in priority order:
   already exists. File-based route discovery ships as `virtual:oj-routes` (a
   `src/routes/` manifest with the index/`$param`/layout conventions), and
   `oj build --ssr` prerenders configured routes to static HTML (`build.prerender`,
-  hydrated). Server functions work in the SSR dev server: a `*.server.ts` module
-  is replaced on the client by RPC stubs, and the real functions run on the
-  module runner. Still ahead: server functions in the production build.
+  hydrated). Server functions work in dev and in the production build: a
+  `*.server.ts` module is replaced on the client by RPC stubs (its code never
+  ships to the browser), and the real functions run on the module runner in dev
+  and a bundled dispatch behind `server.mjs` in production.
 - Edge and serverless server targets, so one app can build for a Node server or
   a worker runtime.
 - A whole-graph module API (`getModuleInfo` across the full graph,

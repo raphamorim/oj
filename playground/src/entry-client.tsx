@@ -6,6 +6,12 @@ import { App, ErrorBoundary, NavContext, applyMeta, preloadRoute, resolveMeta, t
 // hydration concern; the globalThis assignment is a side effect (not shaken).
 import { info as pluginInfo } from "virtual:plugin-greeting";
 (globalThis as Record<string, unknown>).__OJ_CLIENT_PLUGIN = pluginInfo;
+// Server function: on the client this import is an RPC stub; the real greet()
+// runs on the server (dev runner / prod dispatch). Proves end-to-end server fns.
+import { greet } from "./greeting.server";
+greet("prod").then((r) => {
+  (globalThis as Record<string, unknown>).__OJ_SFN = r;
+});
 
 declare global {
   interface Window {
