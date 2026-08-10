@@ -33,6 +33,12 @@ pub struct PluginHost {
     _child: tokio::process::Child,
 }
 
+impl std::fmt::Debug for PluginHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PluginHost")
+    }
+}
+
 impl PluginHost {
     pub async fn spawn(
         root: &Path,

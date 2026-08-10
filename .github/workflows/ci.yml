@@ -66,6 +66,10 @@ jobs:
           grep -q isEntry playground/dist/.vite/manifest.json
           grep -rq hello-from-env playground/dist/assets/*.js
           ! grep -rq must-not-leak playground/dist/assets/*.js
+          # npm plugin hooks run in the prod build too
+          grep -rq transformed-by-plugin playground/dist/assets/*.js
+          grep -rq production:oj-plugin playground/dist/assets/*.js
+          ! grep -rq __OJ_PLUGIN_UNTRANSFORMED__ playground/dist/assets/*.js
       - name: library build
         run: |
           mkdir -p /tmp/lib/src

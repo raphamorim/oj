@@ -21,9 +21,12 @@ use rolldown::{
     BundlerBuilder, BundlerOptions, InputItem, OutputFormat, RawMinifyOptions, SourceMapType,
 };
 use rolldown_plugin::{
-    HookLoadArgs, HookLoadReturn, HookTransformArgs, HookTransformReturn, Plugin,
-    SharedLoadPluginContext, SharedTransformPluginContext,
+    HookLoadArgs, HookLoadOutput, HookLoadReturn, HookResolveIdArgs, HookResolveIdOutput,
+    HookResolveIdReturn, HookTransformArgs, HookTransformOutput, HookTransformReturn, Plugin,
+    PluginContext, SharedLoadPluginContext, SharedTransformPluginContext,
 };
+use rolldown_plugin::__inner::SharedPluginable;
+use oj_server::plugins::PluginHost;
 
 /// The oj build plugin: loads `.css`/`.scss` imports as JS stubs (CSS Modules
 /// export their scoped class map) collecting compiled CSS for one emitted
@@ -113,6 +116,101 @@ impl Plugin for OjCssPlugin {
     }
 }
 
+/// Bridges the Node plugin host into the Rolldown build, so the same
+/// Vite/Rollup-style `resolveId`/`load`/`transform` hooks that run in the dev
+/// server also run in `oj build`. Runs before `OjCssPlugin` so user transforms
+/// see raw source and user resolveId/load win for virtual ids.
+#[derive(Debug)]
+struct OjUserPlugin {
+    host: Arc<PluginHost>,
+}
+
+impl Plugin for OjUserPlugin {
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Borrowed("oj:user-plugins")
+    }
+
+    fn register_hook_usage(&self) -> rolldown_plugin::HookUsage {
+        rolldown_plugin::HookUsage::ResolveId
+            | rolldown_plugin::HookUsage::Load
+            | rolldown_plugin::HookUsage::Transform
+    }
+
+    fn resolve_id(
+        &self,
+        _ctx: &PluginContext,
+        args: &HookResolveIdArgs<'_>,
+    ) -> impl std::future::Future<Output = HookResolveIdReturn> + Send {
+        let host = Arc::clone(&self.host);
+        let spec = args.specifier.to_string();
+        let importer = args.importer.unwrap_or("").to_string();
+        async move {
+            Ok(host
+                .resolve_id(&spec, &importer)
+                .await
+                .ok()
+                .flatten()
+                .map(HookResolveIdOutput::from_id))
+        }
+    }
+
+    fn load(
+        &self,
+        _ctx: SharedLoadPluginContext,
+        args: &HookLoadArgs<'_>,
+    ) -> impl std::future::Future<Output = HookLoadReturn> + Send {
+        let host = Arc::clone(&self.host);
+        let id = args.id.to_string();
+        async move {
+            Ok(host.load(&id).await.ok().flatten().map(|code| HookLoadOutput {
+                code: arcstr::ArcStr::from(code),
+                module_type: Some(rolldown_common::ModuleType::Js),
+                ..Default::default()
+            }))
+        }
+    }
+
+    fn transform(
+        &self,
+        _ctx: SharedTransformPluginContext,
+        args: &HookTransformArgs<'_>,
+    ) -> impl std::future::Future<Output = HookTransformReturn> + Send {
+        let host = Arc::clone(&self.host);
+        let code = args.code.to_string();
+        let id = args.id.to_string();
+        async move {
+            match host.transform(&code, &id).await {
+                Ok(out) if out != code => Ok(Some(HookTransformOutput {
+                    code: Some(out),
+                    ..Default::default()
+                })),
+                _ => Ok(None),
+            }
+        }
+    }
+}
+
+/// Spawn the plugin host for a build (`command: "build"`) if the app declares
+/// plugins, and return it as a Rolldown plugin to prepend to the build.
+async fn user_plugins(root: &Path, base: &str, define: &serde_json::Value) -> Option<SharedPluginable> {
+    let file = oj_server::plugins::plugins_file(root)?;
+    let config = serde_json::json!({
+        "config": { "root": root.display().to_string(), "base": base, "mode": "production", "command": "build", "define": define },
+        "env": { "command": "build", "mode": "production" },
+    })
+    .to_string();
+    match PluginHost::spawn(root, &file, &config).await {
+        Ok(host) => {
+            println!("oj build: plugins from {}", file.file_name().unwrap().to_string_lossy());
+            Some(Arc::new(OjUserPlugin { host }) as SharedPluginable)
+        }
+        Err(e) => {
+            eprintln!("oj build: plugin host failed to start: {e}");
+            None
+        }
+    }
+}
+
 pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> anyhow::Result<()> {
     let root = root
         .canonicalize()
@@ -173,8 +271,13 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         .collect();
 
     let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
+    if let Some(user) = user_plugins(&root, &base, &serde_json::json!(config.define)).await {
+        oj_plugins.push(user); // user plugins run before oj:build
+    }
+    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf() }));
     let mut bundler = BundlerBuilder::default()
-        .with_plugins(vec![Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf() })])
+        .with_plugins(oj_plugins)
         .with_options(BundlerOptions {
         input: Some(inputs),
         cwd: Some(root.clone()),
@@ -203,6 +306,10 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         .map_err(|errs| anyhow::anyhow!("build failed:\n{errs:?}"))?;
 
     for warning in &output.warnings {
+        // oj's transform plugins intentionally don't emit sourcemaps yet.
+        if format!("{warning:?}").contains("SOURCEMAP_BROKEN") {
+            continue;
+        }
         eprintln!("oj build warning: {warning:?}");
     }
 
