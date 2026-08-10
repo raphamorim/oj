@@ -99,6 +99,15 @@ try {
   }
   console.log("ssr-dev: per-route ok (/, /about, dynamic /users/42 from src/routes/**)");
 
+  // 1e. Nested layouts: the root layout wraps every route; a section layout
+  //     (routes/users/layout.tsx) wraps only /users/*.
+  if (!first.includes('data-layout="root"')) throw new Error("root layout did not wrap /");
+  if (about.includes('data-layout="users"')) throw new Error("users layout leaked onto /about");
+  if (!user.includes('data-layout="root"') || !user.includes('data-layout="users"')) {
+    throw new Error("nested layouts did not compose on /users/42");
+  }
+  console.log("ssr-dev: nested layouts ok (root wraps all, users layout wraps /users/*)");
+
   // 1d. Route data loading: the server-authoritative loader ran, its data is
   //     serialized into the document, and the route rendered with it.
   if (!first.includes("window.__OJ_DATA__=") || !first.includes('"likes":')) {
@@ -189,6 +198,26 @@ try {
       if ((await sp.evaluate(() => window.__marker)) !== 5) throw new Error("an error state caused a full reload");
       await sp.close();
       console.log("ssr-dev: pending + error UI states ok (loading, loader error, render error, no reload)");
+
+      // 4a2. Nested-layout persistence: navigating within a section keeps the
+      //      section layout mounted (its local state survives); leaving it
+      //      unmounts the section layout but keeps the root layout.
+      const lp = await browser.newPage();
+      await lp.goto(`${base}/users/42`, { waitUntil: "networkidle" });
+      await lp.locator("[data-layout-inc]").click();
+      await lp.locator("[data-layout-inc]").click();
+      if ((await lp.locator("[data-layout-count]").textContent()) !== "2") throw new Error("layout state not set");
+      await lp.locator('a[href="/users/43"]').click(); // navigate within /users/*
+      await lp.waitForFunction(() => document.querySelector("[data-user-id]")?.textContent === "43", { timeout: 5000 });
+      if ((await lp.locator("[data-layout-count]").textContent()) !== "2") {
+        throw new Error("section layout remounted (state lost) on intra-section navigation");
+      }
+      await lp.locator('a[href="/"]').click(); // leave the section
+      await lp.waitForSelector('[data-page="home"]');
+      if ((await lp.locator('[data-layout="users"]').count()) !== 0) throw new Error("section layout did not unmount");
+      if ((await lp.locator('[data-layout="root"]').count()) !== 1) throw new Error("root layout did not persist");
+      await lp.close();
+      console.log("ssr-dev: nested-layout persistence ok (section state kept, unmounts on leave, root persists)");
 
       // 4b. Action + SPA + HMR, all in place, on a clean page (asserts no
       //     unexpected console errors).

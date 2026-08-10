@@ -86,7 +86,7 @@ function Router() {
 
   return (
     <NavContext.Provider value={nav}>
-      <ErrorBoundary key={route.path}>
+      <ErrorBoundary resetKey={route.path}>
         <App url={route.path} data={route.data} error={route.error} />
       </ErrorBoundary>
     </NavContext.Provider>

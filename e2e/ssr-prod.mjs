@@ -89,6 +89,11 @@ try {
   // File-based dynamic route (src/routes/users/$id.tsx) with a param.
   const user = await (await fetch(`${base}/users/7`)).text();
   if (!user.includes('data-user-id="7"')) throw new Error("dynamic file-based route /users/7 did not render");
+  // Nested layouts: root wraps every route; the users layout wraps only /users/*.
+  if (!user.includes('data-layout="root"') || !user.includes('data-layout="users"')) {
+    throw new Error("nested layouts did not compose on /users/7");
+  }
+  if (about.includes('data-layout="users"')) throw new Error("users layout leaked onto /about");
   if (!html.includes("window.__OJ_DATA__=") || !html.includes('"likes":') || !html.includes('data-likes="0"')) {
     throw new Error(`route data not loaded/serialized server-side:\n${html}`);
   }

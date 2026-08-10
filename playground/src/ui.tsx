@@ -35,12 +35,22 @@ export function RouteError({ error }: { error: string }) {
   );
 }
 
-// Catches render-time errors in the routed tree; the router remounts it on
-// navigation (via `key`) so recovering to another route resets it.
-export class ErrorBoundary extends Component<{ children: ReactNode }, { error: string | null }> {
-  state: { error: string | null } = { error: null };
+// Catches render-time errors in the routed tree. It resets when `resetKey`
+// (the current path) changes — but via derived state, NOT a `key` remount, so
+// the nested layouts it wraps keep their state across navigations.
+export class ErrorBoundary extends Component<
+  { children: ReactNode; resetKey: string },
+  { error: string | null; key: string }
+> {
+  state: { error: string | null; key: string } = { error: null, key: this.props.resetKey };
   static getDerivedStateFromError(e: unknown) {
     return { error: String((e as Error)?.message ?? e) };
+  }
+  static getDerivedStateFromProps(
+    props: { resetKey: string },
+    state: { error: string | null; key: string },
+  ) {
+    return props.resetKey !== state.key ? { error: null, key: props.resetKey } : null;
   }
   render() {
     return this.state.error ? <RouteError error={this.state.error} /> : this.props.children;

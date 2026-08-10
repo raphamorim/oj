@@ -8,6 +8,7 @@ export function loader({ params }: LoaderArgs) {
 }
 
 export default function User({ data, params }: { data: RouteData; params: Record<string, string> }) {
+  const next = Number(params.id) + 1;
   return (
     <main data-page="user">
       <h1>
@@ -15,7 +16,7 @@ export default function User({ data, params }: { data: RouteData; params: Record
       </h1>
       <Likes data={data} />
       <PendingBar />
-      <a href="/">home</a>
+      <a href={`/users/${next}`}>next user</a> <a href="/">home</a>
     </main>
   );
 }
