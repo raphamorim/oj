@@ -315,6 +315,19 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         if let Err(e) = host.build_end().await {
             eprintln!("oj build: plugin buildEnd failed: {e}");
         }
+        // Write any assets plugins emitted via this.emitFile into the output.
+        match host.emitted_files().await {
+            Ok(files) => {
+                for file in files {
+                    let dest = out_dir.join(&file.file_name);
+                    if let Some(parent) = dest.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(&dest, file.source.as_bytes())?;
+                }
+            }
+            Err(e) => eprintln!("oj build: plugin emitFile collection failed: {e}"),
+        }
     }
 
     for warning in &output.warnings {

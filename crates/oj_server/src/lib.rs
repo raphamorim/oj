@@ -801,9 +801,13 @@ async fn ensure_module(
 
     let is_dep = url.contains("/node_modules/") || url.starts_with("/@fs/");
     // Plugin `transform` hooks run on app source before oj compiles it (deps
-    // are skipped to avoid a per-node_modules-module round trip).
+    // are skipped to avoid a per-node_modules-module round trip). The `id` is
+    // the absolute file path (Rollup convention, and what prod passes), so a
+    // plugin's this.resolve gets a usable importer in both dev and prod.
     let source = match &state.plugins {
-        Some(host) if !is_dep => host.transform(&source, url).await.unwrap_or(source),
+        Some(host) if !is_dep => {
+            host.transform(&source, &file.to_string_lossy()).await.unwrap_or(source)
+        }
         _ => source,
     };
 

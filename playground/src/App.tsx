@@ -31,6 +31,8 @@ export function App() {
       <div data-order="base" hidden />
       {/* Filled by whichever apply-gated plugin is active (serve vs build). */}
       <div data-apply="__APPLY__" hidden />
+      {/* Filled via this.resolve("@/Counter") in a plugin: expect Counter.tsx. */}
+      <div data-resolved="__RESOLVED__" hidden />
       <HmrDemo />
     </main>
   );

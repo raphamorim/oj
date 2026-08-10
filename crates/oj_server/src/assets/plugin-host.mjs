@@ -34,12 +34,52 @@ try {
   process.stderr.write(`oj plugin host: failed to load ${pluginsPath}: ${(e && e.stack) || e}\n`);
 }
 
-// Minimal Rollup plugin context. Enough for transform/resolveId/load plugins;
-// hooks that reach for this.resolve/this.emitFile aren't supported yet.
+// Reverse RPC (Node -> Rust): a plugin's this.resolve asks oj's own resolver
+// so plugin resolution matches oj (tsconfig aliases etc.). Correlated by id;
+// the reply comes back as an {rpcReply} line on stdin (see the readline loop).
+let rpcCounter = 1;
+const rpcPending = new Map();
+function ctxRpc(method, args) {
+  const rpc = rpcCounter++;
+  return new Promise((resolve, reject) => {
+    rpcPending.set(rpc, { resolve, reject });
+    process.stdout.write(JSON.stringify({ rpc, method, args }) + "\n");
+  });
+}
+
+// Assets a plugin emits via this.emitFile; the Rust build collects them after
+// buildEnd (getEmittedFiles) and writes them to the output dir.
+let emitCounter = 0;
+const emitted = [];
+
+// Rollup plugin context. Covers warn/error, this.resolve (async, via oj's
+// resolver), and this.emitFile/getFileName (asset form) used by real plugins.
 const ctx = {
   warn: (m) => process.stderr.write(`oj plugin warn: ${m}\n`),
   error: (m) => {
     throw typeof m === "string" ? new Error(m) : m;
+  },
+  // this.resolve(source, importer) -> { id } | null (Rollup shape).
+  async resolve(source, importer) {
+    const id = await ctxRpc("resolve", [source, importer ?? ""]);
+    return id == null ? null : { id };
+  },
+  // this.emitFile({ type:"asset", name?, fileName?, source }) -> reference id.
+  // Assets only; chunk emission isn't supported. fileName defaults to
+  // assets/<name> so plugins can predict the output path via getFileName.
+  emitFile(file) {
+    if (file == null || (file.type && file.type !== "asset")) {
+      throw new Error("oj: this.emitFile supports { type: 'asset' } only");
+    }
+    const fileName = file.fileName ?? `assets/${file.name ?? `asset-${emitCounter}`}`;
+    const referenceId = `oj-ref-${emitCounter++}`;
+    emitted.push({ referenceId, fileName, source: String(file.source ?? "") });
+    return referenceId;
+  },
+  getFileName(referenceId) {
+    const f = emitted.find((e) => e.referenceId === referenceId);
+    if (!f) throw new Error(`oj: unknown emit reference ${referenceId}`);
+    return f.fileName;
   },
 };
 
@@ -179,6 +219,10 @@ async function run(hook, args) {
   if (hook === "handleHotUpdate") return handleHotUpdate(args[0], args[1]);
   if (hook === "transformIndexHtml") return transformIndexHtml(args[0]);
   if (hook === "buildStart" || hook === "buildEnd") return runLifecycle(hook);
+  // Assets emitted via this.emitFile, as a JSON string for the Rust build.
+  if (hook === "getEmittedFiles") {
+    return JSON.stringify(emitted.map(({ fileName, source }) => ({ fileName, source })));
+  }
   return null;
 }
 
@@ -188,6 +232,16 @@ rl.on("line", async (line) => {
   try {
     msg = JSON.parse(line);
   } catch {
+    return;
+  }
+  // A reply to a this.resolve (or other ctx) reverse-RPC we sent earlier.
+  if (msg.rpcReply != null) {
+    const p = rpcPending.get(msg.rpcReply);
+    if (p) {
+      rpcPending.delete(msg.rpcReply);
+      if (msg.error != null) p.reject(new Error(msg.error));
+      else p.resolve(msg.result ?? null);
+    }
     return;
   }
   const { id, hook, args } = msg;

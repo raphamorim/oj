@@ -78,6 +78,11 @@ jobs:
           # buildStart + buildEnd lifecycle hooks fired during the build
           test "$(cat playground/.oj-cache/plugin-buildstart)" = build
           test "$(cat playground/.oj-cache/plugin-buildend)" = build
+          # plugin context: this.resolve injected the resolved basename, and
+          # this.emitFile wrote an asset into the output
+          grep -rq 'Counter.tsx' playground/dist/assets/*.js
+          ! grep -rq __RESOLVED__ playground/dist/assets/*.js
+          test "$(cat playground/dist/assets/oj-plugin-emitted.txt)" = emitted-by-plugin
       - name: library build
         run: |
           mkdir -p /tmp/lib/src

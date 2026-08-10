@@ -21,6 +21,26 @@ function lifecyclePlugin() {
   };
 }
 
+// Uses the full plugin context: this.resolve (resolve a specifier through oj's
+// own resolver — here the tsconfig `@/` alias, proving it isn't plain Node
+// resolution) and this.emitFile (emit an asset into the build output). The
+// resolved module's basename is injected into App.tsx; the emitted file lands
+// in dist/assets/ during the prod build.
+function ctxPlugin() {
+  return {
+    name: "oj-ctx",
+    buildStart() {
+      this.emitFile({ type: "asset", name: "oj-plugin-emitted.txt", source: "emitted-by-plugin" });
+    },
+    async transform(code, id) {
+      if (!id.endsWith("App.tsx") || !code.includes("__RESOLVED__")) return null;
+      const r = await this.resolve("@/Counter", id);
+      const base = r && r.id ? r.id.split(/[\\/]/).pop() : "unresolved";
+      return code.replace("__RESOLVED__", base);
+    },
+  };
+}
+
 // A Vite/Rollup-style plugin: a factory returning a `{ name, transform }`
 // object, exactly the shape npm plugins use. oj's plugin host loads this and
 // runs the transform hook against the compile pipeline.
@@ -128,6 +148,7 @@ function applyPlugin(tag, apply) {
 
 export default [
   lifecyclePlugin(),
+  ctxPlugin(),
   markerPlugin(),
   virtualPlugin(),
   configPlugin(),

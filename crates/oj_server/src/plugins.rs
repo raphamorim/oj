@@ -7,15 +7,24 @@
 //! transforms can be in flight and a cancelled caller simply drops its slot.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use oj_resolver::OjResolver;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
 
 pub const PLUGIN_HOST_JS: &str = include_str!("assets/plugin-host.mjs");
+
+/// A file a plugin asked to emit via `this.emitFile` (asset form only). The
+/// build collects these after `buildEnd` and writes them to the output dir.
+#[derive(Debug)]
+pub struct EmittedFile {
+    pub file_name: String,
+    pub source: String,
+}
 
 /// The convention: a `oj.plugins.{mjs,js}` at the app root default-exports an
 /// array of plugins. Returns its path if one exists.
@@ -31,6 +40,39 @@ pub struct PluginHost {
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Option<String>, String>>>>,
     counter: AtomicU64,
     _child: tokio::process::Child,
+}
+
+/// Handle a plugin-context RPC (Node -> Rust) and write the reply to `stdin`.
+/// Currently just `resolve`, so plugins' `this.resolve` uses oj's own resolver
+/// (tsconfig aliases and all), keeping plugin resolution consistent with oj.
+async fn handle_ctx_rpc(
+    rpc: u64,
+    method: &str,
+    args: &[serde_json::Value],
+    resolver: &OjResolver,
+    root: &Path,
+    stdin: &tokio::sync::Mutex<tokio::process::ChildStdin>,
+) {
+    let reply = match method {
+        "resolve" => {
+            let source = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let importer = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            // Rollup's this.resolve takes the importer FILE; our resolver takes
+            // its directory. Empty importer -> resolve from the app root.
+            let dir = if importer.is_empty() {
+                root.to_path_buf()
+            } else {
+                Path::new(importer).parent().map(Path::to_path_buf).unwrap_or_else(|| root.to_path_buf())
+            };
+            match resolver.resolve(&dir, source) {
+                Ok(p) => serde_json::json!({ "rpcReply": rpc, "result": p.display().to_string() }),
+                Err(_) => serde_json::json!({ "rpcReply": rpc, "result": null }),
+            }
+        }
+        other => serde_json::json!({ "rpcReply": rpc, "error": format!("unknown ctx method: {other}") }),
+    };
+    let mut stdin = stdin.lock().await;
+    let _ = stdin.write_all(format!("{reply}\n").as_bytes()).await;
 }
 
 impl std::fmt::Debug for PluginHost {
@@ -71,11 +113,22 @@ impl PluginHost {
             _child: child,
         });
 
+        let resolver = std::sync::Arc::new(OjResolver::new(root));
+        let root_buf: PathBuf = root.to_path_buf();
         let reader_ref = std::sync::Arc::clone(&host);
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+                // A plugin-context call (this.resolve, ...) coming back FROM Node.
+                if let Some(rpc) = msg["rpc"].as_u64() {
+                    let method = msg["method"].as_str().unwrap_or("").to_string();
+                    let args = msg["args"].as_array().cloned().unwrap_or_default();
+                    // Handled inline: the reader processes one line at a time and
+                    // the sending `call()` holds no stdin lock while awaiting.
+                    handle_ctx_rpc(rpc, &method, &args, &resolver, &root_buf, &reader_ref.stdin).await;
+                    continue;
+                }
                 let Some(id) = msg["id"].as_u64() else { continue };
                 // result is a string, or null (hook returned nothing), or error.
                 let result = if let Some(err) = msg.get("error").and_then(|e| e.as_str()) {
@@ -148,5 +201,23 @@ impl PluginHost {
     /// Run `buildEnd` — the module graph is complete. Side-effect hook; ignored.
     pub async fn build_end(&self) -> Result<(), String> {
         self.call("buildEnd", &[]).await.map(|_| ())
+    }
+
+    /// Collect the assets plugins emitted via `this.emitFile` during the build,
+    /// so the build can write them to the output dir.
+    pub async fn emitted_files(&self) -> Result<Vec<EmittedFile>, String> {
+        let Some(json) = self.call("getEmittedFiles", &[]).await? else {
+            return Ok(Vec::new());
+        };
+        let arr: Vec<serde_json::Value> = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        Ok(arr
+            .into_iter()
+            .filter_map(|v| {
+                Some(EmittedFile {
+                    file_name: v.get("fileName")?.as_str()?.to_string(),
+                    source: v.get("source")?.as_str()?.to_string(),
+                })
+            })
+            .collect())
     }
 }

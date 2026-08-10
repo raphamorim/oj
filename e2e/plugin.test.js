@@ -34,12 +34,16 @@ const path = require("node:path");
     // apply: only the serve-gated plugin runs in dev.
     const apply = await page.getAttribute("[data-apply]", "data-apply");
     if (apply !== "serve-only") throw new Error("apply gating wrong (expected serve-only): " + apply);
+    // this.resolve("@/Counter") went through oj's resolver (tsconfig alias) ->
+    // the transform injected the resolved module's basename.
+    const resolved = await page.getAttribute("[data-resolved]", "data-resolved");
+    if (resolved !== "Counter.tsx") throw new Error("this.resolve wrong (expected Counter.tsx): " + resolved);
     // buildStart fired at dev-server startup, writing the command ("serve").
     const marker = path.join(__dirname, "..", "playground", ".oj-cache", "plugin-buildstart");
     const buildStart = fs.existsSync(marker) ? fs.readFileSync(marker, "utf8").trim() : "MISSING";
     if (buildStart !== "serve") throw new Error("buildStart marker wrong (expected serve): " + buildStart);
     if (errors.length) throw new Error("console errors");
-    console.log("PLUGIN transform + config + transformIndexHtml + enforce/apply + buildStart HOOKS VERIFIED");
+    console.log("PLUGIN transform + config + transformIndexHtml + enforce/apply + buildStart + this.resolve HOOKS VERIFIED");
   } finally {
     await browser.close();
   }
