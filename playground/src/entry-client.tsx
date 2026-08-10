@@ -48,8 +48,17 @@ function Router() {
     };
     const onPop = () => navigate(location.pathname);
 
-    // Prefetch on intent (hover/focus): warm the route's chunk and loader data
-    // so the click navigates instantly.
+    // Connection-aware gating: skip speculative prefetch when the user has Data
+    // Saver on or is on a slow (2g/slow-2g) connection. Explicit navigation
+    // (clicks) is never gated — the user asked for it.
+    const okToPrefetch = (): boolean => {
+      const c = (navigator as unknown as { connection?: { saveData?: boolean; effectiveType?: string } }).connection;
+      if (!c) return true; // Network Information API unavailable -> allow
+      return !c.saveData && !/2g/.test(c.effectiveType ?? "");
+    };
+
+    // Prefetch on intent (hover/focus) or viewport: warm the route's chunk and
+    // loader data so the click navigates instantly.
     const hrefOf = (target: EventTarget | null): string | null => {
       const anchor = (target as Element)?.closest?.("a");
       const href = anchor?.getAttribute("href");
@@ -57,6 +66,7 @@ function Router() {
       return href === location.pathname + location.search ? null : href;
     };
     const prefetch = (target: EventTarget | null) => {
+      if (!okToPrefetch()) return;
       const anchor = (target as Element)?.closest?.("a");
       if (anchor?.hasAttribute("data-no-prefetch")) return; // opt out (prefetch="none")
       const href = hrefOf(anchor ?? null);

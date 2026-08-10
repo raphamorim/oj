@@ -253,6 +253,29 @@ try {
       await pf.close();
       console.log("ssr-dev: prefetch ok (viewport warms visible, hover warms below-fold, opt-out respected)");
 
+      // 4a4. Connection-aware gating: with Data Saver on, speculative prefetch
+      //      is suppressed (viewport + hover), but an explicit click still
+      //      navigates.
+      const cg = await browser.newPage();
+      await cg.addInitScript(() => {
+        Object.defineProperty(navigator, "connection", {
+          configurable: true,
+          get: () => ({ saveData: true, effectiveType: "4g" }),
+        });
+      });
+      const cgReqs = [];
+      cg.on("request", (r) => cgReqs.push(r.url()));
+      await cg.goto(`${base}/`, { waitUntil: "networkidle" });
+      await cg.locator('a[href="/crash"]').hover();
+      await cg.waitForTimeout(400);
+      if (cgReqs.some((u) => u.includes("routes/crash.tsx"))) {
+        throw new Error("prefetch was not gated under Data Saver");
+      }
+      await cg.locator('a[href="/about"]').click(); // explicit nav still works
+      await cg.waitForSelector('[data-page="about"]');
+      await cg.close();
+      console.log("ssr-dev: connection-aware gating ok (Data Saver suppresses prefetch, click still navigates)");
+
       // 4b. Action + SPA + HMR, all in place, on a clean page (asserts no
       //     unexpected console errors).
       const page = await browser.newPage();
