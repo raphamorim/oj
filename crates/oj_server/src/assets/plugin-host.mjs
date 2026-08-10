@@ -52,6 +52,11 @@ function ctxRpc(method, args) {
 let emitCounter = 0;
 const emitted = [];
 
+// ModuleInfo cache: this.load populates it (async, via Rust); getModuleInfo
+// reads it synchronously — matching Rollup, where getModuleInfo returns info
+// for modules already loaded into the graph and null otherwise.
+const moduleInfoCache = new Map();
+
 // Rollup plugin context. Covers warn/error, this.resolve (async, via oj's
 // resolver), and this.emitFile/getFileName (asset form) used by real plugins.
 const ctx = {
@@ -80,6 +85,19 @@ const ctx = {
     const f = emitted.find((e) => e.referenceId === referenceId);
     if (!f) throw new Error(`oj: unknown emit reference ${referenceId}`);
     return f.fileName;
+  },
+  // this.load({ id }) -> ModuleInfo { id, code, importedIds } (or null). Reads
+  // + compiles the module through Rust, then caches it for getModuleInfo.
+  async load(options) {
+    const id = typeof options === "string" ? options : options.id;
+    const info = await ctxRpc("moduleInfo", [id]);
+    if (info) moduleInfoCache.set(info.id, info);
+    return info;
+  },
+  // this.getModuleInfo(id) -> cached ModuleInfo | null. Synchronous (Rollup
+  // shape): only modules previously this.load-ed are present.
+  getModuleInfo(id) {
+    return moduleInfoCache.get(typeof id === "string" ? id : id.id) ?? null;
   },
 };
 

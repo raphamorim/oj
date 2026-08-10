@@ -83,6 +83,9 @@ jobs:
           grep -rq 'Counter.tsx' playground/dist/assets/*.js
           ! grep -rq __RESOLVED__ playground/dist/assets/*.js
           test "$(cat playground/dist/assets/oj-plugin-emitted.txt)" = emitted-by-plugin
+          # this.load + getModuleInfo: Counter's imported-id count and code probe
+          grep -rq '3:true' playground/dist/assets/*.js
+          ! grep -rq __MODINFO__ playground/dist/assets/*.js
       - name: library build
         run: |
           mkdir -p /tmp/lib/src

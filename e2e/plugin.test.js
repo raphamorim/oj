@@ -38,12 +38,15 @@ const path = require("node:path");
     // the transform injected the resolved module's basename.
     const resolved = await page.getAttribute("[data-resolved]", "data-resolved");
     if (resolved !== "Counter.tsx") throw new Error("this.resolve wrong (expected Counter.tsx): " + resolved);
+    // this.load + getModuleInfo on Counter: importedIds count : code has useState.
+    const modinfo = await page.getAttribute("[data-modinfo]", "data-modinfo");
+    if (modinfo !== "3:true") throw new Error("getModuleInfo/this.load wrong (expected 3:true): " + modinfo);
     // buildStart fired at dev-server startup, writing the command ("serve").
     const marker = path.join(__dirname, "..", "playground", ".oj-cache", "plugin-buildstart");
     const buildStart = fs.existsSync(marker) ? fs.readFileSync(marker, "utf8").trim() : "MISSING";
     if (buildStart !== "serve") throw new Error("buildStart marker wrong (expected serve): " + buildStart);
     if (errors.length) throw new Error("console errors");
-    console.log("PLUGIN transform + config + transformIndexHtml + enforce/apply + buildStart + this.resolve HOOKS VERIFIED");
+    console.log("PLUGIN transform + config + transformIndexHtml + enforce/apply + buildStart + this.resolve + getModuleInfo HOOKS VERIFIED");
   } finally {
     await browser.close();
   }

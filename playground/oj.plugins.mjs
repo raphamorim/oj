@@ -33,10 +33,25 @@ function ctxPlugin() {
       this.emitFile({ type: "asset", name: "oj-plugin-emitted.txt", source: "emitted-by-plugin" });
     },
     async transform(code, id) {
-      if (!id.endsWith("App.tsx") || !code.includes("__RESOLVED__")) return null;
-      const r = await this.resolve("@/Counter", id);
-      const base = r && r.id ? r.id.split(/[\\/]/).pop() : "unresolved";
-      return code.replace("__RESOLVED__", base);
+      if (!id.endsWith("App.tsx")) return null;
+      let out = code;
+      if (out.includes("__RESOLVED__")) {
+        const r = await this.resolve("@/Counter", id);
+        const base = r && r.id ? r.id.split(/[\\/]/).pop() : "unresolved";
+        out = out.replace("__RESOLVED__", base);
+      }
+      if (out.includes("__MODINFO__")) {
+        // this.load fetches Counter's code + imports; getModuleInfo then reads
+        // the cached info synchronously. Counter's imports post-compile are
+        // react, its css module, and the auto-injected react/jsx-runtime (3).
+        const r = await this.resolve("@/Counter", id);
+        const loaded = r ? await this.load({ id: r.id }) : null;
+        const info = r ? this.getModuleInfo(r.id) : null;
+        const n = info ? info.importedIds.length : -1;
+        const hasHook = loaded ? loaded.code.includes("useState") : false;
+        out = out.replace("__MODINFO__", `${n}:${hasHook}`);
+      }
+      return out === code ? null : out;
     },
   };
 }

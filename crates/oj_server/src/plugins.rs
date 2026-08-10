@@ -69,6 +69,42 @@ async fn handle_ctx_rpc(
                 Err(_) => serde_json::json!({ "rpcReply": rpc, "result": null }),
             }
         }
+        // Back the plugin ModuleInfo (this.load / getModuleInfo): read the
+        // module, compile it (TS/JSX stripped) for its code + static imports,
+        // and resolve each import to an absolute id via oj's resolver.
+        "moduleInfo" => {
+            let id = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let path = Path::new(id);
+            match std::fs::read_to_string(path) {
+                Ok(src) => {
+                    let dir = path.parent().map(Path::to_path_buf).unwrap_or_else(|| root.to_path_buf());
+                    // Non-JS (css/json/...) modules can't be compiled; hand back
+                    // the raw source with no imports rather than erroring.
+                    let (code, imports) = match oj_compiler::compile(
+                        path,
+                        &src,
+                        &oj_compiler::CompileOptions::prod(),
+                    ) {
+                        Ok(out) => (out.code, out.imports),
+                        Err(_) => (src, Vec::new()),
+                    };
+                    let imported_ids: Vec<String> = imports
+                        .iter()
+                        .map(|spec| {
+                            resolver
+                                .resolve(&dir, spec)
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|_| spec.clone())
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "rpcReply": rpc,
+                        "result": { "id": id, "code": code, "importedIds": imported_ids },
+                    })
+                }
+                Err(_) => serde_json::json!({ "rpcReply": rpc, "result": null }),
+            }
+        }
         other => serde_json::json!({ "rpcReply": rpc, "error": format!("unknown ctx method: {other}") }),
     };
     let mut stdin = stdin.lock().await;

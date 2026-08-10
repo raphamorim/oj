@@ -33,6 +33,8 @@ export function App() {
       <div data-apply="__APPLY__" hidden />
       {/* Filled via this.resolve("@/Counter") in a plugin: expect Counter.tsx. */}
       <div data-resolved="__RESOLVED__" hidden />
+      {/* Filled via this.load + getModuleInfo on Counter: expect 3:true. */}
+      <div data-modinfo="__MODINFO__" hidden />
       <HmrDemo />
     </main>
   );
