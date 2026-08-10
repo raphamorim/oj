@@ -13,6 +13,17 @@ const pluginsPath = process.argv[2];
 const initial = JSON.parse(process.argv[3] ?? "{}");
 const env = initial.env ?? { command: "serve", mode: "development" };
 
+// Vite Environment API: the environment this host serves (oj exposes "client"
+// for the dev server and the app build). `environment.config` is the base
+// config deep-merged with the per-environment overrides from
+// `config.environments[name]`, so plugins read the resolved per-env config.
+const envName = initial.environment?.name ?? "client";
+const environment = {
+  name: envName,
+  mode: initial.environment?.mode ?? env.mode,
+  config: deepMerge(initial.config ?? {}, (initial.config?.environments ?? {})[envName] ?? {}),
+};
+
 let plugins = [];
 try {
   const mod = await import(pathToFileURL(pluginsPath).href);
@@ -23,6 +34,12 @@ try {
     if (p.apply == null) return true;
     if (typeof p.apply === "function") return !!p.apply(initial.config ?? {}, env);
     return p.apply === env.command;
+  });
+  // `applyToEnvironment`: gate a plugin to specific environments (Vite Env API).
+  // A plugin absent from this environment is dropped from the pipeline.
+  plugins = plugins.filter((p) => {
+    if (typeof p.applyToEnvironment !== "function") return true;
+    return !!p.applyToEnvironment(environment);
   });
   // `enforce`: pre plugins run first, post last, others keep array order
   // (Array.prototype.sort is stable).
@@ -68,6 +85,8 @@ const seenIds = new Set();
 // Rollup plugin context. Covers warn/error, this.resolve (async, via oj's
 // resolver), and this.emitFile/getFileName (asset form) used by real plugins.
 const ctx = {
+  // Vite Environment API: hooks read this.environment.name / .config.
+  environment,
   warn: (m) => process.stderr.write(`oj plugin warn: ${m}\n`),
   error: (m) => {
     throw typeof m === "string" ? new Error(m) : m;

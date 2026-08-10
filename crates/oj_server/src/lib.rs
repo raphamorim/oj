@@ -191,8 +191,11 @@ impl DevServer {
                 "command": "serve",
                 "define": config.define,
                 "server": { "port": port, "host": server_cfg.host },
+                "environments": config.environments,
             },
             "env": { "command": "serve", "mode": "development" },
+            // The dev server is the "client" environment (Vite Environment API).
+            "environment": { "name": "client", "mode": "development" },
         })
         .to_string();
         let plugin_host = match plugins::plugins_file(&root) {

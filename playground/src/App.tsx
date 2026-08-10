@@ -37,6 +37,11 @@ export function App() {
       <div data-modinfo="__MODINFO__" hidden />
       {/* Filled via this.getModuleIds (App.tsx + loaded Counter): expect 2. */}
       <div data-moduleids="__MODULEIDS__" hidden />
+      {/* Environment API: this.environment.name -> "client". */}
+      <div data-env-name="__ENV_NAME__" hidden />
+      {/* applyToEnvironment gating: client plugin runs, ssr plugin is dropped. */}
+      <div data-env-client="__ENV_CLIENT__" hidden />
+      <div data-env-ssr="__ENV_SSR__" hidden />
       <HmrDemo />
     </main>
   );

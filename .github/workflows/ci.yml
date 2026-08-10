@@ -91,6 +91,9 @@ jobs:
           # this.getModuleIds: the marker was replaced during transform
           grep -rq 'data-moduleids' playground/dist/assets/*.js
           ! grep -rq __MODULEIDS__ playground/dist/assets/*.js
+          # Environment API: client-gated plugin ran, ssr-gated plugin did not
+          grep -rq 'client-ran' playground/dist/assets/*.js
+          ! grep -rq 'ssr-ran' playground/dist/assets/*.js
       - name: library build
         run: |
           mkdir -p /tmp/lib/src

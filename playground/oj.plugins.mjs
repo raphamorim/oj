@@ -100,6 +100,33 @@ function middlewarePlugin() {
   };
 }
 
+// Vite Environment API. envNamePlugin reads this.environment.name in a hook;
+// envPlugin(name, marker) is gated to one environment via applyToEnvironment, so
+// only the plugin matching oj's current environment ("client") runs — the
+// "ssr"-gated one is dropped and its marker is left untouched.
+function envNamePlugin() {
+  return {
+    name: "oj-env-name",
+    transform(code, id) {
+      if (!id.endsWith("App.tsx") || !code.includes("__ENV_NAME__")) return null;
+      return code.replace("__ENV_NAME__", this.environment.name);
+    },
+  };
+}
+
+function envPlugin(name, marker) {
+  return {
+    name: `oj-env-${name}`,
+    applyToEnvironment(environment) {
+      return environment.name === name;
+    },
+    transform(code, id) {
+      if (!id.endsWith("App.tsx")) return null;
+      return code.replace(marker, `${name}-ran`);
+    },
+  };
+}
+
 // A Vite/Rollup-style plugin: a factory returning a `{ name, transform }`
 // object, exactly the shape npm plugins use. oj's plugin host loads this and
 // runs the transform hook against the compile pipeline.
@@ -210,6 +237,9 @@ export default [
   ctxPlugin(),
   watchPlugin(),
   middlewarePlugin(),
+  envNamePlugin(),
+  envPlugin("client", "__ENV_CLIENT__"),
+  envPlugin("ssr", "__ENV_SSR__"),
   markerPlugin(),
   virtualPlugin(),
   configPlugin(),

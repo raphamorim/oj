@@ -252,11 +252,18 @@ impl Plugin for OjUserPlugin {
 /// Spawn the plugin host for a build (`command: "build"`) if the app declares
 /// plugins. Returned so the build can both add it as a Rolldown plugin and run
 /// transformIndexHtml on the emitted HTML.
-async fn user_plugin_host(root: &Path, base: &str, define: &serde_json::Value) -> Option<Arc<PluginHost>> {
+async fn user_plugin_host(
+    root: &Path,
+    base: &str,
+    define: &serde_json::Value,
+    environments: &serde_json::Value,
+) -> Option<Arc<PluginHost>> {
     let file = oj_server::plugins::plugins_file(root)?;
     let config = serde_json::json!({
-        "config": { "root": root.display().to_string(), "base": base, "mode": "production", "command": "build", "define": define },
+        "config": { "root": root.display().to_string(), "base": base, "mode": "production", "command": "build", "define": define, "environments": environments },
         "env": { "command": "build", "mode": "production" },
+        // The app build is the "client" environment (Vite Environment API).
+        "environment": { "name": "client", "mode": "production" },
     })
     .to_string();
     match PluginHost::spawn(root, &file, &config).await {
@@ -331,7 +338,9 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         .collect();
 
     let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
-    let plugin_host = user_plugin_host(&root, &base, &serde_json::json!(config.define)).await;
+    let plugin_host =
+        user_plugin_host(&root, &base, &serde_json::json!(config.define), &serde_json::json!(config.environments))
+            .await;
     let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
     if let Some(host) = &plugin_host {
         if let Err(e) = host.build_start().await {

@@ -29,6 +29,10 @@ pub struct OjConfig {
     pub virtual_modules: Option<BTreeMap<String, String>>,
     /// oj-specific: default the dev server to registry bundle mode.
     pub bundle: Option<bool>,
+    /// Vite Environment API: per-environment config overrides, keyed by name
+    /// (e.g. `client`, `ssr`). Passed through to plugins so `applyToEnvironment`
+    /// and `this.environment.config` see the merged per-environment config.
+    pub environments: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]

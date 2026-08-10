@@ -48,12 +48,20 @@ const path = require("node:path");
     const marker = path.join(__dirname, "..", "playground", ".oj-cache", "plugin-buildstart");
     const buildStart = fs.existsSync(marker) ? fs.readFileSync(marker, "utf8").trim() : "MISSING";
     if (buildStart !== "serve") throw new Error("buildStart marker wrong (expected serve): " + buildStart);
+    // Environment API: this.environment.name is "client"; applyToEnvironment
+    // gates the client plugin in and the ssr plugin out (marker untouched).
+    const envName = await page.getAttribute("[data-env-name]", "data-env-name");
+    if (envName !== "client") throw new Error("this.environment.name wrong (expected client): " + envName);
+    const envClient = await page.getAttribute("[data-env-client]", "data-env-client");
+    if (envClient !== "client-ran") throw new Error("applyToEnvironment client gate wrong: " + envClient);
+    const envSsr = await page.getAttribute("[data-env-ssr]", "data-env-ssr");
+    if (envSsr !== "__ENV_SSR__") throw new Error("applyToEnvironment ssr plugin should NOT run in client: " + envSsr);
     // configureServer added a dev-server middleware owning /__oj_health.
     const health = await page.request.get("http://localhost:5199/__oj_health");
     const healthText = (await health.text()).trim();
     if (healthText !== "oj-plugin-mw-ok") throw new Error("configureServer middleware wrong: " + healthText);
     if (errors.length) throw new Error("console errors");
-    console.log("PLUGIN transform + config + transformIndexHtml + enforce/apply + buildStart + this.resolve + getModuleInfo + getModuleIds + configureServer HOOKS VERIFIED");
+    console.log("PLUGIN transform + config + transformIndexHtml + enforce/apply + buildStart + this.resolve + getModuleInfo + getModuleIds + configureServer + Environment API HOOKS VERIFIED");
   } finally {
     await browser.close();
   }
