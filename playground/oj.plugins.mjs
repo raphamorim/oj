@@ -63,5 +63,19 @@ function hmrPlugin() {
   };
 }
 
-export default [markerPlugin(), virtualPlugin(), configPlugin(), hmrPlugin()];
+// Uses transformIndexHtml to inject a meta tag into the document head (the
+// tag-descriptor form), plus a string rewrite.
+function htmlPlugin() {
+  return {
+    name: "oj-html",
+    transformIndexHtml(html) {
+      return {
+        html: html.replace("<title>oj playground</title>", '<title>oj playground (plugin)</title>'),
+        tags: [{ tag: "meta", attrs: { name: "oj-plugin-injected", content: "yes" }, injectTo: "head" }],
+      };
+    },
+  };
+}
+
+export default [markerPlugin(), virtualPlugin(), configPlugin(), hmrPlugin(), htmlPlugin()];
 

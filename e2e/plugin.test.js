@@ -21,8 +21,13 @@ const { chromium } = require("playwright");
     console.log("data-plugin:", v, "| data-plugin-config:", cfg, "| errors:", errors.length ? errors : "none");
     if (v !== "transformed-by-plugin") throw new Error("plugin transform did not run: " + v);
     if (cfg !== "development:oj-plugin") throw new Error("config/configResolved handshake failed: " + cfg);
+    // transformIndexHtml injected a meta tag and rewrote the title.
+    const injected = await page.locator('meta[name="oj-plugin-injected"]').getAttribute("content");
+    const title = await page.title();
+    if (injected !== "yes") throw new Error("transformIndexHtml did not inject the meta tag");
+    if (!title.includes("(plugin)")) throw new Error("transformIndexHtml did not rewrite the title: " + title);
     if (errors.length) throw new Error("console errors");
-    console.log("PLUGIN transform + config/configResolved HOOKS VERIFIED");
+    console.log("PLUGIN transform + config + transformIndexHtml HOOKS VERIFIED");
   } finally {
     await browser.close();
   }

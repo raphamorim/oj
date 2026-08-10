@@ -620,7 +620,14 @@ async fn serve_path(
 
     match tokio::fs::read(&file).await {
         Ok(bytes) if ext == "html" => {
-            let raw = String::from_utf8_lossy(&bytes).into_owned();
+            let mut raw = String::from_utf8_lossy(&bytes).into_owned();
+            // Plugin transformIndexHtml runs on the user's HTML first, then oj
+            // injects its dev scripts / preloads.
+            if let Some(host) = &state.plugins {
+                if let Ok(out) = host.transform_index_html(&raw).await {
+                    raw = out;
+                }
+            }
             let html = if state.bundle {
                 inject_bundle_scripts(raw)
             } else {

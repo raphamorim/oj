@@ -104,11 +104,58 @@ async function handleHotUpdate(file, timestamp) {
   return suppress ? "skip" : null;
 }
 
+// Render a Vite tag descriptor { tag, attrs, children } to HTML.
+function renderTag(t) {
+  const attrs = Object.entries(t.attrs ?? {})
+    .map(([k, v]) => (v === true ? ` ${k}` : v === false || v == null ? "" : ` ${k}="${String(v)}"`))
+    .join("");
+  const inner = t.children ?? "";
+  const voidTag = ["meta", "link", "base"].includes(t.tag);
+  return voidTag ? `<${t.tag}${attrs}>` : `<${t.tag}${attrs}>${inner}</${t.tag}>`;
+}
+
+function injectTags(html, tags) {
+  const at = { "head-prepend": [], head: [], "body-prepend": [], body: [] };
+  for (const t of tags) (at[t.injectTo ?? "head"] ?? at.head).push(renderTag(t));
+  const put = (h, marker, html2, after) => {
+    const i = h.indexOf(marker);
+    if (i === -1) return h + html2;
+    const at2 = after ? i + marker.length : i;
+    return h.slice(0, at2) + html2 + h.slice(at2);
+  };
+  html = put(html, "<head>", at["head-prepend"].join(""), true);
+  html = put(html, "</head>", at.head.join(""), false);
+  html = put(html, "<body>", at["body-prepend"].join(""), true);
+  html = put(html, "</body>", at.body.join(""), false);
+  return html;
+}
+
+// transformIndexHtml: each plugin may return a new HTML string, an array of tag
+// descriptors to inject, or { html, tags }. Chained across plugins.
+async function transformIndexHtml(html) {
+  let current = html;
+  for (const p of plugins) {
+    const hook = p.transformIndexHtml;
+    const fn = typeof hook === "function" ? hook : hook?.handler ?? hook?.transform;
+    if (typeof fn !== "function") continue;
+    const r = await fn.call(ctx, current, { path: "/index.html", filename: "index.html" });
+    if (r == null) continue;
+    if (typeof r === "string") current = r;
+    else if (Array.isArray(r)) current = injectTags(current, r);
+    else {
+      if (typeof r.html === "string") current = r.html;
+      if (Array.isArray(r.tags)) current = injectTags(current, r.tags);
+    }
+  }
+  return current;
+}
+
 async function run(hook, args) {
   if (hook === "transform") return transform(args[0], args[1]);
   if (hook === "resolveId") return resolveId(args[0], args[1]);
   if (hook === "load") return load(args[0]);
   if (hook === "handleHotUpdate") return handleHotUpdate(args[0], args[1]);
+  if (hook === "transformIndexHtml") return transformIndexHtml(args[0]);
   return null;
 }
 

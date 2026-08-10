@@ -70,6 +70,7 @@ jobs:
           grep -rq transformed-by-plugin playground/dist/assets/*.js
           grep -rq production:oj-plugin playground/dist/assets/*.js
           ! grep -rq __OJ_PLUGIN_UNTRANSFORMED__ playground/dist/assets/*.js
+          grep -q 'oj-plugin-injected' playground/dist/index.html
       - name: library build
         run: |
           mkdir -p /tmp/lib/src

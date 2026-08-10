@@ -131,4 +131,11 @@ impl PluginHost {
     pub async fn handle_hot_update(&self, file: &str, timestamp: u64) -> Result<Option<String>, String> {
         self.call("handleHotUpdate", &[file, &timestamp.to_string()]).await
     }
+
+    /// Run `transformIndexHtml` (string / tag-array / {html,tags} forms all
+    /// resolved host-side); returns the transformed HTML unchanged if no plugin
+    /// touched it.
+    pub async fn transform_index_html(&self, html: &str) -> Result<String, String> {
+        Ok(self.call("transformIndexHtml", &[html]).await?.unwrap_or_else(|| html.to_string()))
+    }
 }

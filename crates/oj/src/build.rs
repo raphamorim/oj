@@ -191,8 +191,9 @@ impl Plugin for OjUserPlugin {
 }
 
 /// Spawn the plugin host for a build (`command: "build"`) if the app declares
-/// plugins, and return it as a Rolldown plugin to prepend to the build.
-async fn user_plugins(root: &Path, base: &str, define: &serde_json::Value) -> Option<SharedPluginable> {
+/// plugins. Returned so the build can both add it as a Rolldown plugin and run
+/// transformIndexHtml on the emitted HTML.
+async fn user_plugin_host(root: &Path, base: &str, define: &serde_json::Value) -> Option<Arc<PluginHost>> {
     let file = oj_server::plugins::plugins_file(root)?;
     let config = serde_json::json!({
         "config": { "root": root.display().to_string(), "base": base, "mode": "production", "command": "build", "define": define },
@@ -202,7 +203,7 @@ async fn user_plugins(root: &Path, base: &str, define: &serde_json::Value) -> Op
     match PluginHost::spawn(root, &file, &config).await {
         Ok(host) => {
             println!("oj build: plugins from {}", file.file_name().unwrap().to_string_lossy());
-            Some(Arc::new(OjUserPlugin { host }) as SharedPluginable)
+            Some(host)
         }
         Err(e) => {
             eprintln!("oj build: plugin host failed to start: {e}");
@@ -271,9 +272,10 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         .collect();
 
     let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let plugin_host = user_plugin_host(&root, &base, &serde_json::json!(config.define)).await;
     let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
-    if let Some(user) = user_plugins(&root, &base, &serde_json::json!(config.define)).await {
-        oj_plugins.push(user); // user plugins run before oj:build
+    if let Some(host) = &plugin_host {
+        oj_plugins.push(Arc::new(OjUserPlugin { host: Arc::clone(host) })); // before oj:build
     }
     oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf() }));
     let mut bundler = BundlerBuilder::default()
@@ -415,6 +417,12 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         serde_json::to_string_pretty(&build_manifest(&manifest_entries))?,
     )?;
 
+    // Plugin transformIndexHtml runs on the finished document.
+    if let Some(host) = &plugin_host {
+        if let Ok(out) = host.transform_index_html(&rewritten_html).await {
+            rewritten_html = out;
+        }
+    }
     fs::write(out_dir.join("index.html"), rewritten_html)?;
 
     println!("oj build: {} in {:?}", out_dir.display(), started.elapsed());
