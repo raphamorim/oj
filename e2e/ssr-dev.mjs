@@ -201,6 +201,23 @@ try {
     console.log("ssr-dev: per-environment plugin pipelines ok (ssr host transforms server modules)");
   }
 
+  // 3c. SSR resolveId + load: a plugin virtual module resolves and loads on the
+  //     server side (the runner links it via these same endpoints).
+  {
+    const entryAbs = path.join(repo, "playground", "src", "entry-server.tsx");
+    const resolved = await (await fetch(
+      `${base}/@ssr-resolve?importer=${encodeURIComponent(entryAbs)}&spec=virtual:plugin-greeting`,
+    )).json();
+    if (resolved.external || !resolved.id || !resolved.id.includes("virtual:plugin-greeting")) {
+      throw new Error("ssr resolveId did not resolve the plugin virtual module: " + JSON.stringify(resolved));
+    }
+    const mod = await (await fetch(`${base}/@ssr-module?id=${encodeURIComponent(resolved.id)}`)).text();
+    if (!mod.includes("hello from plugin")) {
+      throw new Error("ssr load did not return the plugin virtual module source: " + mod);
+    }
+    console.log("ssr-dev: plugin resolveId + load ok (virtual module resolves/loads server-side)");
+  }
+
   // 4. Real SSR HMR: hot edit applies with state preserved and no reload.
   let pw = null;
   try {

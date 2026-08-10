@@ -354,11 +354,21 @@ async fn ssr_resolve(
             };
             js_response_json(body)
         }
-        // Unresolvable bare specifier (e.g. a Node builtin): let Node try it.
-        Err(_) if !spec.starts_with('.') && !spec.starts_with('/') => {
-            js_response_json(serde_json::json!({ "external": true, "spec": spec }))
+        Err(e) => {
+            // A plugin (ssr environment) may own this specifier — virtual
+            // modules etc. The returned id is fetched from ssr_module, which
+            // consults the plugin's load hook for the source.
+            if let Some(host) = ssr_plugin_host(&state).await {
+                if let Ok(Some(id)) = host.resolve_id(spec, importer).await {
+                    return js_response_json(serde_json::json!({ "id": id }));
+                }
+            }
+            // Unresolvable bare specifier (e.g. a Node builtin): let Node try it.
+            if !spec.starts_with('.') && !spec.starts_with('/') {
+                return js_response_json(serde_json::json!({ "external": true, "spec": spec }));
+            }
+            (StatusCode::NOT_FOUND, format!("cannot resolve {spec}: {}", e.reason)).into_response()
         }
-        Err(e) => (StatusCode::NOT_FOUND, format!("cannot resolve {spec}: {}", e.reason)).into_response(),
     }
 }
 
@@ -379,18 +389,27 @@ async fn ssr_module(
         return (StatusCode::BAD_REQUEST, "id required").into_response();
     };
     let path = PathBuf::from(id);
-    let source = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) => return (StatusCode::NOT_FOUND, format!("{id}: {e}")).into_response(),
+    // Real file, or — for a plugin-resolved id with no file (a virtual module) —
+    // the "ssr" plugin host's load hook.
+    let (source, from_plugin) = match std::fs::read_to_string(&path) {
+        Ok(s) => (s, false),
+        Err(read_err) => match ssr_plugin_host(&state).await {
+            Some(host) => match host.load(id).await {
+                Ok(Some(code)) => (code, true),
+                _ => return (StatusCode::NOT_FOUND, format!("{id}: {read_err}")).into_response(),
+            },
+            None => return (StatusCode::NOT_FOUND, format!("{id}: {read_err}")).into_response(),
+        },
     };
     let ext = path.extension().and_then(|e| e.to_str());
-    if matches!(ext, Some("css") | Some("scss") | Some("sass")) {
+    // CSS/JSON handling is for real files only; virtual modules are JS.
+    if !from_plugin && matches!(ext, Some("css") | Some("scss") | Some("sass")) {
         return match ssr_css_module(&state.root, &path, &source) {
             Ok(code) => js_owned(code),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
     }
-    if ext == Some("json") {
+    if !from_plugin && ext == Some("json") {
         return match oj_compiler::json::to_esm(&source, id) {
             Ok(code) => js_owned(code),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
@@ -403,7 +422,11 @@ async fn ssr_module(
         Some(host) => host.transform(&source, id).await.unwrap_or(source),
         None => source,
     };
-    match oj_compiler::compile(&path, &source, &oj_compiler::CompileOptions::prod()) {
+    // A virtual id has no usable file extension; compile it as TSX so the JS/TS
+    // parser runs (mirrors the client's serve_plugin_id).
+    let compile_path: PathBuf =
+        if from_plugin { PathBuf::from("virtual.tsx") } else { path };
+    match oj_compiler::compile(&compile_path, &source, &oj_compiler::CompileOptions::prod()) {
         Ok(out) => js_owned(out.code),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
