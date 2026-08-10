@@ -120,7 +120,13 @@ try {
     throw new Error("/about did not render its title + meta");
   }
   if (!user.includes("<title>User 42 - oj</title>")) throw new Error("/users/42 did not render its param title");
-  console.log("ssr-dev: per-route head/meta ok (titles + meta in <head>, page overrides layout)");
+  // Open Graph: site-wide tags from the root layout, per-route og:title merged.
+  if (!first.includes('property="og:site_name" content="oj"')) throw new Error("layout og:site_name missing on /");
+  if (!about.includes('property="og:title" content="About oj"')) throw new Error("/about og:title missing");
+  if (!user.includes('property="og:title" content="User 42"') || !user.includes('property="og:site_name"')) {
+    throw new Error("/users/42 did not merge page og:title with layout og:site_name");
+  }
+  console.log("ssr-dev: per-route head/meta + Open Graph ok (title/name/property, page overrides layout)");
 
   // 1d. Route data loading: the loaders ran server-side, the whole chain's data
   //     map is serialized, and each level rendered with its own slice.
@@ -231,8 +237,12 @@ try {
       if ((await lp.locator("[data-layout-count]").textContent()) !== "2") {
         throw new Error("section layout remounted (state lost) on intra-section navigation");
       }
-      // The head/title updates on client navigation.
+      // The head/title AND Open Graph tags update on client navigation.
       await lp.waitForFunction(() => document.title === "User 43 - oj", { timeout: 3000 });
+      await lp.waitForFunction(
+        () => document.querySelector('meta[property="og:title"]')?.content === "User 43",
+        { timeout: 3000 },
+      );
       await lp.locator('a[href="/"]').click(); // leave the section
       await lp.waitForSelector('[data-page="home"]');
       await lp.waitForFunction(() => document.title === "Home - oj", { timeout: 3000 });

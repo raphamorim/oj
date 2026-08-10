@@ -10,7 +10,11 @@ export async function loader(_args: LoaderArgs) {
 }
 
 export function meta() {
-  return [{ title: "About - oj" }, { name: "description", content: "the about page" }];
+  return [
+    { title: "About - oj" },
+    { name: "description", content: "the about page" },
+    { property: "og:title", content: "About oj" },
+  ];
 }
 
 export default function About({ data }: { data: RouteData }) {

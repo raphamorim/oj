@@ -8,7 +8,12 @@ export function loader() {
 
 // Default head for every route; deeper routes override the title.
 export function meta() {
-  return [{ title: "oj app" }, { name: "generator", content: "oj" }];
+  return [
+    { title: "oj app" },
+    { name: "generator", content: "oj" },
+    { property: "og:site_name", content: "oj" },
+    { property: "og:type", content: "website" },
+  ];
 }
 
 export default function RootLayout({ children, data }: { children: ReactNode; data: RouteData }) {

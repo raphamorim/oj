@@ -110,8 +110,11 @@ try {
     throw new Error("per-layout loader data missing on /users/7");
   }
   if (about.includes('data-layout="users"')) throw new Error("users layout leaked onto /about");
-  // Per-route head/meta rendered into <head>.
+  // Per-route head/meta (incl. Open Graph) rendered into <head>.
   if (!user.includes("<title>User 7 - oj</title>")) throw new Error("/users/7 route title missing from head");
+  if (!user.includes('property="og:title" content="User 7"') || !user.includes('property="og:site_name"')) {
+    throw new Error("/users/7 Open Graph tags missing/unmerged");
+  }
   if (!about.includes("<title>About - oj</title>") || !about.includes('name="description"')) {
     throw new Error("/about title/meta missing from head");
   }

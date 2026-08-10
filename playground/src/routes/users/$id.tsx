@@ -7,9 +7,12 @@ export function loader({ params }: LoaderArgs) {
   return { id: params.id, likes: getLikes() };
 }
 
-// Title from the route param.
+// Title + Open Graph title from the route param.
 export function meta({ params }: LoaderArgs) {
-  return [{ title: `User ${params.id} - oj` }];
+  return [
+    { title: `User ${params.id} - oj` },
+    { property: "og:title", content: `User ${params.id}` },
+  ];
 }
 
 export default function User({ data, params }: { data: RouteData; params: Record<string, string> }) {

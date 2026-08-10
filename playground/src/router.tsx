@@ -7,7 +7,8 @@ export type { NavState, RouteData } from "@/ui";
 export type DataMap = Record<string, RouteData>;
 export type LoaderArgs = { params: Record<string, string>; url: string; body?: string };
 export type MetaArgs = { params: Record<string, string>; url: string; data: RouteData };
-export type MetaDescriptor = { title?: string; name?: string; content?: string };
+// A `<title>`, a named `<meta name>`, or an Open Graph `<meta property>` tag.
+export type MetaDescriptor = { title?: string; name?: string; property?: string; content?: string };
 type MetaFn = (args: MetaArgs) => MetaDescriptor[];
 type PageModule = {
   default: ComponentType<{ data: RouteData; params: Record<string, string> }>;
@@ -115,17 +116,20 @@ export function resolveMeta(url: string, data: DataMap): MetaDescriptor[] {
   if (!m) return [];
   let title: string | undefined;
   const byName = new Map<string, string>();
+  const byProperty = new Map<string, string>(); // Open Graph et al.
   for (const n of [...m.layouts, m.page]) {
     const meta = cache.get(n.id)?.meta;
     if (typeof meta !== "function") continue;
     for (const d of meta({ params: m.params, url, data: data[n.id] ?? null })) {
       if (d.title !== undefined) title = d.title;
       else if (d.name) byName.set(d.name, d.content ?? "");
+      else if (d.property) byProperty.set(d.property, d.content ?? "");
     }
   }
   const out: MetaDescriptor[] = [];
   if (title !== undefined) out.push({ title });
   for (const [name, content] of byName) out.push({ name, content });
+  for (const [property, content] of byProperty) out.push({ property, content });
   return out;
 }
 
@@ -135,11 +139,11 @@ const escapeHtml = (s: string) =>
 // Server: render descriptors to head HTML for the SSR shell.
 export function metaToHtml(descriptors: MetaDescriptor[]): string {
   return descriptors
-    .map((d) =>
-      d.title !== undefined
-        ? `<title>${escapeHtml(d.title)}</title>`
-        : `<meta data-oj-meta name="${escapeHtml(d.name ?? "")}" content="${escapeHtml(d.content ?? "")}">`,
-    )
+    .map((d) => {
+      if (d.title !== undefined) return `<title>${escapeHtml(d.title)}</title>`;
+      const attr = d.property ? `property="${escapeHtml(d.property)}"` : `name="${escapeHtml(d.name ?? "")}"`;
+      return `<meta data-oj-meta ${attr} content="${escapeHtml(d.content ?? "")}">`;
+    })
     .join("\n");
 }
 
@@ -150,10 +154,10 @@ export function applyMeta(descriptors: MetaDescriptor[]): void {
   for (const d of descriptors) {
     if (d.title !== undefined) {
       document.title = d.title;
-    } else if (d.name) {
+    } else if (d.name || d.property) {
       const el = document.createElement("meta");
       el.setAttribute("data-oj-meta", "");
-      el.setAttribute("name", d.name);
+      el.setAttribute(d.property ? "property" : "name", (d.property ?? d.name)!);
       el.setAttribute("content", d.content ?? "");
       document.head.appendChild(el);
     }
