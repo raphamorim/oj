@@ -137,6 +137,9 @@ impl PluginHost {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
+            // Never outlive oj: a one-shot build drops the host when done, and
+            // the dev server drops it on shutdown. Prevents leaked node procs.
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| anyhow::anyhow!("cannot spawn node for plugin host: {e}"))?;
         let stdin = child.stdin.take().expect("piped stdin");

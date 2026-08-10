@@ -34,6 +34,11 @@ execSync(`${path.join(repo, "target", "debug", "oj")} build playground --ssr src
 const serverJs = path.join(out, "server.mjs");
 if (!fs.existsSync(path.join(out, "entry-server.mjs"))) throw new Error("no server bundle emitted");
 if (!fs.existsSync(serverJs)) throw new Error("no server.mjs emitted");
+// User plugins run in the SSR build (ssr environment): entry-server imports a
+// plugin virtual module, so its source must be bundled in.
+if (!fs.readFileSync(path.join(out, "entry-server.mjs"), "utf8").includes("hello from plugin")) {
+  throw new Error("SSR build did not run plugin resolveId/load (virtual module absent from server bundle)");
+}
 const assetFiles = fs.readdirSync(path.join(out, "assets"));
 const clientAsset = assetFiles.find((f) => /^entry-client-.*\.js$/.test(f));
 if (!clientAsset) throw new Error("no hashed client hydration bundle emitted");

@@ -1,5 +1,10 @@
 import { renderToReadableStream, renderToString } from "react-dom/server";
 import { App, actionRoute, loadRouteData, metaToHtml, preloadRoute, resolveMeta, type DataMap } from "@/router";
+// Server-only: a plugin virtual module. entry-server is not in the client
+// bundle, so this exercises the SSR build's plugin resolveId/load without any
+// hydration concern. The globalThis assignment is a side effect (not tree-shaken).
+import { info as pluginInfo } from "virtual:plugin-greeting";
+(globalThis as Record<string, unknown>).__OJ_SSR_PLUGIN = pluginInfo;
 
 // Loader: preloads the matched chunks, then runs every loader in the chain.
 export function load(url = "/"): Promise<DataMap> {

@@ -232,7 +232,9 @@ async function setupConfigureServer() {
   middlewarePort = srv.address().port;
   process.stderr.write(`oj plugin host: configureServer middleware on :${middlewarePort}\n`);
 }
-await setupConfigureServer();
+// configureServer is a dev-server hook (Vite runs it only in dev). Skipping it
+// in `build` also avoids leaving an http.Server that keeps this process alive.
+if (env.command !== "build") await setupConfigureServer();
 
 // transform chains through all plugins (Rollup semantics); returns the final code.
 async function transform(code, id) {

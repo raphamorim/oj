@@ -257,22 +257,23 @@ async fn user_plugin_host(
     base: &str,
     define: &serde_json::Value,
     environments: &serde_json::Value,
+    env_name: &str,
 ) -> Option<Arc<PluginHost>> {
     let file = oj_server::plugins::plugins_file(root)?;
     let config = serde_json::json!({
         "config": { "root": root.display().to_string(), "base": base, "mode": "production", "command": "build", "define": define, "environments": environments },
         "env": { "command": "build", "mode": "production" },
-        // The app build is the "client" environment (Vite Environment API).
-        "environment": { "name": "client", "mode": "production" },
+        // Which Vite environment this build represents ("client" or "ssr").
+        "environment": { "name": env_name, "mode": "production" },
     })
     .to_string();
     match PluginHost::spawn(root, &file, &config).await {
         Ok(host) => {
-            println!("oj build: plugins from {}", file.file_name().unwrap().to_string_lossy());
+            println!("oj build ({env_name}): plugins from {}", file.file_name().unwrap().to_string_lossy());
             Some(host)
         }
         Err(e) => {
-            eprintln!("oj build: plugin host failed to start: {e}");
+            eprintln!("oj build ({env_name}): plugin host failed to start: {e}");
             None
         }
     }
@@ -338,9 +339,14 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         .collect();
 
     let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
-    let plugin_host =
-        user_plugin_host(&root, &base, &serde_json::json!(config.define), &serde_json::json!(config.environments))
-            .await;
+    let plugin_host = user_plugin_host(
+        &root,
+        &base,
+        &serde_json::json!(config.define),
+        &serde_json::json!(config.environments),
+        "client",
+    )
+    .await;
     let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
     if let Some(host) = &plugin_host {
         if let Err(e) = host.build_start().await {
@@ -586,6 +592,20 @@ pub(crate) async fn build_ssr(
     let started = Instant::now();
     let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
 
+    // User plugins run in the SSR build as the "ssr" environment, so
+    // resolveId/load/transform (and applyToEnvironment("ssr")) apply to server
+    // modules — parity with the dev SSR runner.
+    let config = oj_config::load(root).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ssr_base = config.base.clone().unwrap_or_else(|| "/".into());
+    let plugin_host = user_plugin_host(
+        root,
+        &ssr_base,
+        &serde_json::json!(config.define),
+        &serde_json::json!(config.environments),
+        "ssr",
+    )
+    .await;
+
     // Externalize a module once it resolves into node_modules (Node requires
     // those at runtime); aliases (`@/…`) and relative imports resolve to
     // source and stay bundled.
@@ -594,8 +614,16 @@ pub(crate) async fn build_ssr(
         Box::pin(async move { Ok(ext) })
     })));
 
+    let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
+    if let Some(host) = &plugin_host {
+        if let Err(e) = host.build_start().await {
+            eprintln!("oj build (ssr): plugin buildStart failed: {e}");
+        }
+        oj_plugins.push(Arc::new(OjUserPlugin { host: Arc::clone(host) }));
+    }
+    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf() }));
     let mut bundler = BundlerBuilder::default()
-        .with_plugins(vec![Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf() })])
+        .with_plugins(oj_plugins)
         .with_options(BundlerOptions {
             input: Some(vec![InputItem {
                 name: Some(stem.clone()),
@@ -632,6 +660,12 @@ pub(crate) async fn build_ssr(
         .write()
         .await
         .map_err(|errs| anyhow::anyhow!("ssr build failed:\n{errs:?}"))?;
+
+    if let Some(host) = &plugin_host {
+        if let Err(e) = host.build_end().await {
+            eprintln!("oj build (ssr): plugin buildEnd failed: {e}");
+        }
+    }
 
     let mut emitted: Vec<(String, usize)> = Vec::new();
     for asset in &output.assets {
