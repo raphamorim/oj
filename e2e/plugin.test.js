@@ -41,12 +41,15 @@ const path = require("node:path");
     // this.load + getModuleInfo on Counter: importedIds count : code has useState.
     const modinfo = await page.getAttribute("[data-modinfo]", "data-modinfo");
     if (modinfo !== "3:true") throw new Error("getModuleInfo/this.load wrong (expected 3:true): " + modinfo);
+    // this.getModuleIds sees App.tsx (being transformed) + the loaded Counter.
+    const moduleids = await page.getAttribute("[data-moduleids]", "data-moduleids");
+    if (moduleids !== "2") throw new Error("getModuleIds wrong (expected 2): " + moduleids);
     // buildStart fired at dev-server startup, writing the command ("serve").
     const marker = path.join(__dirname, "..", "playground", ".oj-cache", "plugin-buildstart");
     const buildStart = fs.existsSync(marker) ? fs.readFileSync(marker, "utf8").trim() : "MISSING";
     if (buildStart !== "serve") throw new Error("buildStart marker wrong (expected serve): " + buildStart);
     if (errors.length) throw new Error("console errors");
-    console.log("PLUGIN transform + config + transformIndexHtml + enforce/apply + buildStart + this.resolve + getModuleInfo HOOKS VERIFIED");
+    console.log("PLUGIN transform + config + transformIndexHtml + enforce/apply + buildStart + this.resolve + getModuleInfo + getModuleIds HOOKS VERIFIED");
   } finally {
     await browser.close();
   }

@@ -57,6 +57,13 @@ const emitted = [];
 // for modules already loaded into the graph and null otherwise.
 const moduleInfoCache = new Map();
 
+// Files a plugin registered via this.addWatchFile (dev watcher pulls these).
+const watchedFiles = new Set();
+// Module ids the host has observed (every transform id + this.load-ed id).
+// getModuleIds returns this — a subset of Rollup's whole-graph view, honest
+// about being "modules the plugin host has seen".
+const seenIds = new Set();
+
 // Rollup plugin context. Covers warn/error, this.resolve (async, via oj's
 // resolver), and this.emitFile/getFileName (asset form) used by real plugins.
 const ctx = {
@@ -91,13 +98,24 @@ const ctx = {
   async load(options) {
     const id = typeof options === "string" ? options : options.id;
     const info = await ctxRpc("moduleInfo", [id]);
-    if (info) moduleInfoCache.set(info.id, info);
+    if (info) {
+      moduleInfoCache.set(info.id, info);
+      seenIds.add(info.id);
+    }
     return info;
   },
   // this.getModuleInfo(id) -> cached ModuleInfo | null. Synchronous (Rollup
   // shape): only modules previously this.load-ed are present.
   getModuleInfo(id) {
     return moduleInfoCache.get(typeof id === "string" ? id : id.id) ?? null;
+  },
+  // this.addWatchFile(id): watch an extra file; a change forces a dev reload.
+  addWatchFile(id) {
+    if (id) watchedFiles.add(String(id));
+  },
+  // this.getModuleIds() -> iterator over observed module ids (Rollup shape).
+  getModuleIds() {
+    return seenIds.values();
   },
 };
 
@@ -130,6 +148,7 @@ await runConfigHooks();
 
 // transform chains through all plugins (Rollup semantics); returns the final code.
 async function transform(code, id) {
+  if (id) seenIds.add(id);
   let current = code;
   for (const p of plugins) {
     if (typeof p.transform !== "function") continue;
@@ -241,6 +260,8 @@ async function run(hook, args) {
   if (hook === "getEmittedFiles") {
     return JSON.stringify(emitted.map(({ fileName, source }) => ({ fileName, source })));
   }
+  // Files registered via this.addWatchFile, for the dev watcher.
+  if (hook === "getWatchFiles") return JSON.stringify([...watchedFiles]);
   return null;
 }
 

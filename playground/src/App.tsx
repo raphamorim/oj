@@ -35,6 +35,8 @@ export function App() {
       <div data-resolved="__RESOLVED__" hidden />
       {/* Filled via this.load + getModuleInfo on Counter: expect 3:true. */}
       <div data-modinfo="__MODINFO__" hidden />
+      {/* Filled via this.getModuleIds (App.tsx + loaded Counter): expect 2. */}
+      <div data-moduleids="__MODULEIDS__" hidden />
       <HmrDemo />
     </main>
   );

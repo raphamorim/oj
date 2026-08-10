@@ -239,6 +239,16 @@ impl PluginHost {
         self.call("buildEnd", &[]).await.map(|_| ())
     }
 
+    /// Files plugins registered via `this.addWatchFile`. The dev watcher forces
+    /// a full reload when one of these changes (even a non-source file oj would
+    /// otherwise ignore). Absolute paths as the plugin passed them.
+    pub async fn watch_files(&self) -> Result<Vec<String>, String> {
+        let Some(json) = self.call("getWatchFiles", &[]).await? else {
+            return Ok(Vec::new());
+        };
+        serde_json::from_str(&json).map_err(|e| e.to_string())
+    }
+
     /// Collect the assets plugins emitted via `this.emitFile` during the build,
     /// so the build can write them to the output dir.
     pub async fn emitted_files(&self) -> Result<Vec<EmittedFile>, String> {

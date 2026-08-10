@@ -86,6 +86,9 @@ jobs:
           # this.load + getModuleInfo: Counter's imported-id count and code probe
           grep -rq '3:true' playground/dist/assets/*.js
           ! grep -rq __MODINFO__ playground/dist/assets/*.js
+          # this.getModuleIds: the marker was replaced during transform
+          grep -rq 'data-moduleids' playground/dist/assets/*.js
+          ! grep -rq __MODULEIDS__ playground/dist/assets/*.js
       - name: library build
         run: |
           mkdir -p /tmp/lib/src

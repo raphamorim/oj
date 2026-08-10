@@ -1,4 +1,5 @@
 import { writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 // buildStart / buildEnd lifecycle hooks. Captures the command from the resolved
 // config, then drops marker files at each phase so the runtime can prove they
@@ -51,7 +52,30 @@ function ctxPlugin() {
         const hasHook = loaded ? loaded.code.includes("useState") : false;
         out = out.replace("__MODINFO__", `${n}:${hasHook}`);
       }
+      if (out.includes("__MODULEIDS__")) {
+        // getModuleIds returns every id the host has observed. App.tsx is here
+        // (it's being transformed) and Counter once this.load-ed -> expect 2.
+        const r = await this.resolve("@/Counter", id);
+        if (r) await this.load({ id: r.id });
+        const ids = [...this.getModuleIds()];
+        const present = [id, r && r.id].filter((x) => x && ids.includes(x)).length;
+        out = out.replace("__MODULEIDS__", String(present));
+      }
       return out === code ? null : out;
+    },
+  };
+}
+
+// Uses this.addWatchFile to watch an external, non-source file. oj ignores a
+// plain .txt change by default, but because the plugin registered it during
+// transform, the dev watcher forces a full reload when it changes.
+function watchPlugin() {
+  return {
+    name: "oj-watch",
+    transform(code, id) {
+      if (!id.endsWith("App.tsx")) return null;
+      this.addWatchFile(resolve("plugin-watched.txt"));
+      return null; // side-effect only
     },
   };
 }
@@ -164,6 +188,7 @@ function applyPlugin(tag, apply) {
 export default [
   lifecyclePlugin(),
   ctxPlugin(),
+  watchPlugin(),
   markerPlugin(),
   virtualPlugin(),
   configPlugin(),

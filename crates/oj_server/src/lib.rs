@@ -1822,6 +1822,20 @@ fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
     let mut messages: Vec<String> = Vec::new();
     let mut updates: Vec<serde_json::Value> = Vec::new();
 
+    // Files plugins registered via this.addWatchFile — a change to one forces a
+    // full reload even if oj would otherwise ignore the file. Fetched once per
+    // burst (canonicalized so /tmp vs /private/tmp style aliases still match).
+    let plugin_watched: std::collections::HashSet<PathBuf> = match &state.plugins {
+        Some(host) => state
+            .rt
+            .block_on(host.watch_files())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| std::fs::canonicalize(&p).unwrap_or_else(|_| PathBuf::from(p)))
+            .collect(),
+        None => Default::default(),
+    };
+
     // Any source change can mint new utility classes: refresh tailwind css.
     let source_changed = paths.iter().any(|p| {
         !p.components().any(|c| {
@@ -1869,6 +1883,18 @@ fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
                     return messages;
                 }
                 _ => {}
+            }
+        }
+
+        // A plugin-watched file (this.addWatchFile): force a full reload.
+        if !plugin_watched.is_empty() {
+            let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            if plugin_watched.contains(&canon) {
+                println!("oj: change {} -> full-reload (plugin watch)", path.display());
+                messages.push(
+                    serde_json::json!({ "type": "full-reload", "reason": "plugin-watch" }).to_string(),
+                );
+                return messages;
             }
         }
 
