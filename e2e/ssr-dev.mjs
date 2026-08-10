@@ -186,6 +186,21 @@ try {
   }
   console.log("ssr-dev: hydration wiring + class parity ok");
 
+  // 3b. Per-environment plugin pipelines (Vite Environment API). The SSR module
+  //     compile runs the "ssr" plugin host; the dev pipeline runs the "client"
+  //     one. applyToEnvironment gates each plugin to exactly one — a clean
+  //     mirror on the same source file.
+  {
+    const appAbs = path.join(repo, "playground", "src", "App.tsx");
+    const ssrMod = await (await fetch(`${base}/@ssr-module?id=${encodeURIComponent(appAbs)}`)).text();
+    if (!ssrMod.includes("ssr-ran")) throw new Error("ssr env: applyToEnvironment('ssr') plugin did not run server-side");
+    if (!ssrMod.includes("__ENV_CLIENT__")) throw new Error("ssr env: client-gated plugin must NOT run server-side");
+    const clientMod = await (await fetch(`${base}/src/App.tsx`)).text();
+    if (!clientMod.includes("client-ran")) throw new Error("client env: client plugin did not run");
+    if (!clientMod.includes("__ENV_SSR__")) throw new Error("client env: ssr-gated plugin must NOT run in client");
+    console.log("ssr-dev: per-environment plugin pipelines ok (ssr host transforms server modules)");
+  }
+
   // 4. Real SSR HMR: hot edit applies with state preserved and no reload.
   let pw = null;
   try {

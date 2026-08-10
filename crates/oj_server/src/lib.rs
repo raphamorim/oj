@@ -109,6 +109,14 @@ struct ServerState {
     /// plugin registered dev-server middleware. Requests oj can't serve are
     /// forwarded here before the SPA fallback / 404.
     plugin_mw_port: Option<u16>,
+    /// A second plugin host running as the "ssr" environment (Vite Environment
+    /// API), lazily spawned the first time an SSR module is compiled so plain
+    /// `oj dev` never pays for it. Its transform runs on server modules, so
+    /// `applyToEnvironment("ssr")` plugins actually execute.
+    plugins_ssr: tokio::sync::OnceCell<Option<std::sync::Arc<PluginHost>>>,
+    /// Prebuilt config JSON for the "ssr" host (identical to the client host's
+    /// but `environment.name` is "ssr").
+    ssr_plugin_config: String,
     /// Runtime handle so the sync file-watcher thread can call async plugin
     /// hooks (handleHotUpdate).
     rt: tokio::runtime::Handle,
@@ -198,6 +206,22 @@ impl DevServer {
             "environment": { "name": "client", "mode": "development" },
         })
         .to_string();
+        // Same config, but tagged as the "ssr" environment — used to lazily
+        // spawn a second host that transforms server modules (see ssr_module).
+        let ssr_plugin_config = serde_json::json!({
+            "config": {
+                "root": root.display().to_string(),
+                "base": config.base.clone().unwrap_or_else(|| "/".into()),
+                "mode": "development",
+                "command": "serve",
+                "define": config.define,
+                "server": { "port": port, "host": server_cfg.host },
+                "environments": config.environments,
+            },
+            "env": { "command": "serve", "mode": "development" },
+            "environment": { "name": "ssr", "mode": "development" },
+        })
+        .to_string();
         let plugin_host = match plugins::plugins_file(&root) {
             Some(file) => match PluginHost::spawn(&root, &file, &plugin_config).await {
                 Ok(host) => {
@@ -256,6 +280,8 @@ impl DevServer {
             virtual_modules: config.virtual_modules.clone().unwrap_or_default(),
             plugins: plugin_host,
             plugin_mw_port,
+            plugins_ssr: tokio::sync::OnceCell::new(),
+            ssr_plugin_config,
             rt: tokio::runtime::Handle::current(),
         });
         {
@@ -370,10 +396,39 @@ async fn ssr_module(
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
         };
     }
+    // Run user plugins' transform as the "ssr" environment before compiling, so
+    // applyToEnvironment("ssr") plugins execute on server modules (the client
+    // host, a different environment, transforms the browser copy separately).
+    let source = match ssr_plugin_host(&state).await {
+        Some(host) => host.transform(&source, id).await.unwrap_or(source),
+        None => source,
+    };
     match oj_compiler::compile(&path, &source, &oj_compiler::CompileOptions::prod()) {
         Ok(out) => js_owned(out.code),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
+}
+
+/// The lazily-spawned "ssr" environment plugin host (spawned on first use so
+/// plain `oj dev` never starts it). `None` if the app has no plugins.
+async fn ssr_plugin_host(state: &Arc<ServerState>) -> Option<std::sync::Arc<PluginHost>> {
+    state
+        .plugins_ssr
+        .get_or_init(|| async {
+            let file = plugins::plugins_file(&state.root)?;
+            match PluginHost::spawn(&state.root, &file, &state.ssr_plugin_config).await {
+                Ok(host) => {
+                    eprintln!("oj ssr: plugins (ssr environment) from {}", file.display());
+                    Some(host)
+                }
+                Err(e) => {
+                    eprintln!("oj ssr: plugin host failed to start: {e}");
+                    None
+                }
+            }
+        })
+        .await
+        .clone()
 }
 
 /// Compile a (possibly CSS-module / Sass) stylesheet into an ESM module for the
