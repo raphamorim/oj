@@ -107,6 +107,18 @@ async function linker(spec, referencing) {
   return dep;
 }
 
+// Dynamic import() inside a module (e.g. a lazy `import.meta.glob` for
+// route-level code splitting): resolve, build, and EVALUATE the target, then
+// hand back its namespace/module.
+async function importDynamic(spec, referencing) {
+  const r = await resolve(referencing.identifier, spec);
+  if (r.external) return import(r.spec);
+  const dep = await build(r.id);
+  registry.get(r.id).importers.add(referencing.identifier);
+  if (dep.status === "linked") await dep.evaluate();
+  return dep;
+}
+
 // Single-flight per id: concurrent importers (e.g. several routes importing the
 // same module via an eager glob) must share ONE instance. Without this, each
 // caller checks the registry before the first `await` registers the module, and
@@ -126,6 +138,7 @@ async function build(id) {
       initializeImportMeta(meta) {
         meta.url = `file://${id}`;
       },
+      importModuleDynamically: (spec, ref) => importDynamic(spec, ref),
     });
     // Register before linking so import cycles resolve to this instance.
     registry.set(id, { mod, mtime: mtimeOf(id), importers: new Set(), evaluated: false });

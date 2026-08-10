@@ -34,14 +34,26 @@ execSync(`${path.join(repo, "target", "debug", "oj")} build playground --ssr src
 const serverJs = path.join(out, "server.mjs");
 if (!fs.existsSync(path.join(out, "entry-server.mjs"))) throw new Error("no server bundle emitted");
 if (!fs.existsSync(serverJs)) throw new Error("no server.mjs emitted");
-const clientAsset = fs.readdirSync(path.join(out, "assets")).find((f) => /^entry-client-.*\.js$/.test(f));
+const assetFiles = fs.readdirSync(path.join(out, "assets"));
+const clientAsset = assetFiles.find((f) => /^entry-client-.*\.js$/.test(f));
 if (!clientAsset) throw new Error("no hashed client hydration bundle emitted");
 console.log("ssr-prod: build emitted server bundle + client assets + server.mjs");
+
+// Route-level code splitting: the entry chunk must NOT inline route bodies;
+// each route is a separate chunk loaded on demand.
+const entryCode = fs.readFileSync(path.join(out, "assets", clientAsset), "utf8");
+if (entryCode.includes("boom: the loader failed")) throw new Error("boom route was bundled into the entry chunk (not split)");
+const boomChunk = assetFiles.find(
+  (f) => f !== clientAsset && f.endsWith(".js") && fs.readFileSync(path.join(out, "assets", f), "utf8").includes("boom: the loader failed"),
+);
+if (!boomChunk) throw new Error("boom route was not emitted as its own chunk");
+console.log(`ssr-prod: route code splitting ok (${assetFiles.filter((f) => f.endsWith(".js")).length} js chunks; boom in ${boomChunk}, not entry)`);
 
 // The server bundle's buffered render() (used as the fallback and by non-server
 // consumers) still works — importing it also proves the Node bundle is valid.
 const mod = await import(pathToFileURL(path.join(out, "entry-server.mjs")).href);
-if (!String(mod.render()).includes("ssr")) throw new Error("buffered render() missing ssr content");
+// render() is async (it preloads the route's code-split chunk first).
+if (!String(await mod.render()).includes("ssr")) throw new Error("buffered render() missing ssr content");
 console.log("ssr-prod: server bundle render() ok (buffered fallback)");
 
 try {

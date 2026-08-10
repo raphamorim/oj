@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { hydrateRoot } from "react-dom/client";
-import { App, ErrorBoundary, NavContext, type DataMap, type NavState } from "@/router";
+import { App, ErrorBoundary, NavContext, preloadRoute, type DataMap, type NavState } from "@/router";
 
 declare global {
   interface Window {
@@ -34,7 +34,8 @@ function Router() {
     const navigate = async (path: string) => {
       setNav("loading");
       try {
-        const { data, error } = await fetchData(path);
+        // Load the route's code-split chunk and its data in parallel.
+        const [{ data, error }] = await Promise.all([fetchData(path), preloadRoute(path)]);
         setRoute({ path, data, error });
       } finally {
         setNav("idle");
@@ -93,4 +94,8 @@ function Router() {
   );
 }
 
-hydrateRoot(document.getElementById("app")!, <Router />);
+// Load the initial route's chunk before hydrating so the tree matches the SSR
+// output (the router renders from the module cache synchronously).
+preloadRoute(location.pathname).then(() => {
+  hydrateRoot(document.getElementById("app")!, <Router />);
+});
