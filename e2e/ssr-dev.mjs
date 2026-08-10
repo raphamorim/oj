@@ -227,6 +227,23 @@ try {
       await lp.close();
       console.log("ssr-dev: nested-layout persistence ok (section state kept, unmounts on leave, root persists)");
 
+      // 4a3. Link prefetch on hover: hovering an internal link warms the target
+      //      route's chunk (and loader data) before any click.
+      const pf = await browser.newPage();
+      const reqs = [];
+      pf.on("request", (r) => reqs.push(r.url()));
+      await pf.goto(`${base}/`, { waitUntil: "networkidle" });
+      const aboutChunk = () => reqs.some((u) => /routes\/about\.tsx/.test(u));
+      if (aboutChunk()) throw new Error("about route was fetched before hover");
+      await pf.locator('a[href="/about"]').hover();
+      await pf.waitForFunction(
+        () => performance.getEntriesByType("resource").some((e) => /routes\/about\.tsx/.test(e.name)),
+        { timeout: 3000 },
+      );
+      if (!aboutChunk()) throw new Error("hovering the link did not prefetch the route chunk");
+      await pf.close();
+      console.log("ssr-dev: link prefetch on hover ok (route chunk warmed before click)");
+
       // 4b. Action + SPA + HMR, all in place, on a clean page (asserts no
       //     unexpected console errors).
       const page = await browser.newPage();

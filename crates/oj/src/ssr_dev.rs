@@ -187,20 +187,34 @@ fn classify(req: &Request, proxy_prefixes: &[String]) -> Route {
 
 /// Send a data command (`load`/`action`) to the runner and return its
 /// serialized loader data (or an error message).
+///
+/// Runs in a DETACHED task so a cancelled HTTP request — an aborted prefetch
+/// when the user moves off a link, say — still drains the runner's one-line
+/// response. Reading it inline would drop the lock mid-protocol on cancel,
+/// leaving a stale line that the next render mis-reads and desyncs on.
 async fn run_data(state: &SsrState, cmd: serde_json::Value) -> Result<String, String> {
-    let mut guard = Arc::clone(&state.runner).lock_owned().await;
-    let line = format!("{cmd}\n");
-    guard.stdin.write_all(line.as_bytes()).await.map_err(|e| e.to_string())?;
-    guard.stdin.flush().await.map_err(|e| e.to_string())?;
-    match read_message(&mut guard.lines).await {
-        Some(v) if v.get("data").and_then(|d| d.as_str()).is_some() => {
-            Ok(v["data"].as_str().unwrap().to_owned())
+    let runner = Arc::clone(&state.runner);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut guard = runner.lock_owned().await;
+        let result = async {
+            let line = format!("{cmd}\n");
+            guard.stdin.write_all(line.as_bytes()).await.map_err(|e| e.to_string())?;
+            guard.stdin.flush().await.map_err(|e| e.to_string())?;
+            match read_message(&mut guard.lines).await {
+                Some(v) if v.get("data").and_then(|d| d.as_str()).is_some() => {
+                    Ok(v["data"].as_str().unwrap().to_owned())
+                }
+                Some(v) if v.get("error").and_then(|e| e.as_str()).is_some() => {
+                    Err(v["error"].as_str().unwrap().to_owned())
+                }
+                _ => Err("SSR runner did not respond".to_string()),
+            }
         }
-        Some(v) if v.get("error").and_then(|e| e.as_str()).is_some() => {
-            Err(v["error"].as_str().unwrap().to_owned())
-        }
-        _ => Err("SSR runner did not respond".to_string()),
-    }
+        .await;
+        let _ = tx.send(result);
+    });
+    rx.await.unwrap_or_else(|_| Err("SSR runner task cancelled".to_string()))
 }
 
 fn data_response(data: Result<String, String>) -> Response {

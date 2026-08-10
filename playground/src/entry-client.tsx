@@ -31,11 +31,16 @@ function Router() {
   const [nav, setNav] = useState<NavState>("idle");
 
   useEffect(() => {
+    // Prefetched loader data by path (the chunk cache lives in preloadRoute).
+    const prefetchedData = new Map<string, Promise<{ data: DataMap; error: string | null }>>();
+
     const navigate = async (path: string) => {
       setNav("loading");
       try {
-        // Load the route's code-split chunk and its data in parallel.
-        const [{ data, error }] = await Promise.all([fetchData(path), preloadRoute(path)]);
+        // Reuse hover-prefetched data if present; load the chunk (cached if
+        // prefetched) alongside.
+        const dataPromise = prefetchedData.get(path) ?? fetchData(path);
+        const [{ data, error }] = await Promise.all([dataPromise, preloadRoute(path)]);
         setRoute({ path, data, error });
       } finally {
         setNav("idle");
@@ -43,18 +48,31 @@ function Router() {
     };
     const onPop = () => navigate(location.pathname);
 
+    // Prefetch on intent (hover/focus): warm the route's chunk and loader data
+    // so the click navigates instantly.
+    const hrefOf = (target: EventTarget | null): string | null => {
+      const anchor = (target as Element)?.closest?.("a");
+      const href = anchor?.getAttribute("href");
+      if (!anchor || anchor.target || !href || !href.startsWith("/")) return null;
+      return href === location.pathname + location.search ? null : href;
+    };
+    const prefetch = (target: EventTarget | null) => {
+      const href = hrefOf(target);
+      if (!href || prefetchedData.has(href)) return;
+      void preloadRoute(href).catch(() => {}); // chunk
+      prefetchedData.set(href, fetchData(href)); // data
+    };
+    const onOver = (e: Event) => prefetch(e.target);
+
     const onClick = (e: MouseEvent) => {
       if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) {
         return;
       }
-      const anchor = (e.target as Element).closest?.("a");
-      const href = anchor?.getAttribute("href");
-      if (!anchor || anchor.target || !href || !href.startsWith("/")) return;
+      const href = hrefOf(e.target);
+      if (!href) return;
       e.preventDefault();
-      if (href !== location.pathname + location.search) {
-        history.pushState(null, "", href);
-        void navigate(location.pathname);
-      }
+      history.pushState(null, "", href);
+      void navigate(location.pathname);
     };
 
     const onSubmit = async (e: SubmitEvent) => {
@@ -70,6 +88,7 @@ function Router() {
           headers: { "oj-loader": "1", "content-type": "application/x-www-form-urlencoded" },
         });
         setRoute((r) => ({ ...r, data, error }));
+        prefetchedData.clear(); // the mutation may have invalidated prefetched data
       } finally {
         setNav("idle");
       }
@@ -78,10 +97,14 @@ function Router() {
     addEventListener("popstate", onPop);
     document.addEventListener("click", onClick);
     document.addEventListener("submit", onSubmit);
+    document.addEventListener("pointerover", onOver);
+    document.addEventListener("focusin", onOver);
     return () => {
       removeEventListener("popstate", onPop);
       document.removeEventListener("click", onClick);
       document.removeEventListener("submit", onSubmit);
+      document.removeEventListener("pointerover", onOver);
+      document.removeEventListener("focusin", onOver);
     };
   }, []);
 
