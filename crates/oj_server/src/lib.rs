@@ -45,6 +45,8 @@ const CLIENT_JS: &str = include_str!("assets/client.js");
 /// Built-in `virtual:oj-routes` module: a file-based route manifest globbed
 /// from `<root>/src/routes`. Shared by the dev server and `oj build`.
 pub const OJ_ROUTES_JS: &str = include_str!("assets/oj-routes.js");
+/// Client runtime for server functions (the `__ojServerCall` RPC helper).
+const SERVER_FN_JS: &str = include_str!("assets/server-fn.js");
 const REFRESH_RUNTIME_JS: &str = include_str!("assets/refresh-runtime.js");
 const REFRESH_PREAMBLE_JS: &str = include_str!("assets/refresh-preamble.js");
 const BUNDLE_RUNTIME_JS: &str = include_str!("assets/bundle-runtime.js");
@@ -329,6 +331,7 @@ impl DevServer {
             .route("/@oj/chunk.js", get(serve_chunk))
             .route("/@oj/patch.js", get(serve_patch))
             .route("/@oj/routes.js", get(serve_oj_routes))
+            .route("/@oj/server-fn.js", get(|| async { js(SERVER_FN_JS) }))
             .route("/@ssr-resolve", get(ssr_resolve))
             .route("/@ssr-module", get(ssr_module))
             .route("/__ws", get(ws_upgrade))
@@ -976,6 +979,25 @@ async fn ensure_module(
         return Ok((String::new(), module));
     }
 
+    // Server functions: a `*.server.*` module never reaches the client — it is
+    // replaced by stubs that RPC to /__oj_fn (served by the SSR dev server).
+    let is_dep_early = url.contains("/node_modules/") || url.starts_with("/@fs/");
+    if is_server_module(file) && !is_dep_early && !state.bundle {
+        let code = server_fn_stub(&oj_compiler::exports(&source, file), url);
+        let module = Arc::new(CachedModule {
+            is_boundary: false,
+            kind: String::new(),
+            code,
+            map_data_url: None,
+            imports: Vec::new(),
+            require_map: Vec::new(),
+            css_exports: Vec::new(),
+            fs_allow: Vec::new(),
+        });
+        register_in_graph(state, url, &module);
+        return Ok((String::new(), module));
+    }
+
     let mode = if state.bundle { "bundle" } else { "dev" };
     let key = state.cache.key(source.as_bytes(), url, mode);
 
@@ -1559,6 +1581,37 @@ fn base64_encode(bytes: &[u8]) -> String {
 /// Serve a plugin-resolved module: run `resolveId(spec, importer)` then
 /// `load(id)`, compile the returned source (TS/JSX strip + import rewrite), and
 /// serve it as a JS module. This is how plugin virtual modules reach the browser.
+/// A `*.server.{ts,tsx,js,jsx}` module — its exports run only on the server and
+/// are replaced by client stubs.
+fn is_server_module(file: &Path) -> bool {
+    file.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| {
+            [".server.ts", ".server.tsx", ".server.js", ".server.jsx"]
+                .iter()
+                .any(|s| n.ends_with(s))
+        })
+        .unwrap_or(false)
+}
+
+/// Client stub module for a server-function module: each export becomes a call
+/// that RPCs to /__oj_fn via the server-fn runtime.
+fn server_fn_stub(exports: &[String], url: &str) -> String {
+    let mut out = String::from("import { __ojServerCall } from \"/@oj/server-fn.js\";\n");
+    for name in exports {
+        if name == "default" {
+            out.push_str(&format!(
+                "export default (...a) => __ojServerCall({url:?}, \"default\", a);\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "export const {name} = (...a) => __ojServerCall({url:?}, {name:?}, a);\n"
+            ));
+        }
+    }
+    out
+}
+
 /// Serve the built-in `virtual:oj-routes` manifest, compiled at the app root so
 /// its `./src/routes/**` glob resolves there (and each route becomes a
 /// code-split lazy import).

@@ -376,7 +376,7 @@ fn parse_snippet<'a>(
     Ok(parsed.program.body.into_iter().collect())
 }
 
-fn export_name(name: &ModuleExportName) -> String {
+pub(crate) fn export_name(name: &ModuleExportName) -> String {
     match name {
         ModuleExportName::IdentifierName(n) => n.name.to_string(),
         ModuleExportName::IdentifierReference(n) => n.name.to_string(),
@@ -384,7 +384,7 @@ fn export_name(name: &ModuleExportName) -> String {
     }
 }
 
-fn binding_names(declaration: &oxc_ast::ast::Declaration) -> Vec<String> {
+pub(crate) fn binding_names(declaration: &oxc_ast::ast::Declaration) -> Vec<String> {
     use oxc_ast::ast::Declaration as D;
     let mut names = Vec::new();
     match declaration {

@@ -187,6 +187,31 @@ async function entryNamespace() {
   return rec.mod.namespace;
 }
 
+// Build + evaluate an arbitrary module by id and return its namespace (used by
+// server-function calls, where the module is not the SSR entry).
+async function moduleNamespace(id) {
+  let rec = registry.get(id);
+  if (!rec || !rec.evaluated) {
+    const mod = await build(id);
+    await mod.evaluate();
+    rec = registry.get(id);
+    rec.evaluated = true;
+  }
+  return rec.mod.namespace;
+}
+
+// Server function: evaluate the (real, server-side) `*.server.*` module and
+// invoke the named export with the client-supplied args.
+async function handleCall(emit, id, name, args) {
+  const ns = await moduleNamespace(id);
+  const fn = name === "default" ? ns.default : ns[name];
+  if (typeof fn !== "function") {
+    throw new Error(`server function "${name}" not found in ${id}`);
+  }
+  const result = await fn(...(Array.isArray(args) ? args : []));
+  emit({ result: JSON.stringify(result ?? null) });
+}
+
 // JSON-serialize loader data with `<` escaped so it can't close the inline
 // <script> the transport embeds it in.
 const serialize = (data) => JSON.stringify(data ?? null).replace(/</g, "\\u003c");
@@ -297,4 +322,5 @@ rl.on("line", (line) => {
   if (msg.cmd === "render") withLock(() => handleRender(emit, url)).catch(fail);
   else if (msg.cmd === "load") withLock(() => handleLoad(emit, url)).catch(fail);
   else if (msg.cmd === "action") withLock(() => handleAction(emit, url, body)).catch(fail);
+  else if (msg.cmd === "call") withLock(() => handleCall(emit, msg.module, msg.name, msg.args)).catch(fail);
 });

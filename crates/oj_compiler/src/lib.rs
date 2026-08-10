@@ -127,6 +127,36 @@ pub fn compile(
     compile_module(path, source_text, opts, None)
 }
 
+/// The module's exported binding names (named exports and re-export specifiers;
+/// `default` when a default export is present). Used to generate client stubs
+/// for server-only (`*.server.*`) modules. Returns empty on a parse failure.
+pub fn exports(source_text: &str, path: &Path) -> Vec<String> {
+    let Ok(source_type) = SourceType::from_path(path) else { return Vec::new() };
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source_text, source_type).parse();
+    if parsed.panicked {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    for stmt in &parsed.program.body {
+        match stmt {
+            // `export const/function/class ...`
+            Statement::ExportDeclaration(decl) => {
+                names.extend(bundle::binding_names(&decl.declaration));
+            }
+            // `export { a, b as c }`
+            Statement::ExportNamedDeclaration(decl) => {
+                for spec in &decl.specifiers {
+                    names.push(bundle::export_name(&spec.exported));
+                }
+            }
+            Statement::ExportDefaultDeclaration(_) => names.push("default".to_string()),
+            _ => {}
+        }
+    }
+    names
+}
+
 pub fn compile_module(
     path: &Path,
     source_text: &str,
@@ -283,6 +313,21 @@ impl<'a> oxc_ast_visit::VisitMut<'a> for DynamicImportRewriter<'a, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exports_lists_named_and_default() {
+        let src = r#"
+export const getUser = async (id) => ({ id });
+export function listUsers() { return []; }
+export class Thing {}
+const x = 1;
+export { x, x as y };
+export default function () {}
+"#;
+        let mut names = exports(src, Path::new("api.server.ts"));
+        names.sort();
+        assert_eq!(names, ["Thing", "default", "getUser", "listUsers", "x", "y"]);
+    }
 
     const APP_TSX: &str = r#"
 interface Props { label: string }

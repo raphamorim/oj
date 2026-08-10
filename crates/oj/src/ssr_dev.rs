@@ -51,6 +51,8 @@ struct SsrState {
     client_url: Option<String>,
     /// `server.proxy` prefixes, which must reach the proxy layer, not SSR.
     proxy_prefixes: Vec<String>,
+    /// App root, to resolve a server-function module URL to its module id.
+    root: PathBuf,
     runner: Arc<tokio::sync::Mutex<Runner>>,
 }
 
@@ -68,6 +70,7 @@ pub async fn ssr_dev(root: PathBuf, entry: String, port: Option<u16>) -> anyhow:
     let ssr_state = Arc::new(SsrState {
         client_url: client_url.clone(),
         proxy_prefixes: built.proxy_prefixes.clone(),
+        root: built.root.clone(),
         runner: Arc::new(tokio::sync::Mutex::new(runner)),
     });
 
@@ -136,6 +139,24 @@ enum Route {
 /// Route app navigations/data/actions to the SSR runner; everything else
 /// (modules, `/@oj/*`, `/@ssr-*`, assets, proxy, `/__ws`) to the dev pipeline.
 async fn ssr_route(State(state): State<Arc<SsrState>>, req: Request, next: Next) -> Response {
+    // Server function RPC: the client stub POSTs {module (url), name, args};
+    // resolve the module to its id and run it on the SSR module runner.
+    if req.method() == axum::http::Method::POST && req.uri().path() == "/__oj_fn" {
+        let bytes = axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024).await.unwrap_or_default();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        let module_url = payload.get("module").and_then(|m| m.as_str()).unwrap_or("");
+        let abs = state.root.join(module_url.trim_start_matches('/'));
+        let cmd = serde_json::json!({
+            "cmd": "call",
+            "module": abs.to_string_lossy(),
+            "name": payload.get("name").cloned().unwrap_or_default(),
+            "args": payload.get("args").cloned().unwrap_or_else(|| serde_json::json!([])),
+        });
+        return match run_call(&state, cmd).await {
+            Ok(json) => ([(header::CONTENT_TYPE, "application/json")], json).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        };
+    }
     match classify(&req, &state.proxy_prefixes) {
         Route::Document => render_route(&state, req.uri().path()).await,
         Route::Loader => {
@@ -204,6 +225,32 @@ async fn run_data(state: &SsrState, cmd: serde_json::Value) -> Result<String, St
             match read_message(&mut guard.lines).await {
                 Some(v) if v.get("data").and_then(|d| d.as_str()).is_some() => {
                     Ok(v["data"].as_str().unwrap().to_owned())
+                }
+                Some(v) if v.get("error").and_then(|e| e.as_str()).is_some() => {
+                    Err(v["error"].as_str().unwrap().to_owned())
+                }
+                _ => Err("SSR runner did not respond".to_string()),
+            }
+        }
+        .await;
+        let _ = tx.send(result);
+    });
+    rx.await.unwrap_or_else(|_| Err("SSR runner task cancelled".to_string()))
+}
+
+/// Like [`run_data`] but reads the runner's `{result}` reply (a server function
+/// call), returning the JSON-serialized result string.
+async fn run_call(state: &SsrState, cmd: serde_json::Value) -> Result<String, String> {
+    let runner = Arc::clone(&state.runner);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut guard = runner.lock_owned().await;
+        let result = async {
+            guard.stdin.write_all(format!("{cmd}\n").as_bytes()).await.map_err(|e| e.to_string())?;
+            guard.stdin.flush().await.map_err(|e| e.to_string())?;
+            match read_message(&mut guard.lines).await {
+                Some(v) if v.get("result").and_then(|d| d.as_str()).is_some() => {
+                    Ok(v["result"].as_str().unwrap().to_owned())
                 }
                 Some(v) if v.get("error").and_then(|e| e.as_str()).is_some() => {
                     Err(v["error"].as_str().unwrap().to_owned())

@@ -218,11 +218,39 @@ try {
     console.log("ssr-dev: plugin resolveId + load ok (virtual module resolves/loads server-side)");
   }
 
-  // 4. Real SSR HMR: hot edit applies with state preserved and no reload.
+  // Playwright is optional (skipped where it isn't installed); shared by the
+  // browser phases below.
   let pw = null;
   try {
     pw = await import("playwright");
-  } catch {} // not installed in this environment
+  } catch {}
+
+  // 3d. Server functions: a `*.server.ts` module is a client stub that RPCs to
+  //     /__oj_fn, where the real function runs on the SSR module runner.
+  if (pw) {
+    const browser = await pw.chromium.launch();
+    try {
+      const sp = await browser.newPage();
+      // The client receives a stub, not the server implementation.
+      const stub = await (await fetch(`${base}/src/greeting.server.ts`)).text();
+      if (!stub.includes("__ojServerCall") || stub.includes("process.versions")) {
+        throw new Error("server module was not replaced by a client stub:\n" + stub);
+      }
+      await sp.goto(`${base}/`, { waitUntil: "domcontentloaded" });
+      const result = await sp.evaluate(async () => {
+        const m = await import("/src/greeting.server.ts");
+        return m.greet("oj");
+      });
+      if (result !== "hello, oj (server=true, call=1)") {
+        throw new Error("server function RPC returned unexpected result: " + JSON.stringify(result));
+      }
+      console.log("ssr-dev: server functions ok (client stub -> /__oj_fn -> server exec)");
+    } finally {
+      await browser.close();
+    }
+  }
+
+  // 4. Real SSR HMR: hot edit applies with state preserved and no reload.
   if (pw) {
     const browser = await pw.chromium.launch();
     try {
