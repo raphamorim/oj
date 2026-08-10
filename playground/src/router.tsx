@@ -6,14 +6,19 @@ export type { NavState, RouteData } from "@/ui";
 
 export type DataMap = Record<string, RouteData>;
 export type LoaderArgs = { params: Record<string, string>; url: string; body?: string };
+export type MetaArgs = { params: Record<string, string>; url: string; data: RouteData };
+export type MetaDescriptor = { title?: string; name?: string; content?: string };
+type MetaFn = (args: MetaArgs) => MetaDescriptor[];
 type PageModule = {
   default: ComponentType<{ data: RouteData; params: Record<string, string> }>;
   loader?: (args: LoaderArgs) => unknown;
   action?: (args: LoaderArgs) => unknown;
+  meta?: MetaFn;
 };
 type LayoutModule = {
   default: ComponentType<{ children: ReactNode; data: RouteData }>;
   loader?: (args: LoaderArgs) => unknown;
+  meta?: MetaFn;
 };
 
 // Route-level code splitting: a LAZY glob gives one dynamic import() per route,
@@ -100,6 +105,59 @@ export async function loadRouteData(url: string): Promise<DataMap> {
     }),
   );
   return Object.fromEntries(entries);
+}
+
+// Collect and merge the matched chain's head descriptors (each node's `meta`
+// gets its own loader-data slice). Deeper routes win: last `title`, last of
+// each named meta.
+export function resolveMeta(url: string, data: DataMap): MetaDescriptor[] {
+  const m = matchRoute(url);
+  if (!m) return [];
+  let title: string | undefined;
+  const byName = new Map<string, string>();
+  for (const n of [...m.layouts, m.page]) {
+    const meta = cache.get(n.id)?.meta;
+    if (typeof meta !== "function") continue;
+    for (const d of meta({ params: m.params, url, data: data[n.id] ?? null })) {
+      if (d.title !== undefined) title = d.title;
+      else if (d.name) byName.set(d.name, d.content ?? "");
+    }
+  }
+  const out: MetaDescriptor[] = [];
+  if (title !== undefined) out.push({ title });
+  for (const [name, content] of byName) out.push({ name, content });
+  return out;
+}
+
+const escapeHtml = (s: string) =>
+  String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+// Server: render descriptors to head HTML for the SSR shell.
+export function metaToHtml(descriptors: MetaDescriptor[]): string {
+  return descriptors
+    .map((d) =>
+      d.title !== undefined
+        ? `<title>${escapeHtml(d.title)}</title>`
+        : `<meta data-oj-meta name="${escapeHtml(d.name ?? "")}" content="${escapeHtml(d.content ?? "")}">`,
+    )
+    .join("\n");
+}
+
+// Client: apply descriptors to the live document on navigation. oj-managed meta
+// tags are replaced wholesale so stale ones from the previous route are cleared.
+export function applyMeta(descriptors: MetaDescriptor[]): void {
+  document.querySelectorAll("meta[data-oj-meta]").forEach((el) => el.remove());
+  for (const d of descriptors) {
+    if (d.title !== undefined) {
+      document.title = d.title;
+    } else if (d.name) {
+      const el = document.createElement("meta");
+      el.setAttribute("data-oj-meta", "");
+      el.setAttribute("name", d.name);
+      el.setAttribute("content", d.content ?? "");
+      document.head.appendChild(el);
+    }
+  }
 }
 
 export async function actionRoute(url: string, body: string): Promise<void> {

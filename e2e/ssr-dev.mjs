@@ -112,6 +112,16 @@ try {
   }
   console.log("ssr-dev: nested layouts + per-layout loaders ok (root, users, page each loaded)");
 
+  // 1f. Per-route head/meta: each route's title/meta is rendered into <head>
+  //     (page title overrides the root layout's; params flow into the title).
+  if (!first.includes("<title>Home - oj</title>")) throw new Error("/ did not render its route title");
+  if (!first.includes('name="generator"')) throw new Error("root-layout meta missing");
+  if (!about.includes("<title>About - oj</title>") || !about.includes('name="description"')) {
+    throw new Error("/about did not render its title + meta");
+  }
+  if (!user.includes("<title>User 42 - oj</title>")) throw new Error("/users/42 did not render its param title");
+  console.log("ssr-dev: per-route head/meta ok (titles + meta in <head>, page overrides layout)");
+
   // 1d. Route data loading: the loaders ran server-side, the whole chain's data
   //     map is serialized, and each level rendered with its own slice.
   if (!first.includes("window.__OJ_DATA__=") || !first.includes('"likes":')) {
@@ -212,6 +222,7 @@ try {
       //      unmounts the section layout but keeps the root layout.
       const lp = await browser.newPage();
       await lp.goto(`${base}/users/42`, { waitUntil: "networkidle" });
+      if ((await lp.title()) !== "User 42 - oj") throw new Error("SSR document title wrong for /users/42");
       await lp.locator("[data-layout-inc]").click();
       await lp.locator("[data-layout-inc]").click();
       if ((await lp.locator("[data-layout-count]").textContent()) !== "2") throw new Error("layout state not set");
@@ -220,12 +231,15 @@ try {
       if ((await lp.locator("[data-layout-count]").textContent()) !== "2") {
         throw new Error("section layout remounted (state lost) on intra-section navigation");
       }
+      // The head/title updates on client navigation.
+      await lp.waitForFunction(() => document.title === "User 43 - oj", { timeout: 3000 });
       await lp.locator('a[href="/"]').click(); // leave the section
       await lp.waitForSelector('[data-page="home"]');
+      await lp.waitForFunction(() => document.title === "Home - oj", { timeout: 3000 });
       if ((await lp.locator('[data-layout="users"]').count()) !== 0) throw new Error("section layout did not unmount");
       if ((await lp.locator('[data-layout="root"]').count()) !== 1) throw new Error("root layout did not persist");
       await lp.close();
-      console.log("ssr-dev: nested-layout persistence ok (section state kept, unmounts on leave, root persists)");
+      console.log("ssr-dev: nested-layout persistence + per-nav title ok (state kept, title 42->43->home)");
 
       // 4a3. Prefetch: links in the viewport warm on load; a below-the-fold
       //      link warms only on hover.

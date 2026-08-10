@@ -507,8 +507,10 @@ createServer(async (req, res) => {
     }
     const data = await load();
     const json = serialize(data);
+    const routeHead = typeof entry.head === "function" ? String(await entry.head(url, data)) : "";
     const HEAD =
       '<!doctype html><html><head><meta charset="utf-8">' +
+      routeHead +
       `<script>window.__OJ_DATA__=${json}</script>` +
       (CLIENT_CSS ? `<link rel="stylesheet" href="${CLIENT_CSS}">` : "") +
       `<script type="module" src="${CLIENT_JS}"></script></head><body><div id="app">`;

@@ -1,9 +1,15 @@
 import { renderToReadableStream, renderToString } from "react-dom/server";
-import { App, actionRoute, loadRouteData, preloadRoute, type DataMap } from "@/router";
+import { App, actionRoute, loadRouteData, metaToHtml, preloadRoute, resolveMeta, type DataMap } from "@/router";
 
 // Loader: preloads the matched chunks, then runs every loader in the chain.
 export function load(url = "/"): Promise<DataMap> {
   return loadRouteData(url);
+}
+
+// The route's <head> (title/meta) as HTML for the SSR shell. Called after load,
+// so the chunks are in cache and loader data is available to meta().
+export function head(url = "/", data: DataMap = {}): string {
+  return metaToHtml(resolveMeta(url, data));
 }
 
 export function action(url = "/", body = ""): Promise<void> {

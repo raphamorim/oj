@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { hydrateRoot } from "react-dom/client";
-import { App, ErrorBoundary, NavContext, preloadRoute, type DataMap, type NavState } from "@/router";
+import { App, ErrorBoundary, NavContext, applyMeta, preloadRoute, resolveMeta, type DataMap, type NavState } from "@/router";
 
 declare global {
   interface Window {
@@ -42,6 +42,7 @@ function Router() {
         const dataPromise = prefetchedData.get(path) ?? fetchData(path);
         const [{ data, error }] = await Promise.all([dataPromise, preloadRoute(path)]);
         setRoute({ path, data, error });
+        applyMeta(resolveMeta(path, data)); // update <title>/meta for the new route
       } finally {
         setNav("idle");
       }
@@ -128,6 +129,7 @@ function Router() {
           headers: { "oj-loader": "1", "content-type": "application/x-www-form-urlencoded" },
         });
         setRoute((r) => ({ ...r, data, error }));
+        applyMeta(resolveMeta(location.pathname, data)); // data-derived meta may have changed
         prefetchedData.clear(); // the mutation may have invalidated prefetched data
       } finally {
         setNav("idle");

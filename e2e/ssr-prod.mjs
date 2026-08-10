@@ -110,6 +110,11 @@ try {
     throw new Error("per-layout loader data missing on /users/7");
   }
   if (about.includes('data-layout="users"')) throw new Error("users layout leaked onto /about");
+  // Per-route head/meta rendered into <head>.
+  if (!user.includes("<title>User 7 - oj</title>")) throw new Error("/users/7 route title missing from head");
+  if (!about.includes("<title>About - oj</title>") || !about.includes('name="description"')) {
+    throw new Error("/about title/meta missing from head");
+  }
   if (!html.includes("window.__OJ_DATA__=") || !html.includes('"likes":') || !html.includes('data-likes="0"')) {
     throw new Error(`route data not loaded/serialized server-side:\n${html}`);
   }

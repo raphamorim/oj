@@ -7,6 +7,11 @@ export function loader({ params }: LoaderArgs) {
   return { id: params.id, likes: getLikes() };
 }
 
+// Title from the route param.
+export function meta({ params }: LoaderArgs) {
+  return [{ title: `User ${params.id} - oj` }];
+}
+
 export default function User({ data, params }: { data: RouteData; params: Record<string, string> }) {
   const next = Number(params.id) + 1;
   return (

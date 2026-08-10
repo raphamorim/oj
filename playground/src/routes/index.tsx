@@ -14,6 +14,10 @@ export async function action(_args: LoaderArgs) {
   addLike();
 }
 
+export function meta() {
+  return [{ title: "Home - oj" }];
+}
+
 export default function Home({ data }: { data: RouteData }) {
   return (
     <main data-page="home">

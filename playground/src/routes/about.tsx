@@ -9,6 +9,10 @@ export async function loader(_args: LoaderArgs) {
   return { likes: getLikes() };
 }
 
+export function meta() {
+  return [{ title: "About - oj" }, { name: "description", content: "the about page" }];
+}
+
 export default function About({ data }: { data: RouteData }) {
   return (
     <main data-page="about">

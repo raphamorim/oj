@@ -216,7 +216,10 @@ async function handleAction(emit, url, body) {
 async function handleRender(emit, url) {
   const ns = await entryNamespace();
   const data = await loadData(ns, url);
-  emit({ data: serialize(data) });
+  // The route's <head> (title/meta) is computed from the chain + data and
+  // injected into the shell alongside the serialized data.
+  const head = typeof ns.head === "function" ? String(await ns.head(url, data)) : "";
+  emit({ data: serialize(data), head });
   if (typeof ns.renderStream === "function") {
     const stream = await ns.renderStream(url, data);
     const reader = stream.getReader();
