@@ -34,10 +34,18 @@ execSync(`${path.join(repo, "target", "debug", "oj")} build playground --ssr src
 const serverJs = path.join(out, "server.mjs");
 if (!fs.existsSync(path.join(out, "entry-server.mjs"))) throw new Error("no server bundle emitted");
 if (!fs.existsSync(serverJs)) throw new Error("no server.mjs emitted");
-// User plugins run in the SSR build (ssr environment): entry-server imports a
-// plugin virtual module, so its source must be bundled in.
+// User plugins run in BOTH SSR-build environments: entry-server (ssr) and
+// entry-client (client) each import a plugin virtual module, so its source must
+// be bundled into both the server bundle and a client asset.
 if (!fs.readFileSync(path.join(out, "entry-server.mjs"), "utf8").includes("hello from plugin")) {
-  throw new Error("SSR build did not run plugin resolveId/load (virtual module absent from server bundle)");
+  throw new Error("ssr build (ssr env) did not run plugin resolveId/load (virtual module absent from server bundle)");
+}
+const clientHasVirtual = fs
+  .readdirSync(path.join(out, "assets"))
+  .filter((f) => f.endsWith(".js"))
+  .some((f) => fs.readFileSync(path.join(out, "assets", f), "utf8").includes("hello from plugin"));
+if (!clientHasVirtual) {
+  throw new Error("ssr build (client env) did not run plugin resolveId/load (virtual module absent from client bundle)");
 }
 const assetFiles = fs.readdirSync(path.join(out, "assets"));
 const clientAsset = assetFiles.find((f) => /^entry-client-.*\.js$/.test(f));

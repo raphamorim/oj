@@ -1,6 +1,11 @@
 import { useEffect, useState } from "react";
 import { hydrateRoot } from "react-dom/client";
 import { App, ErrorBoundary, NavContext, applyMeta, preloadRoute, resolveMeta, type DataMap, type NavState } from "@/router";
+// Client-only: a plugin virtual module, exercising the client hydration
+// bundle's plugin resolveId/load (build_client_entry). Not rendered, so no
+// hydration concern; the globalThis assignment is a side effect (not shaken).
+import { info as pluginInfo } from "virtual:plugin-greeting";
+(globalThis as Record<string, unknown>).__OJ_CLIENT_PLUGIN = pluginInfo;
 
 declare global {
   interface Window {

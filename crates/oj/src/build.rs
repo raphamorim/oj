@@ -828,8 +828,30 @@ async fn build_client_entry(
     let stem = Path::new(entry).file_stem().and_then(|s| s.to_str()).unwrap_or("client").to_string();
     let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
 
+    // User plugins run in the client hydration bundle as the "client"
+    // environment (parity with the dev client pipeline), so a shared module can
+    // use plugin resolveId/load/transform on both the server and client sides.
+    let config = oj_config::load(root).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let client_base = config.base.clone().unwrap_or_else(|| "/".into());
+    let plugin_host = user_plugin_host(
+        root,
+        &client_base,
+        &serde_json::json!(config.define),
+        &serde_json::json!(config.environments),
+        "client",
+    )
+    .await;
+    let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
+    if let Some(host) = &plugin_host {
+        if let Err(e) = host.build_start().await {
+            eprintln!("oj build (client): plugin buildStart failed: {e}");
+        }
+        oj_plugins.push(Arc::new(OjUserPlugin { host: Arc::clone(host) }));
+    }
+    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf() }));
+
     let mut bundler = BundlerBuilder::default()
-        .with_plugins(vec![Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf() })])
+        .with_plugins(oj_plugins)
         .with_options(BundlerOptions {
             input: Some(vec![InputItem { name: Some(stem), import: entry_import, ..Default::default() }]),
             cwd: Some(root.to_path_buf()),
@@ -854,6 +876,12 @@ async fn build_client_entry(
         .write()
         .await
         .map_err(|errs| anyhow::anyhow!("client build failed:\n{errs:?}"))?;
+
+    if let Some(host) = &plugin_host {
+        if let Err(e) = host.build_end().await {
+            eprintln!("oj build (client): plugin buildEnd failed: {e}");
+        }
+    }
 
     let mut js = None;
     for asset in &output.assets {
