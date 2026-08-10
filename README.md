@@ -51,8 +51,6 @@ drives several build environments at once will not work yet.
 oj is meant to run real production React apps without changes to their source.
 The work ahead, roughly in priority order:
 
-- Arbitrary PostCSS pipelines driven by the app's own `postcss.config`, beyond
-  the Tailwind and autoprefixer path that works today.
 - The multi-environment build model: independent client and server module
   graphs, shared plugins, and per-environment output, which modern
   meta-frameworks build on.

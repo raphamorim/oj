@@ -91,6 +91,10 @@ struct ServerState {
     /// (regenerated whenever any source file changes).
     tailwind: tokio::sync::OnceCell<std::sync::Arc<Sidecar>>,
     tailwind_urls: Mutex<std::collections::HashSet<String>>,
+    /// The app has a `postcss.config.*`, so ALL css (not just Tailwind-flagged)
+    /// runs through the CSS sidecar (the app's own PostCSS plugin chain) before
+    /// Lightning — matching Vite. `false` keeps the pure-Rust Lightning path.
+    has_postcss: bool,
     /// Module list persisted by the previous session's crawl: lets a warm
     /// start emit the full modulepreload list immediately, without HTML
     /// ever waiting on the live crawl.
@@ -270,6 +274,7 @@ impl DevServer {
             crawl_done: crawl_rx,
             tailwind: tokio::sync::OnceCell::new(),
             tailwind_urls: Mutex::new(std::collections::HashSet::new()),
+            has_postcss: has_postcss_config(&root),
             fs_allow: Arc::new(Mutex::new(std::collections::HashSet::new())),
             patch_seq: std::sync::atomic::AtomicU64::new(0),
             chunk_cache: Mutex::new(None),
@@ -986,6 +991,17 @@ async fn ensure_module(
         _ => source,
     };
 
+    // Arbitrary PostCSS: with a postcss.config, non-Tailwind .css runs through
+    // the app's PostCSS chain (sidecar) before Lightning below. Tailwind css
+    // already went through the sidecar above and returned; .scss keeps the
+    // sass->Lightning path. Only reached on a cache miss (key is on the raw
+    // source), so cache hits skip the round-trip.
+    let source = if state.has_postcss && file.extension().and_then(|e| e.to_str()) == Some("css") {
+        run_css_sidecar(state, url, &source).await.unwrap_or(source)
+    } else {
+        source
+    };
+
     let root = state.root.clone();
     let resolver = Arc::clone(&state.resolver);
     let fs_allow = Arc::clone(&state.fs_allow);
@@ -1206,6 +1222,24 @@ async fn serve_css_wrapper(state: &Arc<ServerState>, file: &Path, url: &str) -> 
         .into_response()
 }
 
+/// Whether the app has a PostCSS config (so all css goes through the sidecar).
+pub fn has_postcss_config(root: &Path) -> bool {
+    ["postcss.config.js", "postcss.config.cjs", "postcss.config.mjs"]
+        .iter()
+        .any(|f| root.join(f).is_file())
+}
+
+/// Run css through the (lazily-spawned) CSS sidecar — the app's PostCSS chain,
+/// or the Tailwind v4 API when there's no postcss config.
+async fn run_css_sidecar(state: &Arc<ServerState>, url: &str, source: &str) -> Result<String, String> {
+    let sidecar = state
+        .tailwind
+        .get_or_try_init(|| Sidecar::spawn(&state.root))
+        .await
+        .map_err(|e| e.to_string())?;
+    sidecar.compile(source, url).await
+}
+
 /// Compile tailwind-flavored css through the Node sidecar. Never cached:
 /// the output depends on class candidates across the whole app, not on the
 /// css file's own content.
@@ -1214,12 +1248,7 @@ async fn compile_tailwind(
     url: &str,
     source: &str,
 ) -> Result<String, String> {
-    let sidecar = state
-        .tailwind
-        .get_or_try_init(|| Sidecar::spawn(&state.root))
-        .await
-        .map_err(|e| e.to_string())?;
-    let css = sidecar.compile(source, url).await?;
+    let css = run_css_sidecar(state, url, source).await?;
     state.tailwind_urls.lock().unwrap().insert(url.to_string());
     Ok(css)
 }

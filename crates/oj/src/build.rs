@@ -40,6 +40,9 @@ struct OjCssPlugin {
     /// (`/src/x.module.css`) the dev server uses — keeping `oj dev`, `oj build`,
     /// and the SSR/client bundles all in agreement (matters for hydration).
     root: PathBuf,
+    /// App has a postcss.config — run all .css through the sidecar (PostCSS),
+    /// not just Tailwind-flagged css (parity with the dev server).
+    has_postcss: bool,
 }
 
 impl Plugin for OjCssPlugin {
@@ -90,11 +93,14 @@ impl Plugin for OjCssPlugin {
                 let dir = std::path::Path::new(path).parent();
                 source = oj_css::compile_sass(&source, dir).map_err(|e| anyhow::anyhow!(e))?;
             }
-            // `@tailwind` / `@import "tailwindcss"`: expand via the CSS sidecar
-            // (the app's postcss.config, or the Tailwind v4 API) exactly like the
-            // dev server, so JS-imported Tailwind entries build correctly. Plain
-            // CSS skips this and goes straight to Lightning below.
-            if oj_server::sidecar::is_tailwind_css(&source) {
+            // Run css through the CSS sidecar (the app's postcss.config, or the
+            // Tailwind v4 API) exactly like the dev server: for Tailwind-flagged
+            // css always, and for any .css when the app has a postcss.config
+            // (arbitrary PostCSS). Plain css with no postcss config goes straight
+            // to Lightning below.
+            if oj_server::sidecar::is_tailwind_css(&source)
+                || (self.has_postcss && path.ends_with(".css"))
+            {
                 source = expand_css_via_sidecar(&root, std::path::Path::new(path))?;
             }
             // Hash class names from the dev server's root-relative id form.
@@ -534,7 +540,7 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         }
         oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host)))); // before oj:build
     }
-    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf() }));
+    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(&root) }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
         .with_options(BundlerOptions {
@@ -803,7 +809,7 @@ pub(crate) async fn build_ssr(
         }
         oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host))));
     }
-    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf() }));
+    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root) }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
         .with_options(BundlerOptions {
@@ -1031,7 +1037,7 @@ async fn build_client_entry(
         }
         oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host))));
     }
-    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf() }));
+    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root) }));
 
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
@@ -1142,7 +1148,7 @@ async fn build_library(
         }
 
         let mut bundler = BundlerBuilder::default()
-            .with_plugins(vec![Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf() })])
+            .with_plugins(vec![Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root) })])
             .with_options(BundlerOptions {
                 input: Some(vec![InputItem {
                     name: Some(file_name.clone()),
