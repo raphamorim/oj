@@ -17,11 +17,14 @@ const FILE = path.join(__dirname, "..", "playground", "plugin-watched.txt");
   const page = await browser.newPage();
   try {
     // Load the page so App.tsx transforms and the plugin registers the watch.
-    await page.goto("http://localhost:5199/", { waitUntil: "networkidle" });
+    // domcontentloaded (not networkidle) — the HMR WebSocket keeps the
+    // connection live, which makes networkidle flaky under the shared server.
+    await page.goto("http://localhost:5199/", { waitUntil: "domcontentloaded" });
+    await page.waitForSelector("main", { state: "attached", timeout: 15000 });
     await page.evaluate(() => (window.__watch_marker = 77));
     // Change the watched, non-source file: a full reload should drop the marker.
     fs.writeFileSync(FILE, "watched-v2\n");
-    await page.waitForFunction(() => window.__watch_marker === undefined, { timeout: 10000 });
+    await page.waitForFunction(() => window.__watch_marker === undefined, { timeout: 15000 });
     console.log("addWatchFile forced a full reload on a plain .txt change (marker dropped)");
     console.log("PLUGIN addWatchFile HOOK VERIFIED");
   } finally {

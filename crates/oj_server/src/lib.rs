@@ -544,6 +544,52 @@ async fn proxy_middleware(
     }
 }
 
+/// Serve an index.html body: run plugin transformIndexHtml, then inject oj's
+/// dev scripts / bundle scripts. Shared by the direct `/` route and the SPA
+/// history fallback.
+async fn serve_html(state: &ServerState, bytes: Vec<u8>) -> Response {
+    let mut raw = String::from_utf8_lossy(&bytes).into_owned();
+    if let Some(host) = &state.plugins {
+        if let Ok(out) = host.transform_index_html(&raw).await {
+            raw = out;
+        }
+    }
+    let html = if state.bundle {
+        inject_bundle_scripts(raw)
+    } else {
+        inject_module_preloads(inject_dev_scripts(raw), state)
+    };
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
+}
+
+/// Serve the app's root index.html (the SPA fallback target).
+async fn serve_index_html(state: &ServerState) -> Response {
+    match tokio::fs::read(state.root.join("index.html")).await {
+        Ok(bytes) => serve_html(state, bytes).await,
+        Err(_) => (StatusCode::NOT_FOUND, "oj: index.html not found").into_response(),
+    }
+}
+
+/// Whether an unresolved path should fall back to index.html (client-side
+/// routing) rather than 404. True for extension-less paths and browser HTML
+/// navigations; false for oj-internal namespaces, source, and missing assets.
+fn is_spa_navigation(rel: &str, headers: &HeaderMap) -> bool {
+    if rel.starts_with('@')
+        || rel.starts_with("__")
+        || rel.starts_with("src/")
+        || rel.starts_with("node_modules/")
+    {
+        return false;
+    }
+    let last = rel.rsplit('/').next().unwrap_or("");
+    let no_extension = !last.contains('.');
+    let accepts_html = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("text/html"));
+    no_extension || accepts_html
+}
+
 async fn serve_path(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -590,6 +636,13 @@ async fn serve_path(
         match locate(&state.root, rel) {
             Some(file) => file,
             None => {
+                // SPA history fallback: a navigation to a client-router path
+                // (no file extension, or an HTML navigation) serves index.html
+                // so BrowserRouter/etc. can take over. Missing assets and
+                // oj-internal namespaces still 404.
+                if is_spa_navigation(rel, &headers) {
+                    return serve_index_html(&state).await;
+                }
                 return (StatusCode::NOT_FOUND, format!("oj: no such file: /{rel}"))
                     .into_response();
             }
@@ -625,22 +678,7 @@ async fn serve_path(
     }
 
     match tokio::fs::read(&file).await {
-        Ok(bytes) if ext == "html" => {
-            let mut raw = String::from_utf8_lossy(&bytes).into_owned();
-            // Plugin transformIndexHtml runs on the user's HTML first, then oj
-            // injects its dev scripts / preloads.
-            if let Some(host) = &state.plugins {
-                if let Ok(out) = host.transform_index_html(&raw).await {
-                    raw = out;
-                }
-            }
-            let html = if state.bundle {
-                inject_bundle_scripts(raw)
-            } else {
-                inject_module_preloads(inject_dev_scripts(raw), &state)
-            };
-            ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
-        }
+        Ok(bytes) if ext == "html" => serve_html(&state, bytes).await,
         Ok(bytes) if ext == "css" => {
             let source = String::from_utf8_lossy(&bytes).into_owned();
             if is_tailwind_css(&source) {
@@ -2031,5 +2069,27 @@ mod tests {
         assert_eq!(preview_rel("/app/", "/app/").as_deref(), Some("index.html"));
         // traversal denied
         assert_eq!(preview_rel("/../etc/passwd", "/"), None);
+    }
+
+    #[test]
+    fn spa_navigation_falls_back_only_for_routes() {
+        let html = {
+            let mut h = HeaderMap::new();
+            h.insert(header::ACCEPT, "text/html,application/xhtml+xml".parse().unwrap());
+            h
+        };
+        let empty = HeaderMap::new();
+        // Extension-less client routes fall back to index.html.
+        assert!(is_spa_navigation("dashboard", &empty));
+        assert!(is_spa_navigation("users/123/edit", &empty));
+        // A browser HTML navigation falls back even with dots in the path.
+        assert!(is_spa_navigation("report.v2", &html));
+        // Missing assets (has extension, not an HTML nav) stay 404.
+        assert!(!is_spa_navigation("missing.png", &empty));
+        assert!(!is_spa_navigation("assets/app.js", &empty));
+        // oj-internal namespaces and source never fall back.
+        assert!(!is_spa_navigation("@vite/client", &html));
+        assert!(!is_spa_navigation("src/does-not-exist.tsx", &html));
+        assert!(!is_spa_navigation("node_modules/react/missing.js", &html));
     }
 }
