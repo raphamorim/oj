@@ -151,6 +151,30 @@ fn expand_css_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Recursively copy the contents of `src` into `dest` (Vite's publicDir copy).
+/// No-op if `src` doesn't exist. Existing files (e.g. a generated index.html)
+/// are not clobbered by same-named public files.
+fn copy_public_dir(src: &Path, dest: &Path) -> anyhow::Result<()> {
+    if !src.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        if from.is_dir() {
+            fs::create_dir_all(&to)?;
+            copy_public_dir(&from, &to)?;
+        } else if !to.exists() {
+            if let Some(parent) = to.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
 /// Bridges the Node plugin host into the Rolldown build, so the same
 /// Vite/Rollup-style `resolveId`/`load`/`transform` hooks that run in the dev
 /// server also run in `oj build`. Runs before `OjCssPlugin` so user transforms
@@ -472,6 +496,11 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         }
     }
     fs::write(out_dir.join("index.html"), rewritten_html)?;
+
+    // Vite-style publicDir: copy <root>/public/* verbatim to the output root
+    // (favicon.ico, robots.txt, static assets). The dev server serves these
+    // live; the build must ship them.
+    copy_public_dir(&root.join("public"), &out_dir)?;
 
     println!("oj build: {} in {:?}", out_dir.display(), started.elapsed());
     emitted.sort_by(|a, b| b.1.cmp(&a.1));

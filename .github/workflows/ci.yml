@@ -61,6 +61,8 @@ jobs:
         run: |
           test -f playground/dist/index.html
           ls playground/dist/assets/*.js
+          # publicDir assets are copied to the build output
+          test -f playground/dist/robots.txt
           grep -q underline playground/dist/tailwind.css
           test -f playground/dist/.vite/manifest.json
           grep -q isEntry playground/dist/.vite/manifest.json
