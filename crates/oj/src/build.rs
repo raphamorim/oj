@@ -21,8 +21,9 @@ use rolldown::{
     BundlerBuilder, BundlerOptions, InputItem, OutputFormat, RawMinifyOptions, SourceMapType,
 };
 use rolldown_plugin::{
-    HookLoadArgs, HookLoadOutput, HookLoadReturn, HookResolveIdArgs, HookResolveIdOutput,
-    HookResolveIdReturn, HookTransformArgs, HookTransformOutput, HookTransformReturn, Plugin,
+    HookLoadArgs, HookLoadOutput, HookLoadReturn, HookRenderChunkArgs, HookRenderChunkOutput,
+    HookRenderChunkReturn, HookResolveIdArgs, HookResolveIdOutput, HookResolveIdReturn,
+    HookTransformArgs, HookTransformOutput, HookTransformOutputMap, HookTransformReturn, Plugin,
     PluginContext, SharedLoadPluginContext, SharedTransformPluginContext,
 };
 use rolldown_plugin::__inner::SharedPluginable;
@@ -182,6 +183,15 @@ fn copy_public_dir(src: &Path, dest: &Path) -> anyhow::Result<()> {
 #[derive(Debug)]
 struct OjUserPlugin {
     host: Arc<PluginHost>,
+    /// Cached `has_render_chunk()` — renderChunk fires per chunk, so we resolve
+    /// it once instead of round-tripping to Node for every chunk.
+    render_chunk_enabled: Arc<tokio::sync::OnceCell<bool>>,
+}
+
+impl OjUserPlugin {
+    fn new(host: Arc<PluginHost>) -> Self {
+        Self { host, render_chunk_enabled: Arc::new(tokio::sync::OnceCell::new()) }
+    }
 }
 
 impl Plugin for OjUserPlugin {
@@ -194,6 +204,8 @@ impl Plugin for OjUserPlugin {
             | rolldown_plugin::HookUsage::Load
             | rolldown_plugin::HookUsage::Transform
             | rolldown_plugin::HookUsage::GenerateBundle
+            | rolldown_plugin::HookUsage::RenderChunk
+            | rolldown_plugin::HookUsage::WriteBundle
     }
 
     fn resolve_id(
@@ -267,6 +279,61 @@ impl Plugin for OjUserPlugin {
         }
         Ok(())
     }
+
+    // Per-chunk output hook: chain the plugins' renderChunk over each chunk's
+    // rendered code. Cached `has_render_chunk` avoids a Node round-trip per
+    // chunk when nothing uses it. Sourcemap is dropped (Null) on a change.
+    fn render_chunk(
+        &self,
+        _ctx: &PluginContext,
+        args: &HookRenderChunkArgs<'_>,
+    ) -> impl std::future::Future<Output = HookRenderChunkReturn> + Send {
+        let host = Arc::clone(&self.host);
+        let enabled = Arc::clone(&self.render_chunk_enabled);
+        let code = Arc::clone(&args.code);
+        let chunk_json = serialize_rendered_chunk(&args.chunk);
+        async move {
+            let on = *enabled.get_or_init(|| async { host.has_render_chunk().await }).await;
+            if !on {
+                return Ok(None);
+            }
+            match host.render_chunk(&code, &chunk_json).await {
+                Ok(Some(out)) if out != *code => {
+                    Ok(Some(HookRenderChunkOutput { code: out, map: HookTransformOutputMap::Null }))
+                }
+                _ => Ok(None),
+            }
+        }
+    }
+
+    // Post-write hook: files are already on disk, so this is a read-only
+    // notification (plugins do side effects like extra fs writes / logging).
+    async fn write_bundle(
+        &self,
+        _ctx: &PluginContext,
+        args: &mut rolldown_plugin::HookWriteBundleArgs<'_>,
+    ) -> rolldown_plugin::HookNoopReturn {
+        if !self.host.has_write_bundle().await {
+            return Ok(());
+        }
+        let bundle_json = serialize_bundle(args.bundle);
+        let _ = self.host.write_bundle(&bundle_json, true).await;
+        Ok(())
+    }
+}
+
+/// A Rollup RenderedChunk as the plugin host expects it (metadata only; the
+/// code is passed separately as the hook's first argument).
+fn serialize_rendered_chunk(chunk: &rolldown_common::RollupRenderedChunk) -> String {
+    serde_json::json!({
+        "type": "chunk",
+        "fileName": chunk.filename.to_string(),
+        "name": chunk.name.to_string(),
+        "isEntry": chunk.is_entry,
+        "isDynamicEntry": chunk.is_dynamic_entry,
+        "imports": chunk.imports.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+    })
+    .to_string()
 }
 
 /// Serialize the Rolldown output bundle to a Rollup-shaped `bundle` object
@@ -443,7 +510,7 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         if let Err(e) = host.build_start().await {
             eprintln!("oj build: plugin buildStart failed: {e}");
         }
-        oj_plugins.push(Arc::new(OjUserPlugin { host: Arc::clone(host) })); // before oj:build
+        oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host)))); // before oj:build
     }
     oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf() }));
     let mut bundler = BundlerBuilder::default()
@@ -710,7 +777,7 @@ pub(crate) async fn build_ssr(
         if let Err(e) = host.build_start().await {
             eprintln!("oj build (ssr): plugin buildStart failed: {e}");
         }
-        oj_plugins.push(Arc::new(OjUserPlugin { host: Arc::clone(host) }));
+        oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host))));
     }
     oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf() }));
     let mut bundler = BundlerBuilder::default()
@@ -937,7 +1004,7 @@ async fn build_client_entry(
         if let Err(e) = host.build_start().await {
             eprintln!("oj build (client): plugin buildStart failed: {e}");
         }
-        oj_plugins.push(Arc::new(OjUserPlugin { host: Arc::clone(host) }));
+        oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host))));
     }
     oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf() }));
 

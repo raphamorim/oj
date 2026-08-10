@@ -98,6 +98,9 @@ jobs:
           # mutated the entry chunk (banner prepended)
           grep -q 'chunks:' playground/dist/oj-build-report.txt
           grep -rq 'oj-gb-banner' playground/dist/assets/*.js
+          # renderChunk mutated the entry chunk; writeBundle ran post-write
+          grep -rq 'oj-rc-ran' playground/dist/assets/*.js
+          grep -q 'assets/' playground/.oj-cache/plugin-writebundle
       - name: library build
         run: |
           mkdir -p /tmp/lib/src

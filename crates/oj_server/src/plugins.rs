@@ -266,6 +266,29 @@ impl PluginHost {
         self.call("generateBundle", &[bundle_json, if is_write { "true" } else { "false" }]).await
     }
 
+    /// Whether any active plugin defines a `renderChunk` hook.
+    pub async fn has_render_chunk(&self) -> bool {
+        matches!(self.call("hasRenderChunk", &[]).await, Ok(Some(s)) if s == "true")
+    }
+
+    /// Run `renderChunk` for one chunk: chain the plugins' hooks over `code`
+    /// (with the chunk's metadata as JSON) and return the final code, or `None`
+    /// if unchanged.
+    pub async fn render_chunk(&self, code: &str, chunk_json: &str) -> Result<Option<String>, String> {
+        self.call("renderChunk", &[code, chunk_json]).await
+    }
+
+    /// Whether any active plugin defines a `writeBundle` hook.
+    pub async fn has_write_bundle(&self) -> bool {
+        matches!(self.call("hasWriteBundle", &[]).await, Ok(Some(s)) if s == "true")
+    }
+
+    /// Run `writeBundle` (post-write side effects); the bundle is read-only here
+    /// since files are already on disk, so any return is ignored.
+    pub async fn write_bundle(&self, bundle_json: &str, is_write: bool) -> Result<(), String> {
+        self.call("writeBundle", &[bundle_json, if is_write { "true" } else { "false" }]).await.map(|_| ())
+    }
+
     /// The port of the `configureServer` middleware HTTP server, if any plugin
     /// registered dev-server middleware. `None` means no middleware to consult.
     pub async fn middleware_port(&self) -> Option<u16> {

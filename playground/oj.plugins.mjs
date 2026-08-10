@@ -133,12 +133,24 @@ function envPlugin(name, marker) {
 function reportPlugin() {
   return {
     name: "oj-report",
+    // renderChunk: per-chunk code transform. Prepend a side-effect statement to
+    // the entry (a comment would be stripped by minification, which runs after
+    // renderChunk; a globalThis assignment survives).
+    renderChunk(code, chunk) {
+      if (!chunk.isEntry) return null;
+      return { code: `globalThis.__OJ_RC="oj-rc-ran";${code}` };
+    },
     generateBundle(_options, bundle) {
       const chunks = Object.keys(bundle).filter((f) => bundle[f].type === "chunk");
       this.emitFile({ type: "asset", fileName: "oj-build-report.txt", source: `chunks:${chunks.length}` });
       for (const f of chunks) {
         if (bundle[f].isEntry) bundle[f].code = "/*oj-gb-banner*/" + bundle[f].code;
       }
+    },
+    // writeBundle: post-write side effect. Files are on disk; write a sibling
+    // marker with the emitted file names (proves the hook ran after write).
+    writeBundle(_options, bundle) {
+      writeFileSync(".oj-cache/plugin-writebundle", Object.keys(bundle).sort().join(","));
     },
   };
 }

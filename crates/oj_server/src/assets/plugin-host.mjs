@@ -354,6 +354,34 @@ async function generateBundle(bundleJson, isWrite) {
   return JSON.stringify(bundle);
 }
 
+// renderChunk: chain the plugins' renderChunk(code, chunk) over one chunk's
+// code (Rollup semantics). Each may return a string, { code }, or null.
+async function renderChunk(code, chunkJson) {
+  const chunk = JSON.parse(chunkJson || "{}");
+  let current = code;
+  for (const p of plugins) {
+    const fn = typeof p.renderChunk === "function" ? p.renderChunk : p.renderChunk?.handler;
+    if (typeof fn !== "function") continue;
+    const r = await fn.call(ctx, current, chunk);
+    if (r == null) continue;
+    current = typeof r === "string" ? r : (r.code ?? current);
+  }
+  return current;
+}
+
+// writeBundle: post-write side-effect hook. Files are already on disk, so this
+// is read-only (mutations are not written back).
+async function writeBundle(bundleJson, isWrite) {
+  const bundle = JSON.parse(bundleJson || "{}");
+  const outputOptions = environment.config?.build ?? {};
+  for (const p of plugins) {
+    const fn = typeof p.writeBundle === "function" ? p.writeBundle : p.writeBundle?.handler;
+    if (typeof fn !== "function") continue;
+    await fn.call(ctx, outputOptions, bundle, isWrite);
+  }
+  return null;
+}
+
 async function run(hook, args) {
   if (hook === "transform") return transform(args[0], args[1]);
   if (hook === "resolveId") return resolveId(args[0], args[1]);
@@ -371,6 +399,14 @@ async function run(hook, args) {
     return String(plugins.some((p) => typeof (p.generateBundle?.handler ?? p.generateBundle) === "function"));
   }
   if (hook === "generateBundle") return generateBundle(args[0], args[1] === "true");
+  if (hook === "hasRenderChunk") {
+    return String(plugins.some((p) => typeof (p.renderChunk?.handler ?? p.renderChunk) === "function"));
+  }
+  if (hook === "renderChunk") return renderChunk(args[0], args[1]);
+  if (hook === "hasWriteBundle") {
+    return String(plugins.some((p) => typeof (p.writeBundle?.handler ?? p.writeBundle) === "function"));
+  }
+  if (hook === "writeBundle") return writeBundle(args[0], args[1] === "true");
   // The configureServer middleware port (null if no plugin added middleware).
   if (hook === "getMiddlewarePort") return middlewarePort == null ? null : String(middlewarePort);
   return null;
