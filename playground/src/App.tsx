@@ -1,4 +1,5 @@
 import { Counter } from "@/Counter";
+import { HmrDemo } from "@/hmr-demo";
 import meta, { appName } from "./data.json";
 import "./theme.scss";
 
@@ -26,6 +27,7 @@ export function App() {
       <div data-plugin="__OJ_PLUGIN_UNTRANSFORMED__" hidden />
       {/* Filled by a plugin from the config()/configResolved() handshake. */}
       <div data-plugin-config="__OJ_CONFIG_MARKER__" hidden />
+      <HmrDemo />
     </main>
   );
 }

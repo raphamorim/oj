@@ -90,10 +90,25 @@ async function load(id) {
   return null;
 }
 
+// handleHotUpdate: plugins customize HMR for a changed file. oj's simplified
+// contract — return "full-reload" to force a reload, [] to suppress HMR, or
+// undefined to let default HMR proceed. First decisive result wins.
+async function handleHotUpdate(file, timestamp) {
+  let suppress = false;
+  for (const p of plugins) {
+    if (typeof p.handleHotUpdate !== "function") continue;
+    const r = await p.handleHotUpdate.call(ctx, { file, timestamp: Number(timestamp) });
+    if (r === "full-reload") return "full-reload";
+    if (Array.isArray(r) && r.length === 0) suppress = true;
+  }
+  return suppress ? "skip" : null;
+}
+
 async function run(hook, args) {
   if (hook === "transform") return transform(args[0], args[1]);
   if (hook === "resolveId") return resolveId(args[0], args[1]);
   if (hook === "load") return load(args[0]);
+  if (hook === "handleHotUpdate") return handleHotUpdate(args[0], args[1]);
   return null;
 }
 

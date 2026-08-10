@@ -51,5 +51,17 @@ function configPlugin() {
   };
 }
 
-export default [markerPlugin(), virtualPlugin(), configPlugin()];
+// Uses handleHotUpdate to override HMR: this file self-accepts (Fast Refresh)
+// by default, but the plugin forces a full reload for it.
+function hmrPlugin() {
+  return {
+    name: "oj-hmr",
+    handleHotUpdate({ file }) {
+      if (file.endsWith("hmr-demo.tsx")) return "full-reload";
+      return undefined;
+    },
+  };
+}
+
+export default [markerPlugin(), virtualPlugin(), configPlugin(), hmrPlugin()];
 

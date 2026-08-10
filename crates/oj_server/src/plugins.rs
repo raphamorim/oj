@@ -125,4 +125,10 @@ impl PluginHost {
     pub async fn load(&self, id: &str) -> Result<Option<String>, String> {
         self.call("load", &[id]).await
     }
+
+    /// Run `handleHotUpdate`; `Ok(Some("full-reload" | "skip"))` = a plugin
+    /// overrode default HMR for `file`, `Ok(None)` = proceed normally.
+    pub async fn handle_hot_update(&self, file: &str, timestamp: u64) -> Result<Option<String>, String> {
+        self.call("handleHotUpdate", &[file, &timestamp.to_string()]).await
+    }
 }

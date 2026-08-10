@@ -105,6 +105,9 @@ struct ServerState {
     /// Node plugin host running Vite/Rollup `transform` hooks (present when the
     /// app has an `oj.plugins.*`).
     plugins: Option<std::sync::Arc<PluginHost>>,
+    /// Runtime handle so the sync file-watcher thread can call async plugin
+    /// hooks (handleHotUpdate).
+    rt: tokio::runtime::Handle,
 }
 
 /// A fully-configured dev server that hasn't been bound to a socket yet.
@@ -231,6 +234,7 @@ impl DevServer {
             http: reqwest::Client::new(),
             virtual_modules: config.virtual_modules.clone().unwrap_or_default(),
             plugins: plugin_host,
+            rt: tokio::runtime::Handle::current(),
         });
         {
             let state = Arc::clone(&state);
@@ -1830,6 +1834,27 @@ fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
         }) {
             continue;
         }
+
+        // Let plugins customize HMR for this file (handleHotUpdate).
+        if let Some(host) = &state.plugins {
+            let file = path.display().to_string();
+            let ts = now_millis() as u64;
+            match state.rt.block_on(host.handle_hot_update(&file, ts)) {
+                Ok(Some(d)) if d == "skip" => {
+                    println!("oj: change {file} -> HMR suppressed by plugin");
+                    continue;
+                }
+                Ok(Some(d)) if d == "full-reload" => {
+                    println!("oj: change {file} -> full-reload (plugin)");
+                    messages.push(
+                        serde_json::json!({ "type": "full-reload", "reason": "plugin" }).to_string(),
+                    );
+                    return messages;
+                }
+                _ => {}
+            }
+        }
+
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         if ext == "css" {
             let url = url_of(&state.root, path);
