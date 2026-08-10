@@ -1,31 +1,31 @@
 import { useEffect, useState } from "react";
 import { hydrateRoot } from "react-dom/client";
-import { App, ErrorBoundary, NavContext, type NavState, type RouteData } from "@/router";
+import { App, ErrorBoundary, NavContext, type DataMap, type NavState } from "@/router";
 
 declare global {
   interface Window {
-    __OJ_DATA__?: RouteData;
+    __OJ_DATA__?: DataMap;
   }
 }
 
-type Route = { path: string; data: RouteData; error: string | null };
+type Route = { path: string; data: DataMap; error: string | null };
 
-// Fetch server-authoritative route data; a failed loader/action becomes an
-// `error` the route renders instead of crashing.
-async function fetchData(path: string, init?: RequestInit): Promise<{ data: RouteData; error: string | null }> {
+// Fetch server-authoritative route data (the whole chain's loader map); a
+// failed loader/action becomes an `error` the route renders instead of crashing.
+async function fetchData(path: string, init?: RequestInit): Promise<{ data: DataMap; error: string | null }> {
   try {
     const res = await fetch(path, { headers: { "oj-loader": "1" }, ...init });
-    if (!res.ok) return { data: null, error: `request failed (${res.status})` };
-    return { data: (await res.json()) as RouteData, error: null };
+    if (!res.ok) return { data: {}, error: `request failed (${res.status})` };
+    return { data: (await res.json()) as DataMap, error: null };
   } catch (e) {
-    return { data: null, error: String((e as Error)?.message ?? e) };
+    return { data: {}, error: String((e as Error)?.message ?? e) };
   }
 }
 
 function Router() {
   const [route, setRoute] = useState<Route>(() => ({
     path: location.pathname,
-    data: window.__OJ_DATA__ ?? null,
+    data: window.__OJ_DATA__ ?? {},
     error: null,
   }));
   const [nav, setNav] = useState<NavState>("idle");

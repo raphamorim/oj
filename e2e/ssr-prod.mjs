@@ -89,19 +89,25 @@ try {
   // File-based dynamic route (src/routes/users/$id.tsx) with a param.
   const user = await (await fetch(`${base}/users/7`)).text();
   if (!user.includes('data-user-id="7"')) throw new Error("dynamic file-based route /users/7 did not render");
-  // Nested layouts: root wraps every route; the users layout wraps only /users/*.
+  // Nested layouts + per-layout loaders: root + users layouts compose, each
+  // with its own loader data alongside the page's.
   if (!user.includes('data-layout="root"') || !user.includes('data-layout="users"')) {
     throw new Error("nested layouts did not compose on /users/7");
+  }
+  if (!user.includes('data-app-name="oj"') || !user.includes('data-users-count="3"')) {
+    throw new Error("per-layout loader data missing on /users/7");
   }
   if (about.includes('data-layout="users"')) throw new Error("users layout leaked onto /about");
   if (!html.includes("window.__OJ_DATA__=") || !html.includes('"likes":') || !html.includes('data-likes="0"')) {
     throw new Error(`route data not loaded/serialized server-side:\n${html}`);
   }
   // Action + revalidation over HTTP: POST mutates server state, GET reflects it.
+  // The loader response is the chain's data map keyed by route/layout id.
   const acted = await (await fetch(`${base}/`, { method: "POST", headers: { "oj-loader": "1" } })).json();
-  if (acted.likes !== 1) throw new Error(`action did not mutate server state: ${JSON.stringify(acted)}`);
+  if (acted["index"]?.likes !== 1) throw new Error(`action did not mutate server state: ${JSON.stringify(acted)}`);
   const reloaded = await (await fetch(`${base}/about`, { headers: { "oj-loader": "1" } })).json();
-  if (reloaded.likes !== 1) throw new Error("mutation not visible via server-authoritative loader");
+  if (reloaded["about"]?.likes !== 1) throw new Error("mutation not visible via server-authoritative loader");
+  if (reloaded["layout"]?.app !== "oj") throw new Error("root layout loader did not run in the chain");
   // A failing loader returns an error status (surfaced as route-error UI on the client).
   if ((await fetch(`${base}/boom`, { headers: { "oj-loader": "1" } })).status !== 500) {
     throw new Error("failing loader did not return an error status");

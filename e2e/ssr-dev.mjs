@@ -99,28 +99,36 @@ try {
   }
   console.log("ssr-dev: per-route ok (/, /about, dynamic /users/42 from src/routes/**)");
 
-  // 1e. Nested layouts: the root layout wraps every route; a section layout
-  //     (routes/users/layout.tsx) wraps only /users/*.
+  // 1e. Nested layouts + per-layout loaders: the root layout wraps every route
+  //     and has its own loader data; the users layout wraps only /users/* and
+  //     loads its own (section) data; the page loads its own — all composed.
   if (!first.includes('data-layout="root"')) throw new Error("root layout did not wrap /");
   if (about.includes('data-layout="users"')) throw new Error("users layout leaked onto /about");
   if (!user.includes('data-layout="root"') || !user.includes('data-layout="users"')) {
     throw new Error("nested layouts did not compose on /users/42");
   }
-  console.log("ssr-dev: nested layouts ok (root wraps all, users layout wraps /users/*)");
+  if (!user.includes('data-app-name="oj"') || !user.includes('data-users-count="3"') || !user.includes('data-user-id="42"')) {
+    throw new Error(`per-layout loaders did not each provide their data:\n${user}`);
+  }
+  console.log("ssr-dev: nested layouts + per-layout loaders ok (root, users, page each loaded)");
 
-  // 1d. Route data loading: the server-authoritative loader ran, its data is
-  //     serialized into the document, and the route rendered with it.
+  // 1d. Route data loading: the loaders ran server-side, the whole chain's data
+  //     map is serialized, and each level rendered with its own slice.
   if (!first.includes("window.__OJ_DATA__=") || !first.includes('"likes":')) {
     throw new Error(`route data not serialized into the document:\n${first}`);
   }
   if (!first.includes('data-likes="0"')) throw new Error("home not rendered with loader data");
-  // A server-authoritative loader fetch (oj-loader header) returns JSON data.
+  // A server-authoritative loader fetch (oj-loader header) returns the chain's
+  // data map keyed by route/layout id.
   const loaderRes = await fetch(`${base}/about`, { headers: { "oj-loader": "1" } });
   if (loaderRes.headers.get("content-type")?.includes("application/json") !== true) {
     throw new Error("loader fetch did not return JSON");
   }
-  if (typeof (await loaderRes.json()).likes !== "number") throw new Error("loader JSON missing likes");
-  console.log("ssr-dev: route data loaded server-side + serialized + loader fetch");
+  const loaderMap = await loaderRes.json();
+  if (typeof loaderMap["about"]?.likes !== "number" || loaderMap["layout"]?.app !== "oj") {
+    throw new Error(`loader map missing page or root-layout data: ${JSON.stringify(loaderMap)}`);
+  }
+  console.log("ssr-dev: route data loaded server-side + serialized + chain loader map");
 
   // 2. The persistent module runner re-evaluates changed modules on the next
   //    load — two consecutive edits both show up, with no Rolldown SSR bundle.
