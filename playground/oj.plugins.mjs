@@ -12,4 +12,22 @@ function markerPlugin() {
   };
 }
 
-export default [markerPlugin()];
+// A virtual-module plugin using resolveId + load (the classic `virtual:` id
+// pattern real plugins use).
+function virtualPlugin() {
+  const VIRTUAL_ID = "\0virtual:plugin-greeting";
+  return {
+    name: "oj-virtual",
+    resolveId(source) {
+      if (source === "virtual:plugin-greeting") return VIRTUAL_ID;
+      return null;
+    },
+    load(id) {
+      if (id === VIRTUAL_ID) return `export const info = "hello from plugin";`;
+      return null;
+    },
+  };
+}
+
+export default [markerPlugin(), virtualPlugin()];
+

@@ -541,6 +541,18 @@ async fn serve_path(
         };
     }
 
+    // Plugin-resolved modules: `/@id/<hex spec>?importer=<hex>` — a specifier
+    // oj couldn't resolve, handed to plugin resolveId + load.
+    if let Some(hex) = uri.path().strip_prefix("/@id/") {
+        let spec = hex_decode(hex).unwrap_or_default();
+        let importer = uri
+            .query()
+            .and_then(|q| q.strip_prefix("importer="))
+            .and_then(hex_decode)
+            .unwrap_or_default();
+        return serve_plugin_id(&state, &spec, &importer).await;
+    }
+
     let file = if let Some(abs) = uri.path().strip_prefix("/@fs") {
         let candidate = PathBuf::from(abs);
         let allowed = {
@@ -774,6 +786,10 @@ async fn ensure_module(
     let file_owned = file.to_path_buf();
     let url_owned = url.to_string();
     let bundle = state.bundle;
+    // A bare specifier oj can't resolve, when plugins are present (dev only),
+    // is deferred to plugin resolveId/load via a `/@id/` URL served lazily.
+    let plugin_fallback = state.plugins.is_some() && !bundle;
+    let importer_abs = file.to_string_lossy().into_owned();
     let ext = file.extension().and_then(|e| e.to_str());
     let is_css = matches!(ext, Some("css") | Some("scss") | Some("sass"));
     let is_json = ext == Some("json");
@@ -821,7 +837,14 @@ async fn ensure_module(
             if virtual_ids.contains(spec) {
                 return Some(format!("/@virtual/{spec}"));
             }
-            rewrite_specifier(&root, &dir, &resolver, &fs_allow, spec, !bundle)
+            if let Some(url) = rewrite_specifier(&root, &dir, &resolver, &fs_allow, spec, !bundle) {
+                return Some(url);
+            }
+            // Unresolvable bare specifier -> defer to plugin resolveId/load.
+            if plugin_fallback && is_bare_specifier(spec) {
+                return Some(format!("/@id/{}?importer={}", hex_encode(spec), hex_encode(&importer_abs)));
+            }
+            None
         };
         if bundle {
             let factory =
@@ -1266,6 +1289,84 @@ fn base64_encode(bytes: &[u8]) -> String {
         out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
     }
     out
+}
+
+/// Serve a plugin-resolved module: run `resolveId(spec, importer)` then
+/// `load(id)`, compile the returned source (TS/JSX strip + import rewrite), and
+/// serve it as a JS module. This is how plugin virtual modules reach the browser.
+async fn serve_plugin_id(state: &Arc<ServerState>, spec: &str, importer: &str) -> Response {
+    let Some(host) = &state.plugins else {
+        return (StatusCode::NOT_FOUND, "oj: no plugin host").into_response();
+    };
+    let id = match host.resolve_id(spec, importer).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, format!("oj: no plugin resolved {spec}")).into_response();
+        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let source = match host.load(&id).await {
+        Ok(Some(src)) => src,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, format!("oj: no plugin loaded {id}")).into_response();
+        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let root = state.root.clone();
+    let resolver = Arc::clone(&state.resolver);
+    let fs_allow = Arc::clone(&state.fs_allow);
+    let compiled = tokio::task::spawn_blocking(move || {
+        let mut rewrite = |s: &str| rewrite_specifier(&root, &root, &resolver, &fs_allow, s, true);
+        oj_compiler::compile_module(
+            Path::new("plugin.tsx"),
+            &source,
+            &oj_compiler::CompileOptions::dev(),
+            Some(&mut rewrite),
+        )
+        .map(|o| o.code_with_inline_map())
+        .map_err(|e| format!("{e}"))
+    })
+    .await;
+    match compiled {
+        Ok(Ok(code)) => (
+            [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
+            code,
+        )
+            .into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("compile task failed: {e}")).into_response(),
+    }
+}
+
+/// A bare import specifier (not relative/absolute/URL) — e.g. `virtual:foo`,
+/// `react`. Used to decide whether an unresolved import can defer to plugins.
+fn is_bare_specifier(spec: &str) -> bool {
+    !spec.starts_with('.') && !spec.starts_with('/') && !spec.contains("://")
+}
+
+/// Hex encode/decode for stuffing a specifier + importer into a `/@id/` URL
+/// (path-safe, no dependency).
+fn hex_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        out.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        out.push(char::from_digit((b & 0xf) as u32, 16).unwrap());
+    }
+    out
+}
+
+fn hex_decode(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    String::from_utf8(out).ok()
 }
 
 fn content_type(ext: &str) -> &'static str {

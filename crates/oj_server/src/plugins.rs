@@ -28,7 +28,7 @@ pub fn plugins_file(root: &Path) -> Option<std::path::PathBuf> {
 
 pub struct PluginHost {
     stdin: tokio::sync::Mutex<tokio::process::ChildStdin>,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Result<String, String>>>>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<Result<Option<String>, String>>>>,
     counter: AtomicU64,
     _child: tokio::process::Child,
 }
@@ -66,9 +66,11 @@ impl PluginHost {
             while let Ok(Some(line)) = lines.next_line().await {
                 let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
                 let Some(id) = msg["id"].as_u64() else { continue };
-                let result = match msg["code"].as_str() {
-                    Some(code) => Ok(code.to_string()),
-                    None => Err(msg["error"].as_str().unwrap_or("plugin host error").to_string()),
+                // result is a string, or null (hook returned nothing), or error.
+                let result = if let Some(err) = msg.get("error").and_then(|e| e.as_str()) {
+                    Err(err.to_string())
+                } else {
+                    Ok(msg.get("result").and_then(|r| r.as_str()).map(str::to_string))
                 };
                 if let Some(tx) = reader_ref.pending.lock().unwrap().remove(&id) {
                     let _ = tx.send(result);
@@ -78,13 +80,13 @@ impl PluginHost {
         Ok(host)
     }
 
-    /// Run the plugins' `transform` hooks on `code` for module `id`, returning
-    /// the (possibly) transformed code.
-    pub async fn transform(&self, code: &str, id: &str) -> Result<String, String> {
+    /// Call a hook with string args; `Ok(None)` means the hook returned nothing
+    /// (e.g. no plugin resolved/loaded the id).
+    async fn call(&self, hook: &str, args: &[&str]) -> Result<Option<String>, String> {
         let req_id = self.counter.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(req_id, tx);
-        let request = serde_json::json!({ "id": req_id, "code": code, "path": id });
+        let request = serde_json::json!({ "id": req_id, "hook": hook, "args": args });
         {
             let mut stdin = self.stdin.lock().await;
             if stdin.write_all(format!("{request}\n").as_bytes()).await.is_err() {
@@ -96,5 +98,20 @@ impl PluginHost {
             Ok(Ok(result)) => result,
             _ => Err("plugin host timed out".into()),
         }
+    }
+
+    /// Run the plugins' `transform` hooks; returns the (possibly) transformed code.
+    pub async fn transform(&self, code: &str, id: &str) -> Result<String, String> {
+        Ok(self.call("transform", &[code, id]).await?.unwrap_or_else(|| code.to_string()))
+    }
+
+    /// Run `resolveId`; `Ok(None)` = no plugin owns this specifier.
+    pub async fn resolve_id(&self, source: &str, importer: &str) -> Result<Option<String>, String> {
+        self.call("resolveId", &[source, importer]).await
+    }
+
+    /// Run `load`; `Ok(None)` = no plugin provides this id.
+    pub async fn load(&self, id: &str) -> Result<Option<String>, String> {
+        self.call("load", &[id]).await
     }
 }
