@@ -47,6 +47,18 @@ pub fn config_defines(config: &OjConfig) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// A boolean under `environments.<name>.build.<field>` (e.g. `minify`,
+/// `sourcemap`), if set — the per-environment build-output override.
+pub fn environment_build_bool(config: &OjConfig, env_name: &str, field: &str) -> Option<bool> {
+    config
+        .environments
+        .as_ref()
+        .and_then(|e| e.get(env_name))
+        .and_then(|e| e.get("build"))
+        .and_then(|b| b.get(field))
+        .and_then(|v| v.as_bool())
+}
+
 /// Package `exports`/`imports` condition names for an environment. Precedence:
 /// `environments.<name>.resolve.conditions` > top-level `resolve.conditions` >
 /// the built-in default (browser for `client`, node for `ssr`).

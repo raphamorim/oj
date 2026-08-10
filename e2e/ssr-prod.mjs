@@ -51,6 +51,14 @@ if (!clientHasVirtual) {
 if (!fs.readFileSync(path.join(out, "entry-server.mjs"), "utf8").includes("global-define|ssr-define")) {
   throw new Error("ssr build did not apply the ssr-environment define");
 }
+// Per-environment build output: environments.ssr.build.sourcemap=false means
+// no server-bundle sourcemap, while the client bundle still emits one.
+if (fs.existsSync(path.join(out, "entry-server.mjs.map"))) {
+  throw new Error("ssr env sourcemap:false ignored (server bundle emitted a .map)");
+}
+if (!fs.readdirSync(path.join(out, "assets")).some((f) => f.endsWith(".js.map"))) {
+  throw new Error("client env sourcemap missing (no client .map emitted)");
+}
 const assetFiles = fs.readdirSync(path.join(out, "assets"));
 const clientAsset = assetFiles.find((f) => /^entry-client-.*\.js$/.test(f));
 if (!clientAsset) throw new Error("no hashed client hydration bundle emitted");

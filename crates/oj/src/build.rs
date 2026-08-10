@@ -549,8 +549,14 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         dir: Some(out_dir.display().to_string()),
         entry_filenames: Some("assets/[name]-[hash].js".to_string().into()),
         chunk_filenames: Some("assets/[name]-[hash].js".to_string().into()),
-        minify: Some(RawMinifyOptions::Bool(minify)),
-        sourcemap: sourcemap.then_some(SourceMapType::File),
+        // Per-environment build output: the "client" environment may override
+        // minify/sourcemap (Vite Environment API environments.client.build).
+        minify: Some(RawMinifyOptions::Bool(
+            oj_config::environment_build_bool(&config, "client", "minify").unwrap_or(minify),
+        )),
+        sourcemap: oj_config::environment_build_bool(&config, "client", "sourcemap")
+            .unwrap_or(sourcemap)
+            .then_some(SourceMapType::File),
         define: Some({
             // NODE_ENV plus the app's .env-derived import.meta.env.* values,
             // loaded in production mode. BASE_URL reflects the configured base.
@@ -828,8 +834,14 @@ pub(crate) async fn build_ssr(
             format: Some(OutputFormat::Esm),
             entry_filenames: Some(format!("{stem}.mjs").into()),
             chunk_filenames: Some(format!("{stem}-[hash].mjs").into()),
-            minify: Some(RawMinifyOptions::Bool(false)),
-            sourcemap: sourcemap.then_some(SourceMapType::File),
+            // Per-environment build output: "ssr" defaults to unminified but may
+            // override minify/sourcemap (environments.ssr.build).
+            minify: Some(RawMinifyOptions::Bool(
+                oj_config::environment_build_bool(&config, "ssr", "minify").unwrap_or(false),
+            )),
+            sourcemap: oj_config::environment_build_bool(&config, "ssr", "sourcemap")
+                .unwrap_or(sourcemap)
+                .then_some(SourceMapType::File),
             define: Some({
                 let mut pairs = vec![
                     ("process.env.NODE_ENV".to_string(), "'production'".to_string()),
@@ -1052,8 +1064,13 @@ async fn build_client_entry(
             dir: Some(out_dir.display().to_string()),
             entry_filenames: Some("assets/[name]-[hash].js".to_string().into()),
             chunk_filenames: Some("assets/[name]-[hash].js".to_string().into()),
-            minify: Some(RawMinifyOptions::Bool(minify)),
-            sourcemap: sourcemap.then_some(SourceMapType::File),
+            // Per-environment build output for the "client" hydration bundle.
+            minify: Some(RawMinifyOptions::Bool(
+                oj_config::environment_build_bool(&config, "client", "minify").unwrap_or(minify),
+            )),
+            sourcemap: oj_config::environment_build_bool(&config, "client", "sourcemap")
+                .unwrap_or(sourcemap)
+                .then_some(SourceMapType::File),
             define: Some({
                 let env = oj_env::load(root, "production");
                 let mut pairs =

@@ -10,7 +10,12 @@ export default defineConfig({
   },
   environments: {
     client: { define: { __OJ_DEFINE_CLIENT__: JSON.stringify("client-define") } },
-    ssr: { define: { __OJ_DEFINE_SSR__: JSON.stringify("ssr-define") } },
+    ssr: {
+      define: { __OJ_DEFINE_SSR__: JSON.stringify("ssr-define") },
+      // Per-environment build output: the server bundle skips sourcemaps while
+      // the client hydration bundle still emits them.
+      build: { sourcemap: false },
+    },
   },
   server: {
     proxy: {
