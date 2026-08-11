@@ -5,15 +5,14 @@
 2. It was created out of frustration with agents running vite build when I was working on rioterm-js repository. Each build process was carrying 2gb.
 3. If anyone want to move the project upstream, please contact me via email. Currently working mostly to fix my own problems.
 
-A Rust-native build tool for React apps: an opinionated, zero-config,
-low-memory toolchain. Fused oxc compile pipeline (one parse: TS strip, JSX,
-Fast Refresh instrumentation), real React Fast Refresh, CJS to ESM interop,
-content-addressed persistent caching, an experimental registry-runtime bundle
-mode for dev (`--bundle`), production builds via embedded Rolldown, CSS
-Modules on Lightning CSS, and a Tailwind v4 sidecar.
+A Rust-native build tool for React apps. One oxc parse per file does the TS
+strip, JSX, and Fast Refresh instrumentation; on top of that: React Fast
+Refresh, CJS to ESM interop, content-addressed persistent caching, an
+experimental registry-runtime dev bundle mode (`--bundle`), production builds
+via embedded Rolldown, CSS Modules on Lightning CSS, and a Tailwind v4 sidecar.
 
-Aimed at the workloads where Vite 8 is still weak: memory, cold start, and
-multi-tenant / agent-driven builds at scale.
+It optimizes for memory and cold start, where running many builds (CI, agents,
+multi-tenant) under Vite gets expensive.
 
 ## Server rendering
 
@@ -137,10 +136,9 @@ its default dev mode (vite) and its experimental bundled dev mode
 | vite | 5532/5558ms | 5045/5088ms | 1639/1676ms | 42/176ms | 1520MB |
 | vite-fbm | 1425/1437ms | 1427/1435ms | 277/287ms | 68/72ms | 1752MB |
 
-Read honestly: bundle-mode oj wins or ties every column at every scale.
-Cold start at 10k is a statistical tie with vite's bundled mode; everywhere
-else oj leads outright, at 8-16x less memory. Bundled-mode vite uses more
-RAM than its default mode; oj's bundle mode does not.
+Bundle-mode oj matches or beats every column at every size. Cold start at 10k
+ties vite's bundled mode; elsewhere oj is faster, at 8-16x less memory. Vite's
+bundled mode uses more RAM than its default; oj's bundle mode does not.
 
 Production builds (`oj build` vs `vite build`) land at parity: same engine
 (Rolldown), byte-identical output sizes.
