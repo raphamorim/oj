@@ -543,17 +543,27 @@ async fn user_plugin_host(
     environments: &serde_json::Value,
     env_name: &str,
 ) -> Option<Arc<PluginHost>> {
-    let file = oj_server::plugins::plugins_file(root)?;
+    // Plugins come from oj.plugins.* or the app's vite.config (same source and
+    // format as the dev server), so a vite.config-only app runs its plugins in
+    // the build too.
+    let (file, plugins_format, label) = match oj_server::plugins::plugin_source(root)? {
+        oj_server::plugins::PluginSource::OjPlugins(p) => {
+            let label = p.file_name().unwrap().to_string_lossy().into_owned();
+            (p, "oj", label)
+        }
+        oj_server::plugins::PluginSource::ViteConfig(p) => (p, "vite", "vite.config".to_string()),
+    };
     let config = serde_json::json!({
         "config": { "root": root.display().to_string(), "base": base, "mode": "production", "command": "build", "define": define, "environments": environments },
         "env": { "command": "build", "mode": "production" },
         // Which Vite environment this build represents ("client" or "ssr").
         "environment": { "name": env_name, "mode": "production" },
+        "pluginsFormat": plugins_format,
     })
     .to_string();
     match PluginHost::spawn(root, &file, &config).await {
         Ok(host) => {
-            println!("oj build ({env_name}): plugins from {}", file.file_name().unwrap().to_string_lossy());
+            println!("oj build ({env_name}): plugins from {label}");
             Some(host)
         }
         Err(e) => {
