@@ -17,6 +17,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
 
 pub const PLUGIN_HOST_JS: &str = include_str!("assets/plugin-host.mjs");
+pub const VITE_EXTRACT_JS: &str = include_str!("assets/vite-extract.mjs");
 
 /// A file a plugin asked to emit via `this.emitFile` (asset form only). The
 /// build collects these after `buildEnd` and writes them to the output dir.
@@ -45,6 +46,14 @@ pub enum PluginSource {
     ViteConfig(std::path::PathBuf),
 }
 
+/// The app's `vite.config.{ts,mts,mjs,js}`, if one exists.
+pub fn vite_config_file(root: &Path) -> Option<std::path::PathBuf> {
+    ["vite.config.ts", "vite.config.mts", "vite.config.mjs", "vite.config.js"]
+        .into_iter()
+        .map(|f| root.join(f))
+        .find(|p| p.is_file())
+}
+
 /// Resolve the app's plugin source. `oj.plugins.*` wins; otherwise the raw
 /// `vite.config.{ts,js,mjs}` path (the Node host bundles it with the app's own
 /// esbuild — local imports inlined, deps external — before reading `plugins`).
@@ -52,11 +61,51 @@ pub fn plugin_source(root: &Path) -> Option<PluginSource> {
     if let Some(p) = plugins_file(root) {
         return Some(PluginSource::OjPlugins(p));
     }
-    ["vite.config.ts", "vite.config.mts", "vite.config.mjs", "vite.config.js"]
-        .into_iter()
-        .map(|f| root.join(f))
-        .find(|p| p.is_file())
-        .map(PluginSource::ViteConfig)
+    vite_config_file(root).map(PluginSource::ViteConfig)
+}
+
+/// Config VALUES lifted out of an app's `vite.config` (the subset oj honors).
+#[derive(Debug, Default)]
+pub struct ViteValues {
+    pub base: Option<String>,
+    pub port: Option<u16>,
+    pub host: Option<String>,
+    pub define: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Extract `base`, `server.port`/`host`, and `define` from an app's
+/// `vite.config` via a one-shot Node run (same loader the plugin host uses).
+/// Returns `None` when `oj.plugins.*` is present (oj.config supplies values),
+/// when there is no `vite.config`, or when extraction fails (e.g. a config
+/// whose plugins assert during evaluation) — callers fall back to defaults.
+pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
+    if plugins_file(root).is_some() {
+        return None;
+    }
+    let vite = vite_config_file(root)?;
+    let cache = root.join(".oj-cache");
+    let _ = std::fs::create_dir_all(&cache);
+    let script = cache.join("oj-vite-extract.mjs");
+    std::fs::write(&script, VITE_EXTRACT_JS).ok()?;
+    let out = std::process::Command::new("node")
+        .arg(&script)
+        .arg(&vite)
+        .arg(root)
+        .arg("serve")
+        .arg("development")
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !out.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+    }
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    Some(ViteValues {
+        base: json.get("base").and_then(|v| v.as_str()).map(str::to_string),
+        port: json.get("port").and_then(|v| v.as_u64()).map(|p| p as u16),
+        host: json.get("host").and_then(|v| v.as_str()).map(str::to_string),
+        define: json.get("define").and_then(|v| v.as_object()).cloned(),
+    })
 }
 
 pub struct PluginHost {
