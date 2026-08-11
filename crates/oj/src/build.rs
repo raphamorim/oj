@@ -62,16 +62,31 @@ impl Plugin for OjCssPlugin {
 
     // Built-in `virtual:oj-routes` -> a synthetic module at the app root (so its
     // `./src/routes/**` glob resolves there); `load` returns the manifest source
-    // and `transform` (below) expands the glob.
+    // and `transform` (below) expands the glob. Also handles Vite's `?url` asset
+    // imports: resolve the real file, keep the `?url` marker so `load` emits it.
     fn resolve_id(
         &self,
-        _ctx: &PluginContext,
+        ctx: &PluginContext,
         args: &HookResolveIdArgs<'_>,
     ) -> impl std::future::Future<Output = HookResolveIdReturn> + Send {
         let is_routes = args.specifier == "virtual:oj-routes";
-        let id = self.root.join("oj-routes.tsx").to_string_lossy().into_owned();
+        let routes_id = self.root.join("oj-routes.tsx").to_string_lossy().into_owned();
+        let url_base = args.specifier.strip_suffix("?url").map(str::to_string);
+        let importer = args.importer.map(str::to_string);
+        let ctx = ctx.clone();
         async move {
-            Ok(is_routes.then(|| HookResolveIdOutput::from_id(id)))
+            if is_routes {
+                return Ok(Some(HookResolveIdOutput::from_id(routes_id)));
+            }
+            if let Some(base) = url_base {
+                // Resolve through Rolldown's resolver (honors alias/tsconfig),
+                // then re-attach `?url` so `load` recognizes it.
+                if let Ok(Ok(resolved)) = ctx.resolve(&base, importer.as_deref(), None).await {
+                    let id = format!("{}?url", resolved.id.as_str());
+                    return Ok(Some(HookResolveIdOutput::from_id(id)));
+                }
+            }
+            Ok(None)
         }
     }
 
@@ -96,7 +111,7 @@ impl Plugin for OjCssPlugin {
 
     fn load(
         &self,
-        _ctx: SharedLoadPluginContext,
+        ctx: SharedLoadPluginContext,
         args: &HookLoadArgs<'_>,
     ) -> impl std::future::Future<Output = HookLoadReturn> + Send {
         let id = args.id.to_string();
@@ -105,6 +120,35 @@ impl Plugin for OjCssPlugin {
         let routes_id = root.join("oj-routes.tsx").to_string_lossy().into_owned();
         let client = self.client;
         async move {
+            // Vite `?url` asset import: emit the real file as a build asset and
+            // resolve the module to its final (hashed, base-prefixed) URL.
+            if let Some(file) = id.strip_suffix("?url") {
+                let bytes = std::fs::read(file)
+                    .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
+                let name = std::path::Path::new(file)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("asset")
+                    .to_string();
+                let reference = ctx
+                    .emit_file(
+                        rolldown_common::EmittedAsset {
+                            name: Some(name),
+                            source: rolldown_common::StrOrBytes::Bytes(bytes),
+                            ..Default::default()
+                        },
+                        None,
+                        None,
+                    )
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                return Ok(Some(rolldown_plugin::HookLoadOutput {
+                    code: arcstr::ArcStr::from(format!(
+                        "export default import.meta.ROLLUP_FILE_URL_{reference};"
+                    )),
+                    module_type: Some(rolldown_common::ModuleType::Js),
+                    ..Default::default()
+                }));
+            }
             let path = id.split('?').next().unwrap_or(&id);
             // Server functions: in the client build, a `*.server.*` module is
             // replaced by RPC stubs so its real code never reaches the browser.
