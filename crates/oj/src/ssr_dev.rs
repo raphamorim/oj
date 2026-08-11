@@ -3,24 +3,21 @@
 
 //! Dev-server SSR with a module runner (`oj dev --ssr <entry>`).
 //!
-//! The initial paint is server-rendered by a persistent Node **module runner**
-//! (`oj_server::SSR_RUNNER_JS`): oj spawns it once, under the app root, and
-//! drives it over stdin/stdout. The runner links the SSR module graph on demand
-//! — app source is fetched already-compiled from the dev server's `/@ssr-*`
-//! endpoints and evaluated with `vm.SourceTextModule`; node_modules import
-//! natively. There is no Rolldown bundle and no per-render Node spawn, and an
-//! edit re-evaluates only the changed modules and their importers (the runner
-//! invalidates by file mtime).
+//! Initial paint is server-rendered by a persistent Node module runner
+//! (`oj_server::SSR_RUNNER_JS`), spawned once under the app root and driven over
+//! stdin/stdout. It links the SSR graph on demand: app source comes
+//! already-compiled from the dev server's `/@ssr-*` endpoints, evaluated via
+//! `vm.SourceTextModule`; node_modules import natively. No Rolldown bundle, no
+//! per-render spawn; an edit re-evaluates only changed modules and their
+//! importers (invalidated by file mtime).
 //!
-//! Hydration and client HMR are handled by oj's normal unbundled dev pipeline:
-//! the SSR `/` route is merged onto [`oj_server::DevServer`], so the client
-//! entry, Fast Refresh, and the HMR WebSocket all come from it. Editing a
-//! component hot-updates the running page with React state preserved and no
-//! reload; the server-rendered markup follows on the next full navigation.
+//! Hydration and client HMR ride the normal unbundled dev pipeline: the SSR `/`
+//! route is merged onto [`oj_server::DevServer`], so client entry, Fast Refresh,
+//! and the HMR WebSocket all come from it. Server-rendered markup follows on the
+//! next full navigation.
 //!
-//! CSS-module class names hash identically in the runner and the dev pipeline
-//! (both key off the root-relative id), so the hydrated markup matches the SSR
-//! HTML — no hydration mismatch.
+//! CSS-module class names hash identically in runner and dev pipeline (both key
+//! off the root-relative id), so hydrated markup matches the SSR HTML.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -47,7 +44,7 @@ struct Runner {
 
 struct SsrState {
     /// URL of the client hydration entry (`/src/entry-client.tsx`), served by
-    /// the dev pipeline. `None` => SSR-only, inert page.
+    /// the dev pipeline. `None` means SSR-only, inert page.
     client_url: Option<String>,
     /// `server.proxy` prefixes, which must reach the proxy layer, not SSR.
     proxy_prefixes: Vec<String>,
@@ -58,8 +55,8 @@ struct SsrState {
 
 pub async fn ssr_dev(root: PathBuf, entry: String, port: Option<u16>) -> anyhow::Result<()> {
     // Reuse the full dev server for the client side (Fast Refresh, HMR, module
-    // compilation, and the /@ssr-* runner endpoints). We add the server-rendered
-    // `/` route on top.
+    // compilation, /@ssr-* runner endpoints); the server-rendered `/` route sits
+    // on top.
     let built = oj_server::DevServer { root, port, bundle: false }.build_app().await?;
 
     let client_url =
@@ -75,9 +72,8 @@ pub async fn ssr_dev(root: PathBuf, entry: String, port: Option<u16>) -> anyhow:
         runner: Arc::new(tokio::sync::Mutex::new(runner)),
     });
 
-    // A layer in front of the dev router: browser document navigations (any
-    // path) are server-rendered per route; module/asset/proxy requests fall
-    // through to the dev pipeline unchanged.
+    // Layer in front of the dev router: document navigations are rendered per
+    // route; module/asset/proxy requests fall through unchanged.
     let app = built
         .router
         .layer(axum::middleware::from_fn_with_state(Arc::clone(&ssr_state), ssr_route));
@@ -126,22 +122,22 @@ async fn spawn_runner(root: &Path, base: &str, entry_abs: &Path) -> anyhow::Resu
 
 /// How an app-route request should be served.
 enum Route {
-    /// Browser navigation -> full HTML document.
+    /// Browser navigation: full HTML document.
     Document,
-    /// Client data fetch (`oj-loader` header) -> JSON loader data.
+    /// Client data fetch (`oj-loader` header): JSON loader data.
     Loader,
-    /// Form submit / mutation (POST) -> run the action, then revalidate.
-    /// `json` = a fetch call wants JSON back; otherwise redirect (no-JS form).
+    /// Form submit / mutation (POST): run the action, then revalidate.
+    /// `json` means a fetch call wants JSON back; otherwise redirect (no-JS form).
     Action { json: bool },
-    /// Not an app route (module, asset, `/@…`, `/__…`, proxy) -> dev pipeline.
+    /// Not an app route (module, asset, `/@…`, `/__…`, proxy): dev pipeline.
     Pass,
 }
 
 /// Route app navigations/data/actions to the SSR runner; everything else
 /// (modules, `/@oj/*`, `/@ssr-*`, assets, proxy, `/__ws`) to the dev pipeline.
 async fn ssr_route(State(state): State<Arc<SsrState>>, req: Request, next: Next) -> Response {
-    // Server function RPC: the client stub POSTs {module (url), name, args};
-    // resolve the module to its id and run it on the SSR module runner.
+    // Server function RPC: client stub POSTs {module (url), name, args}; resolve
+    // the module to its id and run it on the module runner.
     if req.method() == axum::http::Method::POST && req.uri().path() == "/__oj_fn" {
         let bytes = axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024).await.unwrap_or_default();
         let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
@@ -172,8 +168,8 @@ async fn ssr_route(State(state): State<Arc<SsrState>>, req: Request, next: Next)
             if json {
                 data_response(data)
             } else if data.is_ok() {
-                // Progressive enhancement: the mutation ran; redirect so the
-                // browser re-GETs the updated document (POST/redirect/GET).
+                // Progressive enhancement: mutation ran; redirect so the browser
+                // re-GETs the updated document (POST/redirect/GET).
                 (StatusCode::SEE_OTHER, [(header::LOCATION, path)]).into_response()
             } else {
                 error_page(&data.unwrap_err())
@@ -186,14 +182,14 @@ async fn ssr_route(State(state): State<Arc<SsrState>>, req: Request, next: Next)
 /// Classify a request. App routes are extensionless paths that aren't a reserved
 /// dev prefix (`/@…`, `/__…`) or a configured proxy prefix (`/api`). Modules and
 /// assets carry extensions or the `/@` prefix; proxied paths reach the proxy
-/// layer; everything else — `/`, `/about`, … — is ours.
+/// layer; everything else (`/`, `/about`, …) is an app route.
 fn classify(req: &Request, proxy_prefixes: &[String]) -> Route {
     let path = req.uri().path();
     if path.starts_with("/@") || path.starts_with("/__") {
         return Route::Pass;
     }
     if path.rsplit('/').next().is_some_and(|seg| seg.contains('.')) {
-        return Route::Pass; // has a file extension -> asset
+        return Route::Pass; // file extension: asset
     }
     if proxy_prefixes.iter().any(|p| path.starts_with(p.as_str())) {
         return Route::Pass;
@@ -210,7 +206,7 @@ fn classify(req: &Request, proxy_prefixes: &[String]) -> Route {
 /// Send a command to the runner and return the string under `reply_key`
 /// (`"data"` for loaders/actions, `"result"` for server-function calls).
 ///
-/// Runs in a detached task so a cancelled request (an aborted prefetch, say)
+/// Runs in a detached task so a cancelled request (e.g. an aborted prefetch)
 /// still drains the runner's one-line reply; reading inline would drop the lock
 /// mid-protocol and leave a stale line the next render desyncs on.
 async fn run_command(
@@ -255,9 +251,9 @@ async fn render_route(state: &SsrState, path: &str) -> Response {
     if guard.stdin.write_all(cmd.as_bytes()).await.is_err() || guard.stdin.flush().await.is_err() {
         return error_page("SSR runner is not accepting input (did it crash?)");
     }
-    // The runner sends the loader's serialized data and the route's <head>
-    // (title/meta) first, then the render output. Both go into the shell so the
-    // client hydrates with the data (no refetch) and the head is SEO-visible.
+    // Runner sends loader data and the route's <head> (title/meta) first, then
+    // the render output. Both go into the shell so the client hydrates without
+    // refetching and the head is SEO-visible.
     let (data_json, head_html) = match read_message(&mut guard.lines).await {
         Some(v) if v.get("data").and_then(|d| d.as_str()).is_some() => (
             v["data"].as_str().unwrap().to_owned(),
@@ -277,8 +273,8 @@ async fn render_route(state: &SsrState, path: &str) -> Response {
     if let Some(html) = v.get("html").and_then(|h| h.as_str()) {
         return Html(page(state, html, &data_json, &head_html)).into_response();
     }
-    // Streaming entry (renderStream): `{chunk}`… then `{end}`. Flush the shell
-    // immediately, forward each chunk as React produces it, close with the tail.
+    // Streaming entry (renderStream): `{chunk}`… then `{end}`. Flush the shell,
+    // forward each chunk as React produces it, close with the tail.
     if let Some(first_chunk) = v.get("chunk").and_then(|c| c.as_str()).map(str::to_owned) {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
         let head = page_head(&data_json, &head_html);
@@ -320,10 +316,10 @@ async fn read_message(
     serde_json::from_str(&line).ok()
 }
 
-/// The document head + open of `#app`: charset, the route loader's data (so the
-/// client hydrates without refetching), then the Fast Refresh preamble (must be
-/// the first module script, so the refresh hook installs before any module
-/// pulls in React) and the dev HMR client.
+/// Document head + open of `#app`: charset, loader data (for hydration without
+/// refetch), then the Fast Refresh preamble and dev HMR client. The preamble
+/// must be the first module script, so the refresh hook installs before any
+/// module pulls in React.
 fn page_head(data_json: &str, head_html: &str) -> String {
     format!(
         "<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n{head_html}\n\

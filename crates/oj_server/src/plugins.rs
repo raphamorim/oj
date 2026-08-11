@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-//! Persistent Node plugin host: runs Vite/Rollup-style plugin `transform` hooks
-//! against the compile pipeline. Same shape as the Tailwind sidecar — JSON
-//! lines over stdio with correlation ids and a background reader, so many
-//! transforms can be in flight and a cancelled caller simply drops its slot.
+//! Persistent Node plugin host: runs Vite/Rollup-style plugin hooks against the
+//! compile pipeline. JSON lines over stdio with correlation ids and a
+//! background reader, so many transforms can be in flight at once.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,8 +26,8 @@ pub struct EmittedFile {
     pub source: String,
 }
 
-/// The convention: a `oj.plugins.{mjs,js}` at the app root default-exports an
-/// array of plugins. Returns its path if one exists.
+/// A `oj.plugins.{mjs,js}` at the app root default-exports a plugin array.
+/// Returns its path if one exists.
 pub fn plugins_file(root: &Path) -> Option<std::path::PathBuf> {
     ["oj.plugins.mjs", "oj.plugins.js"]
         .into_iter()
@@ -40,9 +39,9 @@ pub fn plugins_file(root: &Path) -> Option<std::path::PathBuf> {
 /// them: oj's own `oj.plugins.*` (a plugin array) or an app's `vite.config.*`
 /// (the default export's `.plugins`).
 pub enum PluginSource {
-    /// An `oj.plugins.{mjs,js}` — default-exports a plugin array.
+    /// An `oj.plugins.{mjs,js}`: default-exports a plugin array.
     OjPlugins(std::path::PathBuf),
-    /// A compiled `vite.config.{ts,js,mjs}` — read plugins from `default.plugins`.
+    /// A compiled `vite.config.{ts,js,mjs}`; read plugins from `default.plugins`.
     ViteConfig(std::path::PathBuf),
 }
 
@@ -56,7 +55,7 @@ pub fn vite_config_file(root: &Path) -> Option<std::path::PathBuf> {
 
 /// Resolve the app's plugin source. `oj.plugins.*` wins; otherwise the raw
 /// `vite.config.{ts,js,mjs}` path (the Node host bundles it with the app's own
-/// esbuild — local imports inlined, deps external — before reading `plugins`).
+/// esbuild, local imports inlined and deps external, before reading `plugins`).
 pub fn plugin_source(root: &Path) -> Option<PluginSource> {
     if let Some(p) = plugins_file(root) {
         return Some(PluginSource::OjPlugins(p));
@@ -64,7 +63,7 @@ pub fn plugin_source(root: &Path) -> Option<PluginSource> {
     vite_config_file(root).map(PluginSource::ViteConfig)
 }
 
-/// Config VALUES lifted out of an app's `vite.config` (the subset oj honors).
+/// Config values lifted out of an app's `vite.config` (the subset oj honors).
 #[derive(Debug, Default)]
 pub struct ViteValues {
     pub base: Option<String>,
@@ -79,7 +78,7 @@ pub struct ViteValues {
 /// `vite.config` via a one-shot Node run (same loader the plugin host uses).
 /// Returns `None` when `oj.plugins.*` is present (oj.config supplies values),
 /// when there is no `vite.config`, or when extraction fails (e.g. a config
-/// whose plugins assert during evaluation) — callers fall back to defaults.
+/// whose plugins assert during evaluation); callers fall back to defaults.
 pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
     if plugins_file(root).is_some() {
         return None;
@@ -170,7 +169,7 @@ pub struct PluginHost {
     _child: tokio::process::Child,
 }
 
-/// Handle a plugin-context RPC (Node -> Rust) and write the reply to `stdin`.
+/// Handle a plugin-context RPC (Node to Rust) and write the reply to `stdin`.
 /// Currently just `resolve`, so plugins' `this.resolve` uses oj's own resolver
 /// (tsconfig aliases and all), keeping plugin resolution consistent with oj.
 async fn handle_ctx_rpc(
@@ -185,8 +184,8 @@ async fn handle_ctx_rpc(
         "resolve" => {
             let source = args.first().and_then(|v| v.as_str()).unwrap_or("");
             let importer = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
-            // Rollup's this.resolve takes the importer FILE; our resolver takes
-            // its directory. Empty importer -> resolve from the app root.
+            // Rollup's this.resolve takes the importer file; oj's resolver takes
+            // its directory. Empty importer: resolve from the app root.
             let dir = if importer.is_empty() {
                 root.to_path_buf()
             } else {
@@ -287,7 +286,7 @@ impl PluginHost {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
-                // A plugin-context call (this.resolve, ...) coming back FROM Node.
+                // A plugin-context call (this.resolve, ...) coming back from Node.
                 if let Some(rpc) = msg["rpc"].as_u64() {
                     let method = msg["method"].as_str().unwrap_or("").to_string();
                     let args = msg["args"].as_array().cloned().unwrap_or_default();
@@ -359,29 +358,29 @@ impl PluginHost {
         Ok(self.call("transformIndexHtml", &[html]).await?.unwrap_or_else(|| html.to_string()))
     }
 
-    /// Run `buildStart` — the build lifecycle is starting. Side-effect hook
+    /// Run `buildStart`: the build lifecycle is starting. Side-effect hook
     /// (plugins init state / clean output); the return value is ignored.
     pub async fn build_start(&self) -> Result<(), String> {
         self.call("buildStart", &[]).await.map(|_| ())
     }
 
-    /// Run `buildEnd` — the module graph is complete. Side-effect hook; ignored.
+    /// Run `buildEnd`: the module graph is complete. Side-effect hook; ignored.
     pub async fn build_end(&self) -> Result<(), String> {
         self.call("buildEnd", &[]).await.map(|_| ())
     }
 
-    /// Run `renderStart` — the output phase is beginning. Side-effect hook.
+    /// Run `renderStart`: the output phase is beginning. Side-effect hook.
     pub async fn render_start(&self) -> Result<(), String> {
         self.call("renderStart", &[]).await.map(|_| ())
     }
 
-    /// Run `watchChange` — a watched file changed (Rollup watch hook). `event`
+    /// Run `watchChange`: a watched file changed (Rollup watch hook). `event`
     /// is `create` / `update` / `delete`. Side-effect; ignored return.
     pub async fn watch_change(&self, file: &str, event: &str) -> Result<(), String> {
         self.call("watchChange", &[file, event]).await.map(|_| ())
     }
 
-    /// Run `closeBundle` — the very last hook, after everything is written.
+    /// Run `closeBundle`: the very last hook, after everything is written.
     pub async fn close_bundle(&self) -> Result<(), String> {
         self.call("closeBundle", &[]).await.map(|_| ())
     }
@@ -396,7 +395,7 @@ impl PluginHost {
         serde_json::from_str(&json).map_err(|e| e.to_string())
     }
 
-    /// Whether any active plugin defines a `generateBundle` hook — lets the
+    /// Whether any active plugin defines a `generateBundle` hook; lets the
     /// build skip serializing the whole output bundle when nothing uses it.
     pub async fn has_generate_bundle(&self) -> bool {
         matches!(self.call("hasGenerateBundle", &[]).await, Ok(Some(s)) if s == "true")
@@ -405,7 +404,7 @@ impl PluginHost {
     /// Run `generateBundle`: hand the output bundle (JSON keyed by fileName) to
     /// the plugins' generateBundle hooks and return the possibly-mutated bundle
     /// JSON (chunk `code` / asset `source` edits). Plugins may also `emitFile`
-    /// here — those are collected via [`Self::emitted_files`].
+    /// here; those are collected via [`Self::emitted_files`].
     pub async fn generate_bundle(&self, bundle_json: &str, is_write: bool) -> Result<Option<String>, String> {
         self.call("generateBundle", &[bundle_json, if is_write { "true" } else { "false" }]).await
     }

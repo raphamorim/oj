@@ -1,19 +1,18 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-//! ESM -> registry-factory transform for full bundle mode (M4).
+//! ESM to registry-factory transform for full bundle mode (M4).
 //!
-//! Output shape per module: a plain statement list (the factory BODY) that
+//! Output shape per module: a plain statement list (the factory body) that
 //! runs with `module`, `__oj_exports`, `__oj_require` in scope, provided by
 //! the client runtime. Imports become `var _oj_mN = __oj_require("url")`
-//! plus member-access rewriting of every reference (scope-aware, via oxc
-//! semantic — shadowed names are untouched). Exports become getter
-//! registrations (`__oj_esm`) installed BEFORE the body runs, so circular
+//! plus scope-aware member-access rewriting of every reference (via oxc
+//! semantic; shadowed names are untouched). Exports become getter
+//! registrations (`__oj_esm`) installed before the body runs, so circular
 //! imports and hoisted function exports behave like real ESM live bindings.
 //!
-//! Node synthesis uses parse-template-and-transplant: tiny snippets are
-//! parsed in the same arena (via `alloc_str`, so atoms stay valid) and real
-//! AST nodes are swapped into their placeholders. No AstBuilder churn.
+//! Node synthesis parses tiny snippets in the same arena (via `alloc_str`,
+//! so atoms stay valid) and swaps the real AST nodes into their placeholders.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -39,11 +38,11 @@ pub enum FactoryKind {
 
 #[derive(Debug)]
 pub struct FactoryOutput {
-    /// Factory body statements (no wrapper — the chunk assembler wraps).
+    /// Factory body statements (no wrapper; the chunk assembler wraps).
     pub code: String,
     /// Resolved local urls this module depends on (graph edges + crawl).
     pub imports: Vec<String>,
-    /// CJS only: raw specifier -> resolved url, resolved by the runtime's
+    /// CJS only: raw specifier to resolved url, resolved by the runtime's
     /// in-factory `require`.
     pub require_map: Vec<(String, String)>,
     pub kind: FactoryKind,
@@ -70,7 +69,7 @@ pub fn compile_factory(
 }
 
 /// CJS is already factory-shaped: `module`/`exports`/`require` come from the
-/// runtime. We only NODE_ENV-replace, DCE, and collect the require map.
+/// runtime. Only NODE_ENV-replace, DCE, and collect the require map.
 fn compile_cjs_factory(
     path: &Path,
     source_text: &str,
@@ -136,9 +135,8 @@ fn compile_esm_factory(
         return Err(CompileError::Transform { path: path.to_path_buf(), message });
     }
 
-    // import.meta.env static replacement (same as unbundled). Essential in
-    // bundle mode: the factory is a plain function where `import.meta` is
-    // invalid, so any `import.meta.env` MUST be replaced away here.
+    // import.meta.env static replacement: the factory is a plain function
+    // where `import.meta` is invalid, so it must be replaced away here.
     if source_text.contains("import.meta.env") {
         use oxc_transformer_plugins::{ReplaceGlobalDefines, ReplaceGlobalDefinesConfig};
         let scoping = SemanticBuilder::new().build(&program).semantic.into_scoping();
@@ -165,7 +163,7 @@ fn compile_esm_factory(
     let mut import_vars: Vec<String> = Vec::new(); // url per _oj_mN
     let mut var_of_url: HashMap<String, usize> = HashMap::new();
     let mut replacements: HashMap<ReferenceId, Replacement> = HashMap::new();
-    let mut getters: Vec<(String, String)> = Vec::new(); // exported name -> getter body
+    let mut getters: Vec<(String, String)> = Vec::new(); // exported name to getter body
     let mut stars: Vec<usize> = Vec::new();
     let mut has_default_expr = false;
 
@@ -203,9 +201,7 @@ fn compile_esm_factory(
                     for &reference_id in
                         semantic.scoping().get_resolved_reference_ids(symbol_id)
                     {
-                        // Keyed by ReferenceId, not span: transforms synthesize
-                        // nodes with duplicated spans, which made span keys
-                        // collide (e.g. $RefreshReg$ turning into jsxDEV).
+                        // Key by ReferenceId; spans collide after transforms.
                         replacements.insert(
                             reference_id,
                             Replacement { var: format!("_oj_m{vi}"), member: member.clone() },
@@ -436,7 +432,7 @@ impl<'a> VisitMut<'a> for RefRewriter<'a, '_> {
                     Some(member) => format!("{}.{}", r.var, member),
                     None => r.var.clone(),
                 }),
-            // import.meta.url -> the module's url as a string
+            // import.meta.url becomes the module's url as a string
             Expression::StaticMemberExpression(member)
                 if matches!(member.object, Expression::ImportMeta(_))
                     && member.property.name == "url" =>
@@ -445,7 +441,7 @@ impl<'a> VisitMut<'a> for RefRewriter<'a, '_> {
                 // as a directive and yield an empty body.
                 Some(format!("({:?})", self.url))
             }
-            // import.meta.hot -> module.hot (provided by the runtime)
+            // import.meta.hot becomes module.hot (provided by the runtime)
             Expression::StaticMemberExpression(member)
                 if matches!(member.object, Expression::ImportMeta(_))
                     && member.property.name == "hot" =>

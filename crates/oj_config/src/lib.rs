@@ -3,11 +3,11 @@
 
 //! Loads `oj.config.{ts,js,mjs,json}`.
 //!
-//! `.json` is parsed directly. For `.ts`/`.js`/`.mjs` we strip TypeScript
-//! types with oxc, then evaluate the module in an embedded QuickJS engine
-//! (no Node) with `defineConfig` and `process.env` shimmed, capturing the
-//! default export and reading it back as JSON. Computed values, ternaries,
-//! and `process.env` all work; the exported object must be JSON-serializable
+//! `.json` is parsed directly. `.ts`/`.js`/`.mjs` have their TypeScript types
+//! stripped with oxc, then evaluate in an embedded QuickJS engine (no Node)
+//! with `defineConfig` and `process.env` shimmed, capturing the default
+//! export and reading it back as JSON. Computed values, ternaries, and
+//! `process.env` all work; the exported object must be JSON-serializable
 //! (functions/plugins are out of scope until the plugin system).
 
 use std::path::{Path, PathBuf};
@@ -28,8 +28,8 @@ pub enum ConfigError {
 const CANDIDATES: &[&str] = &["oj.config.ts", "oj.config.mjs", "oj.config.js", "oj.config.json"];
 
 /// A `define` value as a JS-expression string. A JSON string is already the
-/// expression the user wrote (e.g. `JSON.stringify("x")` -> `"x"`); anything
-/// else is JSON-serialized (numbers/bools/objects are valid JS as-is).
+/// expression the user wrote (e.g. `JSON.stringify("x")` yields `"x"`);
+/// anything else is JSON-serialized (numbers/bools/objects are valid JS as-is).
 fn define_value(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::String(s) => s.clone(),
@@ -48,7 +48,7 @@ pub fn config_defines(config: &OjConfig) -> Vec<(String, String)> {
 }
 
 /// A boolean under `environments.<name>.build.<field>` (e.g. `minify`,
-/// `sourcemap`), if set — the per-environment build-output override.
+/// `sourcemap`), if set: the per-environment build-output override.
 pub fn environment_build_bool(config: &OjConfig, env_name: &str, field: &str) -> Option<bool> {
     config
         .environments
@@ -107,7 +107,7 @@ pub fn resolve_alias(config: &OjConfig, env_name: &str) -> Vec<(String, String)>
     merged.into_iter().collect()
 }
 
-/// `config.environments.<name>.define` as `(name, js-expression)` pairs — the
+/// `config.environments.<name>.define` as `(name, js-expression)` pairs: the
 /// per-environment overrides of the Vite Environment API.
 pub fn environment_defines(config: &OjConfig, env_name: &str) -> Vec<(String, String)> {
     config

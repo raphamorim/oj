@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-//! CSS compilation on Lightning CSS — the same engine inside Tailwind v4,
-//! Vite's CSS pipeline, and Parcel. Handles plain CSS (syntax lowering,
+//! CSS compilation on Lightning CSS. Handles plain CSS (syntax lowering,
 //! autoprefixing, optional minify), CSS Modules scoping for `*.module.css`,
 //! and Sass/SCSS via the pure-Rust `grass` compiler (no Node sidecar).
 //!
-//! Targets drive both autoprefixing and modern-CSS lowering (nesting, etc.),
-//! which is what most apps reach for PostCSS/autoprefixer to do.
+//! Targets drive both autoprefixing and modern-CSS lowering (nesting, etc.).
 
 use std::path::Path;
 
@@ -19,7 +17,7 @@ use lightningcss::targets::{Browsers, Targets};
 #[derive(Debug)]
 pub struct CssOutput {
     pub css: String,
-    /// CSS Modules only: exported class name -> scoped name.
+    /// CSS Modules only: exported class name to scoped name.
     pub exports: Option<Vec<(String, String)>>,
 }
 

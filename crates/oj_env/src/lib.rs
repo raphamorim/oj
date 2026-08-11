@@ -94,7 +94,7 @@ fn expand(input: &str, vars: &BTreeMap<String, String>) -> String {
 }
 
 /// Load and merge the four env files for `mode` from `dir`. Process env is
-/// the expansion base but is NOT emitted (only file-declared vars are).
+/// the expansion base but is not emitted (only file-declared vars are).
 pub fn load(dir: &Path, mode: &str) -> Vec<(String, String)> {
     let mut base: BTreeMap<String, String> = std::env::vars().collect();
     let mut merged: BTreeMap<String, String> = BTreeMap::new();
@@ -135,7 +135,7 @@ pub fn import_meta_env_defines(
     for (k, v) in &obj {
         defines.push((format!("import.meta.env.{k}"), v.to_string()));
     }
-    // Bare `import.meta.env` -> the whole object.
+    // Bare `import.meta.env`: the whole object.
     defines.push(("import.meta.env".into(), serde_json::Value::Object(obj).to_string()));
     defines
 }

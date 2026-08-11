@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-//! CJS -> ESM interop for dependencies served to a native-ESM browser.
+//! CJS to ESM interop for dependencies served to a native-ESM browser.
 //!
-//! This is the correctness swamp every bundler wades through; the scope here
-//! is deliberate: make the common npm dist shape work (react, react-dom,
-//! scheduler and friends), loudly fail on what we don't handle yet.
+//! Scope is deliberate: make the common npm dist shape work (react,
+//! react-dom, scheduler and friends), fail loudly on the rest.
 //!
 //! Pipeline per CJS file:
-//! 1. `process.env.NODE_ENV` -> `"development"` (AST-aware, via
-//!    oxc ReplaceGlobalDefines) — load-bearing for React.
+//! 1. `process.env.NODE_ENV` becomes `"development"` (AST-aware, via
+//!    oxc ReplaceGlobalDefines); load-bearing for React.
 //! 2. Dead-branch elimination (oxc DCE), so the
 //!    `if (NODE_ENV === "production") require("./prod.js")` pattern drops the
 //!    production graph entirely instead of importing both builds.
@@ -20,7 +19,7 @@
 //! 4. Wrap: requires become static imports of the dep wrappers, the body runs
 //!    in a closure with `module`/`exports`/`require` in scope, and the
 //!    detected names become real ESM named exports (snapshotted after the
-//!    body runs — live-binding CJS mutation after module eval is not
+//!    body runs; live-binding CJS mutation after module eval is not
 //!    supported yet).
 //!
 //! Known-unsupported (fail loud or documented): dynamic `require(expr)`,

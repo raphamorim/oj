@@ -5,10 +5,9 @@
 //! webpack's enhanced-resolve, shared with Rspack).
 //!
 //! The library solves the Node algorithm (exports maps, conditions, browser
-//! field, symlinks). What lives HERE is our policy: extension order for a
-//! TS-first React project, browser-flavored condition names, and — later —
-//! the dedup rules that guarantee a single copy of react in the graph
-//! (pnpm symlink identity; a wrong call here = "invalid hook call").
+//! field, symlinks). This module sets the policy: extension order for a
+//! TS-first React project, browser-flavored condition names, and later the
+//! dedup rules that keep a single copy of react in the graph.
 
 use std::path::{Path, PathBuf};
 
@@ -31,8 +30,8 @@ pub struct ResolveFailure {
 impl OjResolver {
     /// Build a resolver for an app rooted at `root`. If the app has a
     /// `tsconfig.json`, its `paths` (the `@/*` alias convention) are wired in
-    /// via oxc_resolver's tsconfig support — this IS resolve.alias for the
-    /// TS+Vite apps that make up almost all of the target.
+    /// via oxc_resolver's tsconfig support, covering resolve.alias for
+    /// TS+Vite apps.
     pub fn new(root: &Path) -> Self {
         Self::with_conditions(root, &["browser", "import", "module", "default"].map(String::from))
     }
@@ -118,7 +117,7 @@ mod tests {
 
     #[test]
     fn resolves_tsconfig_paths_alias() {
-        // `@/*` -> `src/*` from the playground tsconfig.json.
+        // `@/*` maps to `src/*` from the playground tsconfig.json.
         let resolver = OjResolver::new(&playground_root());
         let resolved = resolver.resolve(&playground_src(), "@/App").unwrap();
         assert!(resolved.ends_with("App.tsx"), "alias @/App -> {resolved:?}");
@@ -126,7 +125,7 @@ mod tests {
 
     #[test]
     fn resolves_config_alias() {
-        // A `resolve.alias` entry (`~` -> `./src`) rewrites the specifier prefix
+        // A `resolve.alias` entry (`~` maps to `./src`) rewrites the specifier prefix
         // and then resolves through the normal extension probing.
         let resolver = OjResolver::with_options(
             &playground_root(),

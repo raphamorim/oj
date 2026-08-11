@@ -3,13 +3,11 @@
 
 //! The fused per-file compile pipeline.
 //!
-//! One arena, one parse, one fused transform pass-set, one codegen:
-//! TSX/TS/JSX -> strip types -> JSX (automatic runtime) -> React Fast Refresh
-//! instrumentation (dev) -> JS + sourcemap.
+//! One arena, one parse, one fused transform pass-set, one codegen.
+//! For TSX/TS/JSX: strip types, apply JSX (automatic runtime), then React
+//! Fast Refresh instrumentation (dev), emitting JS plus sourcemap.
 //!
-//! This is the hot path of the whole tool. Everything here must stay
-//! allocation-conscious and must never re-parse between stages — that
-//! single-parse property is the speed edge over plugin-pipeline designs.
+//! Never re-parses between stages; keep it allocation-conscious.
 
 pub mod bundle;
 pub mod cjs;
@@ -27,8 +25,8 @@ use oxc_span::SourceType;
 use oxc_transformer::{JsxRuntime, ReactRefreshOptions, TransformOptions, Transformer};
 use oxc_transformer_plugins::{ReplaceGlobalDefines, ReplaceGlobalDefinesConfig};
 
-/// Maps an import specifier to a replacement (e.g. `./App` -> `/src/App.tsx`).
-/// Returning `None` leaves the specifier untouched.
+/// Maps an import specifier to a replacement (e.g. `./App` becomes
+/// `/src/App.tsx`). Returning `None` leaves the specifier untouched.
 pub type ImportRewriter<'r> = dyn FnMut(&str) -> Option<String> + 'r;
 
 /// `import.meta.env.*` define pairs, set once at dev/build startup from the
@@ -206,10 +204,8 @@ pub fn compile_module(
         return Err(CompileError::Transform { path: path.to_path_buf(), message });
     }
 
-    // Vite-compatible static define replacement (import.meta.env plus any
-    // config/environment `define`). Gated on a cheap substring test so the
-    // common module pays nothing: run if the source references import.meta.env
-    // or any non-import.meta defined name (e.g. a `__FLAG__` global define).
+    // Static define replacement (import.meta.env plus config/env `define`),
+    // gated on a substring test so modules without defines pay nothing.
     let defines = import_meta_env_defines(opts.dev);
     let needs_defines = source_text.contains("import.meta.env")
         || defines

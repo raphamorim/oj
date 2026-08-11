@@ -1,25 +1,18 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// Persistent SSR module runner for `oj dev --ssr`.
+// Persistent SSR module runner for `oj dev --ssr`. Spawned once and driven over
+// stdin/stdout instead of bundling and spawning Node per render.
 //
-// Instead of building a Rolldown bundle and spawning Node per render, oj spawns
-// this once and drives it over stdin/stdout. It links the SSR module graph on
-// demand: app source is fetched (already TS/JSX-compiled) from the dev server
-// and evaluated as ES modules via `vm.SourceTextModule` with a custom linker;
-// node_modules are imported natively in this realm (React elements interop
-// across the vm realm via `Symbol.for`, so `renderToString` just works).
+// Links the SSR module graph on demand: app source is fetched (already
+// TS/JSX-compiled) from the dev server and evaluated via `vm.SourceTextModule`
+// with a custom linker; node_modules are imported natively in this realm (React
+// elements interop across the vm realm via `Symbol.for`).
 //
-// A module's identity is its absolute file path, so invalidation is by mtime:
-// any source whose file changed — plus every module that transitively imports
-// it — is dropped and rebuilt, and `vm` re-evaluates only those. Unchanged
-// subtrees and native imports are reused. No bundle step, one long-lived
-// process.
-//
-// Invalidation is push-driven: the runner subscribes to the dev server's HMR
-// WebSocket and drops stale modules the instant the server reports a change,
-// so the SSR graph tracks edits in the background rather than only at the next
-// render. A render-time mtime scan remains as a fallback.
+// Module identity is the absolute file path, so invalidation is by mtime: any
+// changed source, plus everything that transitively imports it, is dropped and
+// rebuilt; `vm` re-evaluates only those. Push-driven via the dev server's HMR
+// WebSocket, with a render-time mtime scan as fallback.
 //
 // Usage: node --experimental-vm-modules ssr-runner.mjs <baseUrl> <entryAbsPath>
 
@@ -49,9 +42,9 @@ const context = vm.createContext({
   performance,
 });
 
-// id (abs path) -> { mod, mtime, importers:Set<id>, evaluated:bool }
+// id (abs path): { mod, mtime, importers:Set<id>, evaluated:bool }
 const registry = new Map();
-// bare specifier -> SyntheticModule wrapping the native import namespace
+// bare specifier: SyntheticModule wrapping the native import namespace
 const externals = new Map();
 
 const enc = encodeURIComponent;
@@ -108,7 +101,7 @@ async function linker(spec, referencing) {
 }
 
 // Dynamic import() inside a module (e.g. a lazy `import.meta.glob` for
-// route-level code splitting): resolve, build, and EVALUATE the target, then
+// route-level code splitting): resolve, build, and evaluate the target, then
 // hand back its namespace/module.
 async function importDynamic(spec, referencing) {
   const r = await resolve(referencing.identifier, spec);
@@ -120,10 +113,9 @@ async function importDynamic(spec, referencing) {
 }
 
 // Single-flight per id: concurrent importers (e.g. several routes importing the
-// same module via an eager glob) must share ONE instance. Without this, each
-// caller checks the registry before the first `await` registers the module, and
-// they all create duplicates — a subtle correctness bug (shared module state
-// would diverge).
+// same module via an eager glob) must share one instance. Without this, each
+// caller checks the registry before the first `await` registers the module and
+// they all create duplicates, diverging shared module state.
 const building = new Map();
 async function build(id) {
   const existing = registry.get(id);
@@ -236,7 +228,7 @@ async function handleAction(emit, url, body) {
 
 // Produce the render for `url`. First runs the route loader (if any) and emits
 // `{data}` for the transport to serialize into the document; then the render
-// output — `{chunk}`… `{end}` for a streaming entry (renderStream), or a single
+// output: `{chunk}`… `{end}` for a streaming entry (renderStream), or a single
 // `{html}`.
 async function handleRender(emit, url) {
   const ns = await entryNamespace();

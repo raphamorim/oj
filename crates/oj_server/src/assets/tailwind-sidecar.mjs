@@ -3,10 +3,10 @@
 
 // oj CSS sidecar. If the app has a postcss.config.* it runs CSS through PostCSS
 // with the app's own plugins (Tailwind v3 or v4-via-@tailwindcss/postcss,
-// autoprefixer, ...) — exactly like Vite. Otherwise it falls back to the
-// Tailwind v4 JS API (@tailwindcss/node). Everything resolves from the APP's
-// node_modules. Protocol: one JSON per line on stdin {id, base, css, from} ->
-// stdout {id, css} | {id, error}. `--once <cssfile> <base>` prints compiled css.
+// autoprefixer, ...), like Vite. Otherwise it falls back to the Tailwind v4 JS
+// API (@tailwindcss/node). Everything resolves from the app's node_modules.
+// Protocol: one JSON per line on stdin {id, base, css, from}, stdout {id, css} |
+// {id, error}. `--once <cssfile> <base>` prints compiled css.
 import { createRequire } from "node:module";
 import { existsSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
@@ -16,7 +16,7 @@ import readline from "node:readline";
 const processors = new Map();
 
 // Build a PostCSS processor from the app's postcss.config.*, or null if the app
-// has none (then we use the Tailwind v4 fallback below).
+// has none (then the Tailwind v4 fallback below is used).
 async function loadPostcss(base) {
   if (processors.has(base)) return processors.get(base);
   const req = createRequire(base + "/package.json");
@@ -29,7 +29,7 @@ async function loadPostcss(base) {
     try {
       postcss = (await import(req.resolve("postcss"))).default;
     } catch {
-      postcss = null; // postcss not installed -> fall back
+      postcss = null; // postcss not installed: fall back
     }
     if (postcss) {
       const mod = await import(pathToFileURL(cfgPath).href);

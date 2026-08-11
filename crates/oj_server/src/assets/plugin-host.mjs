@@ -3,8 +3,8 @@
 
 // Persistent plugin host: loads Vite/Rollup-style plugins from the app's
 // plugins module and runs their hooks (transform / resolveId / load) against
-// oj's pipeline. JSON-lines over stdio with correlation ids (many calls can be
-// in flight; a cancelled caller just drops its response).
+// oj's pipeline. JSON-lines over stdio with correlation ids, so many calls can
+// be in flight at once.
 import http from "node:http";
 import { writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -29,7 +29,7 @@ const environment = {
 // Resolve an app's vite.config to its config object. Preferred path: Vite's
 // own `loadConfigFromFile` (a direct dep of any Vite app; handles TS, local
 // imports, and `defineConfig`). Fallback: bundle the config graph with the
-// app's esbuild ourselves (local imports inlined, node_modules external).
+// app's esbuild (local imports inlined, node_modules external).
 async function loadViteConfig(configPath) {
   const appRoot = initial.config?.root ?? process.cwd();
   const req = createRequire(appRoot + "/package.json");
@@ -75,7 +75,7 @@ try {
   let list;
   if (initial.pluginsFormat === "vite") {
     // vite.config.*: run its `plugins` array. Config plugins can be nested
-    // arrays and promises (async plugins) — flatten and await.
+    // arrays and promises (async plugins); flatten and await.
     const cfg = await loadViteConfig(pluginsPath);
     list = await Promise.all((cfg?.plugins ?? []).flat(Infinity));
   } else {
@@ -106,7 +106,7 @@ try {
   process.stderr.write(`oj plugin host: failed to load ${pluginsPath}: ${(e && e.stack) || e}\n`);
 }
 
-// Reverse RPC (Node -> Rust): a plugin's this.resolve asks oj's own resolver
+// Reverse RPC (Node to Rust): a plugin's this.resolve asks oj's own resolver
 // so plugin resolution matches oj (tsconfig aliases etc.). Correlated by id;
 // the reply comes back as an {rpcReply} line on stdin (see the readline loop).
 let rpcCounter = 1;
@@ -125,15 +125,15 @@ let emitCounter = 0;
 const emitted = [];
 
 // ModuleInfo cache: this.load populates it (async, via Rust); getModuleInfo
-// reads it synchronously — matching Rollup, where getModuleInfo returns info
+// reads it synchronously, matching Rollup, where getModuleInfo returns info
 // for modules already loaded into the graph and null otherwise.
 const moduleInfoCache = new Map();
 
 // Files a plugin registered via this.addWatchFile (dev watcher pulls these).
 const watchedFiles = new Set();
 // Module ids the host has observed (every transform id + this.load-ed id).
-// getModuleIds returns this — a subset of Rollup's whole-graph view, honest
-// about being "modules the plugin host has seen".
+// getModuleIds returns this: a subset of Rollup's whole-graph view, only the
+// modules the plugin host has actually seen.
 const seenIds = new Set();
 
 // Rollup plugin context. Covers warn/error, this.resolve (async, via oj's
@@ -145,12 +145,12 @@ const ctx = {
   error: (m) => {
     throw typeof m === "string" ? new Error(m) : m;
   },
-  // this.resolve(source, importer) -> { id } | null (Rollup shape).
+  // this.resolve(source, importer) returns { id } | null (Rollup shape).
   async resolve(source, importer) {
     const id = await ctxRpc("resolve", [source, importer ?? ""]);
     return id == null ? null : { id };
   },
-  // this.emitFile({ type:"asset", name?, fileName?, source }) -> reference id.
+  // this.emitFile({ type:"asset", name?, fileName?, source }) returns a reference id.
   // Assets only; chunk emission isn't supported. fileName defaults to
   // assets/<name> so plugins can predict the output path via getFileName.
   emitFile(file) {
@@ -167,7 +167,7 @@ const ctx = {
     if (!f) throw new Error(`oj: unknown emit reference ${referenceId}`);
     return f.fileName;
   },
-  // this.load({ id }) -> ModuleInfo { id, code, importedIds } (or null). Reads
+  // this.load({ id }) returns ModuleInfo { id, code, importedIds } (or null). Reads
   // + compiles the module through Rust, then caches it for getModuleInfo.
   async load(options) {
     const id = typeof options === "string" ? options : options.id;
@@ -178,7 +178,7 @@ const ctx = {
     }
     return info;
   },
-  // this.getModuleInfo(id) -> cached ModuleInfo | null. Synchronous (Rollup
+  // this.getModuleInfo(id) returns cached ModuleInfo | null. Synchronous (Rollup
   // shape): only modules previously this.load-ed are present.
   getModuleInfo(id) {
     return moduleInfoCache.get(typeof id === "string" ? id : id.id) ?? null;
@@ -187,7 +187,7 @@ const ctx = {
   addWatchFile(id) {
     if (id) watchedFiles.add(String(id));
   },
-  // this.getModuleIds() -> iterator over observed module ids (Rollup shape).
+  // this.getModuleIds() returns an iterator over observed module ids (Rollup shape).
   getModuleIds() {
     return seenIds.values();
   },
@@ -341,7 +341,7 @@ async function load(id) {
 }
 
 // handleHotUpdate: plugins customize HMR for a changed file. oj's simplified
-// contract — return "full-reload" to force a reload, [] to suppress HMR, or
+// contract: return "full-reload" to force a reload, [] to suppress HMR, or
 // undefined to let default HMR proceed. First decisive result wins.
 async function handleHotUpdate(file, timestamp) {
   let suppress = false;
@@ -409,7 +409,7 @@ async function runLifecycle(hook) {
   return null;
 }
 
-// generateBundle: hand the output bundle (fileName -> chunk|asset) to each
+// generateBundle: hand the output bundle (fileName to chunk|asset) to each
 // plugin's generateBundle(outputOptions, bundle, isWrite). Plugins may read it,
 // mutate chunk.code / asset.source, or this.emitFile new assets. Returns the
 // possibly-mutated bundle as JSON.
@@ -493,7 +493,7 @@ rl.on("line", async (line) => {
   } catch {
     return;
   }
-  // A reply to a this.resolve (or other ctx) reverse-RPC we sent earlier.
+  // A reply to a this.resolve (or other ctx) reverse-RPC sent earlier.
   if (msg.rpcReply != null) {
     const p = rpcPending.get(msg.rpcReply);
     if (p) {

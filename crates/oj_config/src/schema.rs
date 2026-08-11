@@ -23,9 +23,9 @@ pub struct OjConfig {
     pub env_dir: Option<String>,
     pub build: Option<BuildConfig>,
     pub preview: Option<PreviewConfig>,
-    /// Virtual modules: import id -> module source. `import x from "virtual:id"`
+    /// Virtual modules: import id to module source. `import x from "virtual:id"`
     /// resolves here instead of the filesystem (the first slice of plugin
-    /// support — resolve+load for author-provided modules).
+    /// support: resolve+load for author-provided modules).
     pub virtual_modules: Option<BTreeMap<String, String>>,
     /// oj-specific: default the dev server to registry bundle mode.
     pub bundle: Option<bool>,
@@ -56,7 +56,7 @@ pub struct ServerConfig {
     /// Response headers added to every dev response (e.g. COOP/COEP for
     /// SharedArrayBuffer). Mirrors Vite's `server.headers`.
     pub headers: Option<BTreeMap<String, String>>,
-    /// path prefix -> target (string) or detailed options.
+    /// path prefix to target (string) or detailed options.
     pub proxy: Option<BTreeMap<String, ProxyEntry>>,
 }
 
@@ -81,7 +81,7 @@ impl ProxyEntry {
     pub fn ws(&self) -> bool {
         matches!(self, ProxyEntry::Options(o) if o.ws.unwrap_or(false))
     }
-    /// Optional `^prefix` -> replacement rewrite of the request path.
+    /// Optional `^prefix` to replacement rewrite of the request path.
     pub fn rewrite(&self) -> Option<(&str, &str)> {
         match self {
             ProxyEntry::Options(o) => o.rewrite.as_ref().map(|r| (r.from.as_str(), r.to.as_str())),
@@ -109,7 +109,7 @@ pub struct ProxyRewrite {
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResolveConfig {
-    /// find -> replacement (absolute or `./`-relative to root).
+    /// find to replacement (absolute or `./`-relative to root).
     pub alias: Option<BTreeMap<String, String>>,
     pub dedupe: Option<Vec<String>>,
     pub extensions: Option<Vec<String>>,

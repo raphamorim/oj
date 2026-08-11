@@ -3,16 +3,14 @@
 
 //! The server-side module graph and HMR update propagation.
 //!
-//! Semantics follow Vite's model (the de-facto standard the React ecosystem
-//! is written against): on a file change, walk UP the importer chain from the
-//! changed module looking for accepting boundaries. If every path terminates
-//! in a boundary, send a targeted hot update; if any path dead-ends at an
-//! entry without acceptance, fall back to a full reload.
+//! Semantics follow Vite's model: on a file change, walk up the importer
+//! chain from the changed module looking for accepting boundaries. If every
+//! path terminates in a boundary, send a targeted hot update; if any path
+//! dead-ends at an entry without acceptance, fall back to a full reload.
 //!
 //! For React, a module becomes self-accepting when the Fast Refresh glue
 //! decides every export is a component (the `validateRefreshBoundary` rule).
-//! That wiring lands in milestone 1; the propagation algorithm below is
-//! already the real one.
+//! That wiring lands in milestone 1.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -102,9 +100,9 @@ impl ModuleGraph {
     /// Decide what to do about a change to `changed`.
     ///
     /// Mirrors Vite's `propagateUpdate`: walk each importer chain upward;
-    /// a chain ending at a non-accepting entry OR looping back on itself
+    /// a chain ending at a non-accepting entry or looping back on itself
     /// (circular import) means full reload.
-    /// TODO(perf): memoize per-module outcomes — per-chain DFS is
+    /// TODO(perf): memoize per-module outcomes; per-chain DFS is
     /// exponential on dense diamond graphs.
     pub fn propagate_update(&self, changed: &Path) -> HmrDecision {
         if !self.modules.contains_key(changed) {
@@ -126,7 +124,7 @@ impl ModuleGraph {
 
     /// Bundle-mode patch planning: like `propagate_update`, but also returns
     /// every module on the paths from `changed` to its boundaries. The
-    /// runtime must invalidate that whole set — intermediate modules hold
+    /// runtime must invalidate that whole set; intermediate modules hold
     /// references to the old instances' export namespaces.
     pub fn update_plan(&self, changed: &Path) -> Result<UpdatePlan, String> {
         match self.propagate_update(changed) {
@@ -225,7 +223,7 @@ mod tests {
         PathBuf::from(s)
     }
 
-    /// main.tsx -> App.tsx -> Button.tsx, where the components self-accept.
+    /// main.tsx imports App.tsx imports Button.tsx, where the components self-accept.
     fn graph() -> ModuleGraph {
         let mut g = ModuleGraph::new();
         g.add_import(&p("main.tsx"), &p("App.tsx"));
@@ -254,7 +252,7 @@ mod tests {
         let mut g = graph();
         g.set_self_accepting(&p("App.tsx"), false);
         g.add_import(&p("App.tsx"), &p("config.ts"));
-        // config.ts -> App.tsx (not accepting) -> main.tsx (entry, not accepting)
+        // config.ts up through App.tsx (not accepting) to main.tsx (entry, not accepting)
         assert!(matches!(
             g.propagate_update(&p("config.ts")),
             HmrDecision::FullReload { .. }
@@ -271,24 +269,24 @@ mod tests {
 
     #[test]
     fn update_plan_collects_dirty_chain_through_non_boundaries() {
-        // utils.ts -> Button.tsx (boundary): dirty = {utils, Button}
+        // utils.ts up to Button.tsx (boundary): dirty = {utils, Button}
         let mut g = graph();
         g.add_import(&p("Button.tsx"), &p("utils.ts"));
         let plan = g.update_plan(&p("utils.ts")).unwrap();
         assert_eq!(plan.boundaries, vec![p("Button.tsx")]);
         assert_eq!(plan.dirty, vec![p("Button.tsx"), p("utils.ts")]);
-        // Boundary stops the climb: App.tsx is NOT dirty.
+        // Boundary stops the climb: App.tsx is not dirty.
         assert!(!plan.dirty.contains(&p("App.tsx")));
-        // Dead end -> Err(reason) for full reload.
+        // Dead end: Err(reason) for full reload.
         assert!(g.update_plan(&p("main.tsx")).is_err());
     }
 
     #[test]
     fn invalidate_skips_own_acceptance_and_climbs_to_importer() {
-        // Button invalidates itself -> App (accepting) becomes the boundary.
+        // Button invalidates itself, so App (accepting) becomes the boundary.
         let decision = graph().propagate_update_from_importers(&p("Button.tsx"));
         assert_eq!(decision, HmrDecision::Update { boundaries: vec![p("App.tsx")] });
-        // App invalidates itself -> main.tsx is a non-accepting entry.
+        // App invalidates itself, so main.tsx is a non-accepting entry.
         assert!(matches!(
             graph().propagate_update_from_importers(&p("App.tsx")),
             HmrDecision::FullReload { .. }
@@ -301,7 +299,7 @@ mod tests {
         g.add_import(&p("App.tsx"), &p("old-dep.ts"));
         // App refactored: now only imports Button.
         g.set_imports(&p("App.tsx"), &[p("Button.tsx")]);
-        // old-dep no longer reaches a boundary through App -> full reload,
+        // old-dep no longer reaches a boundary through App: full reload,
         // because nothing imports it anymore.
         assert!(matches!(
             g.propagate_update(&p("old-dep.ts")),

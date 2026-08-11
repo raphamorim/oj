@@ -3,13 +3,12 @@
 
 //! Content-addressed persistent cache for compiled module outputs.
 //!
-//! Discipline (per the webpack-5/Turbopack trauma notes in the research):
-//! every input is part of the key — source bytes, the serving URL, and a
-//! salt that folds in tool version + cache format + compile mode. There is
-//! no invalidation protocol to get wrong: content changes -> different key.
-//! Stale entries are just never read again (GC is a TODO).
+//! Every input is part of the key: source bytes, the serving URL, and a
+//! salt folding in tool version, cache format, and compile mode. No
+//! invalidation protocol to get wrong; changed content means a different
+//! key, and stale entries are simply never read again (GC is a TODO).
 //!
-//! Layout: `<dir>/<first two hex chars>/<hash>.json`. JSON for now —
+//! Layout: `<dir>/<first two hex chars>/<hash>.json`. JSON for now:
 //! debuggable with `cat`; a binary format is a profiling decision, not an
 //! architectural one.
 
@@ -31,10 +30,10 @@ pub struct CachedModule {
     /// Bundle mode: "esm" or "cjs" factory kind ("" for unbundled entries).
     #[serde(default)]
     pub kind: String,
-    /// Bundle mode, CJS only: raw require specifier -> resolved url.
+    /// Bundle mode, CJS only: raw require specifier to resolved url.
     #[serde(default)]
     pub require_map: Vec<(String, String)>,
-    /// CSS modules only: exported class name -> scoped name.
+    /// CSS modules only: exported class name to scoped name.
     #[serde(default)]
     pub css_exports: Vec<(String, String)>,
     /// Absolute out-of-root paths this module's rewritten /@fs/ urls point

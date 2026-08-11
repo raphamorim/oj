@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// One-shot: load an app's vite.config and print the config VALUES oj consumes
+// One-shot: load an app's vite.config and print the config values oj consumes
 // (base, server.port/host, define) as JSON on stdout. Uses Vite's own config
-// loader when available, else bundles with the app's esbuild — the same path
+// loader when available, else bundles with the app's esbuild, the same path
 // the plugin host uses to read the `plugins` array.
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";

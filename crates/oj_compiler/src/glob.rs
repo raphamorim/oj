@@ -156,7 +156,7 @@ fn collect_patterns(arg: &Argument) -> Option<Vec<String>> {
                 if let ArrayExpressionElement::StringLiteral(s) = el {
                     out.push(s.value.to_string());
                 } else {
-                    return None; // non-literal -> bail, leave call untouched
+                    return None; // non-literal: bail, leave call untouched
                 }
             }
             Some(out)

@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-//! `oj build`: production build via embedded Rolldown.
+//! `oj build`: production build via embedded Rolldown 1.x (MIT).
 //!
-//! Per the research decision, the prod linker (tree shaking, chunking,
-//! minification) is the least differentiated multi-month component — we
-//! embed Rolldown 1.x (MIT) instead of rebuilding it. oj owns the app-shaped
-//! parts: HTML entry discovery, NODE_ENV, hashed-asset HTML rewriting, and
-//! the summary UX.
+//! oj owns the app-shaped parts: HTML entry discovery, NODE_ENV, hashed-asset
+//! HTML rewriting, and the build summary.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,18 +27,18 @@ use rolldown_plugin::__inner::SharedPluginable;
 use oj_server::plugins::PluginHost;
 
 /// The oj build plugin: loads `.css`/`.scss` imports as JS stubs (CSS Modules
-/// export their scoped class map) collecting compiled CSS for one emitted
-/// stylesheet, and — via `transform` — expands `import.meta.glob` (Rolldown
-/// has no native glob), keeping prod builds in sync with dev.
+/// export their scoped class map), collecting compiled CSS into one emitted
+/// stylesheet. Its `transform` expands `import.meta.glob` (Rolldown has no
+/// native glob), keeping prod builds in sync with dev.
 #[derive(Debug)]
 struct OjCssPlugin {
     collected: Arc<Mutex<Vec<(String, String)>>>,
     /// App root, so CSS-module class names hash from the same root-relative id
-    /// (`/src/x.module.css`) the dev server uses — keeping `oj dev`, `oj build`,
-    /// and the SSR/client bundles all in agreement (matters for hydration).
+    /// (`/src/x.module.css`) the dev server uses. Keeps `oj dev`, `oj build`,
+    /// and the SSR/client bundles consistent, which hydration relies on.
     root: PathBuf,
-    /// App has a postcss.config — run all .css through the sidecar (PostCSS),
-    /// not just Tailwind-flagged css (parity with the dev server).
+    /// App has a postcss.config: run all .css through the sidecar (PostCSS),
+    /// not just Tailwind-flagged css, as the dev server does.
     has_postcss: bool,
     /// This is a client (browser) build: replace `*.server.*` modules with RPC
     /// stubs so server-only code never ships to the browser. The server build
@@ -60,10 +57,11 @@ impl Plugin for OjCssPlugin {
             | rolldown_plugin::HookUsage::Transform
     }
 
-    // Built-in `virtual:oj-routes` -> a synthetic module at the app root (so its
-    // `./src/routes/**` glob resolves there); `load` returns the manifest source
-    // and `transform` (below) expands the glob. Also handles Vite's `?url` asset
-    // imports: resolve the real file, keep the `?url` marker so `load` emits it.
+    // Built-in `virtual:oj-routes` resolves to a synthetic module at the app
+    // root (so its `./src/routes/**` glob resolves there); `load` returns the
+    // manifest source and `transform` (below) expands the glob. Also handles
+    // Vite's `?url` asset imports: resolve the real file, keep the `?url` marker
+    // so `load` emits it.
     fn resolve_id(
         &self,
         ctx: &PluginContext,
@@ -179,16 +177,15 @@ impl Plugin for OjCssPlugin {
             }
             let mut source = std::fs::read_to_string(path)
                 .map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
-            // Sass/SCSS -> CSS first (sibling @use/@import resolve from dir).
+            // Sass/SCSS to CSS first (sibling @use/@import resolve from dir).
             if oj_css::is_sass(path) {
                 let dir = std::path::Path::new(path).parent();
                 source = oj_css::compile_sass(&source, dir).map_err(|e| anyhow::anyhow!(e))?;
             }
-            // Run css through the CSS sidecar (the app's postcss.config, or the
-            // Tailwind v4 API) exactly like the dev server: for Tailwind-flagged
-            // css always, and for any .css when the app has a postcss.config
-            // (arbitrary PostCSS). Plain css with no postcss config goes straight
-            // to Lightning below.
+            // Run css through the CSS sidecar (the app's postcss.config or the
+            // Tailwind v4 API), as the dev server does: always for Tailwind-
+            // flagged css, and for any .css when the app has a postcss.config.
+            // Plain css with no postcss config goes straight to Lightning below.
             if oj_server::sidecar::is_tailwind_css(&source)
                 || (self.has_postcss && path.ends_with(".css"))
             {
@@ -222,9 +219,8 @@ impl Plugin for OjCssPlugin {
 }
 
 /// Expand `@tailwind`/`@apply` (and any `postcss.config.*` plugins) in a CSS
-/// file via oj's one-shot CSS sidecar — the same sidecar the dev server runs,
-/// so `oj dev` and `oj build` produce identical Tailwind output. Returns the
-/// fully-expanded CSS.
+/// file via oj's one-shot CSS sidecar, the same one the dev server runs, so
+/// `oj dev` and `oj build` produce identical Tailwind output.
 fn expand_css_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String> {
     let script = root.join(".oj-cache").join("css-sidecar.mjs");
     if let Some(parent) = script.parent() {
@@ -331,8 +327,8 @@ fn copy_public_dir(src: &Path, dest: &Path) -> anyhow::Result<()> {
 #[derive(Debug)]
 struct OjUserPlugin {
     host: Arc<PluginHost>,
-    /// Cached `has_render_chunk()` — renderChunk fires per chunk, so we resolve
-    /// it once instead of round-tripping to Node for every chunk.
+    /// Cached `has_render_chunk()`: renderChunk fires per chunk, so resolve it
+    /// once instead of round-tripping to Node for every chunk.
     render_chunk_enabled: Arc<tokio::sync::OnceCell<bool>>,
 }
 
@@ -413,8 +409,8 @@ impl Plugin for OjUserPlugin {
 
     // Output-phase hook: the plugins see the finished bundle (keyed by
     // fileName), may read it, mutate chunk `code` / asset `source`, or emitFile
-    // new assets (collected separately). Skipped entirely when no plugin
-    // defines generateBundle, so builds that don't use it pay nothing.
+    // new assets (collected separately). Skipped when no plugin defines
+    // generateBundle.
     async fn generate_bundle(
         &self,
         _ctx: &PluginContext,
@@ -645,7 +641,7 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
             .await;
     }
 
-    // Library mode: build a distributable, not an app — no index.html.
+    // Library mode: build a distributable, not an app (no index.html).
     if let Some(lib) = build_cfg.lib.clone() {
         return build_library(&root, &out_dir, lib, minify, sourcemap).await;
     }
@@ -738,7 +734,7 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
     // Fire the closeBundle hook (the last output hook; write() alone doesn't).
     bundler.close().await.map_err(|errs| anyhow::anyhow!("close failed:\n{errs:?}"))?;
 
-    // The module graph is complete: buildEnd fires before we emit HTML/manifest.
+    // The module graph is complete: buildEnd fires before emitting HTML/manifest.
     if let Some(host) = &plugin_host {
         if let Err(e) = host.build_end().await {
             eprintln!("oj build: plugin buildEnd failed: {e}");
@@ -759,7 +755,7 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
     }
 
     for warning in &output.warnings {
-        // oj's transform plugins intentionally don't emit sourcemaps yet.
+        // oj's transform plugins don't emit sourcemaps yet.
         if format!("{warning:?}").contains("SOURCEMAP_BROKEN") {
             continue;
         }
@@ -948,7 +944,7 @@ pub(crate) async fn build_ssr(
 
     // User plugins run in the SSR build as the "ssr" environment, so
     // resolveId/load/transform (and applyToEnvironment("ssr")) apply to server
-    // modules — parity with the dev SSR runner.
+    // modules, matching the dev SSR runner.
     let mut config = oj_config::load(root).map_err(|e| anyhow::anyhow!("{e}"))?;
     oj_server::plugins::adopt_vite_config_values(&mut config, root);
     let ssr_base = config.base.clone().unwrap_or_else(|| "/".into());
@@ -1046,10 +1042,6 @@ pub(crate) async fn build_ssr(
     Ok(())
 }
 
-/// The emitted streaming production SSR server. Imports the server bundle,
-/// streams `renderToReadableStream` over a chunked HTTP response with the
-/// hashed client script/stylesheet injected, and serves the client assets.
-/// `__CLIENT_JS__` / `__CLIENT_CSS__` are filled in at build time.
 /// Server-function dispatch module: globs the app's `*.server.*` modules (real
 /// implementations) and calls the requested export. Bundled to
 /// `<out>/_oj_server_fns.mjs` and imported by the production server.
@@ -1089,7 +1081,7 @@ fn has_server_modules(root: &Path) -> bool {
 }
 
 /// Build the server-function dispatch bundle to `<out>/_oj_server_fns.mjs`
-/// (node platform, node_modules external, real server code — not stubbed).
+/// (node platform, node_modules external, real server code, not stubbed).
 async fn build_server_fns(root: &Path, out_dir: &Path) -> anyhow::Result<()> {
     use rolldown::{IsExternal, Platform};
     let entry_path = root.join("_oj_server_fns_entry.tsx");
@@ -1195,7 +1187,7 @@ for (const url of paths) {
 }
 "#;
 
-const SSR_PROD_SERVER: &str = r#"// Generated by `oj build --ssr` — streaming production SSR server.
+const SSR_PROD_SERVER: &str = r#"// Generated by `oj build --ssr`: streaming production SSR server.
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -1290,7 +1282,7 @@ createServer(async (req, res) => {
 }).listen(PORT, () => console.log(`oj ssr server on http://localhost:${PORT}`));
 "#;
 
-/// Generated by `oj build --ssr` — an edge/worker SSR entry: a Web-standard
+/// Generated by `oj build --ssr`: an edge/worker SSR entry, a Web-standard
 /// `fetch` handler (Request/Response/ReadableStream, no `node:*`) for a
 /// Cloudflare-Workers / `workerd`-style runtime. Static assets are served by
 /// the platform; this handles SSR, loaders/actions, and server functions.
@@ -1351,9 +1343,8 @@ export default {
 };
 "#;
 
-/// Derive the client hydration entry from the server entry by convention:
-/// swap "server" -> "client" in the filename, if that sibling exists.
-/// Derive the client entry path from an SSR entry (`entry-server.tsx` ->
+/// Derive the client hydration entry from the SSR entry by convention: swap
+/// "server" for "client" in the filename (`entry-server.tsx` becomes
 /// `entry-client.tsx`), if that sibling file exists.
 pub(crate) fn derive_client_entry(root: &Path, server_entry: &str) -> Option<String> {
     let file = Path::new(server_entry).file_name()?.to_str()?;
@@ -1371,7 +1362,7 @@ pub(crate) fn derive_client_entry(root: &Path, server_entry: &str) -> Option<Str
 /// Full production SSR build: the Node server bundle, a browser client bundle
 /// for hydration (from the sibling `*-client.*` entry), and a streaming
 /// `server.mjs` that ties them together. Without a client entry, only the
-/// server bundle is emitted (no runnable server — nothing to hydrate).
+/// server bundle is emitted (no runnable server, nothing to hydrate).
 pub(crate) async fn build_ssr_app(
     root: &Path,
     out_dir: &Path,
@@ -1455,7 +1446,7 @@ async fn build_client_entry(
     let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
 
     // User plugins run in the client hydration bundle as the "client"
-    // environment (parity with the dev client pipeline), so a shared module can
+    // environment (matching the dev client pipeline), so a shared module can
     // use plugin resolveId/load/transform on both the server and client sides.
     let mut config = oj_config::load(root).map_err(|e| anyhow::anyhow!("{e}"))?;
     oj_server::plugins::adopt_vite_config_values(&mut config, root);
@@ -1693,7 +1684,7 @@ struct ManifestEntry {
 
 /// Build a Vite-compatible `manifest.json` value: keyed by root-relative
 /// source path, each row carrying the emitted file plus name/isEntry/imports/
-/// css. This is the exact shape Laravel/Rails/Django Vite plugins consume.
+/// css. The shape Laravel/Rails/Django Vite plugins consume.
 fn build_manifest(entries: &[ManifestEntry]) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     for e in entries {
