@@ -32,6 +32,9 @@ struct Runner {
 struct StartState {
     proxy_prefixes: Vec<String>,
     runner: Arc<tokio::sync::Mutex<Runner>>,
+    /// The browser-bundled client hydration entry, served at
+    /// `/@oj-start/client-entry.js`.
+    client_bundle: PathBuf,
 }
 
 pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
@@ -41,6 +44,7 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
     let cache = root.join(".oj-cache").join("start");
     oj_server::write_start_assets(&cache)?;
     generate_route_tree(&root, &cache)?;
+    bundle_client_entry(&root, &cache)?;
 
     // Reuse the dev server for module/asset serving; the document route sits on top.
     let built = oj_server::DevServer { root: root.clone(), port, bundle: false }.build_app().await?;
@@ -48,6 +52,7 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
     let state = Arc::new(StartState {
         proxy_prefixes: built.proxy_prefixes.clone(),
         runner: Arc::new(tokio::sync::Mutex::new(runner)),
+        client_bundle: cache.join("client-entry.js"),
     });
 
     let app = built
@@ -66,14 +71,24 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
 
 /// Run `@tanstack/router-generator` once to write `src/routeTree.gen.ts`.
 fn generate_route_tree(root: &Path, cache: &Path) -> anyhow::Result<()> {
+    run_node(root, &cache.join("generate.mjs"), "route tree generation")
+}
+
+/// Bundle the client hydration entry for the browser (esbuild, aliases resolved).
+fn bundle_client_entry(root: &Path, cache: &Path) -> anyhow::Result<()> {
+    run_node(root, &cache.join("bundle-client.mjs"), "client entry bundling")
+}
+
+fn run_node(root: &Path, script: &Path, what: &str) -> anyhow::Result<()> {
     let status = std::process::Command::new("node")
-        .arg(cache.join("generate.mjs"))
+        .arg(script)
         .env("OJ_APP_ROOT", root)
+        .env("NODE_ENV", "development")
         .current_dir(root)
         .status()
-        .map_err(|e| anyhow::anyhow!("could not run route generator (node): {e}"))?;
+        .map_err(|e| anyhow::anyhow!("could not run {what} (node): {e}"))?;
     if !status.success() {
-        anyhow::bail!("route tree generation failed");
+        anyhow::bail!("{what} failed");
     }
     Ok(())
 }
@@ -120,14 +135,18 @@ fn classify(req: &Request, proxy_prefixes: &[String]) -> Route {
 }
 
 async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: Next) -> Response {
-    // The client hydration entry is not wired yet (browser-side alias
-    // resolution is a later slice); serve an inert module so it does not 404.
+    // The browser-bundled client hydration entry (esbuild, aliases resolved).
     if req.uri().path() == "/@oj-start/client-entry.js" {
-        return (
-            [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
-            "// oj: client hydration not wired yet\nexport {};\n",
-        )
-            .into_response();
+        return match tokio::fs::read(&state.client_bundle).await {
+            Ok(bytes) => (
+                [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
+                bytes,
+            )
+                .into_response(),
+            Err(e) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("oj start: client entry: {e}")).into_response()
+            }
+        };
     }
     match classify(&req, &state.proxy_prefixes) {
         Route::Document => render_document(&state, req.uri().path()).await,
