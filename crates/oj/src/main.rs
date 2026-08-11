@@ -3,6 +3,7 @@
 
 mod build;
 mod ssr_dev;
+mod start_dev;
 
 use std::path::PathBuf;
 
@@ -75,6 +76,8 @@ async fn main() -> anyhow::Result<()> {
             });
             if let Some(entry) = ssr {
                 ssr_dev::ssr_dev(root, entry, port).await
+            } else if oj_server::is_tanstack_start_app(&root) {
+                start_dev::start_dev(root, port).await
             } else {
                 oj_server::DevServer { root, port, bundle }.run().await
             }

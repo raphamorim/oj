@@ -45,6 +45,38 @@ const BUNDLE_RUNTIME_JS: &str = include_str!("assets/bundle-runtime.js");
 pub const SSR_RUNNER_JS: &str = include_str!("assets/ssr-runner.mjs");
 const COMPILABLE: &[&str] = &["tsx", "ts", "jsx", "js", "mjs"];
 
+/// TanStack Start adapter assets: a Node loader hook (resolves the framework's
+/// four alias specifiers + compiles TS/JSX), the persistent SSR runner, the
+/// route-tree generator, and the synthesized server/client/manifest entries.
+const START_ASSETS: &[(&str, &str)] = &[
+    ("loader.mjs", include_str!("assets/start/loader.mjs")),
+    ("runner.mjs", include_str!("assets/start/runner.mjs")),
+    ("generate.mjs", include_str!("assets/start/generate.mjs")),
+    ("server-entry.tsx", include_str!("assets/start/server-entry.tsx")),
+    ("client-entry.tsx", include_str!("assets/start/client-entry.tsx")),
+    ("start-entry.ts", include_str!("assets/start/start-entry.ts")),
+    ("plugin-adapters.ts", include_str!("assets/start/plugin-adapters.ts")),
+    ("manifest.ts", include_str!("assets/start/manifest.ts")),
+];
+
+/// Write the TanStack Start adapter assets into `dir` (`.oj-cache/start`).
+pub fn write_start_assets(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    for (name, content) in START_ASSETS {
+        std::fs::write(dir.join(name), content)?;
+    }
+    Ok(())
+}
+
+/// A TanStack Start app: `@tanstack/react-start` in package.json plus a
+/// `src/routes/` directory.
+pub fn is_tanstack_start_app(root: &Path) -> bool {
+    root.join("src/routes").is_dir()
+        && std::fs::read_to_string(root.join("package.json"))
+            .map(|s| s.contains("@tanstack/react-start"))
+            .unwrap_or(false)
+}
+
 pub struct DevServer {
     pub root: PathBuf,
     /// CLI `--port`; `None` falls back to config `server.port` then 5199.
@@ -210,7 +242,15 @@ impl DevServer {
 
         // Where plugins come from: oj.plugins.* (array) or a vite.config.*
         // (default export's `plugins`). The host reads them per `pluginsFormat`.
-        let (plugins_path, plugins_format, plugins_label) = match plugins::plugin_source(&root) {
+        // A TanStack Start app's vite.config plugins are the framework's (run by
+        // the start adapter, not the plugin host), and depend on Vite internals
+        // oj does not host, so skip loading them here.
+        let plugin_src = if is_tanstack_start_app(&root) {
+            None
+        } else {
+            plugins::plugin_source(&root)
+        };
+        let (plugins_path, plugins_format, plugins_label) = match plugin_src {
             Some(plugins::PluginSource::OjPlugins(p)) => {
                 let label = p.file_name().unwrap().to_string_lossy().into_owned();
                 (Some(p), "oj", label)
