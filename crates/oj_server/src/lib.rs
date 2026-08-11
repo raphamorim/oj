@@ -177,40 +177,10 @@ impl DevServer {
         let mut config = oj_config::load(&root).map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // When the app configures itself through a `vite.config` (no
-        // `oj.plugins.*`), adopt its `base`, `server.port`/`host`, and `define`
-        // for any field oj.config left unset — so `oj dev` honors the app's own
-        // declared config, not just its plugin array.
-        if let Some(v) = plugins::extract_vite_values(&root) {
-            if config.base.is_none() {
-                config.base = v.base;
-            }
-            if let Some(vdef) = v.define {
-                let def = config.define.get_or_insert_with(Default::default);
-                for (k, val) in vdef {
-                    def.entry(k).or_insert(val);
-                }
-            }
-            if v.port.is_some() || v.host.is_some() {
-                let sc = config.server.get_or_insert_with(Default::default);
-                if sc.port.is_none() {
-                    sc.port = v.port;
-                }
-                if sc.host.is_none() {
-                    sc.host = v.host;
-                }
-            }
-            if let Some(valias) = v.alias {
-                if !valias.is_empty() {
-                    let rc = config.resolve.get_or_insert_with(Default::default);
-                    let map = rc.alias.get_or_insert_with(Default::default);
-                    for (find, replacement) in valias {
-                        if let Some(s) = replacement.as_str() {
-                            map.entry(find).or_insert_with(|| s.to_string());
-                        }
-                    }
-                }
-            }
-        }
+        // `oj.plugins.*`), adopt its `base`, `server.port`/`host`, `define`, and
+        // `resolve.alias` for any field oj.config left unset. Shared with the
+        // production build so `oj dev` and `oj build` agree.
+        plugins::adopt_vite_config_values(&mut config, &root);
 
         // Load .env files (dev mode) and install the import.meta.env defines
         // before any module compiles. envPrefix from config overrides VITE_.

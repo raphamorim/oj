@@ -206,6 +206,33 @@ fn expand_css_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String
 }
 
 /// Whether a module path is a server-function module (`*.server.{ts,tsx,js,jsx}`).
+/// Build Rolldown's `resolve.alias` from the app's `resolve.alias` config for
+/// an environment (client/ssr). Relative replacements (`./src`) become absolute
+/// against `root`, matching oj's own resolver. Returns `None` when there are no
+/// aliases, so Rolldown keeps its defaults (including tsconfig `paths`).
+fn rolldown_resolve(
+    root: &Path,
+    config: &oj_config::OjConfig,
+    env: &str,
+) -> Option<rolldown_common::ResolveOptions> {
+    let alias = oj_config::resolve_alias(config, env);
+    if alias.is_empty() {
+        return None;
+    }
+    let alias = alias
+        .into_iter()
+        .map(|(find, replacement)| {
+            let target = if replacement.starts_with('.') {
+                root.join(&replacement).to_string_lossy().into_owned()
+            } else {
+                replacement
+            };
+            (find, vec![Some(target)])
+        })
+        .collect();
+    Some(rolldown_common::ResolveOptions { alias: Some(alias), ..Default::default() })
+}
+
 fn is_server_module_path(path: &str) -> bool {
     [".server.ts", ".server.tsx", ".server.js", ".server.jsx"].iter().any(|s| path.ends_with(s))
 }
@@ -541,7 +568,10 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         .canonicalize()
         .with_context(|| format!("app root not found: {}", root.display()))?;
 
-    let config = oj_config::load(&root).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut config = oj_config::load(&root).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Adopt vite.config base/define/resolve.alias for vite-configured apps, so
+    // `oj build` resolves the same way `oj dev` does.
+    oj_server::plugins::adopt_vite_config_values(&mut config, &root);
     let build_cfg = config.build.clone().unwrap_or_default();
     // Precedence: CLI --out > config build.outDir > "dist".
     let out = out
@@ -619,6 +649,7 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         input: Some(inputs),
         cwd: Some(root.clone()),
         dir: Some(out_dir.display().to_string()),
+        resolve: rolldown_resolve(&root, &config, "client"),
         entry_filenames: Some("assets/[name]-[hash].js".to_string().into()),
         chunk_filenames: Some("assets/[name]-[hash].js".to_string().into()),
         // Per-environment build output: the "client" environment may override
@@ -864,7 +895,8 @@ pub(crate) async fn build_ssr(
     // User plugins run in the SSR build as the "ssr" environment, so
     // resolveId/load/transform (and applyToEnvironment("ssr")) apply to server
     // modules — parity with the dev SSR runner.
-    let config = oj_config::load(root).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut config = oj_config::load(root).map_err(|e| anyhow::anyhow!("{e}"))?;
+    oj_server::plugins::adopt_vite_config_values(&mut config, root);
     let ssr_base = config.base.clone().unwrap_or_else(|| "/".into());
     let plugin_host = user_plugin_host(
         root,
@@ -901,6 +933,7 @@ pub(crate) async fn build_ssr(
             }]),
             cwd: Some(root.to_path_buf()),
             dir: Some(out_dir.display().to_string()),
+            resolve: rolldown_resolve(root, &config, "ssr"),
             platform: Some(Platform::Node),
             external: Some(external),
             format: Some(OutputFormat::Esm),
@@ -1368,7 +1401,8 @@ async fn build_client_entry(
     // User plugins run in the client hydration bundle as the "client"
     // environment (parity with the dev client pipeline), so a shared module can
     // use plugin resolveId/load/transform on both the server and client sides.
-    let config = oj_config::load(root).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut config = oj_config::load(root).map_err(|e| anyhow::anyhow!("{e}"))?;
+    oj_server::plugins::adopt_vite_config_values(&mut config, root);
     let client_base = config.base.clone().unwrap_or_else(|| "/".into());
     let plugin_host = user_plugin_host(
         root,
@@ -1393,6 +1427,7 @@ async fn build_client_entry(
             input: Some(vec![InputItem { name: Some(stem), import: entry_import, ..Default::default() }]),
             cwd: Some(root.to_path_buf()),
             dir: Some(out_dir.display().to_string()),
+            resolve: rolldown_resolve(root, &config, "client"),
             entry_filenames: Some("assets/[name]-[hash].js".to_string().into()),
             chunk_filenames: Some("assets/[name]-[hash].js".to_string().into()),
             // Per-environment build output for the "client" hydration bundle.
