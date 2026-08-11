@@ -37,10 +37,37 @@ export async function resolve(spec, context, next) {
   return next(spec, context);
 }
 
+// createServerFn provider transform (server side). A bare `.handler(fn)`
+// leaves the runtime's `extractedFn` returning the raw value, but it expects
+// `{ result }`. Rewrite each top-level `const NAME = createServerFn(...).handler(FN)`
+// to the provider shape so `NAME()` runs the handler in-process during SSR:
+//   const NAME_createServerFn_handler = createServerRpc({id,name,filename},
+//     (opts) => NAME.__executeServer(opts));
+//   const NAME = createServerFn(...).handler(NAME_createServerFn_handler, FN);
+function transformServerFns(code, path) {
+  if (!code.includes("createServerFn")) return code;
+  const rel = path.startsWith(APP) ? path.slice(APP.length).replace(/^\//, "") : path;
+  const re =
+    /(^|[\n;])([ \t]*)((?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*createServerFn\b[\s\S]*?\.handler\s*\()/g;
+  let changed = false;
+  const out = code.replace(re, (_m, pre, indent, decl, name) => {
+    changed = true;
+    const id = JSON.stringify(`${rel}#${name}`);
+    const meta = `{ id: ${id}, name: ${JSON.stringify(name)}, filename: ${JSON.stringify(rel)} }`;
+    const rpc =
+      `${indent}const ${name}_createServerFn_handler = createServerRpc(${meta}, ` +
+      `(opts) => ${name}.__executeServer(opts));\n`;
+    return `${pre}${rpc}${indent}${decl}${name}_createServerFn_handler, `;
+  });
+  if (!changed) return code;
+  return `import { createServerRpc } from "@tanstack/react-start/server-rpc";\n${out}`;
+}
+
 export async function load(url, context, next) {
   if (url.endsWith(".tsx") || url.endsWith(".ts")) {
     const path = fileURLToPath(url);
-    const out = transformSync(readFileSync(path, "utf8"), {
+    const src = transformServerFns(readFileSync(path, "utf8"), path);
+    const out = transformSync(src, {
       loader: url.endsWith("tsx") ? "tsx" : "ts",
       format: "esm", jsx: "automatic", sourcefile: path,
     });

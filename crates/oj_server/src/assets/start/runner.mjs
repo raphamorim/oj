@@ -7,6 +7,10 @@ import { pathToFileURL, fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import readline from "node:readline";
 
+// Server-function base path (server functions build their URL from it; a bare
+// createServerRpc needs it defined even for the in-process SSR path).
+process.env.TSS_SERVER_FN_BASE ??= "/_serverFn/";
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 register(pathToFileURL(join(HERE, "loader.mjs")).href, pathToFileURL(HERE + "/").href);
 
