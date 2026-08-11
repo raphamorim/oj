@@ -2182,10 +2182,12 @@ fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
             continue;
         }
 
-        // Let plugins customize HMR for this file (handleHotUpdate).
+        // Notify plugins the file changed (Rollup watchChange), then let them
+        // customize HMR (handleHotUpdate).
         if let Some(host) = &state.plugins {
             let file = path.display().to_string();
             let ts = now_millis() as u64;
+            let _ = state.rt.block_on(host.watch_change(&file, "update"));
             match state.rt.block_on(host.handle_hot_update(&file, ts)) {
                 Ok(Some(d)) if d == "skip" => {
                     println!("oj: change {file} -> HMR suppressed by plugin");

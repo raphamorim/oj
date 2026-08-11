@@ -66,8 +66,9 @@ The work ahead, roughly in priority order:
   and a bundled dispatch behind `server.mjs` in production.
 - Edge and serverless server targets, so one app can build for a Node server or
   a worker runtime.
-- A whole-graph module API (`getModuleInfo` across the full graph,
-  `moduleParsed`, `watchChange`) for plugins that inspect the dependency graph.
+- More of the module-graph plugin API. The `moduleParsed` and `watchChange`
+  hooks fire today; still ahead is a synchronous whole-graph `getModuleInfo`
+  (oj's plugin host is out of process, so cross-graph lookups are async).
 
 ## Quickstart
 

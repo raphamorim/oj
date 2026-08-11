@@ -247,6 +247,12 @@ impl PluginHost {
         self.call("renderStart", &[]).await.map(|_| ())
     }
 
+    /// Run `watchChange` — a watched file changed (Rollup watch hook). `event`
+    /// is `create` / `update` / `delete`. Side-effect; ignored return.
+    pub async fn watch_change(&self, file: &str, event: &str) -> Result<(), String> {
+        self.call("watchChange", &[file, event]).await.map(|_| ())
+    }
+
     /// Run `closeBundle` — the very last hook, after everything is written.
     pub async fn close_bundle(&self) -> Result<(), String> {
         self.call("closeBundle", &[]).await.map(|_| ())

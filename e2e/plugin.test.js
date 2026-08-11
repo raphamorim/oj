@@ -63,6 +63,9 @@ const path = require("node:path");
     const health = await page.request.get("http://localhost:5199/__oj_health");
     const healthText = (await health.text()).trim();
     if (healthText !== "oj-plugin-mw-ok") throw new Error("configureServer middleware wrong: " + healthText);
+    // moduleParsed fired for every parsed module (App.tsx among them).
+    const parsed = (await (await page.request.get("http://localhost:5199/__oj_parsed")).text()).trim();
+    if (!parsed.split(",").includes("App.tsx")) throw new Error("moduleParsed did not record App.tsx: " + parsed);
     if (errors.length) throw new Error("console errors");
     console.log("PLUGIN transform + config + transformIndexHtml + enforce/apply + buildStart + this.resolve + getModuleInfo + getModuleIds + configureServer + Environment API + per-env define HOOKS VERIFIED");
   } finally {

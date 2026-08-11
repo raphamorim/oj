@@ -246,7 +246,23 @@ async function transform(code, id) {
     if (r == null) continue;
     current = typeof r === "string" ? r : (r.code ?? current);
   }
+  // moduleParsed: the module has been transformed. Fire with a minimal
+  // ModuleInfo (id + final code); getModuleInfo caches it for later lookup.
+  const info = { id, code: current, importedIds: [] };
+  moduleInfoCache.set(id, info);
+  seenIds.add(id);
+  for (const p of plugins) {
+    if (typeof p.moduleParsed === "function") await p.moduleParsed.call(ctx, info);
+  }
   return current;
+}
+
+// watchChange: a watched file changed (dev). Fire each plugin's hook.
+async function watchChange(id, event) {
+  for (const p of plugins) {
+    if (typeof p.watchChange === "function") await p.watchChange.call(ctx, id, { event });
+  }
+  return null;
 }
 
 // resolveId / load are first-non-null-wins.
@@ -391,6 +407,7 @@ async function run(hook, args) {
   if (hook === "buildStart" || hook === "buildEnd" || hook === "renderStart" || hook === "closeBundle") {
     return runLifecycle(hook);
   }
+  if (hook === "watchChange") return watchChange(args[0], args[1]);
   // Assets emitted via this.emitFile, as a JSON string for the Rust build.
   if (hook === "getEmittedFiles") {
     return JSON.stringify(emitted.map(({ fileName, source }) => ({ fileName, source })));

@@ -163,6 +163,32 @@ function reportPlugin() {
   };
 }
 
+// Whole-graph / watch hooks: moduleParsed records every module the host parses
+// (exposed via a configureServer endpoint for the test), and watchChange fires
+// when a watched file changes, dropping a marker.
+function graphPlugin() {
+  const parsed = new Set();
+  return {
+    name: "oj-graph",
+    moduleParsed(info) {
+      parsed.add(info.id);
+    },
+    watchChange(id, change) {
+      writeFileSync(".oj-cache/plugin-watchchange", `${change.event}:${id.split(/[\\/]/).pop()}`);
+    },
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        if (req.url === "/__oj_parsed") {
+          res.setHeader("content-type", "text/plain");
+          res.end([...parsed].map((p) => p.split(/[\\/]/).pop()).sort().join(","));
+          return;
+        }
+        next();
+      });
+    },
+  };
+}
+
 // A Vite/Rollup-style plugin: a factory returning a `{ name, transform }`
 // object, exactly the shape npm plugins use. oj's plugin host loads this and
 // runs the transform hook against the compile pipeline.
@@ -273,6 +299,7 @@ export default [
   ctxPlugin(),
   watchPlugin(),
   middlewarePlugin(),
+  graphPlugin(),
   envNamePlugin(),
   envPlugin("client", "__ENV_CLIENT__"),
   envPlugin("ssr", "__ENV_SSR__"),

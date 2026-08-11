@@ -26,7 +26,11 @@ const FILE = path.join(__dirname, "..", "playground", "plugin-watched.txt");
     fs.writeFileSync(FILE, "watched-v2\n");
     await page.waitForFunction(() => window.__watch_marker === undefined, { timeout: 15000 });
     console.log("addWatchFile forced a full reload on a plain .txt change (marker dropped)");
-    console.log("PLUGIN addWatchFile HOOK VERIFIED");
+    // watchChange also fired for the same change (Rollup watch hook).
+    const marker = path.join(__dirname, "..", "playground", ".oj-cache", "plugin-watchchange");
+    const wc = fs.existsSync(marker) ? fs.readFileSync(marker, "utf8").trim() : "MISSING";
+    if (!wc.includes("plugin-watched.txt")) throw new Error("watchChange did not fire for the edit: " + wc);
+    console.log("PLUGIN addWatchFile + watchChange HOOKS VERIFIED");
   } finally {
     fs.writeFileSync(FILE, original);
     await browser.close();
