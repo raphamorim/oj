@@ -558,11 +558,20 @@ fn ssr_css_module(root: &Path, path: &Path, source: &str) -> Result<String, Stri
 /// Static server for a production build (`oj preview`). Serves `dir`,
 /// strips `base`, refuses traversal, and falls back to `index.html` for
 /// extensionless routes (SPA client routing).
-pub async fn preview(dir: PathBuf, port: u16, base: String) -> anyhow::Result<()> {
+pub async fn preview(
+    dir: PathBuf,
+    port: u16,
+    base: String,
+    headers: Vec<(String, String)>,
+) -> anyhow::Result<()> {
     let dir = dir
         .canonicalize()
         .with_context(|| format!("build dir not found: {} (run `oj build` first)", dir.display()))?;
-    let state = Arc::new((dir.clone(), base));
+    let headers: Vec<(header::HeaderName, header::HeaderValue)> = headers
+        .iter()
+        .filter_map(|(k, v)| Some((k.parse().ok()?, v.parse().ok()?)))
+        .collect();
+    let state = Arc::new((dir.clone(), base, headers));
     let app = Router::new().fallback(get(preview_serve)).with_state(state);
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr)
@@ -587,10 +596,10 @@ fn preview_rel<'a>(path: &'a str, base: &str) -> Option<String> {
 }
 
 async fn preview_serve(
-    State(state): State<Arc<(PathBuf, String)>>,
+    State(state): State<Arc<(PathBuf, String, Vec<(header::HeaderName, header::HeaderValue)>)>>,
     uri: Uri,
 ) -> Response {
-    let (dir, base) = &*state;
+    let (dir, base, extra_headers) = &*state;
     let Some(rel) = preview_rel(uri.path(), base) else {
         return (StatusCode::FORBIDDEN, "oj: path traversal denied").into_response();
     };
@@ -608,7 +617,14 @@ async fn preview_serve(
     };
 
     match tokio::fs::read(&target).await {
-        Ok(bytes) => ([(header::CONTENT_TYPE, ctype)], bytes).into_response(),
+        Ok(bytes) => {
+            let mut resp = ([(header::CONTENT_TYPE, ctype)], bytes).into_response();
+            let h = resp.headers_mut();
+            for (name, value) in extra_headers {
+                h.insert(name.clone(), value.clone());
+            }
+            resp
+        }
         Err(_) => (StatusCode::NOT_FOUND, "oj: not found").into_response(),
     }
 }

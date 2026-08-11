@@ -119,7 +119,15 @@ async fn main() -> anyhow::Result<()> {
                 .or_else(|| config.preview.as_ref().and_then(|p| p.port))
                 .unwrap_or(4173);
             let base = config.base.clone().unwrap_or_else(|| "/".into());
-            oj_server::preview(out_dir, port, base).await
+            // preview.headers, else server.headers (COOP/COEP, etc.).
+            let headers: Vec<(String, String)> = config
+                .preview
+                .as_ref()
+                .and_then(|p| p.headers.clone())
+                .or_else(|| config.server.as_ref().and_then(|s| s.headers.clone()))
+                .map(|m| m.into_iter().collect())
+                .unwrap_or_default();
+            oj_server::preview(out_dir, port, base, headers).await
         }
     }
 }
