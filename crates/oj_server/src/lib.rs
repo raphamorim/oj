@@ -209,6 +209,17 @@ impl DevServer {
         let proxy: Vec<(String, oj_config::ProxyEntry)> =
             server_cfg.proxy.clone().unwrap_or_default().into_iter().collect();
 
+        // Where plugins come from: oj.plugins.* (array) or a vite.config.*
+        // (default export's `plugins`). The host reads them per `pluginsFormat`.
+        let (plugins_path, plugins_format, plugins_label) = match plugins::plugin_source(&root) {
+            Some(plugins::PluginSource::OjPlugins(p)) => {
+                let label = p.file_name().unwrap().to_string_lossy().into_owned();
+                (Some(p), "oj", label)
+            }
+            Some(plugins::PluginSource::ViteConfig(p)) => (Some(p), "vite", "vite.config".to_string()),
+            None => (None, "oj", String::new()),
+        };
+
         // Spawn the plugin host up front if the app declares plugins. Plugins'
         // config()/configResolved() hooks receive this resolved config + env.
         let plugin_config = serde_json::json!({
@@ -224,6 +235,7 @@ impl DevServer {
             "env": { "command": "serve", "mode": "development" },
             // The dev server is the "client" environment (Vite Environment API).
             "environment": { "name": "client", "mode": "development" },
+            "pluginsFormat": plugins_format,
         })
         .to_string();
         // Same config, but tagged as the "ssr" environment — used to lazily
@@ -240,12 +252,13 @@ impl DevServer {
             },
             "env": { "command": "serve", "mode": "development" },
             "environment": { "name": "ssr", "mode": "development" },
+            "pluginsFormat": plugins_format,
         })
         .to_string();
-        let plugin_host = match plugins::plugins_file(&root) {
+        let plugin_host = match plugins_path {
             Some(file) => match PluginHost::spawn(&root, &file, &plugin_config).await {
                 Ok(host) => {
-                    println!("  plugins: {}", file.file_name().unwrap().to_string_lossy());
+                    println!("  plugins: {plugins_label}");
                     // buildStart fires once when the dev server starts (Vite
                     // semantics; buildEnd is a prod-build hook — the dev server
                     // has no close lifecycle to fire it on).
@@ -469,7 +482,9 @@ async fn ssr_plugin_host(state: &Arc<ServerState>) -> Option<std::sync::Arc<Plug
     state
         .plugins_ssr
         .get_or_init(|| async {
-            let file = plugins::plugins_file(&state.root)?;
+            let file = match plugins::plugin_source(&state.root)? {
+                plugins::PluginSource::OjPlugins(p) | plugins::PluginSource::ViteConfig(p) => p,
+            };
             match PluginHost::spawn(&state.root, &file, &state.ssr_plugin_config).await {
                 Ok(host) => {
                     eprintln!("oj ssr: plugins (ssr environment) from {}", file.display());

@@ -34,7 +34,10 @@ itself. It is there to show the primitives compose, not to be a framework.
 ## Plugins
 
 Vite/Rollup-style plugins run through a persistent Node plugin host. Drop an
-`oj.plugins.mjs` at the app root that default-exports a plugin array. The dev
+`oj.plugins.mjs` at the app root that default-exports a plugin array, or let oj
+read an app's `vite.config.{ts,js,mjs}` and pick up its `plugins` array
+directly (prototype: inline and npm-imported plugins; a config that imports
+local `.ts` files still needs bundling). The dev
 server and `oj build` run `transform`, `resolveId`, `load`, `config`,
 `configResolved`, `transformIndexHtml`, `handleHotUpdate`, `buildStart`,
 `buildEnd`, `renderStart`, `renderChunk`, `generateBundle`, `writeBundle`,

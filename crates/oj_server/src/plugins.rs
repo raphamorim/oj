@@ -35,6 +35,44 @@ pub fn plugins_file(root: &Path) -> Option<std::path::PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// Where a build's plugins come from, and in what shape the host should read
+/// them: oj's own `oj.plugins.*` (a plugin array) or an app's `vite.config.*`
+/// (the default export's `.plugins`).
+pub enum PluginSource {
+    /// An `oj.plugins.{mjs,js}` — default-exports a plugin array.
+    OjPlugins(std::path::PathBuf),
+    /// A compiled `vite.config.{ts,js,mjs}` — read plugins from `default.plugins`.
+    ViteConfig(std::path::PathBuf),
+}
+
+/// Resolve the app's plugin source. `oj.plugins.*` wins; otherwise a
+/// `vite.config.{ts,js,mjs}` is TS-stripped to `.oj-cache/oj-vite-config.mjs`
+/// so the Node host can import it and read its `plugins` array. (Prototype:
+/// inline and npm-imported plugins work; a config importing local `.ts` files
+/// needs bundling, which is future work.)
+pub fn plugin_source(root: &Path) -> Option<PluginSource> {
+    if let Some(p) = plugins_file(root) {
+        return Some(PluginSource::OjPlugins(p));
+    }
+    let vite = ["vite.config.ts", "vite.config.mjs", "vite.config.js"]
+        .into_iter()
+        .map(|f| root.join(f))
+        .find(|p| p.is_file())?;
+    let source = std::fs::read_to_string(&vite).ok()?;
+    let compiled = match oj_compiler::compile(&vite, &source, &oj_compiler::CompileOptions::prod()) {
+        Ok(out) => out.code,
+        Err(e) => {
+            eprintln!("oj: could not read {}: {e}", vite.display());
+            return None;
+        }
+    };
+    let cache = root.join(".oj-cache");
+    let _ = std::fs::create_dir_all(&cache);
+    let out = cache.join("oj-vite-config.mjs");
+    std::fs::write(&out, compiled).ok()?;
+    Some(PluginSource::ViteConfig(out))
+}
+
 pub struct PluginHost {
     stdin: tokio::sync::Mutex<tokio::process::ChildStdin>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Option<String>, String>>>>,

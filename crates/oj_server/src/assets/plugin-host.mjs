@@ -27,7 +27,15 @@ const environment = {
 let plugins = [];
 try {
   const mod = await import(pathToFileURL(pluginsPath).href);
-  const list = mod.default ?? mod.plugins ?? [];
+  let list;
+  if (initial.pluginsFormat === "vite") {
+    // vite.config.*: the default export is the config (or a factory of it);
+    // its `plugins` array is what we run. Config can nest arrays — flatten.
+    const cfg = typeof mod.default === "function" ? await mod.default(env) : mod.default;
+    list = (cfg?.plugins ?? []).flat(Infinity);
+  } else {
+    list = mod.default ?? mod.plugins ?? [];
+  }
   plugins = (Array.isArray(list) ? list : [list]).filter(Boolean);
   // `apply`: keep plugins active for this command ("serve"/"build" or a fn).
   plugins = plugins.filter((p) => {
