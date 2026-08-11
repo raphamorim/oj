@@ -50,6 +50,9 @@ pub struct ServerConfig {
     pub open: Option<bool>,
     pub cors: Option<bool>,
     pub allowed_hosts: Option<Vec<String>>,
+    /// Response headers added to every dev response (e.g. COOP/COEP for
+    /// SharedArrayBuffer). Mirrors Vite's `server.headers`.
+    pub headers: Option<BTreeMap<String, String>>,
     /// path prefix -> target (string) or detailed options.
     pub proxy: Option<BTreeMap<String, ProxyEntry>>,
 }

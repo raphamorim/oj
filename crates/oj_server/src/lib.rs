@@ -357,6 +357,24 @@ impl DevServer {
             .route("/@ssr-module", get(ssr_module))
             .route("/__ws", get(ws_upgrade))
             .fallback(get(serve_path));
+        // Configured `server.headers` (COOP/COEP, etc.) applied to every
+        // response — needed for e.g. SharedArrayBuffer-based apps.
+        let extra_headers: Vec<(header::HeaderName, header::HeaderValue)> = config
+            .server
+            .as_ref()
+            .and_then(|s| s.headers.as_ref())
+            .map(|h| {
+                h.iter()
+                    .filter_map(|(k, v)| Some((k.parse().ok()?, v.parse().ok()?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !extra_headers.is_empty() {
+            app = app.layer(axum::middleware::from_fn_with_state(
+                Arc::new(extra_headers),
+                apply_dev_headers,
+            ));
+        }
         // Proxy runs ahead of routing so configured prefixes (/api, ...) are
         // forwarded before hitting the file fallback.
         if !state.proxy.is_empty() {
@@ -620,6 +638,21 @@ async fn ws_upgrade(
 /// Forward requests whose path matches a `server.proxy` prefix to the
 /// configured target (longest prefix wins), otherwise pass through. Supports
 /// `changeOrigin`, `ws` (marker only for now), and `^from -> to` rewrite.
+/// Add the app's configured `server.headers` (e.g. COOP/COEP for
+/// SharedArrayBuffer) to every dev response.
+async fn apply_dev_headers(
+    State(headers): State<Arc<Vec<(header::HeaderName, header::HeaderValue)>>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    for (name, value) in headers.iter() {
+        h.insert(name.clone(), value.clone());
+    }
+    resp
+}
+
 async fn proxy_middleware(
     State(state): State<Arc<ServerState>>,
     req: axum::extract::Request,

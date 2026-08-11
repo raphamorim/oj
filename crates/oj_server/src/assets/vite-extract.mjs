@@ -53,6 +53,14 @@ function extractAlias(alias) {
   return out;
 }
 
+// Keep only string-valued entries of an object (headers, etc.).
+function stringMap(obj) {
+  if (!obj || typeof obj !== "object") return null;
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) if (typeof v === "string") out[k] = v;
+  return Object.keys(out).length ? out : null;
+}
+
 try {
   const c = (await loadConfig()) ?? {};
   process.stdout.write(
@@ -62,6 +70,8 @@ try {
       host: typeof c.server?.host === "string" ? c.server.host : null,
       define: c.define && typeof c.define === "object" ? c.define : null,
       alias: extractAlias(c.resolve?.alias),
+      // server.headers: string values only (e.g. COOP/COEP).
+      headers: stringMap(c.server?.headers),
     }),
   );
 } catch (e) {

@@ -72,6 +72,7 @@ pub struct ViteValues {
     pub host: Option<String>,
     pub define: Option<serde_json::Map<String, serde_json::Value>>,
     pub alias: Option<serde_json::Map<String, serde_json::Value>>,
+    pub headers: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// Extract `base`, `server.port`/`host`, and `define` from an app's
@@ -107,6 +108,7 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
         host: json.get("host").and_then(|v| v.as_str()).map(str::to_string),
         define: json.get("define").and_then(|v| v.as_object()).cloned(),
         alias: json.get("alias").and_then(|v| v.as_object()).cloned(),
+        headers: json.get("headers").and_then(|v| v.as_object()).cloned(),
     })
 }
 
@@ -128,13 +130,24 @@ pub fn adopt_vite_config_values(config: &mut oj_config::OjConfig, root: &Path) {
             def.entry(k).or_insert(val);
         }
     }
-    if v.port.is_some() || v.host.is_some() {
+    if v.port.is_some() || v.host.is_some() || v.headers.is_some() {
         let sc = config.server.get_or_insert_with(Default::default);
         if sc.port.is_none() {
             sc.port = v.port;
         }
         if sc.host.is_none() {
             sc.host = v.host;
+        }
+        if sc.headers.is_none() {
+            if let Some(vheaders) = v.headers {
+                let map = vheaders
+                    .into_iter()
+                    .filter_map(|(k, val)| val.as_str().map(|s| (k, s.to_string())))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                if !map.is_empty() {
+                    sc.headers = Some(map);
+                }
+            }
         }
     }
     if let Some(valias) = v.alias {
