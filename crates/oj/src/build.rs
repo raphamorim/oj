@@ -249,7 +249,6 @@ fn expand_css_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Whether a module path is a server-function module (`*.server.{ts,tsx,js,jsx}`).
 /// Build Rolldown's `resolve.alias` from the app's `resolve.alias` config for
 /// an environment (client/ssr). Relative replacements (`./src`) become absolute
 /// against `root`, matching oj's own resolver. Returns `None` when there are no
@@ -277,6 +276,7 @@ fn rolldown_resolve(
     Some(rolldown_common::ResolveOptions { alias: Some(alias), ..Default::default() })
 }
 
+/// Whether a module path is a server-function module (`*.server.{ts,tsx,js,jsx}`).
 fn is_server_module_path(path: &str) -> bool {
     [".server.ts", ".server.tsx", ".server.js", ".server.jsx"].iter().any(|s| path.ends_with(s))
 }
@@ -1353,7 +1353,9 @@ export default {
 
 /// Derive the client hydration entry from the server entry by convention:
 /// swap "server" -> "client" in the filename, if that sibling exists.
-fn derive_client_entry(root: &Path, server_entry: &str) -> Option<String> {
+/// Derive the client entry path from an SSR entry (`entry-server.tsx` ->
+/// `entry-client.tsx`), if that sibling file exists.
+pub(crate) fn derive_client_entry(root: &Path, server_entry: &str) -> Option<String> {
     let file = Path::new(server_entry).file_name()?.to_str()?;
     if !file.contains("server") {
         return None;

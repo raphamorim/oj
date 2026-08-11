@@ -62,7 +62,8 @@ pub async fn ssr_dev(root: PathBuf, entry: String, port: Option<u16>) -> anyhow:
     // `/` route on top.
     let built = oj_server::DevServer { root, port, bundle: false }.build_app().await?;
 
-    let client_url = derive_client_entry(&built.root, &entry).map(|rel| format!("/{rel}"));
+    let client_url =
+        crate::build::derive_client_entry(&built.root, &entry).map(|rel| format!("/{rel}"));
     let base = format!("http://{}:{}", built.host, built.port);
     let entry_abs = built.root.join(&entry);
     let runner = spawn_runner(&built.root, &base, &entry_abs).await?;
@@ -152,7 +153,7 @@ async fn ssr_route(State(state): State<Arc<SsrState>>, req: Request, next: Next)
             "name": payload.get("name").cloned().unwrap_or_default(),
             "args": payload.get("args").cloned().unwrap_or_else(|| serde_json::json!([])),
         });
-        return match run_call(&state, cmd).await {
+        return match run_command(&state, cmd, "result").await {
             Ok(json) => ([(header::CONTENT_TYPE, "application/json")], json).into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
@@ -160,14 +161,14 @@ async fn ssr_route(State(state): State<Arc<SsrState>>, req: Request, next: Next)
     match classify(&req, &state.proxy_prefixes) {
         Route::Document => render_route(&state, req.uri().path()).await,
         Route::Loader => {
-            data_response(run_data(&state, serde_json::json!({ "cmd": "load", "url": req.uri().path() })).await)
+            data_response(run_command(&state, serde_json::json!({ "cmd": "load", "url": req.uri().path() }), "data").await)
         }
         Route::Action { json } => {
             let path = req.uri().path().to_string();
             let bytes = axum::body::to_bytes(req.into_body(), 256 * 1024).await.unwrap_or_default();
             let body = String::from_utf8_lossy(&bytes).into_owned();
             let cmd = serde_json::json!({ "cmd": "action", "url": path, "body": body });
-            let data = run_data(&state, cmd).await;
+            let data = run_command(&state, cmd, "data").await;
             if json {
                 data_response(data)
             } else if data.is_ok() {
@@ -206,42 +207,19 @@ fn classify(req: &Request, proxy_prefixes: &[String]) -> Route {
     }
 }
 
-/// Send a data command (`load`/`action`) to the runner and return its
-/// serialized loader data (or an error message).
+/// Send a command to the runner and return the string under `reply_key`
+/// (`"data"` for loaders/actions, `"result"` for server-function calls).
 ///
-/// Runs in a DETACHED task so a cancelled HTTP request — an aborted prefetch
-/// when the user moves off a link, say — still drains the runner's one-line
-/// response. Reading it inline would drop the lock mid-protocol on cancel,
-/// leaving a stale line that the next render mis-reads and desyncs on.
-async fn run_data(state: &SsrState, cmd: serde_json::Value) -> Result<String, String> {
+/// Runs in a detached task so a cancelled request (an aborted prefetch, say)
+/// still drains the runner's one-line reply; reading inline would drop the lock
+/// mid-protocol and leave a stale line the next render desyncs on.
+async fn run_command(
+    state: &SsrState,
+    cmd: serde_json::Value,
+    reply_key: &str,
+) -> Result<String, String> {
     let runner = Arc::clone(&state.runner);
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let mut guard = runner.lock_owned().await;
-        let result = async {
-            let line = format!("{cmd}\n");
-            guard.stdin.write_all(line.as_bytes()).await.map_err(|e| e.to_string())?;
-            guard.stdin.flush().await.map_err(|e| e.to_string())?;
-            match read_message(&mut guard.lines).await {
-                Some(v) if v.get("data").and_then(|d| d.as_str()).is_some() => {
-                    Ok(v["data"].as_str().unwrap().to_owned())
-                }
-                Some(v) if v.get("error").and_then(|e| e.as_str()).is_some() => {
-                    Err(v["error"].as_str().unwrap().to_owned())
-                }
-                _ => Err("SSR runner did not respond".to_string()),
-            }
-        }
-        .await;
-        let _ = tx.send(result);
-    });
-    rx.await.unwrap_or_else(|_| Err("SSR runner task cancelled".to_string()))
-}
-
-/// Like [`run_data`] but reads the runner's `{result}` reply (a server function
-/// call), returning the JSON-serialized result string.
-async fn run_call(state: &SsrState, cmd: serde_json::Value) -> Result<String, String> {
-    let runner = Arc::clone(&state.runner);
+    let reply_key = reply_key.to_owned();
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let mut guard = runner.lock_owned().await;
@@ -249,8 +227,8 @@ async fn run_call(state: &SsrState, cmd: serde_json::Value) -> Result<String, St
             guard.stdin.write_all(format!("{cmd}\n").as_bytes()).await.map_err(|e| e.to_string())?;
             guard.stdin.flush().await.map_err(|e| e.to_string())?;
             match read_message(&mut guard.lines).await {
-                Some(v) if v.get("result").and_then(|d| d.as_str()).is_some() => {
-                    Ok(v["result"].as_str().unwrap().to_owned())
+                Some(v) if v.get(&reply_key).and_then(|d| d.as_str()).is_some() => {
+                    Ok(v[&reply_key].as_str().unwrap().to_owned())
                 }
                 Some(v) if v.get("error").and_then(|e| e.as_str()).is_some() => {
                     Err(v["error"].as_str().unwrap().to_owned())
@@ -381,22 +359,4 @@ fn error_page(msg: &str) -> Response {
 
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
-}
-
-/// Derive the client hydration entry from the server entry by convention:
-/// swap "server" -> "client" in the filename and return it (root-relative) if
-/// that file exists, else None.
-fn derive_client_entry(root: &Path, server_entry: &str) -> Option<String> {
-    let file = Path::new(server_entry).file_name()?.to_str()?;
-    if !file.contains("server") {
-        return None;
-    }
-    let client_file = file.replace("server", "client");
-    let client_rel = match Path::new(server_entry).parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => {
-            format!("{}/{}", dir.to_string_lossy(), client_file)
-        }
-        _ => client_file,
-    };
-    root.join(&client_rel).is_file().then_some(client_rel)
 }

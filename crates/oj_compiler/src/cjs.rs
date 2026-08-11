@@ -31,7 +31,7 @@ use std::path::Path;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     AssignmentExpression, AssignmentOperator, AssignmentTarget, CallExpression, Expression,
-    ObjectPropertyKind, Program, PropertyKey, Statement,
+    ObjectPropertyKind, PropertyKey, Statement,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_codegen::Codegen;
@@ -329,8 +329,6 @@ impl CjsAnalyzer {
         }
     }
 }
-
-fn _assert_types(_p: &Program) {}
 
 #[cfg(test)]
 mod tests {

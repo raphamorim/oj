@@ -230,9 +230,11 @@ impl DevServer {
             None => (None, "oj", String::new()),
         };
 
-        // Spawn the plugin host up front if the app declares plugins. Plugins'
-        // config()/configResolved() hooks receive this resolved config + env.
-        let plugin_config = serde_json::json!({
+        // Config the plugin hosts receive in their config()/configResolved()
+        // hooks. The client host tags itself the "client" environment; the ssr
+        // host (lazily spawned for server modules) flips it to "ssr" so
+        // applyToEnvironment("ssr") plugins run there.
+        let mut plugin_cfg = serde_json::json!({
             "config": {
                 "root": root.display().to_string(),
                 "base": config.base.clone().unwrap_or_else(|| "/".into()),
@@ -243,28 +245,12 @@ impl DevServer {
                 "environments": config.environments,
             },
             "env": { "command": "serve", "mode": "development" },
-            // The dev server is the "client" environment (Vite Environment API).
             "environment": { "name": "client", "mode": "development" },
             "pluginsFormat": plugins_format,
-        })
-        .to_string();
-        // Same config, but tagged as the "ssr" environment — used to lazily
-        // spawn a second host that transforms server modules (see ssr_module).
-        let ssr_plugin_config = serde_json::json!({
-            "config": {
-                "root": root.display().to_string(),
-                "base": config.base.clone().unwrap_or_else(|| "/".into()),
-                "mode": "development",
-                "command": "serve",
-                "define": config.define,
-                "server": { "port": port, "host": server_cfg.host },
-                "environments": config.environments,
-            },
-            "env": { "command": "serve", "mode": "development" },
-            "environment": { "name": "ssr", "mode": "development" },
-            "pluginsFormat": plugins_format,
-        })
-        .to_string();
+        });
+        let plugin_config = plugin_cfg.to_string();
+        plugin_cfg["environment"]["name"] = serde_json::json!("ssr");
+        let ssr_plugin_config = plugin_cfg.to_string();
         let plugin_host = match plugins_path {
             Some(file) => match PluginHost::spawn(&root, &file, &plugin_config).await {
                 Ok(host) => {
@@ -396,11 +382,7 @@ impl DevServer {
     }
 }
 
-fn js(body: &'static str) -> Response {
-    ([(header::CONTENT_TYPE, "text/javascript")], body).into_response()
-}
-
-fn js_owned(body: String) -> Response {
+fn js(body: impl IntoResponse) -> Response {
     ([(header::CONTENT_TYPE, "text/javascript")], body).into_response()
 }
 
@@ -480,13 +462,13 @@ async fn ssr_module(
     // CSS/JSON handling is for real files only; virtual modules are JS.
     if !from_plugin && matches!(ext, Some("css") | Some("scss") | Some("sass")) {
         return match ssr_css_module(&state.root, &path, &source) {
-            Ok(code) => js_owned(code),
+            Ok(code) => js(code),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
     }
     if !from_plugin && ext == Some("json") {
         return match oj_compiler::json::to_esm(&source, id) {
-            Ok(code) => js_owned(code),
+            Ok(code) => js(code),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
         };
     }
@@ -502,7 +484,7 @@ async fn ssr_module(
     let compile_path: PathBuf =
         if from_plugin { PathBuf::from("virtual.tsx") } else { path };
     match oj_compiler::compile(&compile_path, &source, &oj_compiler::CompileOptions::prod()) {
-        Ok(out) => js_owned(out.code),
+        Ok(out) => js(out.code),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
 }
@@ -1664,9 +1646,6 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Serve a plugin-resolved module: run `resolveId(spec, importer)` then
-/// `load(id)`, compile the returned source (TS/JSX strip + import rewrite), and
-/// serve it as a JS module. This is how plugin virtual modules reach the browser.
 /// A `*.server.{ts,tsx,js,jsx}` module — its exports run only on the server and
 /// are replaced by client stubs.
 fn is_server_module(file: &Path) -> bool {
@@ -1730,6 +1709,9 @@ async fn serve_oj_routes(State(state): State<Arc<ServerState>>) -> Response {
     }
 }
 
+/// Serve a plugin-resolved module: run `resolveId(spec, importer)` then
+/// `load(id)`, compile the returned source (TS/JSX strip + import rewrite), and
+/// serve it as a JS module. This is how plugin virtual modules reach the browser.
 async fn serve_plugin_id(state: &Arc<ServerState>, spec: &str, importer: &str) -> Response {
     let Some(host) = &state.plugins else {
         return (StatusCode::NOT_FOUND, "oj: no plugin host").into_response();
