@@ -1626,7 +1626,7 @@ dependencies = [
 
 [[package]]
 name = "oj"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "arcstr",
@@ -1648,7 +1648,7 @@ dependencies = [
 
 [[package]]
 name = "oj_cache"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "blake3",
  "serde",
@@ -1657,7 +1657,7 @@ dependencies = [
 
 [[package]]
 name = "oj_compiler"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "glob",
  "oxc_allocator",
@@ -1678,7 +1678,7 @@ dependencies = [
 
 [[package]]
 name = "oj_config"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "oxc_allocator",
  "oxc_codegen",
@@ -1694,7 +1694,7 @@ dependencies = [
 
 [[package]]
 name = "oj_css"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "grass",
  "lightningcss",
@@ -1702,18 +1702,18 @@ dependencies = [
 
 [[package]]
 name = "oj_env"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "oj_graph"
-version = "0.0.1"
+version = "0.0.2"
 
 [[package]]
 name = "oj_resolver"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "oxc_resolver",
  "thiserror",
@@ -1721,7 +1721,7 @@ dependencies = [
 
 [[package]]
 name = "oj_server"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "axum",
