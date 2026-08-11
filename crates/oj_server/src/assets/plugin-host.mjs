@@ -6,6 +6,8 @@
 // oj's pipeline. JSON-lines over stdio with correlation ids (many calls can be
 // in flight; a cancelled caller just drops its response).
 import http from "node:http";
+import { writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import readline from "node:readline";
 
@@ -24,16 +26,60 @@ const environment = {
   config: deepMerge(initial.config ?? {}, (initial.config?.environments ?? {})[envName] ?? {}),
 };
 
+// Resolve an app's vite.config to its config object. Preferred path: Vite's
+// own `loadConfigFromFile` (a direct dep of any Vite app; handles TS, local
+// imports, and `defineConfig`). Fallback: bundle the config graph with the
+// app's esbuild ourselves (local imports inlined, node_modules external).
+async function loadViteConfig(configPath) {
+  const appRoot = initial.config?.root ?? process.cwd();
+  const req = createRequire(appRoot + "/package.json");
+  try {
+    const vite = await import(req.resolve("vite"));
+    if (typeof vite.loadConfigFromFile === "function") {
+      const loaded = await vite.loadConfigFromFile(
+        { command: env.command, mode: env.mode },
+        configPath,
+        appRoot,
+      );
+      if (loaded && loaded.config) return loaded.config;
+    }
+  } catch (e) {
+    process.stderr.write(`oj: vite.loadConfigFromFile unavailable (${e}); bundling config directly\n`);
+  }
+  // Fallback for apps without a usable vite install.
+  let mod;
+  if (/\.(ts|tsx|mts|cts)$/.test(configPath)) {
+    const esbuild = await import(req.resolve("esbuild"));
+    const result = await esbuild.build({
+      entryPoints: [configPath],
+      bundle: true,
+      platform: "node",
+      format: "esm",
+      packages: "external",
+      write: false,
+      sourcemap: false,
+      logLevel: "silent",
+      absWorkingDir: appRoot,
+    });
+    const out = `${appRoot}/.oj-cache/oj-vite-config.mjs`;
+    writeFileSync(out, result.outputFiles[0].text);
+    mod = await import(pathToFileURL(out).href);
+  } else {
+    mod = await import(pathToFileURL(configPath).href);
+  }
+  return typeof mod.default === "function" ? await mod.default(env) : mod.default;
+}
+
 let plugins = [];
 try {
-  const mod = await import(pathToFileURL(pluginsPath).href);
   let list;
   if (initial.pluginsFormat === "vite") {
-    // vite.config.*: the default export is the config (or a factory of it);
-    // its `plugins` array is what we run. Config can nest arrays — flatten.
-    const cfg = typeof mod.default === "function" ? await mod.default(env) : mod.default;
-    list = (cfg?.plugins ?? []).flat(Infinity);
+    // vite.config.*: run its `plugins` array. Config plugins can be nested
+    // arrays and promises (async plugins) — flatten and await.
+    const cfg = await loadViteConfig(pluginsPath);
+    list = await Promise.all((cfg?.plugins ?? []).flat(Infinity));
   } else {
+    const mod = await import(pathToFileURL(pluginsPath).href);
     list = mod.default ?? mod.plugins ?? [];
   }
   plugins = (Array.isArray(list) ? list : [list]).filter(Boolean);

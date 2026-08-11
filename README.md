@@ -36,8 +36,9 @@ itself. It is there to show the primitives compose, not to be a framework.
 Vite/Rollup-style plugins run through a persistent Node plugin host. Drop an
 `oj.plugins.mjs` at the app root that default-exports a plugin array, or let oj
 read an app's `vite.config.{ts,js,mjs}` and pick up its `plugins` array
-directly (prototype: inline and npm-imported plugins; a config that imports
-local `.ts` files still needs bundling). The dev
+directly. A TypeScript config (including one that imports local `.ts` files) is
+loaded via Vite's own config loader when Vite is installed, or bundled with the
+app's esbuild otherwise. The dev
 server and `oj build` run `transform`, `resolveId`, `load`, `config`,
 `configResolved`, `transformIndexHtml`, `handleHotUpdate`, `buildStart`,
 `buildEnd`, `renderStart`, `renderChunk`, `generateBundle`, `writeBundle`,
