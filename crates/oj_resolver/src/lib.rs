@@ -12,7 +12,9 @@
 
 use std::path::{Path, PathBuf};
 
-use oxc_resolver::{ResolveOptions, Resolver, TsconfigDiscovery, TsconfigOptions, TsconfigReferences};
+use oxc_resolver::{
+    AliasValue, ResolveOptions, Resolver, TsconfigDiscovery, TsconfigOptions, TsconfigReferences,
+};
 
 pub struct OjResolver {
     inner: Resolver,
@@ -40,12 +42,33 @@ impl OjResolver {
     /// node conditions, so packages with conditional `exports` resolve their
     /// correct per-environment variant (Vite Environment API `resolve.conditions`).
     pub fn with_conditions(root: &Path, conditions: &[String]) -> Self {
+        Self::with_options(root, conditions, &[])
+    }
+
+    /// As [`Self::with_conditions`], plus `resolve.alias` entries (`find`,
+    /// `replacement`) from the app's config. These sit alongside tsconfig
+    /// `paths`; a bare `find` matches the exact specifier or a `find/...`
+    /// prefix (webpack/Vite semantics). A relative `replacement` (`./src`) is
+    /// resolved against `root` to an absolute path, as Vite does.
+    pub fn with_options(root: &Path, conditions: &[String], alias: &[(String, String)]) -> Self {
         let tsconfig = root.join("tsconfig.json");
+        let alias = alias
+            .iter()
+            .map(|(find, replacement)| {
+                let target = if replacement.starts_with('.') {
+                    root.join(replacement).to_string_lossy().into_owned()
+                } else {
+                    replacement.clone()
+                };
+                (find.clone(), vec![AliasValue::Path(target)])
+            })
+            .collect();
         let options = ResolveOptions {
             extensions: [".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs", ".json"]
                 .map(String::from)
                 .to_vec(),
             condition_names: conditions.to_vec(),
+            alias,
             tsconfig: tsconfig.is_file().then(|| {
                 TsconfigDiscovery::Manual(TsconfigOptions {
                     config_file: tsconfig,
@@ -99,6 +122,19 @@ mod tests {
         let resolver = OjResolver::new(&playground_root());
         let resolved = resolver.resolve(&playground_src(), "@/App").unwrap();
         assert!(resolved.ends_with("App.tsx"), "alias @/App -> {resolved:?}");
+    }
+
+    #[test]
+    fn resolves_config_alias() {
+        // A `resolve.alias` entry (`~` -> `./src`) rewrites the specifier prefix
+        // and then resolves through the normal extension probing.
+        let resolver = OjResolver::with_options(
+            &playground_root(),
+            &["browser", "import", "default"].map(String::from),
+            &[("~".to_string(), "./src".to_string())],
+        );
+        let resolved = resolver.resolve(&playground_root(), "~/App").unwrap();
+        assert!(resolved.ends_with("App.tsx"), "alias ~/App -> {resolved:?}");
     }
 
     #[test]

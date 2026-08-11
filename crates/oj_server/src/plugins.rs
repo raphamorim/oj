@@ -71,6 +71,7 @@ pub struct ViteValues {
     pub port: Option<u16>,
     pub host: Option<String>,
     pub define: Option<serde_json::Map<String, serde_json::Value>>,
+    pub alias: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// Extract `base`, `server.port`/`host`, and `define` from an app's
@@ -105,6 +106,7 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
         port: json.get("port").and_then(|v| v.as_u64()).map(|p| p as u16),
         host: json.get("host").and_then(|v| v.as_str()).map(str::to_string),
         define: json.get("define").and_then(|v| v.as_object()).cloned(),
+        alias: json.get("alias").and_then(|v| v.as_object()).cloned(),
     })
 }
 

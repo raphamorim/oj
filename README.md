@@ -39,8 +39,8 @@ read an app's `vite.config.{ts,js,mjs}` and pick up its `plugins` array
 directly. A TypeScript config (including one that imports local `.ts` files) is
 loaded via Vite's own config loader when Vite is installed, or bundled with the
 app's esbuild otherwise. From a `vite.config` oj also adopts the app's `base`,
-`server.port`/`host`, and `define` for any field its own config leaves unset.
-The dev
+`server.port`/`host`, `define`, and `resolve.alias` for any field its own config
+leaves unset; alias entries resolve alongside tsconfig `paths`. The dev
 server and `oj build` run `transform`, `resolveId`, `load`, `config`,
 `configResolved`, `transformIndexHtml`, `handleHotUpdate`, `buildStart`,
 `buildEnd`, `renderStart`, `renderChunk`, `generateBundle`, `writeBundle`,

@@ -38,6 +38,21 @@ async function loadConfig() {
   return typeof m.default === "function" ? await m.default({ command, mode }) : m.default;
 }
 
+// resolve.alias is either an object ({ find: replacement }) or an array of
+// { find, replacement }. Keep only string find/replacement pairs (a RegExp
+// find has no string form for oxc_resolver's prefix matcher).
+function extractAlias(alias) {
+  const out = {};
+  if (!alias) return out;
+  const entries = Array.isArray(alias)
+    ? alias.map((e) => [e.find, e.replacement])
+    : Object.entries(alias);
+  for (const [find, replacement] of entries) {
+    if (typeof find === "string" && typeof replacement === "string") out[find] = replacement;
+  }
+  return out;
+}
+
 try {
   const c = (await loadConfig()) ?? {};
   process.stdout.write(
@@ -46,6 +61,7 @@ try {
       port: typeof c.server?.port === "number" ? c.server.port : null,
       host: typeof c.server?.host === "string" ? c.server.host : null,
       define: c.define && typeof c.define === "object" ? c.define : null,
+      alias: extractAlias(c.resolve?.alias),
     }),
   );
 } catch (e) {

@@ -199,6 +199,17 @@ impl DevServer {
                     sc.host = v.host;
                 }
             }
+            if let Some(valias) = v.alias {
+                if !valias.is_empty() {
+                    let rc = config.resolve.get_or_insert_with(Default::default);
+                    let map = rc.alias.get_or_insert_with(Default::default);
+                    for (find, replacement) in valias {
+                        if let Some(s) = replacement.as_str() {
+                            map.entry(find).or_insert_with(|| s.to_string());
+                        }
+                    }
+                }
+            }
         }
 
         // Load .env files (dev mode) and install the import.meta.env defines
@@ -318,13 +329,15 @@ impl DevServer {
             bundle,
             reload_tx,
             graph: Mutex::new(ModuleGraph::new()),
-            resolver: Arc::new(OjResolver::with_conditions(
+            resolver: Arc::new(OjResolver::with_options(
                 &root,
                 &oj_config::resolve_conditions(&config, "client"),
+                &oj_config::resolve_alias(&config, "client"),
             )),
-            ssr_resolver: Arc::new(OjResolver::with_conditions(
+            ssr_resolver: Arc::new(OjResolver::with_options(
                 &root,
                 &oj_config::resolve_conditions(&config, "ssr"),
+                &oj_config::resolve_alias(&config, "ssr"),
             )),
             cache: PersistentCache::new(
                 root.join(".oj-cache"),

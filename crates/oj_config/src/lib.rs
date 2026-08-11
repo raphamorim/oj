@@ -80,6 +80,33 @@ pub fn resolve_conditions(config: &OjConfig, env_name: &str) -> Vec<String> {
     [base, "import", "module", "default"].map(String::from).to_vec()
 }
 
+/// `resolve.alias` entries (`find`, `replacement`) for an environment.
+/// Precedence: `environments.<name>.resolve.alias` merged over top-level
+/// `resolve.alias`. Returns `(find, replacement)` pairs for the resolver.
+pub fn resolve_alias(config: &OjConfig, env_name: &str) -> Vec<(String, String)> {
+    let mut merged: std::collections::BTreeMap<String, String> = config
+        .resolve
+        .as_ref()
+        .and_then(|r| r.alias.as_ref())
+        .map(|a| a.clone().into_iter().collect())
+        .unwrap_or_default();
+    if let Some(env_alias) = config
+        .environments
+        .as_ref()
+        .and_then(|e| e.get(env_name))
+        .and_then(|e| e.get("resolve"))
+        .and_then(|r| r.get("alias"))
+        .and_then(|a| a.as_object())
+    {
+        for (find, replacement) in env_alias {
+            if let Some(s) = replacement.as_str() {
+                merged.insert(find.clone(), s.to_string());
+            }
+        }
+    }
+    merged.into_iter().collect()
+}
+
 /// `config.environments.<name>.define` as `(name, js-expression)` pairs — the
 /// per-environment overrides of the Vite Environment API.
 pub fn environment_defines(config: &OjConfig, env_name: &str) -> Vec<(String, String)> {
