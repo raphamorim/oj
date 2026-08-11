@@ -64,8 +64,9 @@ The work ahead, roughly in priority order:
   `*.server.ts` module is replaced on the client by RPC stubs (its code never
   ships to the browser), and the real functions run on the module runner in dev
   and a bundled dispatch behind `server.mjs` in production.
-- Edge and serverless server targets, so one app can build for a Node server or
-  a worker runtime.
+- Deeper edge support. `oj build --ssr` already emits a `worker.mjs` Web
+  `fetch` handler (Workers/`workerd`-style) beside the Node `server.mjs`; still
+  ahead is bundling for a specific edge runtime's constraints and asset story.
 - More of the module-graph plugin API. The `moduleParsed` and `watchChange`
   hooks fire today; still ahead is a synchronous whole-graph `getModuleInfo`
   (oj's plugin host is out of process, so cross-graph lookups are async).

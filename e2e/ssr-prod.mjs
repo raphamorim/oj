@@ -66,6 +66,26 @@ if (!fs.existsSync(serverJs)) throw new Error("no server.mjs emitted");
   if (clientLeak) throw new Error("server-only code leaked into the client bundle");
   console.log("ssr-prod: server functions ok (dispatch bundle has real code, client has only stubs)");
 }
+// Edge/worker entry: a Web `fetch` handler (Request/Response/ReadableStream, no
+// node:http), runnable in Node too. Renders per route and runs server fns.
+{
+  const workerPath = path.join(out, "worker.mjs");
+  if (!fs.existsSync(workerPath)) throw new Error("no worker.mjs (edge entry) emitted");
+  const worker = (await import(pathToFileURL(workerPath).href)).default;
+  const res = await worker.fetch(new Request("http://localhost/"));
+  const html = await res.text();
+  if (!html.includes('data-page="home"')) throw new Error("worker SSR did not render the home route");
+  if (!html.includes("deferred-streamed")) throw new Error("worker SSR did not stream the Suspense content");
+  const fn = await worker.fetch(
+    new Request("http://localhost/__oj_fn", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ module: "/src/greeting.server.ts", name: "greet", args: ["edge"] }),
+    }),
+  );
+  if ((await fn.json()) !== "hello, edge (server=true)") throw new Error("worker server function failed");
+  console.log("ssr-prod: edge/worker entry ok (Web fetch handler renders + runs server functions)");
+}
 // User plugins run in BOTH SSR-build environments: entry-server (ssr) and
 // entry-client (client) each import a plugin virtual module, so its source must
 // be bundled into both the server bundle and a client asset.
