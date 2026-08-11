@@ -100,6 +100,7 @@ node e2e/run.mjs                                # browser e2e suite (add --bundl
 node e2e/ssr-dev.mjs                            # SSR dev e2e; e2e/ssr-prod.mjs for the built server
 node bench/generate.mjs 1000                    # generate a benchmark app (then npm i inside it)
 node bench/run.mjs 1000                         # p50/p95 benchmark vs vite
+node bench/card.mjs                             # render bench/card.html to oj-benchmarks.png
 ```
 
 ## Benchmarks
