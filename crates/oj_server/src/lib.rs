@@ -132,6 +132,10 @@ struct ServerState {
     /// Runtime handle so the sync file-watcher thread can call async plugin
     /// hooks (handleHotUpdate).
     rt: tokio::runtime::Handle,
+    /// Configured `base` (e.g. `/riotermjs/`). In dev, requests carrying this
+    /// prefix (app fetches built from `import.meta.env.BASE_URL`) have it
+    /// stripped before file lookup, so the app serves under `base` like Vite.
+    base: Option<String>,
 }
 
 /// A fully-configured dev server that hasn't been bound to a socket yet.
@@ -332,6 +336,7 @@ impl DevServer {
             plugins_ssr: tokio::sync::OnceCell::new(),
             ssr_plugin_config,
             rt: tokio::runtime::Handle::current(),
+            base: config.base.clone().filter(|b| b != "/"),
         });
         {
             let state = Arc::clone(&state);
@@ -813,7 +818,16 @@ async fn serve_path(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    let rel = uri.path().trim_start_matches('/');
+    // Serve under `base` like Vite: strip the configured base prefix from app
+    // requests (built from `import.meta.env.BASE_URL`). oj's own root-relative
+    // URLs (/@fs, /@id, /@oj, /src) don't carry the prefix, so this is a no-op
+    // for them.
+    let path = state
+        .base
+        .as_deref()
+        .and_then(|b| uri.path().strip_prefix(b.trim_end_matches('/')))
+        .unwrap_or_else(|| uri.path());
+    let rel = path.trim_start_matches('/');
     let rel = if rel.is_empty() { "index.html" } else { rel };
 
     // Virtual modules: serve author-provided source at /@virtual/<id>.
