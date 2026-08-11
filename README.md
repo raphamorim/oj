@@ -80,6 +80,16 @@ The work ahead, roughly in priority order:
 
 ## Quickstart
 
+Install the CLI from crates.io, then run `oj` in any app:
+
+```sh
+cargo install oj                                # install the `oj` CLI
+oj dev                                           # dev server for the current app on :5199
+oj build                                         # production build into ./dist
+```
+
+Or run it from a checkout of this repo:
+
 ```sh
 cargo run -p oj -- dev                          # dev server for ./playground on :5199
 cargo run -p oj -- dev --bundle                 # registry-runtime bundle mode
