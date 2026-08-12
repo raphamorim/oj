@@ -120,6 +120,9 @@ const ALIASES = {
   "#tanstack-start-plugin-adapters": pathResolve(HERE, "plugin-adapters.ts"),
   "#tanstack-start-server-fn-resolver": pathResolve(HERE, "server-fn-resolver.mjs"),
   "tanstack-start-manifest:v": pathResolve(HERE, "manifest.ts"),
+  // The Cloudflare Vite plugin injects this virtual module; supply a dev shim
+  // exposing getCloudflareContext() with the wrangler `vars` + `.dev.vars`.
+  "@cloudflare/vite-plugin/server": pathResolve(HERE, "cf-server.mjs"),
 };
 
 // App package.json "imports" subpath map (e.g. "#shared/*" -> "./shared/*").
