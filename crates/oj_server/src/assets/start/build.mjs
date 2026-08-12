@@ -5,7 +5,7 @@
 // HTTP dispatch and prerender are follow-ups.
 import { existsSync, readFileSync, writeFileSync, mkdirSync, cpSync, rmSync } from "node:fs";
 import { dirname, join, resolve, relative } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import esbuild from "esbuild";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -24,14 +24,19 @@ const SERVER = [
   'const HERE = dirname(fileURLToPath(import.meta.url));',
   'const CLIENT = join(HERE, "client");',
   'const PORT = process.env.PORT || 3000;',
-  'const MIME = { ".js":"text/javascript", ".css":"text/css", ".json":"application/json", ".wasm":"application/wasm", ".ico":"image/x-icon", ".png":"image/png", ".svg":"image/svg+xml", ".woff2":"font/woff2" };',
+  'const MIME = { ".html":"text/html; charset=utf-8", ".js":"text/javascript", ".css":"text/css", ".json":"application/json", ".wasm":"application/wasm", ".ico":"image/x-icon", ".png":"image/png", ".svg":"image/svg+xml", ".woff2":"font/woff2" };',
   'function readBody(req){ return new Promise((r)=>{ const c=[]; req.on("data",(d)=>c.push(d)); req.on("end",()=>r(Buffer.concat(c))); }); }',
   'createServer(async (req, res) => {',
   '  const url = new URL(req.url, "http://" + (req.headers.host || "localhost"));',
   '  if (req.method === "GET") {',
   '    const rel = url.pathname.replace(/^\\/+/, "");',
-  '    if (rel && !rel.startsWith("_serverFn/")) {',
-  '      try { const bytes = await readFile(join(CLIENT, rel)); res.writeHead(200, { "content-type": MIME[extname(rel)] || "application/octet-stream" }); res.end(bytes); return; } catch {}',
+  '    if (!rel.startsWith("_serverFn/")) {',
+  '      const candidates = [];',
+  '      if (rel) candidates.push(rel);',                          // exact asset
+  '      candidates.push((rel ? rel.replace(/\\/+$/, "") + "/" : "") + "index.html");', // prerendered doc
+  '      for (const c of candidates) {',
+  '        try { const bytes = await readFile(join(CLIENT, c)); res.writeHead(200, { "content-type": MIME[extname(c)] || "application/octet-stream" }); res.end(bytes); return; } catch {}',
+  '      }',
   '    }',
   '  }',
   '  const body = (req.method === "GET" || req.method === "HEAD") ? undefined : await readBody(req);',
@@ -181,5 +186,21 @@ writeFileSync(join(DIST, "server.mjs"), SERVER);
 
 // 5. Copy public/.
 if (existsSync(join(APP, "public"))) cpSync(join(APP, "public"), CLIENT, { recursive: true });
+
+// 6. Prerender (SSG): render each configured route to a static HTML file the
+// server serves before falling back to SSR. Routes come from build.prerender.
+const prerender = (process.env.OJ_PRERENDER || "").split(",").map((s) => s.trim()).filter(Boolean);
+if (prerender.length) {
+  const handler = (await import(pathToFileURL(join(DIST, "server-bundle.mjs")).href)).default;
+  for (const route of prerender) {
+    const res = await handler.fetch(new Request("http://localhost" + route));
+    const html = await res.text();
+    const rel = route === "/" ? "index.html" : `${route.replace(/^\/+/, "").replace(/\/+$/, "")}/index.html`;
+    const outFile = join(CLIENT, rel);
+    mkdirSync(dirname(outFile), { recursive: true });
+    writeFileSync(outFile, html);
+  }
+  process.stderr.write(`oj: prerendered ${prerender.length} route(s)\n`);
+}
 
 process.stderr.write(`oj: built dist (client ${clientUrl})\n`);

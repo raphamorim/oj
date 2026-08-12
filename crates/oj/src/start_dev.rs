@@ -80,7 +80,24 @@ pub async fn start_build(root: PathBuf) -> anyhow::Result<()> {
     oj_server::write_start_assets(&cache)?;
     generate_route_tree(&root, &cache)?;
     run_node(&root, &cache.join("gen-resolver.mjs"), "server-fn resolver")?;
-    run_node(&root, &cache.join("build.mjs"), "production build")?;
+    // Routes to prerender (SSG) from oj.config `build.prerender`.
+    let prerender = oj_config::load(&root)
+        .ok()
+        .and_then(|c| c.build)
+        .and_then(|b| b.prerender)
+        .unwrap_or_default()
+        .join(",");
+    let status = std::process::Command::new("node")
+        .arg(cache.join("build.mjs"))
+        .env("OJ_APP_ROOT", &root)
+        .env("NODE_ENV", "production")
+        .env("OJ_PRERENDER", &prerender)
+        .current_dir(&root)
+        .status()
+        .map_err(|e| anyhow::anyhow!("could not run production build (node): {e}"))?;
+    if !status.success() {
+        anyhow::bail!("production build failed");
+    }
     println!("  oj build (tanstack start) -> {}/dist", root.display());
     println!("  run: node dist/server.mjs");
     Ok(())
