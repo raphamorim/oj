@@ -36,6 +36,9 @@ struct StartState {
     /// The browser-bundled client hydration entry, served at
     /// `/@oj-start/client-entry.js`.
     client_bundle: PathBuf,
+    /// The live-reload client (snapshot/restore + reconnecting WebSocket),
+    /// served at `/@oj-start/live-reload.js`.
+    live_reload: PathBuf,
     /// Fires after a rebuild so the injected client reloads the page.
     reload_tx: broadcast::Sender<()>,
 }
@@ -58,6 +61,7 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
         proxy_prefixes: built.proxy_prefixes.clone(),
         runner: Arc::new(tokio::sync::Mutex::new(runner)),
         client_bundle: cache.join("client-entry.js"),
+        live_reload: cache.join("live-reload.js"),
         reload_tx: reload_tx.clone(),
     });
 
@@ -109,9 +113,9 @@ fn list_route_files(root: &Path) -> std::collections::BTreeSet<PathBuf> {
     out
 }
 
-/// Injected into HTML documents in dev: reconnecting WebSocket that reloads
-/// the page when the server signals a rebuild.
-const RELOAD_CLIENT: &str = "<script>(()=>{let w;function c(){w=new WebSocket((location.protocol===\"https:\"?\"wss\":\"ws\")+\"://\"+location.host+\"/@oj-start/hmr\");w.onmessage=()=>location.reload();w.onclose=()=>setTimeout(c,1000);}c();})();</script>";
+/// Injected into HTML documents in dev: loads the live-reload client, which
+/// snapshots ephemeral state, reloads on a rebuild signal, then restores it.
+const RELOAD_CLIENT: &str = "<script type=\"module\" src=\"/@oj-start/live-reload.js\"></script>";
 
 /// Watch `src/`: on a real change, regenerate the route tree + resolver,
 /// rebuild the client bundle, restart the runner (fresh SSR), then reload.
@@ -305,16 +309,11 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
     }
     // The browser-bundled client hydration entry (esbuild, aliases resolved).
     if req.uri().path() == "/@oj-start/client-entry.js" {
-        return match tokio::fs::read(&state.client_bundle).await {
-            Ok(bytes) => (
-                [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
-                bytes,
-            )
-                .into_response(),
-            Err(e) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("oj start: client entry: {e}")).into_response()
-            }
-        };
+        return serve_js(&state.client_bundle, "client entry").await;
+    }
+    // The live-reload client (snapshot/restore + reconnecting WebSocket).
+    if req.uri().path() == "/@oj-start/live-reload.js" {
+        return serve_js(&state.live_reload, "live-reload client").await;
     }
     // Server-function RPC: forward the whole request (method/headers/body) to
     // the runner's fetch handler, which dispatches it via `handleServerAction`.
@@ -334,6 +333,18 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
             forward(&state, "GET".into(), url, vec![], None).await
         }
         Route::Pass => next.run(req).await,
+    }
+}
+
+/// Serve a cached dev JS asset (no-cache so rebuilds always take effect).
+async fn serve_js(path: &Path, what: &str) -> Response {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => (
+            [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj start: {what}: {e}")).into_response(),
     }
 }
 

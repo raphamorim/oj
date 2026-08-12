@@ -56,6 +56,7 @@ const START_ASSETS: &[(&str, &str)] = &[
     ("fn-stubs.mjs", include_str!("assets/start/fn-stubs.mjs")),
     ("bundle-client.mjs", include_str!("assets/start/bundle-client.mjs")),
     ("build.mjs", include_str!("assets/start/build.mjs")),
+    ("live-reload.js", include_str!("assets/start/live-reload.js")),
     ("server-entry.tsx", include_str!("assets/start/server-entry.tsx")),
     ("client-entry.tsx", include_str!("assets/start/client-entry.tsx")),
     ("start-entry.ts", include_str!("assets/start/start-entry.ts")),
