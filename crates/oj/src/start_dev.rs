@@ -15,13 +15,14 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Request, State},
+    extract::{FromRequestParts, Request, State, WebSocketUpgrade, ws::Message},
     http::{Method, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::sync::broadcast;
 
 struct Runner {
     stdin: ChildStdin,
@@ -35,6 +36,8 @@ struct StartState {
     /// The browser-bundled client hydration entry, served at
     /// `/@oj-start/client-entry.js`.
     client_bundle: PathBuf,
+    /// Fires after a rebuild so the injected client reloads the page.
+    reload_tx: broadcast::Sender<()>,
 }
 
 pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
@@ -50,11 +53,17 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
     // Reuse the dev server for module/asset serving; the document route sits on top.
     let built = oj_server::DevServer { root: root.clone(), port, bundle: false }.build_app().await?;
     let runner = spawn_start_runner(&root, &cache).await?;
+    let (reload_tx, _) = broadcast::channel::<()>(16);
     let state = Arc::new(StartState {
         proxy_prefixes: built.proxy_prefixes.clone(),
         runner: Arc::new(tokio::sync::Mutex::new(runner)),
         client_bundle: cache.join("client-entry.js"),
+        reload_tx: reload_tx.clone(),
     });
+
+    // Watch src/: on change, regenerate the route tree, rebuild the client, and
+    // restart the runner (so SSR is fresh), then reload the page.
+    spawn_start_watcher(root.clone(), cache.clone(), Arc::clone(&state));
 
     let app = built
         .router
@@ -68,6 +77,64 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
     println!("  http://localhost:{}/", built.port);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Injected into HTML documents in dev: reconnecting WebSocket that reloads
+/// the page when the server signals a rebuild.
+const RELOAD_CLIENT: &str = "<script>(()=>{let w;function c(){w=new WebSocket((location.protocol===\"https:\"?\"wss\":\"ws\")+\"://\"+location.host+\"/@oj-start/hmr\");w.onmessage=()=>location.reload();w.onclose=()=>setTimeout(c,1000);}c();})();</script>";
+
+/// Watch `src/`: on a real change, regenerate the route tree + resolver,
+/// rebuild the client bundle, restart the runner (fresh SSR), then reload.
+fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
+    let rt = tokio::runtime::Handle::current();
+    std::thread::spawn(move || {
+        use notify::{RecursiveMode, Watcher};
+        use std::sync::mpsc::RecvTimeoutError;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(tx) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("oj start: file watcher failed: {e}");
+                return;
+            }
+        };
+        let src = root.join("src");
+        if let Err(e) = watcher.watch(&src, RecursiveMode::Recursive) {
+            eprintln!("oj start: cannot watch {}: {e}", src.display());
+            return;
+        }
+        loop {
+            let mut paths: std::collections::HashSet<PathBuf> = match rx.recv() {
+                Ok(Ok(ev)) => ev.paths.into_iter().collect(),
+                Ok(Err(_)) => continue,
+                Err(_) => break,
+            };
+            loop {
+                match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok(Ok(ev)) => paths.extend(ev.paths),
+                    Ok(Err(_)) => {}
+                    Err(RecvTimeoutError::Timeout) => break,
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
+            }
+            // Ignore our own generated route tree to avoid a rebuild loop.
+            if !paths.iter().any(|p| !p.ends_with("routeTree.gen.ts")) {
+                continue;
+            }
+            let _ = generate_route_tree(&root, &cache);
+            let _ = run_node(&root, &cache.join("gen-resolver.mjs"), "server-fn resolver");
+            let _ = bundle_client_entry(&root, &cache);
+            rt.block_on(async {
+                match spawn_start_runner(&root, &cache).await {
+                    Ok(new) => *state.runner.lock().await = new,
+                    Err(e) => eprintln!("oj start: runner restart failed: {e}"),
+                }
+            });
+            let _ = state.reload_tx.send(());
+            println!("  oj start: rebuilt, reloading");
+        }
+    });
 }
 
 /// Production build for a TanStack Start app (`oj build`): generate the route
@@ -169,6 +236,23 @@ fn classify(req: &Request, proxy_prefixes: &[String]) -> Route {
 }
 
 async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: Next) -> Response {
+    // Live-reload channel: the injected client reconnects and reloads on a ping.
+    if req.uri().path() == "/@oj-start/hmr" {
+        let (mut parts, _) = req.into_parts();
+        return match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+            Ok(ws) => {
+                let mut rx = state.reload_tx.subscribe();
+                ws.on_upgrade(move |mut socket| async move {
+                    while rx.recv().await.is_ok() {
+                        if socket.send(Message::Text("reload".into())).await.is_err() {
+                            break;
+                        }
+                    }
+                })
+            }
+            Err(e) => e.into_response(),
+        };
+    }
     // The browser-bundled client hydration entry (esbuild, aliases resolved).
     if req.uri().path() == "/@oj-start/client-entry.js" {
         return match tokio::fs::read(&state.client_bundle).await {
@@ -243,7 +327,20 @@ async fn forward(
     match rx.await.unwrap_or_else(|_| Err("start runner task cancelled".to_string())) {
         Ok(v) => {
             let status = v.get("status").and_then(|s| s.as_u64()).unwrap_or(200) as u16;
-            let body = v.get("body").and_then(|b| b.as_str()).unwrap_or("").to_owned();
+            let mut body = v.get("body").and_then(|b| b.as_str()).unwrap_or("").to_owned();
+            let is_html = v
+                .get("headers")
+                .and_then(|h| h.get("content-type"))
+                .and_then(|c| c.as_str())
+                .is_some_and(|c| c.contains("text/html"));
+            // Inject the live-reload client into HTML documents.
+            if is_html {
+                if let Some(i) = body.rfind("</body>") {
+                    body.insert_str(i, RELOAD_CLIENT);
+                } else {
+                    body.push_str(RELOAD_CLIENT);
+                }
+            }
             let mut resp = Response::new(axum::body::Body::from(body));
             *resp.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
             if let Some(h) = v.get("headers").and_then(|h| h.as_object()) {
