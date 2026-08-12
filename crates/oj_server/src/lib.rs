@@ -49,6 +49,8 @@ const COMPILABLE: &[&str] = &["tsx", "ts", "jsx", "js", "mjs"];
 /// four alias specifiers + compiles TS/JSX), the persistent SSR runner, the
 /// route-tree generator, and the synthesized server/client/manifest entries.
 const START_ASSETS: &[(&str, &str)] = &[
+    ("resolve-pkg.mjs", include_str!("assets/start/resolve-pkg.mjs")),
+    ("esbuild-assets.mjs", include_str!("assets/start/esbuild-assets.mjs")),
     ("loader.mjs", include_str!("assets/start/loader.mjs")),
     ("runner.mjs", include_str!("assets/start/runner.mjs")),
     ("generate.mjs", include_str!("assets/start/generate.mjs")),

@@ -6,7 +6,8 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, cpSync, rmSync } from "node:fs";
 import { dirname, join, resolve, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import esbuild from "esbuild";
+import { importPkg } from "./resolve-pkg.mjs";
+const esbuild = await importPkg(process.env.OJ_APP_ROOT ?? process.cwd(), "esbuild", ["vite", "@tanstack/react-start"]);
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();

@@ -5,10 +5,11 @@
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { readFileSync, existsSync } from "node:fs";
 import { resolve as pathResolve, dirname } from "node:path";
-import { transformSync } from "esbuild";
+import { importPkg } from "./resolve-pkg.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
+const { transformSync } = await importPkg(APP, "esbuild", ["vite", "@tanstack/react-start"]);
 const EXTS = [".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.tsx"];
 
 // Warm-reload versioning. On a dev rebuild the runner bumps V (over a
@@ -23,6 +24,8 @@ export async function initialize(data) {
 const stripQ = (u) => u.split("?")[0];
 const withV = (u) => (V ? `${stripQ(u)}?ojv=${V}` : stripQ(u));
 const isTanstack = (u) => /\/@tanstack\//.test(u) && /\.(js|mjs)$/.test(stripQ(u));
+const ASSET_SUFFIX = /\?(raw|url|inline)$/;
+const ASSET_EXT = /\.(svg|png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|eot|mp4|webm|wasm)$/;
 
 function probe(base) {
   if (existsSync(base)) return base;
@@ -40,6 +43,26 @@ const ALIASES = {
 
 export async function resolve(spec, context, next) {
   if (context.parentURL) context = { ...context, parentURL: stripQ(context.parentURL) };
+  // Asset conventions: resolve the underlying file, then tag the URL so load()
+  // returns a string / URL / data URI (?url mirrors the client's /@oj-start/fs
+  // path) or a no-op for side-effect CSS (styling is a client concern in SSR).
+  const suffix = spec.match(ASSET_SUFFIX);
+  const isCss = !spec.includes("?") && /\.css$/.test(spec);
+  const isAsset = !spec.includes("?") && ASSET_EXT.test(spec);
+  if (suffix || isCss || isAsset) {
+    const kind = suffix ? suffix[1] : isCss ? "css" : "url";
+    const clean = spec.replace(ASSET_SUFFIX, "");
+    let abs = null;
+    if (clean.startsWith(".") && context.parentURL) {
+      abs = probe(pathResolve(dirname(fileURLToPath(context.parentURL)), clean));
+    } else if (ALIASES[clean]) {
+      abs = probe(ALIASES[clean]);
+    }
+    if (!abs) {
+      try { abs = fileURLToPath(stripQ((await next(clean, context)).url)); } catch {}
+    }
+    if (abs) return { url: pathToFileURL(abs).href + `?ojasset=${kind}`, shortCircuit: true };
+  }
   if (ALIASES[spec]) {
     const hit = probe(ALIASES[spec]);
     if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true };
@@ -84,6 +107,21 @@ function transformServerFns(code, path) {
 
 export async function load(url, context, next) {
   const clean = stripQ(url);
+  // Tagged asset (from resolve above).
+  const kind = /[?&]ojasset=(\w+)/.exec(url)?.[1];
+  if (kind) {
+    const path = fileURLToPath(clean);
+    let src = "export default {};"; // css: no-op on the server
+    if (kind === "raw") src = `export default ${JSON.stringify(readFileSync(path, "utf8"))};`;
+    else if (kind === "url") src = `export default ${JSON.stringify("/@oj-start/fs" + path)};`;
+    else if (kind === "inline")
+      src = `export default ${JSON.stringify("data:application/octet-stream;base64," + readFileSync(path).toString("base64"))};`;
+    return { format: "module", source: src, shortCircuit: true };
+  }
+  // JSON without an import attribute: hand back a module (Node would reject it).
+  if (clean.endsWith(".json")) {
+    return { format: "module", source: `export default ${readFileSync(fileURLToPath(clean), "utf8")};`, shortCircuit: true };
+  }
   if (clean.endsWith(".tsx") || clean.endsWith(".ts")) {
     const path = fileURLToPath(clean);
     const src = transformServerFns(readFileSync(path, "utf8"), path);

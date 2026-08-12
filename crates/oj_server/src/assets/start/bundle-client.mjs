@@ -7,10 +7,25 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import esbuild from "esbuild";
+import { importPkg } from "./resolve-pkg.mjs";
+import { assetsPlugin, pnpmStorePaths } from "./esbuild-assets.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
+const esbuild = await importPkg(APP, "esbuild", ["vite", "@tanstack/react-start"]);
+
+// Farthest ancestor with a node_modules (the pnpm/workspace root).
+function workspaceRoot(app) {
+  let best = app;
+  for (let cur = app; ; ) {
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    if (existsSync(join(parent, "node_modules"))) best = parent;
+    cur = parent;
+  }
+  return best;
+}
+const WORKSPACE = workspaceRoot(APP);
 const SERVER_FN_BASE = process.env.TSS_SERVER_FN_BASE ?? "/_serverFn/";
 
 // Client server-fn transform: rewrite each top-level
@@ -72,12 +87,18 @@ const ALS =
   "run(s,cb,...a){const p=this._s;this._s=s;try{return cb(...a)}finally{this._s=p}}" +
   "enterWith(s){this._s=s}exit(cb,...a){const p=this._s;this._s=undefined;try{return cb(...a)}finally{this._s=p}}" +
   "disable(){this._s=undefined}}export default {AsyncLocalStorage};";
+// Node builtins reach the browser bundle two ways: `node:`-prefixed, and bare
+// (`import "url"` in older deps like source-map). Shim both; async_hooks gets a
+// working synchronous AsyncLocalStorage, everything else an empty module.
+const BARE_BUILTINS =
+  /^(assert|buffer|child_process|cluster|console|constants|crypto|dgram|dns|domain|events|fs|http|http2|https|module|net|os|path|perf_hooks|process|punycode|querystring|readline|repl|stream|string_decoder|sys|timers|tls|tty|url|util|v8|vm|worker_threads|zlib|async_hooks)$/;
 const nodeShims = {
   name: "node-builtin-shims",
   setup(build) {
     build.onResolve({ filter: /^node:/ }, (args) => ({ path: args.path, namespace: "node-shim" }));
+    build.onResolve({ filter: BARE_BUILTINS }, (args) => ({ path: args.path, namespace: "node-shim" }));
     build.onLoad({ filter: /.*/, namespace: "node-shim" }, (args) => ({
-      contents: args.path === "node:async_hooks" ? ALS : "export default {};",
+      contents: /(^|:)async_hooks$/.test(args.path) ? ALS : "export default {};",
       loader: "js",
     }));
   },
@@ -94,6 +115,9 @@ await esbuild.build({
     "#tanstack-router-entry": routerEntry(),
     "#tanstack-start-entry": join(HERE, "start-entry.ts"),
     "#tanstack-start-plugin-adapters": join(HERE, "plugin-adapters.ts"),
+    // The router manifest virtual (start-server-core can be pulled into the
+    // client graph before tree-shaking drops it).
+    "tanstack-start-manifest:v": join(HERE, "manifest.ts"),
     // Runtime isomorphic-fn impl (the stubs default to the server impl).
     "@tanstack/start-fn-stubs": join(HERE, "fn-stubs.mjs"),
   },
@@ -107,7 +131,8 @@ await esbuild.build({
       `globalThis.process=globalThis.process||{env:{NODE_ENV:"development",TSS_SERVER_FN_BASE:${JSON.stringify(SERVER_FN_BASE)}}};` +
       "globalThis.global=globalThis.global||globalThis;",
   },
-  plugins: [serverFnClient, nodeShims],
+  plugins: [assetsPlugin({ mode: "dev" }), serverFnClient, nodeShims],
+  nodePaths: pnpmStorePaths(WORKSPACE),
   outfile: join(HERE, "client-entry.js"),
   logLevel: "silent",
 });

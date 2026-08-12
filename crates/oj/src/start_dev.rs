@@ -39,6 +39,10 @@ struct StartState {
     /// The live-reload client (snapshot/restore + reconnecting WebSocket),
     /// served at `/@oj-start/live-reload.js`.
     live_reload: PathBuf,
+    /// Trust boundary for `/@oj-start/fs/` asset serving: the farthest ancestor
+    /// of the app root that has a `node_modules` (the pnpm/workspace root), so
+    /// assets under sibling workspace packages and the shared store resolve.
+    workspace_root: PathBuf,
     /// Fires after a rebuild so the injected client reloads the page.
     reload_tx: broadcast::Sender<()>,
 }
@@ -62,6 +66,7 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
         runner: Arc::new(tokio::sync::Mutex::new(runner)),
         client_bundle: cache.join("client-entry.js"),
         live_reload: cache.join("live-reload.js"),
+        workspace_root: workspace_root(&root),
         reload_tx: reload_tx.clone(),
     });
 
@@ -111,6 +116,42 @@ fn list_route_files(root: &Path) -> std::collections::BTreeSet<PathBuf> {
     }
     walk(&root.join("src").join("routes"), &mut out);
     out
+}
+
+/// The farthest ancestor of `app` (including itself) that contains a
+/// `node_modules`. Under pnpm workspaces this is the repo root, so assets in
+/// sibling packages and the shared store are reachable via `/@oj-start/fs/`.
+fn workspace_root(app: &Path) -> PathBuf {
+    let mut best = app.to_path_buf();
+    let mut cur = app;
+    while let Some(parent) = cur.parent() {
+        if parent.join("node_modules").is_dir() {
+            best = parent.to_path_buf();
+        }
+        cur = parent;
+    }
+    best
+}
+
+fn asset_mime(ext: &str) -> &'static str {
+    match ext {
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "ico" => "image/x-icon",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "wasm" => "application/wasm",
+        _ => "application/octet-stream",
+    }
 }
 
 /// Injected into HTML documents in dev: loads the live-reload client, which
@@ -315,6 +356,12 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
     if req.uri().path() == "/@oj-start/live-reload.js" {
         return serve_js(&state.live_reload, "live-reload client").await;
     }
+    // Asset files referenced by the client bundle (?url imports, side-effect
+    // CSS). The path after the prefix is the file's real absolute path, bounded
+    // to the workspace root; relative url() refs inside CSS resolve here too.
+    if let Some(abs) = req.uri().path().strip_prefix("/@oj-start/fs") {
+        return serve_fs_asset(&state, abs).await;
+    }
     // Server-function RPC: forward the whole request (method/headers/body) to
     // the runner's fetch handler, which dispatches it via `handleServerAction`.
     if req.uri().path().starts_with("/_serverFn/") {
@@ -345,6 +392,59 @@ async fn serve_js(path: &Path, what: &str) -> Response {
         )
             .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj start: {what}: {e}")).into_response(),
+    }
+}
+
+/// Serve an asset file by absolute path, bounded to the workspace root. `abs`
+/// is the URL path after `/@oj-start/fs` (starts with `/`), percent-decoded.
+async fn serve_fs_asset(state: &StartState, abs: &str) -> Response {
+    let decoded = percent_decode(abs);
+    let path = PathBuf::from(&decoded);
+    let canon = match tokio::fs::canonicalize(&path).await {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::NOT_FOUND, format!("oj start: asset: {e}")).into_response(),
+    };
+    if !canon.starts_with(&state.workspace_root) {
+        return (StatusCode::FORBIDDEN, "oj start: asset outside workspace").into_response();
+    }
+    match tokio::fs::read(&canon).await {
+        Ok(bytes) => {
+            let ext = canon.extension().and_then(|e| e.to_str()).unwrap_or("");
+            (
+                [(header::CONTENT_TYPE, asset_mime(ext)), (header::CACHE_CONTROL, "no-cache")],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj start: asset: {e}")).into_response(),
+    }
+}
+
+/// Minimal percent-decode for `%XX` sequences in a URL path.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
