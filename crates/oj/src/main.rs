@@ -99,7 +99,11 @@ async fn main() -> anyhow::Result<()> {
                 let playground = PathBuf::from("playground");
                 if playground.join("index.html").is_file() { playground } else { PathBuf::from(".") }
             });
-            build::build(root, out, ssr).await
+            if oj_server::is_tanstack_start_app(&root) {
+                start_dev::start_build(root).await
+            } else {
+                build::build(root, out, ssr).await
+            }
         }
         Command::Preview { root, out, port } => {
             let root = root

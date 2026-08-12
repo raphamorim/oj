@@ -70,6 +70,22 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Production build for a TanStack Start app (`oj build`): generate the route
+/// tree + resolver, then run the esbuild pipeline that writes `dist/`.
+pub async fn start_build(root: PathBuf) -> anyhow::Result<()> {
+    let root = root
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("app root not found: {}: {e}", root.display()))?;
+    let cache = root.join(".oj-cache").join("start");
+    oj_server::write_start_assets(&cache)?;
+    generate_route_tree(&root, &cache)?;
+    run_node(&root, &cache.join("gen-resolver.mjs"), "server-fn resolver")?;
+    run_node(&root, &cache.join("build.mjs"), "production build")?;
+    println!("  oj build (tanstack start) -> {}/dist", root.display());
+    println!("  run: node dist/server.mjs");
+    Ok(())
+}
+
 /// Run `@tanstack/router-generator` once to write `src/routeTree.gen.ts`.
 fn generate_route_tree(root: &Path, cache: &Path) -> anyhow::Result<()> {
     run_node(root, &cache.join("generate.mjs"), "route tree generation")
