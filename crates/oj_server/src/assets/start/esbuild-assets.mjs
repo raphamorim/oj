@@ -11,7 +11,7 @@
 // In dev, asset URLs point at the server's /@oj-start/fs route; in prod they are
 // emitted into dist/client/assets and referenced by hash.
 import { readFileSync, readdirSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { join, dirname, extname, basename } from "node:path";
+import { join, dirname, extname, basename, resolve } from "node:path";
 import { createHash } from "node:crypto";
 
 const SUFFIX = /\?(raw|url|inline)$/;
@@ -195,12 +195,16 @@ export function workspaceRoot(app) {
 // A content-addressed asset emitter: copies a file into `${clientDir}/assets`
 // under a name that includes an 8-char hash of its bytes and returns the
 // absolute URL. Client and server builds independently produce identical URLs
-// for identical bytes, so no shared manifest is needed.
+// for identical bytes, so no shared manifest is needed. CSS is special-cased:
+// its relative url() references (fonts, images, @import) are emitted too and
+// rewritten to the hashed URLs, otherwise they'd 404 (the flat /assets layout
+// doesn't preserve the source's relative directory structure).
 export function contentHashEmitter(clientDir) {
   const assetsDir = join(clientDir, "assets");
   const seen = new Set();
-  return function emit(absPath) {
-    const buf = readFileSync(absPath);
+  const emitting = new Set();
+
+  const write = (absPath, buf) => {
     const ext = extname(absPath);
     const hash = createHash("sha256").update(buf).digest("hex").slice(0, 8);
     const name = basename(absPath, ext).replace(/[^\w.-]+/g, "_") + "-" + hash + ext;
@@ -211,4 +215,32 @@ export function contentHashEmitter(clientDir) {
     }
     return "/assets/" + name;
   };
+
+  function emit(absPath) {
+    if (extname(absPath).toLowerCase() === ".css" && !emitting.has(absPath)) {
+      emitting.add(absPath);
+      try {
+        return write(absPath, Buffer.from(rewriteCss(readFileSync(absPath, "utf8"), dirname(absPath)), "utf8"));
+      } finally {
+        emitting.delete(absPath);
+      }
+    }
+    return write(absPath, readFileSync(absPath));
+  }
+
+  // Rewrite url(...) references relative to the CSS file: emit each referenced
+  // asset and substitute its hashed URL. Skips data:, absolute, and rooted refs.
+  function rewriteCss(css, dir) {
+    return css.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (m, _q, ref) => {
+      const t = ref.trim();
+      if (/^(data:|https?:|\/\/|#|\/)/.test(t)) return m;
+      const clean = t.replace(/[?#].*$/, "");
+      const suffix = t.slice(clean.length);
+      const abs = resolve(dir, clean);
+      if (!existsSync(abs)) return m;
+      return `url(${JSON.stringify(emit(abs) + suffix)})`;
+    });
+  }
+
+  return emit;
 }
