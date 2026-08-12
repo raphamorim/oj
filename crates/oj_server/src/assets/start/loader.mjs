@@ -33,7 +33,8 @@ const stripQ = (u) => u.split("?")[0];
 const withV = (u) => (V ? `${stripQ(u)}?ojv=${V}` : stripQ(u));
 const isTanstack = (u) => /\/@tanstack\//.test(u) && /\.(js|mjs)$/.test(stripQ(u));
 const ASSET_SUFFIX = /\?(raw|url|inline)$/;
-const ASSET_EXT = /\.(svg|png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|eot|mp4|webm|wasm)$/;
+// `.svg` handled separately (svgr may make it a component); see load() below.
+const ASSET_EXT = /\.(png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|eot|mp4|webm|wasm)$/;
 
 const isFile = (p) => {
   try { return statSync(p).isFile(); } catch { return false; }
@@ -344,6 +345,14 @@ export async function load(url, context, next) {
   // Versioned @tanstack/* module: load its ESM source fresh under the new URL.
   if (url.includes("?ojv=") && isTanstack(url)) {
     return { format: "module", source: readFileSync(fileURLToPath(clean), "utf8"), shortCircuit: true };
+  }
+  // .svg: svgr (a `load` hook) may turn it into a React component; otherwise
+  // serve it as a URL like any other asset.
+  if (clean.endsWith(".svg")) {
+    const path = fileURLToPath(clean);
+    const loaded = container ? await container.load(path) : null;
+    const src = loaded != null ? loaded : `export default ${JSON.stringify("/@oj-start/fs" + path)};`;
+    return { format: "module", source: src, shortCircuit: true };
   }
   // A file a vite plugin compiles end-to-end (e.g. .mdx via customerMdx): run
   // its transform hooks, then esbuild the JSX result to ESM.

@@ -13,7 +13,10 @@ import { join } from "node:path";
 const SUFFIX = /\?(raw|url|inline)$/;
 // Bare asset imports (Vite treats these as a URL by default, e.g. `import logo
 // from "./logo.svg"`). `.svg?react` (svgr) is deliberately not covered here.
-const ASSET_EXT = /\.(svg|png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|eot|mp4|webm|wasm)$/;
+// `.svg` is intentionally excluded: svgr (a vite plugin) may turn it into a
+// React component, so it's routed through the plugin container, with a URL
+// fallback for svgs svgr doesn't claim.
+const ASSET_EXT = /\.(png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|eot|mp4|webm|wasm)$/;
 
 export function assetsPlugin({ mode = "dev", fsBase = "/@oj-start/fs" } = {}) {
   const devUrl = (abs) => `export default ${JSON.stringify(fsBase + abs)};`;

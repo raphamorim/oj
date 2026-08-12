@@ -145,6 +145,15 @@ const container = await loadPluginContainer(APP, { command: "serve", environment
 const vitePlugins = {
   name: "oj-vite-plugins",
   setup(build) {
+    // .svg: svgr (a plugin `load` hook) may make it a React component; else a
+    // URL. Registered unconditionally so .svg always has a loader.
+    build.onLoad({ filter: /\.svg$/ }, async (args) => {
+      if (container) {
+        const code = await container.load(args.path);
+        if (code != null) return { contents: code, loader: "js", resolveDir: dirname(args.path) };
+      }
+      return { contents: `export default ${JSON.stringify("/@oj-start/fs" + args.path)};`, loader: "js" };
+    });
     if (!container) return;
     const resolve = async (args) => {
       const rid = await container.resolveId(args.path, args.importer);
