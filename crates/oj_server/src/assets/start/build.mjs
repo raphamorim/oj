@@ -62,6 +62,8 @@ const SERVER = [
   '    }',
   '  }',
   '  const body = (req.method === "GET" || req.method === "HEAD") ? undefined : await readBody(req);',
+  // No static index.html matched: render `.../index.html` as the `.../` document.
+  '  if (url.pathname.endsWith("/index.html")) url.pathname = url.pathname.slice(0, -10);',
   '  const response = await handler.fetch(new Request(url.href, { method: req.method, headers: req.headers, body }));',
   '  res.writeHead(response.status, Object.fromEntries(response.headers));',
   '  res.end(await response.text());',

@@ -318,7 +318,11 @@ fn classify(req: &Request, proxy_prefixes: &[String]) -> Route {
     if path.starts_with("/@") || path.starts_with("/__") {
         return Route::Pass;
     }
-    if path.rsplit('/').next().is_some_and(|seg| seg.contains('.')) {
+    // A request for `index.html` is the document for its directory, not a static
+    // file (a TanStack Start app has no index.html on disk); everything else
+    // with an extension falls through to the dev pipeline.
+    let last = path.rsplit('/').next().unwrap_or("");
+    if last != "index.html" && last.contains('.') {
         return Route::Pass;
     }
     if proxy_prefixes.iter().any(|p| path.starts_with(p.as_str())) {
@@ -328,6 +332,20 @@ fn classify(req: &Request, proxy_prefixes: &[String]) -> Route {
         Method::GET => Route::Document,
         _ => Route::Pass,
     }
+}
+
+/// Serve `.../index.html` as the document for `.../` so the router matches the
+/// directory route instead of a nonexistent file. Preserves the query string.
+fn document_url(url: &str) -> String {
+    let (path, query) = match url.split_once('?') {
+        Some((p, q)) => (p, format!("?{q}")),
+        None => (url, String::new()),
+    };
+    let path = match path.strip_suffix("/index.html") {
+        Some(prefix) => format!("{prefix}/"),
+        None => path.to_string(),
+    };
+    format!("{path}{query}")
 }
 
 async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: Next) -> Response {
@@ -376,8 +394,8 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
     }
     match classify(&req, &state.proxy_prefixes) {
         Route::Document => {
-            let url = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
-            forward(&state, "GET".into(), url, vec![], None).await
+            let raw = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
+            forward(&state, "GET".into(), document_url(raw), vec![], None).await
         }
         Route::Pass => next.run(req).await,
     }
