@@ -84,7 +84,9 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
   }
   const all = (loaded?.config?.plugins ?? []).flat(Infinity).filter(Boolean);
   const plugins = ordered(
-    all.filter((p) => (p.resolveId || p.load || p.transform) && applyMatches(p, command, mode)),
+    all.filter(
+      (p) => (p.resolveId || p.load || p.transform || p.generateBundle) && applyMatches(p, command, mode),
+    ),
   );
 
   const ctx = {
@@ -138,5 +140,26 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
     return changed ? current : null;
   }
 
-  return { resolveId, load, transform, pluginCount: plugins.length };
+  // Run the plugins' generateBundle hooks with a real emitFile, so plugins that
+  // publish files (e.g. content-assets emitting /__content/<collection>/<file>)
+  // produce their output. `emit` receives Rollup's emitFile arg
+  // ({type,fileName,source}) and is expected to write the file. Plugins that
+  // read the output `bundle` get an empty one (we don't reconstruct it), so
+  // bundle-derived emissions are skipped; asset emissions from a manifest work.
+  async function generateBundle(emit) {
+    const genCtx = { ...ctx, emitFile: (f) => (emit(f), "oj-emit-ref") };
+    for (const p of plugins) {
+      const h = hookHandler(p.generateBundle);
+      if (!h) continue;
+      const ae = p.applyToEnvironment;
+      if (typeof ae === "function") {
+        let ok;
+        try { ok = ae({ name: environment }); } catch { ok = true; }
+        if (ok === false) continue;
+      }
+      try { await h.call(genCtx, { format: "es" }, {}, false); } catch {}
+    }
+  }
+
+  return { resolveId, load, transform, generateBundle, pluginCount: plugins.length };
 }

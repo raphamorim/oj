@@ -8,8 +8,12 @@
 // is a no-op so `waitUntil`/`passThroughOnException` are safe to call.
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
+// The built client assets sit next to this file in prod (dist/client); the
+// ASSETS binding serves them (e.g. /__content/<collection>/<file>).
+const CLIENT_DIR = fileURLToPath(new URL("./client", import.meta.url));
 
 // Strip // and /* */ comments outside strings, then trailing commas (wrangler
 // config is JSONC and its string values contain `//` in URLs).
@@ -75,11 +79,26 @@ function devVars() {
   return vars;
 }
 
+// A Workers static-assets binding backed by dist/client: apps read published
+// content (e.g. /__content/<collection>/<file>) through env.ASSETS.fetch().
+const ASSETS = {
+  async fetch(url) {
+    const pathname = new URL(url).pathname.replace(/^\/+/, "");
+    const file = join(CLIENT_DIR, pathname);
+    if (!file.startsWith(CLIENT_DIR)) return new Response("", { status: 403 });
+    try {
+      return new Response(readFileSync(file), { status: 200 });
+    } catch {
+      return new Response("", { status: 404 });
+    }
+  },
+};
+
 let cached;
 export async function getCloudflareContext() {
   if (!cached) {
     cached = {
-      env: { ...process.env, ...wranglerVars(), ...devVars() },
+      env: { ASSETS, ...process.env, ...wranglerVars(), ...devVars() },
       cf: {},
       ctx: { waitUntil() {}, passThroughOnException() {} },
     };

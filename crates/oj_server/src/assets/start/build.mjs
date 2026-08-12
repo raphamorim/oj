@@ -188,6 +188,18 @@ const client = await esbuild.build({
 const entryOut = Object.entries(client.metafile.outputs).find(([, o]) => o.entryPoint);
 const clientUrl = "/" + relative(CLIENT, join(APP, entryOut[0]));
 
+// Run the client plugins' generateBundle hooks, writing any files they publish
+// (e.g. content-assets' /__content/<collection>/<file>) into dist/client so the
+// prod server's ASSETS binding can serve them.
+if (clientContainer) {
+  await clientContainer.generateBundle(({ type, fileName, source }) => {
+    if (type !== "asset" || !fileName || source == null) return;
+    const outFile = join(CLIENT, fileName);
+    mkdirSync(dirname(outFile), { recursive: true });
+    writeFileSync(outFile, source);
+  });
+}
+
 // 2. Manifest pointing at the hashed client entry.
 writeFileSync(
   join(HERE, "manifest.ts"),
