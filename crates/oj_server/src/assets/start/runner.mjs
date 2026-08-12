@@ -23,6 +23,13 @@ register(pathToFileURL(join(HERE, "loader.mjs")).href, {
   transferList: [port2],
 });
 
+// stdout is the JSON-lines protocol channel to oj. App code and its deps write
+// to stdout via console.log / process.stdout.write, which would interleave with
+// (and corrupt) the protocol. Capture the real writer for protocol frames, then
+// divert stdout to stderr so app logs stay visible without breaking framing.
+const send = process.stdout.write.bind(process.stdout);
+process.stdout.write = process.stderr.write.bind(process.stderr);
+
 let version = 0;
 let handler = (await import(ENTRY)).default;
 process.stderr.write("oj start runner: ready\n");
@@ -38,9 +45,9 @@ for await (const line of rl) {
       version += 1;
       port1.postMessage(version);
       handler = (await import(`${ENTRY}?ojv=${version}`)).default;
-      process.stdout.write(JSON.stringify({ reloaded: true }) + "\n");
+      send(JSON.stringify({ reloaded: true }) + "\n");
     } catch (e) {
-      process.stdout.write(JSON.stringify({ reloaded: false, error: String((e && e.stack) || e) }) + "\n");
+      send(JSON.stringify({ reloaded: false, error: String((e && e.stack) || e) }) + "\n");
     }
     continue;
   }
@@ -54,8 +61,8 @@ for await (const line of rl) {
     const body = await res.text();
     const headers = {};
     res.headers.forEach((v, k) => { headers[k] = v; });
-    process.stdout.write(JSON.stringify({ id: msg.id, status: res.status, headers, body }) + "\n");
+    send(JSON.stringify({ id: msg.id, status: res.status, headers, body }) + "\n");
   } catch (e) {
-    process.stdout.write(JSON.stringify({ id: msg.id, status: 500, headers: {}, body: String((e && e.stack) || e) }) + "\n");
+    send(JSON.stringify({ id: msg.id, status: 500, headers: {}, body: String((e && e.stack) || e) }) + "\n");
   }
 }
