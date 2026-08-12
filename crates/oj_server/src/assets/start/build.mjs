@@ -14,6 +14,15 @@ const DIST = join(APP, "dist");
 const CLIENT = join(DIST, "client");
 const sfid = (rel, name) => Buffer.from(`${rel}#${name}`).toString("base64url");
 
+// Cloudflare Worker / workerd entry: a Web fetch handler. Static assets are
+// served by the platform (Workers Assets binding / a CDN over dist/client);
+// this worker handles SSR + server-function RPC. Needs the nodejs_compat flag.
+const WORKER = [
+  'import handler from "./server-bundle.mjs";',
+  'export default { async fetch(request, env, ctx) { return handler.fetch(request); } };',
+  '',
+].join("\n");
+
 // Node production server: serve built client assets + public, else SSR fetch.
 const SERVER = [
   'import { createServer } from "node:http";',
@@ -181,8 +190,9 @@ await esbuild.build({
   logLevel: "silent",
 });
 
-// 4. server.mjs: Node http, serve client assets + public, else SSR fetch.
+// 4. server.mjs (Node http) + worker.mjs (edge Web fetch handler).
 writeFileSync(join(DIST, "server.mjs"), SERVER);
+writeFileSync(join(DIST, "worker.mjs"), WORKER);
 
 // 5. Copy public/.
 if (existsSync(join(APP, "public"))) cpSync(join(APP, "public"), CLIENT, { recursive: true });
