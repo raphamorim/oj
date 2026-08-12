@@ -21,6 +21,7 @@ const ALIASES = {
   "#tanstack-router-entry": pathResolve(APP, "src/router"),
   "#tanstack-start-entry": pathResolve(HERE, "start-entry.ts"),
   "#tanstack-start-plugin-adapters": pathResolve(HERE, "plugin-adapters.ts"),
+  "#tanstack-start-server-fn-resolver": pathResolve(HERE, "server-fn-resolver.mjs"),
   "tanstack-start-manifest:v": pathResolve(HERE, "manifest.ts"),
 };
 
@@ -52,10 +53,11 @@ function transformServerFns(code, path) {
   let changed = false;
   const out = code.replace(re, (_m, pre, indent, decl, name) => {
     changed = true;
-    const id = JSON.stringify(`${rel}#${name}`);
+    const id = JSON.stringify(Buffer.from(`${rel}#${name}`).toString("base64url"));
     const meta = `{ id: ${id}, name: ${JSON.stringify(name)}, filename: ${JSON.stringify(rel)} }`;
+    // Exported so the server-fn resolver can import it for HTTP dispatch.
     const rpc =
-      `${indent}const ${name}_createServerFn_handler = createServerRpc(${meta}, ` +
+      `${indent}export const ${name}_createServerFn_handler = createServerRpc(${meta}, ` +
       `(opts) => ${name}.__executeServer(opts));\n`;
     return `${pre}${rpc}${indent}${decl}${name}_createServerFn_handler, `;
   });

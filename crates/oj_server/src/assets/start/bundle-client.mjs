@@ -4,13 +4,55 @@
 // everything bundled, NODE_ENV defined, and node: builtins shimmed (the storage
 // context imports node:async_hooks, which is a server concern). Output:
 // client-entry.js.
-import { existsSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join, resolve, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import esbuild from "esbuild";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
+const SERVER_FN_BASE = process.env.TSS_SERVER_FN_BASE ?? "/_serverFn/";
+
+// Client server-fn transform: rewrite each top-level
+// `const NAME = createServerFn(...).handler(FN)` to inject `createClientRpc(id)`
+// as the first handler arg. The runtime uses arg 1 as the extractedFn, so the
+// browser makes an HTTP RPC to /_serverFn/<id> instead of running the handler.
+// `id` must match the server resolver's manifest (same `<relpath>#<name>`).
+const serverFnClient = {
+  name: "server-fn-client",
+  setup(build) {
+    build.onLoad({ filter: /\.(ts|tsx)$/ }, (args) => {
+      const code = readFileSync(args.path, "utf8");
+      if (!code.includes("createServerFn")) return null;
+      const rel = relative(APP, args.path);
+      // For each top-level `const NAME = createServerFn(...).handler(FN)`,
+      // REPLACE the handler args with `createClientRpc(id)` (single arg): a
+      // trailing second arg makes the runtime treat it as a server build and
+      // run the handler in the browser. Balanced-paren scan to strip FN.
+      const re = /(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*createServerFn\b[\s\S]*?\.handler\s*\(/g;
+      const edits = [];
+      let m;
+      while ((m = re.exec(code))) {
+        const open = m.index + m[0].length; // just after `.handler(`
+        let depth = 1;
+        let i = open;
+        for (; i < code.length && depth > 0; i++) {
+          if (code[i] === "(") depth++;
+          else if (code[i] === ")") depth--;
+        }
+        edits.push({ name: m[1], open, close: i - 1 });
+      }
+      if (!edits.length) return null;
+      let out = code;
+      for (const e of edits.reverse()) {
+        const id = Buffer.from(`${rel}#${e.name}`).toString("base64url");
+        out = out.slice(0, e.open) + `createClientRpc(${JSON.stringify(id)})` + out.slice(e.close);
+      }
+      const src = `import { createClientRpc } from "@tanstack/react-start/client-rpc";\n${out}`;
+      return { contents: src, loader: args.path.endsWith("tsx") ? "tsx" : "ts" };
+    });
+  },
+};
 
 function routerEntry() {
   for (const ext of [".tsx", ".ts", ".jsx", ".js"]) {
@@ -22,10 +64,14 @@ function routerEntry() {
 
 // Browser shims for node: builtins pulled in transitively. AsyncLocalStorage
 // needs a working no-op (used by the storage context); the rest are empty.
+// Best-effort synchronous AsyncLocalStorage for the browser: persists the
+// store (enterWith) and scopes it (run). No cross-await propagation, but the
+// client Start context is set persistently, so getStore() works.
 const ALS =
-  "export class AsyncLocalStorage{getStore(){return undefined}" +
-  "run(_s,cb,...a){return cb(...a)}enterWith(){}exit(cb,...a){return cb(...a)}disable(){}}" +
-  "export default {AsyncLocalStorage};";
+  "export class AsyncLocalStorage{getStore(){return this._s}" +
+  "run(s,cb,...a){const p=this._s;this._s=s;try{return cb(...a)}finally{this._s=p}}" +
+  "enterWith(s){this._s=s}exit(cb,...a){const p=this._s;this._s=undefined;try{return cb(...a)}finally{this._s=p}}" +
+  "disable(){this._s=undefined}}export default {AsyncLocalStorage};";
 const nodeShims = {
   name: "node-builtin-shims",
   setup(build) {
@@ -48,10 +94,20 @@ await esbuild.build({
     "#tanstack-router-entry": routerEntry(),
     "#tanstack-start-entry": join(HERE, "start-entry.ts"),
     "#tanstack-start-plugin-adapters": join(HERE, "plugin-adapters.ts"),
+    // Runtime isomorphic-fn impl (the stubs default to the server impl).
+    "@tanstack/start-fn-stubs": join(HERE, "fn-stubs.mjs"),
   },
-  define: { "process.env.NODE_ENV": '"development"', global: "globalThis" },
-  banner: { js: "globalThis.process=globalThis.process||{env:{NODE_ENV:\"development\"}};globalThis.global=globalThis.global||globalThis;" },
-  plugins: [nodeShims],
+  define: {
+    "process.env.NODE_ENV": '"development"',
+    "process.env.TSS_SERVER_FN_BASE": JSON.stringify(SERVER_FN_BASE),
+    global: "globalThis",
+  },
+  banner: {
+    js:
+      `globalThis.process=globalThis.process||{env:{NODE_ENV:"development",TSS_SERVER_FN_BASE:${JSON.stringify(SERVER_FN_BASE)}}};` +
+      "globalThis.global=globalThis.global||globalThis;",
+  },
+  plugins: [serverFnClient, nodeShims],
   outfile: join(HERE, "client-entry.js"),
   logLevel: "silent",
 });

@@ -22,10 +22,17 @@ for await (const line of rl) {
   let msg;
   try { msg = JSON.parse(line); } catch { continue; }
   try {
-    const res = await entry.default.fetch(new Request("http://localhost" + (msg.url ?? "/")));
+    const init = { method: msg.method || "GET", headers: msg.headers || {} };
+    if (init.method !== "GET" && init.method !== "HEAD" && msg.body != null) init.body = msg.body;
+    // Build the URL from the real Host so the request origin matches the
+    // client's Origin (server functions enforce a same-origin CSRF check).
+    const host = (msg.headers && msg.headers.host) || "localhost";
+    const res = await entry.default.fetch(new Request("http://" + host + (msg.url ?? "/"), init));
     const body = await res.text();
-    process.stdout.write(JSON.stringify({ id: msg.id, status: res.status, body }) + "\n");
+    const headers = {};
+    res.headers.forEach((v, k) => { headers[k] = v; });
+    process.stdout.write(JSON.stringify({ id: msg.id, status: res.status, headers, body }) + "\n");
   } catch (e) {
-    process.stdout.write(JSON.stringify({ id: msg.id, status: 500, body: String((e && e.stack) || e) }) + "\n");
+    process.stdout.write(JSON.stringify({ id: msg.id, status: 500, headers: {}, body: String((e && e.stack) || e) }) + "\n");
   }
 }

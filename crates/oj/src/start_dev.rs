@@ -18,7 +18,7 @@ use axum::{
     extract::{Request, State},
     http::{Method, StatusCode, header},
     middleware::Next,
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout};
@@ -44,6 +44,7 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
     let cache = root.join(".oj-cache").join("start");
     oj_server::write_start_assets(&cache)?;
     generate_route_tree(&root, &cache)?;
+    run_node(&root, &cache.join("gen-resolver.mjs"), "server-fn resolver")?;
     bundle_client_entry(&root, &cache)?;
 
     // Reuse the dev server for module/asset serving; the document route sits on top.
@@ -148,22 +149,51 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
             }
         };
     }
+    // Server-function RPC: forward the whole request (method/headers/body) to
+    // the runner's fetch handler, which dispatches it via `handleServerAction`.
+    if req.uri().path().starts_with("/_serverFn/") {
+        let method = req.method().to_string();
+        let url = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
+        let headers = collect_headers(req.headers());
+        let body = axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024)
+            .await
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned());
+        return forward(&state, method, url, headers, body).await;
+    }
     match classify(&req, &state.proxy_prefixes) {
-        Route::Document => render_document(&state, req.uri().path()).await,
+        Route::Document => {
+            let url = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
+            forward(&state, "GET".into(), url, vec![], None).await
+        }
         Route::Pass => next.run(req).await,
     }
 }
 
-/// Send `{url}` to the runner and return the rendered document. Detached so a
-/// cancelled request still drains the runner's one-line reply.
-async fn render_document(state: &StartState, path: &str) -> Response {
+fn collect_headers(headers: &header::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(k, v)| Some((k.as_str().to_owned(), v.to_str().ok()?.to_owned())))
+        .collect()
+}
+
+/// Forward a request to the runner's fetch handler and return its response.
+/// Detached so a cancelled request still drains the runner's one-line reply.
+async fn forward(
+    state: &StartState,
+    method: String,
+    url: String,
+    req_headers: Vec<(String, String)>,
+    body: Option<String>,
+) -> Response {
     let runner = Arc::clone(&state.runner);
-    let url = path.to_owned();
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let mut guard = runner.lock_owned().await;
         let result = async {
-            let cmd = serde_json::json!({ "url": url });
+            let hdrs: serde_json::Map<String, serde_json::Value> =
+                req_headers.into_iter().map(|(k, v)| (k, serde_json::Value::String(v))).collect();
+            let cmd = serde_json::json!({ "method": method, "url": url, "headers": hdrs, "body": body });
             guard.stdin.write_all(format!("{cmd}\n").as_bytes()).await.map_err(|e| e.to_string())?;
             guard.stdin.flush().await.map_err(|e| e.to_string())?;
             let line = guard
@@ -172,21 +202,33 @@ async fn render_document(state: &StartState, path: &str) -> Response {
                 .await
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| "start runner closed".to_string())?;
-            let v: serde_json::Value =
-                serde_json::from_str(&line).map_err(|e| e.to_string())?;
-            let status = v.get("status").and_then(|s| s.as_u64()).unwrap_or(200) as u16;
-            let body = v.get("body").and_then(|b| b.as_str()).unwrap_or("").to_owned();
-            Ok::<_, String>((status, body))
+            serde_json::from_str::<serde_json::Value>(&line).map_err(|e| e.to_string())
         }
         .await;
         let _ = tx.send(result);
     });
     match rx.await.unwrap_or_else(|_| Err("start runner task cancelled".to_string())) {
-        Ok((status, body)) => (
-            StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
-            Html(body),
-        )
-            .into_response(),
+        Ok(v) => {
+            let status = v.get("status").and_then(|s| s.as_u64()).unwrap_or(200) as u16;
+            let body = v.get("body").and_then(|b| b.as_str()).unwrap_or("").to_owned();
+            let mut resp = Response::new(axum::body::Body::from(body));
+            *resp.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+            if let Some(h) = v.get("headers").and_then(|h| h.as_object()) {
+                for (k, val) in h {
+                    // Skip framing headers: the body is re-sent verbatim.
+                    let lower = k.to_ascii_lowercase();
+                    if lower == "content-length" || lower == "content-encoding" || lower == "transfer-encoding" {
+                        continue;
+                    }
+                    if let (Ok(name), Some(vs)) = (header::HeaderName::from_bytes(k.as_bytes()), val.as_str()) {
+                        if let Ok(value) = header::HeaderValue::from_str(vs) {
+                            resp.headers_mut().insert(name, value);
+                        }
+                    }
+                }
+            }
+            resp
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj start: {e}")).into_response(),
     }
 }
