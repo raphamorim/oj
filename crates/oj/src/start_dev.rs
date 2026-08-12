@@ -160,9 +160,16 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             if routes_changed || server_fn_changed {
                 let _ = run_node(&root, &cache.join("gen-resolver.mjs"), "server-fn resolver");
             }
-            let _ = bundle_client_entry(&root, &cache);
+            // Rebuild the client and restart the runner concurrently (they are
+            // independent), so the change costs max(bundle, restart), not sum.
             rt.block_on(async {
-                match spawn_start_runner(&root, &cache).await {
+                let (r, c) = (root.clone(), cache.clone());
+                let client = tokio::task::spawn_blocking(move || {
+                    let _ = bundle_client_entry(&r, &c);
+                });
+                let runner = spawn_start_runner(&root, &cache);
+                let (_, runner_res) = tokio::join!(client, runner);
+                match runner_res {
                     Ok(new) => *state.runner.lock().await = new,
                     Err(e) => eprintln!("oj start: runner restart failed: {e}"),
                 }
