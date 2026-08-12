@@ -102,7 +102,8 @@ const serverFnPlugin = {
       const out = code.replace(re, (_m, pre, indent, decl, name) => {
         changed = true;
         const meta = `{ id: ${JSON.stringify(sfid(rel, name))}, name: ${JSON.stringify(name)}, filename: ${JSON.stringify(rel)} }`;
-        return `${pre}${indent}const ${name}_h = createServerRpc(${meta}, (opts) => ${name}.__executeServer(opts));\n${indent}${decl}${name}_h, `;
+        // Exported under the resolver's expected name (matches loader.mjs).
+        return `${pre}${indent}export const ${name}_createServerFn_handler = createServerRpc(${meta}, (opts) => ${name}.__executeServer(opts));\n${indent}${decl}${name}_createServerFn_handler, `;
       });
       if (!changed) return null;
       return {
@@ -165,6 +166,7 @@ await esbuild.build({
     "#tanstack-router-entry": routerEntry(),
     "#tanstack-start-entry": join(HERE, "start-entry.ts"),
     "#tanstack-start-plugin-adapters": join(HERE, "plugin-adapters.ts"),
+    "#tanstack-start-server-fn-resolver": join(HERE, "server-fn-resolver.mjs"),
     "tanstack-start-manifest:v": join(HERE, "manifest.ts"),
   },
   define: { "process.env.NODE_ENV": '"production"', "process.env.TSS_SERVER_FN_BASE": '"/_serverFn/"' },
