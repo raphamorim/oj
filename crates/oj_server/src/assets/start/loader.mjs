@@ -11,6 +11,19 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
 const EXTS = [".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.tsx"];
 
+// Warm-reload versioning. On a dev rebuild the runner bumps V (over a
+// MessagePort) and re-imports with `?ojv=V`. App files and `@tanstack/*`
+// modules (ESM) get the query, so they re-evaluate fresh (resetting the
+// framework's module-scope caches like `entriesPromise`); React and other
+// node_modules stay unversioned and warm, keeping a single React instance.
+let V = 0;
+export async function initialize(data) {
+  if (data && data.port) data.port.on("message", (v) => (V = v));
+}
+const stripQ = (u) => u.split("?")[0];
+const withV = (u) => (V ? `${stripQ(u)}?ojv=${V}` : stripQ(u));
+const isTanstack = (u) => /\/@tanstack\//.test(u) && /\.(js|mjs)$/.test(stripQ(u));
+
 function probe(base) {
   if (existsSync(base)) return base;
   for (const ext of EXTS) if (existsSync(base + ext)) return base + ext;
@@ -26,16 +39,20 @@ const ALIASES = {
 };
 
 export async function resolve(spec, context, next) {
+  if (context.parentURL) context = { ...context, parentURL: stripQ(context.parentURL) };
   if (ALIASES[spec]) {
     const hit = probe(ALIASES[spec]);
-    if (hit) return { url: pathToFileURL(hit).href, shortCircuit: true };
+    if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true };
   }
   if (spec.startsWith(".") && context.parentURL) {
     const base = pathResolve(dirname(fileURLToPath(context.parentURL)), spec);
     const hit = probe(base);
-    if (hit && hit !== base) return { url: pathToFileURL(hit).href, shortCircuit: true };
+    if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true };
   }
-  return next(spec, context);
+  const r = await next(spec, context);
+  // Version-bust @tanstack/* (ESM) so their module state re-evaluates on reload.
+  if (r && r.url && isTanstack(r.url)) return { ...r, url: withV(r.url), shortCircuit: true };
+  return r;
 }
 
 // createServerFn provider transform (server side). A bare `.handler(fn)`
@@ -66,14 +83,19 @@ function transformServerFns(code, path) {
 }
 
 export async function load(url, context, next) {
-  if (url.endsWith(".tsx") || url.endsWith(".ts")) {
-    const path = fileURLToPath(url);
+  const clean = stripQ(url);
+  if (clean.endsWith(".tsx") || clean.endsWith(".ts")) {
+    const path = fileURLToPath(clean);
     const src = transformServerFns(readFileSync(path, "utf8"), path);
     const out = transformSync(src, {
-      loader: url.endsWith("tsx") ? "tsx" : "ts",
+      loader: clean.endsWith("tsx") ? "tsx" : "ts",
       format: "esm", jsx: "automatic", sourcefile: path,
     });
     return { format: "module", source: out.code, shortCircuit: true };
+  }
+  // Versioned @tanstack/* module: load its ESM source fresh under the new URL.
+  if (url.includes("?ojv=") && isTanstack(url)) {
+    return { format: "module", source: readFileSync(fileURLToPath(clean), "utf8"), shortCircuit: true };
   }
   return next(url, context);
 }

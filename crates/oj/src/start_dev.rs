@@ -79,6 +79,17 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Tell the warm runner to re-import the server entry in place, and drain its
+/// ack line so the request/response protocol stays aligned.
+async fn reload_runner(state: &StartState) {
+    let mut guard = state.runner.lock().await;
+    if guard.stdin.write_all(b"{\"cmd\":\"reload\"}\n").await.is_err() {
+        return;
+    }
+    let _ = guard.stdin.flush().await;
+    let _ = guard.lines.next_line().await;
+}
+
 /// The set of route source files under `src/routes` (recursive). Used to
 /// decide whether the route tree needs regenerating.
 fn list_route_files(root: &Path) -> std::collections::BTreeSet<PathBuf> {
@@ -160,19 +171,15 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             if routes_changed || server_fn_changed {
                 let _ = run_node(&root, &cache.join("gen-resolver.mjs"), "server-fn resolver");
             }
-            // Rebuild the client and restart the runner concurrently (they are
-            // independent), so the change costs max(bundle, restart), not sum.
+            // Rebuild the client and warm-reload the runner concurrently. The
+            // runner re-imports the entry in place (app + @tanstack re-evaluate,
+            // React stays warm) rather than respawning the process.
             rt.block_on(async {
                 let (r, c) = (root.clone(), cache.clone());
                 let client = tokio::task::spawn_blocking(move || {
                     let _ = bundle_client_entry(&r, &c);
                 });
-                let runner = spawn_start_runner(&root, &cache);
-                let (_, runner_res) = tokio::join!(client, runner);
-                match runner_res {
-                    Ok(new) => *state.runner.lock().await = new,
-                    Err(e) => eprintln!("oj start: runner restart failed: {e}"),
-                }
+                let (_, _) = tokio::join!(client, reload_runner(&state));
             });
             let _ = state.reload_tx.send(());
             println!("  oj start: rebuilt, reloading");
