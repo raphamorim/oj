@@ -210,7 +210,7 @@ writeFileSync(
 // resolve at build time; node: builtins stay external on platform:node).
 await esbuild.build({
   entryPoints: [join(HERE, "server-entry.tsx")],
-  bundle: true, format: "esm", platform: "node", jsx: "automatic",
+  bundle: true, format: "esm", platform: "node", jsx: "automatic", minify: true,
   // Code-split rather than emit one file: real ESM chunks preserve top-level
   // await (react-start's server module uses it), which esbuild's single-file
   // lazy-init wrappers cannot always propagate.
