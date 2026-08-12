@@ -37,7 +37,12 @@ const SERVER = [
   'import { readFile } from "node:fs/promises";',
   'import { join, extname, dirname } from "node:path";',
   'import { fileURLToPath } from "node:url";',
-  'import handler from "./server-bundle.mjs";',
+  'import { register } from "node:module";',
+  // Resolve @cloudflare/vite-plugin/server (a virtual the CF plugin injects) to
+  // the dev shim: the app imports it with a runtime, variable specifier, which
+  // escapes the build-time alias, so a loader hook is needed to catch it.
+  'register("./cf-loader.mjs", import.meta.url);',
+  'const handler = (await import("./server-bundle.mjs")).default;',
   'const HERE = dirname(fileURLToPath(import.meta.url));',
   'const CLIENT = join(HERE, "client");',
   'const PORT = process.env.PORT || 3000;',
@@ -223,9 +228,21 @@ await esbuild.build({
   logLevel: "silent",
 });
 
-// 4. server.mjs (Node http) + worker.mjs (edge Web fetch handler).
+// 4. server.mjs (Node http) + worker.mjs (edge Web fetch handler), plus the
+// Cloudflare-context shim and the loader that maps the framework's virtual
+// `@cloudflare/vite-plugin/server` specifier to it at runtime. (The edge worker
+// gets real bindings from `cloudflare:workers`, so it needs neither.)
 writeFileSync(join(DIST, "server.mjs"), SERVER);
 writeFileSync(join(DIST, "worker.mjs"), WORKER);
+cpSync(join(HERE, "cf-server.mjs"), join(DIST, "cf-server.mjs"));
+writeFileSync(
+  join(DIST, "cf-loader.mjs"),
+  'export async function resolve(spec, ctx, next) {\n' +
+    '  if (spec === "@cloudflare/vite-plugin/server")\n' +
+    '    return { url: new URL("./cf-server.mjs", import.meta.url).href, shortCircuit: true };\n' +
+    '  return next(spec, ctx);\n' +
+    '}\n',
+);
 
 // 5. Copy public/.
 if (existsSync(join(APP, "public"))) cpSync(join(APP, "public"), CLIENT, { recursive: true });
