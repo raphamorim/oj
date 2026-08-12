@@ -79,6 +79,25 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The set of route source files under `src/routes` (recursive). Used to
+/// decide whether the route tree needs regenerating.
+fn list_route_files(root: &Path) -> std::collections::BTreeSet<PathBuf> {
+    let mut out = std::collections::BTreeSet::new();
+    fn walk(dir: &Path, out: &mut std::collections::BTreeSet<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "ts" || x == "tsx") {
+                out.insert(p);
+            }
+        }
+    }
+    walk(&root.join("src").join("routes"), &mut out);
+    out
+}
+
 /// Injected into HTML documents in dev: reconnecting WebSocket that reloads
 /// the page when the server signals a rebuild.
 const RELOAD_CLIENT: &str = "<script>(()=>{let w;function c(){w=new WebSocket((location.protocol===\"https:\"?\"wss\":\"ws\")+\"://\"+location.host+\"/@oj-start/hmr\");w.onmessage=()=>location.reload();w.onclose=()=>setTimeout(c,1000);}c();})();</script>";
@@ -104,6 +123,10 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             eprintln!("oj start: cannot watch {}: {e}", src.display());
             return;
         }
+        // Regenerate the route tree only when the route-file SET changes (add/
+        // remove/rename); content edits leave the tree unchanged, so skip the
+        // generator (its cost scales with route count).
+        let mut prev_routes = list_route_files(&root);
         loop {
             let mut paths: std::collections::HashSet<PathBuf> = match rx.recv() {
                 Ok(Ok(ev)) => ev.paths.into_iter().collect(),
@@ -122,8 +145,21 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             if !paths.iter().any(|p| !p.ends_with("routeTree.gen.ts")) {
                 continue;
             }
-            let _ = generate_route_tree(&root, &cache);
-            let _ = run_node(&root, &cache.join("gen-resolver.mjs"), "server-fn resolver");
+            let routes_now = list_route_files(&root);
+            let routes_changed = routes_now != prev_routes;
+            if routes_changed {
+                let _ = generate_route_tree(&root, &cache);
+                prev_routes = routes_now;
+            }
+            // Regenerate the server-fn resolver only when a server-fn file was
+            // added/removed/edited (or routes changed), not on every edit.
+            let server_fn_changed = paths.iter().any(|p| {
+                let is_ts = p.extension().is_some_and(|e| e == "ts" || e == "tsx");
+                is_ts && (!p.exists() || std::fs::read_to_string(p).is_ok_and(|s| s.contains("createServerFn")))
+            });
+            if routes_changed || server_fn_changed {
+                let _ = run_node(&root, &cache.join("gen-resolver.mjs"), "server-fn resolver");
+            }
             let _ = bundle_client_entry(&root, &cache);
             rt.block_on(async {
                 match spawn_start_runner(&root, &cache).await {
