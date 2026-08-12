@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { importPkg, viteEnvDefine } from "./resolve-pkg.mjs";
 import { assetsPlugin, pnpmStorePaths } from "./esbuild-assets.mjs";
 import { loadPluginContainer } from "./vite-plugin-bridge.mjs";
+import { transformGlob } from "./glob-transform.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
@@ -29,17 +30,22 @@ function workspaceRoot(app) {
 const WORKSPACE = workspaceRoot(APP);
 const SERVER_FN_BASE = process.env.TSS_SERVER_FN_BASE ?? "/_serverFn/";
 
-// Client server-fn transform: rewrite each top-level
-// `const NAME = createServerFn(...).handler(FN)` to inject `createClientRpc(id)`
-// as the first handler arg. The runtime uses arg 1 as the extractedFn, so the
-// browser makes an HTTP RPC to /_serverFn/<id> instead of running the handler.
-// `id` must match the server resolver's manifest (same `<relpath>#<name>`).
+// App-source transform for the client: expand `import.meta.glob`, then rewrite
+// each top-level `const NAME = createServerFn(...).handler(FN)` to inject
+// `createClientRpc(id)` as the first handler arg. The runtime uses arg 1 as the
+// extractedFn, so the browser makes an HTTP RPC to /_serverFn/<id> instead of
+// running the handler. `id` must match the server resolver's manifest (same
+// `<relpath>#<name>`). node_modules is left to esbuild's native loader.
 const serverFnClient = {
   name: "server-fn-client",
   setup(build) {
     build.onLoad({ filter: /\.(ts|tsx)$/ }, (args) => {
-      const code = readFileSync(args.path, "utf8");
-      if (!code.includes("createServerFn")) return null;
+      if (args.path.includes("/node_modules/")) return null;
+      const loader = args.path.endsWith("tsx") ? "tsx" : "ts";
+      let code = transformGlob(readFileSync(args.path, "utf8"), args.path);
+      if (!code.includes("createServerFn")) {
+        return { contents: code, loader };
+      }
       const rel = relative(APP, args.path);
       // For each top-level `const NAME = createServerFn(...).handler(FN)`,
       // REPLACE the handler args with `createClientRpc(id)` (single arg): a
@@ -58,14 +64,14 @@ const serverFnClient = {
         }
         edits.push({ name: m[1], open, close: i - 1 });
       }
-      if (!edits.length) return null;
+      if (!edits.length) return { contents: code, loader };
       let out = code;
       for (const e of edits.reverse()) {
         const id = Buffer.from(`${rel}#${e.name}`).toString("base64url");
         out = out.slice(0, e.open) + `createClientRpc(${JSON.stringify(id)})` + out.slice(e.close);
       }
       const src = `import { createClientRpc } from "@tanstack/react-start/client-rpc";\n${out}`;
-      return { contents: src, loader: args.path.endsWith("tsx") ? "tsx" : "ts" };
+      return { contents: src, loader };
     });
   },
 };
@@ -149,6 +155,12 @@ const vitePlugins = {
     build.onLoad({ filter: /.*/, namespace: "oj-vite-virtual" }, async (args) => {
       const code = await container.load(args.path);
       return code == null ? undefined : { contents: code, loader: "js", resolveDir: APP };
+    });
+    // Files a plugin compiles end-to-end (e.g. .mdx via customerMdx): run the
+    // plugins' transform hooks, hand the result to esbuild as JSX.
+    build.onLoad({ filter: /\.mdx?$/ }, async (args) => {
+      const out = await container.transform(readFileSync(args.path, "utf8"), args.path);
+      return out == null ? undefined : { contents: out, loader: "jsx", resolveDir: dirname(args.path) };
     });
   },
 };

@@ -5,8 +5,10 @@
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { resolve as pathResolve, dirname } from "node:path";
+import { createRequire } from "node:module";
 import { importPkg, viteEnvDefine } from "./resolve-pkg.mjs";
 import { loadPluginContainer } from "./vite-plugin-bridge.mjs";
+import { transformGlob } from "./glob-transform.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
@@ -49,6 +51,67 @@ function probe(base) {
   }
   for (const ext of EXTS) if (isFile(base + ext)) return base + ext;
   return null;
+}
+
+// CJS -> ESM interop. Node builds named exports for a required CJS module with
+// cjs-module-lexer, which misses exports it can't statically see (e.g.
+// `module.exports = {...}`), so `import { x } from "cjs-pkg"` throws. Facade the
+// module instead: require() it at load time and re-export its ACTUAL runtime
+// keys -- strictly more complete than any static analysis, and it fixes every
+// import shape (default, named, namespace) at once.
+const RESERVED = new Set(
+  ("break case catch class const continue debugger default delete do else enum export extends false finally " +
+    "for function if import in instanceof new null return super switch this throw true try typeof var void " +
+    "while with yield let static await").split(" "),
+);
+const pkgTypeCache = new Map();
+function nearestPkgType(startDir) {
+  if (pkgTypeCache.has(startDir)) return pkgTypeCache.get(startDir);
+  let d = startDir, type = "commonjs";
+  for (let i = 0; i < 40 && d; i++) {
+    const pj = pathResolve(d, "package.json");
+    if (isFile(pj)) {
+      try { type = JSON.parse(readFileSync(pj, "utf8")).type || "commonjs"; } catch {}
+      break;
+    }
+    const parent = dirname(d);
+    if (parent === d) break;
+    d = parent;
+  }
+  pkgTypeCache.set(startDir, type);
+  return type;
+}
+// A `.js` file is CJS only if its package isn't type:module AND it has no ESM
+// syntax -- Node 22 detects ESM syntax in a type-less .js and loads it as ESM
+// (dual packages ship `export`-using `.js` behind the `import` condition), so
+// faceting those with require() would throw ERR_REQUIRE_CYCLE_MODULE.
+function hasEsmSyntax(path) {
+  try {
+    const s = readFileSync(path, "utf8");
+    return /(^|[\n;])\s*export\s/.test(s) || /(^|[\n;])\s*import\s[^(]/.test(s);
+  } catch {
+    return false;
+  }
+}
+function isCjsFile(path) {
+  if (path.endsWith(".cjs")) return true;
+  if (path.endsWith(".mjs")) return false;
+  if (!path.endsWith(".js")) return false;
+  if (nearestPkgType(dirname(path)) === "module") return false;
+  return !hasEsmSyntax(path);
+}
+function cjsFacade(path) {
+  const url = pathToFileURL(path).href;
+  const mod = createRequire(url)(path);
+  const isEsm = !!(mod && mod.__esModule);
+  const enumerable = mod && (typeof mod === "object" || typeof mod === "function") ? Object.keys(mod) : [];
+  const names = enumerable.filter((k) => k !== "default" && /^[A-Za-z_$][\w$]*$/.test(k) && !RESERVED.has(k));
+  return [
+    `import { createRequire as _cr } from "node:module";`,
+    `const _m = _cr(${JSON.stringify(url)})(${JSON.stringify(path)});`,
+    `export default ${isEsm ? "(_m && _m.default !== undefined ? _m.default : _m)" : "_m"};`,
+    ...names.map((n) => `export const ${n} = _m[${JSON.stringify(n)}];`),
+  ].join("\n");
 }
 
 const ALIASES = {
@@ -267,7 +330,7 @@ export async function load(url, context, next) {
   }
   if (clean.endsWith(".tsx") || clean.endsWith(".ts")) {
     const path = fileURLToPath(clean);
-    const src = transformServerFns(readFileSync(path, "utf8"), path);
+    const src = transformServerFns(transformGlob(readFileSync(path, "utf8"), path), path);
     const out = transformSync(src, {
       loader: clean.endsWith("tsx") ? "tsx" : "ts",
       format: "esm", jsx: "automatic", sourcefile: path,
@@ -278,6 +341,26 @@ export async function load(url, context, next) {
   // Versioned @tanstack/* module: load its ESM source fresh under the new URL.
   if (url.includes("?ojv=") && isTanstack(url)) {
     return { format: "module", source: readFileSync(fileURLToPath(clean), "utf8"), shortCircuit: true };
+  }
+  // A file a vite plugin compiles end-to-end (e.g. .mdx via customerMdx): run
+  // its transform hooks, then esbuild the JSX result to ESM.
+  if (container && clean.endsWith(".mdx")) {
+    const path = fileURLToPath(clean);
+    const compiled = await container.transform(readFileSync(path, "utf8"), path);
+    if (compiled != null) {
+      const out = transformSync(compiled, {
+        loader: "jsx", format: "esm", jsx: "automatic", sourcefile: path,
+        define: viteEnvDefine({ ssr: true }),
+      });
+      return { format: "module", source: out.code, shortCircuit: true };
+    }
+  }
+  // CJS dependency imported via ESM: facade it so named imports resolve.
+  if (clean.startsWith("file:") && clean.includes("/node_modules/")) {
+    const path = fileURLToPath(clean);
+    if (isCjsFile(path)) {
+      try { return { format: "module", source: cjsFacade(path), shortCircuit: true }; } catch {}
+    }
   }
   return next(url, context);
 }

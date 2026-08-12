@@ -83,7 +83,9 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
     return null;
   }
   const all = (loaded?.config?.plugins ?? []).flat(Infinity).filter(Boolean);
-  const plugins = ordered(all.filter((p) => (p.resolveId || p.load) && applyMatches(p, command, mode)));
+  const plugins = ordered(
+    all.filter((p) => (p.resolveId || p.load || p.transform) && applyMatches(p, command, mode)),
+  );
 
   const ctx = {
     environment: { name: environment, mode: command === "build" ? "build" : "dev" },
@@ -120,5 +122,21 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
     return null;
   }
 
-  return { resolveId, load, pluginCount: plugins.length };
+  // Run the plugins' transform hooks in order, chaining code through each
+  // (Rollup/Vite semantics). Returns the transformed code, or null if no plugin
+  // touched it. Used for files a plugin owns end-to-end, e.g. `.mdx`.
+  async function transform(code, id) {
+    let current = code, changed = false;
+    for (const p of plugins) {
+      const h = hookHandler(p.transform);
+      if (!h || !idAllowed(hookFilter(p.transform), id)) continue;
+      let r;
+      try { r = await h.call(ctx, current, id); } catch { continue; }
+      const next = r == null ? null : typeof r === "string" ? r : r.code;
+      if (next != null) { current = next; changed = true; }
+    }
+    return changed ? current : null;
+  }
+
+  return { resolveId, load, transform, pluginCount: plugins.length };
 }
