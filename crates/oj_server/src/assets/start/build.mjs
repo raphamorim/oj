@@ -6,13 +6,20 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, cpSync, rmSync } from "node:fs";
 import { dirname, join, resolve, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { importPkg } from "./resolve-pkg.mjs";
-const esbuild = await importPkg(process.env.OJ_APP_ROOT ?? process.cwd(), "esbuild", ["vite", "@tanstack/react-start"]);
+import { importPkg, viteEnvDefine } from "./resolve-pkg.mjs";
+import {
+  assetsPlugin, makeVitePlugins, nodeBuiltinShims, pnpmStorePaths, workspaceRoot, contentHashEmitter,
+} from "./esbuild-assets.mjs";
+import { loadPluginContainer } from "./vite-plugin-bridge.mjs";
+import { transformGlob } from "./glob-transform.mjs";
+
+const APP = process.env.OJ_APP_ROOT ?? process.cwd();
+const esbuild = await importPkg(APP, "esbuild", ["vite", "@tanstack/react-start"]);
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const APP = process.env.OJ_APP_ROOT ?? process.cwd();
 const DIST = join(APP, "dist");
 const CLIENT = join(DIST, "client");
+const WORKSPACE = workspaceRoot(APP);
 const sfid = (rel, name) => Buffer.from(`${rel}#${name}`).toString("base64url");
 
 // Cloudflare Worker / workerd entry: a Web fetch handler. Static assets are
@@ -81,35 +88,41 @@ function serverFns(code) {
   return out;
 }
 
-// Client transform: replace `.handler(FN)` with `.handler(createClientRpc(id))`.
+// Client app-source transform: expand import.meta.glob, then replace
+// `.handler(FN)` with `.handler(createClientRpc(id))`.
 const clientFnPlugin = {
   name: "server-fn-client",
   setup(build) {
     build.onLoad({ filter: /\.(ts|tsx)$/ }, (args) => {
-      const code = readFileSync(args.path, "utf8");
-      if (!code.includes("createServerFn")) return null;
+      if (args.path.includes("/node_modules/")) return null;
+      const loader = args.path.endsWith("tsx") ? "tsx" : "ts";
+      const code = transformGlob(readFileSync(args.path, "utf8"), args.path);
+      if (!code.includes("createServerFn")) return { contents: code, loader };
       const rel = relative(APP, args.path);
       const fns = serverFns(code);
-      if (!fns.length) return null;
+      if (!fns.length) return { contents: code, loader };
       let out = code;
       for (const f of fns.reverse()) {
         out = out.slice(0, f.open) + `createClientRpc(${JSON.stringify(sfid(rel, f.name))})` + out.slice(f.close);
       }
       return {
         contents: `import { createClientRpc } from "@tanstack/react-start/client-rpc";\n${out}`,
-        loader: args.path.endsWith("tsx") ? "tsx" : "ts",
+        loader,
       };
     });
   },
 };
 
-// Server transform: provider shape so handlers run in-process during SSR.
+// Server app-source transform: expand import.meta.glob, then rewrite each
+// createServerFn to the provider shape so handlers run in-process during SSR.
 const serverFnPlugin = {
   name: "server-fn-server",
   setup(build) {
     build.onLoad({ filter: /\.(ts|tsx)$/ }, (args) => {
-      const code = readFileSync(args.path, "utf8");
-      if (!code.includes("createServerFn")) return null;
+      if (args.path.includes("/node_modules/")) return null;
+      const loader = args.path.endsWith("tsx") ? "tsx" : "ts";
+      const code = transformGlob(readFileSync(args.path, "utf8"), args.path);
+      if (!code.includes("createServerFn")) return { contents: code, loader };
       const rel = relative(APP, args.path);
       const re =
         /(^|[\n;])([ \t]*)((?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*createServerFn\b[\s\S]*?\.handler\s*\()/g;
@@ -120,30 +133,25 @@ const serverFnPlugin = {
         // Exported under the resolver's expected name (matches loader.mjs).
         return `${pre}${indent}export const ${name}_createServerFn_handler = createServerRpc(${meta}, (opts) => ${name}.__executeServer(opts));\n${indent}${decl}${name}_createServerFn_handler, `;
       });
-      if (!changed) return null;
+      if (!changed) return { contents: code, loader };
       return {
         contents: `import { createServerRpc } from "@tanstack/react-start/server-rpc";\n${out}`,
-        loader: args.path.endsWith("tsx") ? "tsx" : "ts",
+        loader,
       };
     });
   },
 };
 
-const ALS =
-  "export class AsyncLocalStorage{getStore(){return this._s}run(s,cb,...a){const p=this._s;this._s=s;try{return cb(...a)}finally{this._s=p}}enterWith(s){this._s=s}exit(cb,...a){const p=this._s;this._s=undefined;try{return cb(...a)}finally{this._s=p}}disable(){this._s=undefined}}export default {AsyncLocalStorage};";
-const nodeShims = {
-  name: "node-shims",
-  setup(build) {
-    build.onResolve({ filter: /^node:/ }, (a) => ({ path: a.path, namespace: "node-shim" }));
-    build.onLoad({ filter: /.*/, namespace: "node-shim" }, (a) => ({
-      contents: a.path === "node:async_hooks" ? ALS : "export default {};",
-      loader: "js",
-    }));
-  },
-};
-
 rmSync(DIST, { recursive: true, force: true });
 mkdirSync(CLIENT, { recursive: true });
+
+// Shared across both builds: a content-hash asset emitter (client and server
+// produce matching /assets/<hash> URLs) and the app's vite plugin container
+// (build command; client vs ssr environment changes plugin behavior).
+const emit = contentHashEmitter(CLIENT);
+const NODE_PATHS = pnpmStorePaths(WORKSPACE);
+const clientContainer = await loadPluginContainer(APP, { command: "build", environment: "client" });
+const serverContainer = await loadPluginContainer(APP, { command: "build", environment: "ssr" });
 
 // 1. Client bundle (minified, hashed).
 const client = await esbuild.build({
@@ -155,11 +163,21 @@ const client = await esbuild.build({
     "#tanstack-router-entry": routerEntry(),
     "#tanstack-start-entry": join(HERE, "start-entry.ts"),
     "#tanstack-start-plugin-adapters": join(HERE, "plugin-adapters.ts"),
+    "tanstack-start-manifest:v": join(HERE, "manifest.ts"),
     "@tanstack/start-fn-stubs": join(HERE, "fn-stubs.mjs"),
   },
-  define: { "process.env.NODE_ENV": '"production"', "process.env.TSS_SERVER_FN_BASE": '"/_serverFn/"', global: "globalThis" },
+  define: {
+    "process.env.NODE_ENV": '"production"', "process.env.TSS_SERVER_FN_BASE": '"/_serverFn/"',
+    global: "globalThis", ...viteEnvDefine({ ssr: false, mode: "production" }),
+  },
   banner: { js: 'globalThis.process=globalThis.process||{env:{NODE_ENV:"production",TSS_SERVER_FN_BASE:"/_serverFn/"}};globalThis.global=globalThis.global||globalThis;' },
-  plugins: [clientFnPlugin, nodeShims],
+  plugins: [
+    makeVitePlugins({ container: clientContainer, appRoot: APP, mode: "prod", emit }),
+    clientFnPlugin,
+    assetsPlugin({ mode: "prod", server: false, emit }),
+    nodeBuiltinShims,
+  ],
+  nodePaths: NODE_PATHS,
   logLevel: "silent",
 });
 const entryOut = Object.entries(client.metafile.outputs).find(([, o]) => o.entryPoint);
@@ -176,18 +194,32 @@ writeFileSync(
 await esbuild.build({
   entryPoints: [join(HERE, "server-entry.tsx")],
   bundle: true, format: "esm", platform: "node", jsx: "automatic",
-  outfile: join(DIST, "server-bundle.mjs"),
+  // Code-split rather than emit one file: real ESM chunks preserve top-level
+  // await (react-start's server module uses it), which esbuild's single-file
+  // lazy-init wrappers cannot always propagate.
+  outdir: DIST, entryNames: "server-bundle", chunkNames: "chunks/[name]-[hash]", splitting: true,
+  outExtension: { ".js": ".mjs" },
   alias: {
     "#tanstack-router-entry": routerEntry(),
     "#tanstack-start-entry": join(HERE, "start-entry.ts"),
     "#tanstack-start-plugin-adapters": join(HERE, "plugin-adapters.ts"),
     "#tanstack-start-server-fn-resolver": join(HERE, "server-fn-resolver.mjs"),
     "tanstack-start-manifest:v": join(HERE, "manifest.ts"),
+    // Cloudflare context shim (the CF vite plugin injects this virtual module).
+    "@cloudflare/vite-plugin/server": join(HERE, "cf-server.mjs"),
   },
-  define: { "process.env.NODE_ENV": '"production"', "process.env.TSS_SERVER_FN_BASE": '"/_serverFn/"' },
+  define: {
+    "process.env.NODE_ENV": '"production"', "process.env.TSS_SERVER_FN_BASE": '"/_serverFn/"',
+    ...viteEnvDefine({ ssr: true, mode: "production" }),
+  },
   // CJS deps bundled into ESM need a working `require` for node builtins.
   banner: { js: "import { createRequire as ___cr } from 'node:module'; const require = ___cr(import.meta.url);" },
-  plugins: [serverFnPlugin],
+  plugins: [
+    makeVitePlugins({ container: serverContainer, fallback: clientContainer, appRoot: APP, mode: "prod", emit }),
+    serverFnPlugin,
+    assetsPlugin({ mode: "prod", server: true, emit }),
+  ],
+  nodePaths: NODE_PATHS,
   logLevel: "silent",
 });
 

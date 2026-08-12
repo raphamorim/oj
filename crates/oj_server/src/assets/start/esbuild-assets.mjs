@@ -1,25 +1,34 @@
 // SPDX-License-Identifier: MIT
-// esbuild plugin for Vite-style asset conventions used by TanStack Start apps:
-//   import u from "./x.png?url"      -> a URL string
-//   import s from "./x.txt?raw"      -> the file contents as a string
-//   import d from "./x.svg?inline"   -> a data: URI
-//   import "./x.css"                 -> injects the stylesheet (side effect)
-// In dev, ?url and plain-css resolve to `${fsBase}${absPath}` so the dev server
-// streams the real file (relative url() refs inside CSS resolve against the
-// same directory). In prod, esbuild's file/css loaders emit hashed assets.
-import { readFileSync, readdirSync, existsSync } from "node:fs";
-import { join } from "node:path";
+// Shared esbuild building blocks for the TanStack Start adapter, used by both
+// the dev client bundle and the prod build so the two stay in lockstep:
+//   - assetsPlugin: Vite-style ?url / ?raw / ?inline / bare-asset / css imports
+//   - makeVitePlugins: routes virtual: ids, .mdx, and .svg through the app's
+//     vite plugin container (svgr, mdx, virtual modules)
+//   - nodeBuiltinShims: browser shims for node: (and bare) builtins
+//   - pnpmStorePaths / contentHashEmitter: pnpm phantom-dep resolution + a
+//     content-addressed asset emitter (client and server emit matching URLs
+//     with no shared manifest, since the URL is a hash of the bytes)
+// In dev, asset URLs point at the server's /@oj-start/fs route; in prod they are
+// emitted into dist/client/assets and referenced by hash.
+import { readFileSync, readdirSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { join, dirname, extname, basename } from "node:path";
+import { createHash } from "node:crypto";
 
 const SUFFIX = /\?(raw|url|inline)$/;
 // Bare asset imports (Vite treats these as a URL by default, e.g. `import logo
-// from "./logo.svg"`). `.svg?react` (svgr) is deliberately not covered here.
-// `.svg` is intentionally excluded: svgr (a vite plugin) may turn it into a
-// React component, so it's routed through the plugin container, with a URL
-// fallback for svgs svgr doesn't claim.
+// from "./logo.png"`). `.svg` is excluded: svgr (a vite plugin) may turn it
+// into a React component, so it is routed through the plugin container with a
+// URL fallback for svgs svgr doesn't claim.
 const ASSET_EXT = /\.(png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|eot|mp4|webm|wasm)$/;
 
-export function assetsPlugin({ mode = "dev", fsBase = "/@oj-start/fs" } = {}) {
-  const devUrl = (abs) => `export default ${JSON.stringify(fsBase + abs)};`;
+// dev: the file is streamed by the server's /@oj-start/fs route (relative url()
+// refs resolve against the same dir). prod: the file is emitted into
+// dist/client/assets under a content hash and referenced absolutely.
+const makeUrlFor = ({ mode, fsBase, emit }) => (abs) => (mode === "dev" ? fsBase + abs : emit(abs));
+
+export function assetsPlugin({ mode = "dev", server = false, fsBase = "/@oj-start/fs", emit } = {}) {
+  const urlFor = makeUrlFor({ mode, fsBase, emit });
+  const urlModule = (abs) => `export default ${JSON.stringify(urlFor(abs))};`;
   return {
     name: "oj-assets",
     setup(build) {
@@ -50,10 +59,7 @@ export function assetsPlugin({ mode = "dev", fsBase = "/@oj-start/fs" } = {}) {
         loader: "js",
       }));
 
-      build.onLoad({ filter: /.*/, namespace: "oj-url" }, (a) =>
-        mode === "dev"
-          ? { contents: devUrl(a.path), loader: "js" }
-          : { contents: readFileSync(a.path), loader: "file" });
+      build.onLoad({ filter: /.*/, namespace: "oj-url" }, (a) => ({ contents: urlModule(a.path), loader: "js" }));
 
       build.onLoad({ filter: /.*/, namespace: "oj-inline" }, (a) => ({
         contents: readFileSync(a.path),
@@ -61,14 +67,14 @@ export function assetsPlugin({ mode = "dev", fsBase = "/@oj-start/fs" } = {}) {
       }));
 
       build.onLoad({ filter: /.*/, namespace: "oj-css" }, (a) => {
-        if (mode !== "dev") return { contents: readFileSync(a.path, "utf8"), loader: "css" };
-        // Dev: inject a <link> to the dev-served stylesheet (keeps relative
-        // url() refs resolving, and lets the server process CSS if it needs to).
-        const href = fsBase + a.path;
+        // Styling is a client concern; on the server a css import is a no-op.
+        if (server) return { contents: "export default {};", loader: "js" };
+        // Inject a <link> to the stylesheet (dev-served or emitted), which keeps
+        // relative url() refs resolving against the file's own directory.
         return {
           contents:
             `const l=document.createElement("link");l.rel="stylesheet";` +
-            `l.href=${JSON.stringify(href)};document.head.appendChild(l);`,
+            `l.href=${JSON.stringify(urlFor(a.path))};document.head.appendChild(l);`,
           loader: "js",
         };
       });
@@ -76,13 +82,92 @@ export function assetsPlugin({ mode = "dev", fsBase = "/@oj-start/fs" } = {}) {
   };
 }
 
+// Route virtual: ids, .mdx, and .svg through the app's vite plugin container.
+// `.svg` is svgr (a component) when the container claims it, else an asset URL.
+// `fallback` is a second container consulted when the primary can't `load` a
+// virtual: the ssr build's plugins sometimes error expecting cross-environment
+// state (Vite builds client first and shares it), so the client container's
+// output is used instead.
+export function makeVitePlugins({ container, fallback, appRoot, mode = "dev", fsBase = "/@oj-start/fs", emit } = {}) {
+  const urlFor = makeUrlFor({ mode, fsBase, emit });
+  return {
+    name: "oj-vite-plugins",
+    setup(build) {
+      // Registered unconditionally so .svg always has a loader.
+      build.onLoad({ filter: /\.svg$/ }, async (args) => {
+        if (container) {
+          const code = await container.load(args.path);
+          if (code != null) return { contents: code, loader: "js", resolveDir: dirname(args.path) };
+        }
+        return { contents: `export default ${JSON.stringify(urlFor(args.path))};`, loader: "js" };
+      });
+      if (!container) return;
+      const resolveVirtual = async (args) => {
+        const rid = await container.resolveId(args.path, args.importer);
+        return rid ? { path: rid, namespace: "oj-vite-virtual" } : undefined;
+      };
+      build.onResolve({ filter: /^virtual:/ }, resolveVirtual);
+      build.onResolve({ filter: /^\0/ }, resolveVirtual);
+      build.onLoad({ filter: /.*/, namespace: "oj-vite-virtual" }, async (args) => {
+        let code = await container.load(args.path);
+        if (code == null && fallback) code = await fallback.load(args.path);
+        return code == null ? undefined : { contents: code, loader: "js", resolveDir: appRoot };
+      });
+      build.onLoad({ filter: /\.mdx?$/ }, async (args) => {
+        const out = await container.transform(readFileSync(args.path, "utf8"), args.path);
+        return out == null ? undefined : { contents: out, loader: "jsx", resolveDir: dirname(args.path) };
+      });
+    },
+  };
+}
+
+// Node builtins reach the browser bundle `node:`-prefixed and bare (`import
+// "url"` in older deps). SSR-only framework code (stream rendering) can land in
+// the client graph and named-import from them, so a few need real named exports
+// (browser globals where they exist; inert stubs otherwise -- that code is not
+// reached client-side). async_hooks gets a working synchronous AsyncLocalStorage.
+const ALS =
+  "export class AsyncLocalStorage{getStore(){return this._s}" +
+  "run(s,cb,...a){const p=this._s;this._s=s;try{return cb(...a)}finally{this._s=p}}" +
+  "enterWith(s){this._s=s}exit(cb,...a){const p=this._s;this._s=undefined;try{return cb(...a)}finally{this._s=p}}" +
+  "disable(){this._s=undefined}}export default {AsyncLocalStorage};";
+const SHIM_STREAM_WEB =
+  "export const ReadableStream=globalThis.ReadableStream;export const WritableStream=globalThis.WritableStream;" +
+  "export const TransformStream=globalThis.TransformStream;export const ByteLengthQueuingStrategy=globalThis.ByteLengthQueuingStrategy;" +
+  "export const CountQueuingStrategy=globalThis.CountQueuingStrategy;" +
+  "export default {ReadableStream,WritableStream,TransformStream,ByteLengthQueuingStrategy,CountQueuingStrategy};";
+const SHIM_STREAM =
+  "class S{on(){return this}once(){return this}emit(){return false}pipe(t){return t}end(){}write(){return true}" +
+  "removeListener(){return this}destroy(){}}export class Readable extends S{static from(){return new Readable()}}" +
+  "export class Writable extends S{}export class Duplex extends S{}export class Transform extends S{}" +
+  "export class PassThrough extends S{}export class Stream extends S{}" +
+  "export default {Readable,Writable,Duplex,Transform,PassThrough,Stream};";
+const SHIM_PUNYCODE =
+  "export const toUnicode=(s)=>s;export const toASCII=(s)=>s;export const encode=(s)=>s;export const decode=(s)=>s;" +
+  "export const ucs2={decode:()=>[],encode:()=>\"\"};export default {toUnicode,toASCII,encode,decode,ucs2};";
+const BARE_BUILTINS =
+  /^(assert|buffer|child_process|cluster|console|constants|crypto|dgram|dns|domain|events|fs|http|http2|https|module|net|os|path|perf_hooks|process|punycode|querystring|readline|repl|stream|stream\/web|string_decoder|sys|timers|tls|tty|url|util|v8|vm|worker_threads|zlib|async_hooks)$/;
+function shimSource(spec) {
+  const name = spec.replace(/^node:/, "");
+  if (name === "async_hooks") return ALS;
+  if (name === "stream/web") return SHIM_STREAM_WEB;
+  if (name === "stream") return SHIM_STREAM;
+  if (name === "punycode") return SHIM_PUNYCODE;
+  return "export default {};";
+}
+export const nodeBuiltinShims = {
+  name: "node-builtin-shims",
+  setup(build) {
+    build.onResolve({ filter: /^node:/ }, (a) => ({ path: a.path, namespace: "node-shim" }));
+    build.onResolve({ filter: BARE_BUILTINS }, (a) => ({ path: a.path, namespace: "node-shim" }));
+    build.onLoad({ filter: /.*/, namespace: "node-shim" }, (a) => ({ contents: shimSource(a.path), loader: "js" }));
+  },
+};
+
 // Resolve phantom dependencies (a package importing something it doesn't
 // declare, e.g. @babel/runtime helpers) by giving esbuild pnpm's virtual store
 // as NODE_PATH-style fallback dirs. esbuild consults `nodePaths` only when
-// normal resolution fails, natively, with no per-import JS cost -- unlike a
-// resolver plugin, which would wrap every bare import and stall a large graph.
-// Vite's dev server never hits phantom deps in an unvisited route because it
-// serves modules lazily; our client is one eager bundle over the whole graph.
+// normal resolution fails, natively, with no per-import JS cost.
 export function pnpmStorePaths(workspaceRoot) {
   const paths = [];
   const pnpmDir = join(workspaceRoot, "node_modules/.pnpm");
@@ -93,4 +178,37 @@ export function pnpmStorePaths(workspaceRoot) {
     }
   } catch {}
   return paths;
+}
+
+// Farthest ancestor with a node_modules (the pnpm/workspace root).
+export function workspaceRoot(app) {
+  let best = app;
+  for (let cur = app; ; ) {
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    if (existsSync(join(parent, "node_modules"))) best = parent;
+    cur = parent;
+  }
+  return best;
+}
+
+// A content-addressed asset emitter: copies a file into `${clientDir}/assets`
+// under a name that includes an 8-char hash of its bytes and returns the
+// absolute URL. Client and server builds independently produce identical URLs
+// for identical bytes, so no shared manifest is needed.
+export function contentHashEmitter(clientDir) {
+  const assetsDir = join(clientDir, "assets");
+  const seen = new Set();
+  return function emit(absPath) {
+    const buf = readFileSync(absPath);
+    const ext = extname(absPath);
+    const hash = createHash("sha256").update(buf).digest("hex").slice(0, 8);
+    const name = basename(absPath, ext).replace(/[^\w.-]+/g, "_") + "-" + hash + ext;
+    if (!seen.has(name)) {
+      mkdirSync(assetsDir, { recursive: true });
+      writeFileSync(join(assetsDir, name), buf);
+      seen.add(name);
+    }
+    return "/assets/" + name;
+  };
 }
