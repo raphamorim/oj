@@ -3,14 +3,20 @@
 // compiles TS/JSX (via the app's esbuild), and probes extensions for
 // bundler-style extensionless imports. Registered by runner.mjs.
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, statSync } from "node:fs";
 import { resolve as pathResolve, dirname } from "node:path";
-import { importPkg } from "./resolve-pkg.mjs";
+import { importPkg, viteEnvDefine } from "./resolve-pkg.mjs";
+import { loadPluginContainer } from "./vite-plugin-bridge.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
 const { transformSync } = await importPkg(APP, "esbuild", ["vite", "@tanstack/react-start"]);
-const EXTS = [".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.tsx"];
+// The app's vite.config plugin container, for `virtual:*` ids on the SSR side
+// (environment "ssr"). Null when there's no config/Vite; then virtuals just
+// fall through to normal resolution as before.
+const container = await loadPluginContainer(APP, { command: "serve", environment: "ssr" });
+const VIRTUAL_SCHEME = "ojvirtual:///";
+const EXTS = [".ts", ".tsx", ".js", ".jsx", ".mjs", "/index.ts", "/index.tsx", "/index.js", "/index.jsx", "/index.mjs"];
 
 // Warm-reload versioning. On a dev rebuild the runner bumps V (over a
 // MessagePort) and re-imports with `?ojv=V`. App files and `@tanstack/*`
@@ -27,9 +33,21 @@ const isTanstack = (u) => /\/@tanstack\//.test(u) && /\.(js|mjs)$/.test(stripQ(u
 const ASSET_SUFFIX = /\?(raw|url|inline)$/;
 const ASSET_EXT = /\.(svg|png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|eot|mp4|webm|wasm)$/;
 
+const isFile = (p) => {
+  try { return statSync(p).isFile(); } catch { return false; }
+};
+// TS/bundler convention: source imports carry a `.js`/`.jsx`/`.mjs` extension
+// but the file on disk is the TS equivalent.
+const JS_TO_TS = { ".js": [".ts", ".tsx"], ".jsx": [".tsx"], ".mjs": [".mts"], ".cjs": [".cts"] };
 function probe(base) {
-  if (existsSync(base)) return base;
-  for (const ext of EXTS) if (existsSync(base + ext)) return base + ext;
+  if (isFile(base)) return base;
+  for (const [js, tss] of Object.entries(JS_TO_TS)) {
+    if (base.endsWith(js)) {
+      const stem = base.slice(0, -js.length);
+      for (const ts of tss) if (isFile(stem + ts)) return stem + ts;
+    }
+  }
+  for (const ext of EXTS) if (isFile(base + ext)) return base + ext;
   return null;
 }
 
@@ -41,8 +59,116 @@ const ALIASES = {
   "tanstack-start-manifest:v": pathResolve(HERE, "manifest.ts"),
 };
 
+// App package.json "imports" subpath map (e.g. "#shared/*" -> "./shared/*").
+// Node resolves these but never probes extensions, and the app writes
+// extensionless, bundler-style imports -- so mirror the map here with probing.
+const IMPORT_RULES = (() => {
+  try {
+    const imports = JSON.parse(readFileSync(pathResolve(APP, "package.json"), "utf8")).imports ?? {};
+    return Object.entries(imports)
+      .map(([pattern, target]) => [pattern, typeof target === "string" ? target : target?.import ?? target?.default ?? target?.node])
+      .filter(([, t]) => typeof t === "string");
+  } catch {
+    return [];
+  }
+})();
+function resolveImports(spec) {
+  for (const [pattern, target] of IMPORT_RULES) {
+    if (pattern.endsWith("/*") && target.endsWith("/*")) {
+      const pfx = pattern.slice(0, -1);
+      if (spec.startsWith(pfx)) {
+        const hit = probe(pathResolve(APP, target.slice(0, -1) + spec.slice(pfx.length)));
+        if (hit) return hit;
+      }
+    } else if (spec === pattern) {
+      const hit = probe(pathResolve(APP, target));
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
+
+// tsconfig `paths` aliases (e.g. "@platform/auth" -> "./lib/auth/adapter.ts").
+// esbuild reads these natively for the client bundle; Node's SSR resolver does
+// not, so mirror them here (tolerant JSONC parse, follow `extends`, probe).
+// Strip // and /* */ comments only outside strings, so comment syntax inside
+// glob patterns (e.g. "./shared/*") survives, then drop trailing commas.
+function stripJsonc(s) {
+  let out = "", i = 0, inStr = false, q = "";
+  while (i < s.length) {
+    const c = s[i], n = s[i + 1];
+    if (inStr) {
+      out += c;
+      if (c === "\\") { out += n ?? ""; i += 2; continue; }
+      if (c === q) inStr = false;
+      i++; continue;
+    }
+    if (c === '"' || c === "'") { inStr = true; q = c; out += c; i++; continue; }
+    if (c === "/" && n === "/") { while (i < s.length && s[i] !== "\n") i++; continue; }
+    if (c === "/" && n === "*") { i += 2; while (i < s.length && !(s[i] === "*" && s[i + 1] === "/")) i++; i += 2; continue; }
+    out += c; i++;
+  }
+  return out;
+}
+function readJsonc(file) {
+  try {
+    return JSON.parse(stripJsonc(readFileSync(file, "utf8")).replace(/,(\s*[}\]])/g, "$1"));
+  } catch {
+    return null;
+  }
+}
+const TS = (() => {
+  let file = pathResolve(APP, "tsconfig.json");
+  const chain = [];
+  for (let guard = 0; file && guard < 6; guard++) {
+    const cfg = readJsonc(file);
+    if (!cfg) break;
+    chain.unshift({ cfg, dir: dirname(file) });
+    file = typeof cfg.extends === "string" && cfg.extends.startsWith(".")
+      ? pathResolve(dirname(file), cfg.extends.endsWith(".json") ? cfg.extends : cfg.extends + ".json")
+      : null;
+  }
+  let paths = {}, baseDir = APP;
+  for (const { cfg, dir } of chain) {
+    const co = cfg.compilerOptions || {};
+    if (co.paths) paths = { ...paths, ...co.paths };
+    baseDir = co.baseUrl != null ? pathResolve(dir, co.baseUrl) : dir;
+  }
+  return { rules: Object.entries(paths).map(([k, v]) => [k, Array.isArray(v) ? v : [v]]), baseDir };
+})();
+function resolveTsPaths(spec) {
+  for (const [pattern, targets] of TS.rules) {
+    if (pattern.includes("*")) {
+      const [pre, post = ""] = pattern.split("*");
+      if (spec.startsWith(pre) && spec.endsWith(post) && spec.length >= pre.length + post.length) {
+        const mid = spec.slice(pre.length, spec.length - post.length);
+        for (const t of targets) {
+          const hit = probe(pathResolve(TS.baseDir, t.replace("*", mid)));
+          if (hit) return hit;
+        }
+      }
+    } else if (spec === pattern) {
+      for (const t of targets) {
+        const hit = probe(pathResolve(TS.baseDir, t));
+        if (hit) return hit;
+      }
+    }
+  }
+  return null;
+}
+
 export async function resolve(spec, context, next) {
   if (context.parentURL) context = { ...context, parentURL: stripQ(context.parentURL) };
+  // Plugin-owned virtual modules (virtual:* or a \0-prefixed resolved id from
+  // within loaded virtual code): resolve via the vite plugin container and
+  // carry the resolved id in a custom scheme that load() below serves.
+  if (container && (spec.startsWith("virtual:") || spec.startsWith("\0"))) {
+    const importer = context.parentURL && context.parentURL.startsWith("file:")
+      ? fileURLToPath(context.parentURL)
+      : undefined;
+    const rid = await container.resolveId(spec, importer);
+    if (rid != null) return { url: VIRTUAL_SCHEME + encodeURIComponent(rid), shortCircuit: true };
+  }
   // Asset conventions: resolve the underlying file, then tag the URL so load()
   // returns a string / URL / data URI (?url mirrors the client's /@oj-start/fs
   // path) or a no-op for side-effect CSS (styling is a client concern in SSR).
@@ -58,6 +184,7 @@ export async function resolve(spec, context, next) {
     } else if (ALIASES[clean]) {
       abs = probe(ALIASES[clean]);
     }
+    if (!abs && clean.startsWith("#")) abs = resolveImports(clean);
     if (!abs) {
       try { abs = fileURLToPath(stripQ((await next(clean, context)).url)); } catch {}
     }
@@ -65,6 +192,16 @@ export async function resolve(spec, context, next) {
   }
   if (ALIASES[spec]) {
     const hit = probe(ALIASES[spec]);
+    if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true };
+  }
+  // App "#" subpath imports with bundler-style extension probing.
+  if (spec.startsWith("#")) {
+    const hit = resolveImports(spec);
+    if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true };
+  }
+  // tsconfig `paths` aliases (bare-looking specifiers like "@platform/auth").
+  if (!spec.startsWith(".") && !spec.startsWith("/")) {
+    const hit = resolveTsPaths(spec);
     if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true };
   }
   if (spec.startsWith(".") && context.parentURL) {
@@ -106,6 +243,12 @@ function transformServerFns(code, path) {
 }
 
 export async function load(url, context, next) {
+  // Plugin-owned virtual module: load its code from the container.
+  if (url.startsWith(VIRTUAL_SCHEME)) {
+    const rid = decodeURIComponent(url.slice(VIRTUAL_SCHEME.length));
+    const code = container ? await container.load(rid) : null;
+    return { format: "module", source: code ?? "export default undefined;", shortCircuit: true };
+  }
   const clean = stripQ(url);
   // Tagged asset (from resolve above).
   const kind = /[?&]ojasset=(\w+)/.exec(url)?.[1];
@@ -128,6 +271,7 @@ export async function load(url, context, next) {
     const out = transformSync(src, {
       loader: clean.endsWith("tsx") ? "tsx" : "ts",
       format: "esm", jsx: "automatic", sourcefile: path,
+      define: viteEnvDefine({ ssr: true }),
     });
     return { format: "module", source: out.code, shortCircuit: true };
   }

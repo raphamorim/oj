@@ -37,3 +37,13 @@ export async function importPkg(root, spec, preferred = []) {
   const m = await import(pathToFileURL(p).href);
   return m.default ?? m;
 }
+
+// esbuild `define` for Vite's `import.meta.env`: the standard MODE/DEV/PROD/SSR/
+// BASE_URL plus every VITE_* var in the environment. Defining the whole object
+// (not just dotted keys) keeps `const { VITE_X } = import.meta.env` working and
+// makes unknown keys read as undefined instead of throwing.
+export function viteEnvDefine({ ssr = false, mode = "development" } = {}) {
+  const env = { MODE: mode, DEV: mode !== "production", PROD: mode === "production", SSR: !!ssr, BASE_URL: "/" };
+  for (const [k, v] of Object.entries(process.env)) if (k.startsWith("VITE_")) env[k] = v;
+  return { "import.meta.env": JSON.stringify(env) };
+}
