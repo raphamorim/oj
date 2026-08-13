@@ -1,0 +1,21 @@
+{
+  // Cloudflare Worker config for the oj docs site.
+  // Deploy with:  oj build .  &&  wrangler deploy
+  "name": "oj-docs",
+  "main": "dist/worker.mjs",
+  "compatibility_date": "2024-11-01",
+  // The worker bundle uses node builtins (via oj's shims + require), so enable
+  // Node compatibility on the edge.
+  "compatibility_flags": ["nodejs_compat"],
+  // Serve the built client assets (dist/client) directly from Cloudflare's edge;
+  // anything not matching a static file falls through to the worker's fetch (SSR).
+  "assets": {
+    "directory": "dist/client",
+    "binding": "ASSETS",
+    "not_found_handling": "none",
+    "run_worker_first": false
+  },
+  "vars": {
+    "SITE_NAME": "oj"
+  }
+}
