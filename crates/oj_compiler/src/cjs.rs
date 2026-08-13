@@ -463,4 +463,52 @@ exports.named = 1;
             assert!(!is_valid_export_name(bad), "{bad:?} should be rejected");
         }
     }
+
+    #[test]
+    fn unresolved_require_is_omitted_and_guarded_at_runtime() {
+        let src = r#"var missing = require('./gone'); exports.use = function () { return missing; };"#;
+        let mut resolve = |_: &str| None; // nothing resolves
+        let out = wrap_cjs(Path::new("u.js"), "/n/u.js", src, &mut resolve).unwrap();
+        // the unresolved dep is neither imported nor a graph edge
+        assert!(!out.code.contains("__oj_dep_0"), "unresolved dep must not import: {}", out.code);
+        assert!(out.imports.is_empty(), "unresolved dep is not an edge: {:?}", out.imports);
+        // the runtime require() still throws a named error if the call survives DCE
+        assert!(out.code.contains("unresolved require("), "runtime guard present: {}", out.code);
+    }
+
+    #[test]
+    fn duplicate_requires_dedupe_to_one_import() {
+        let src = r#"var a = require('dep'); var b = require('dep'); exports.x = function () { return a || b; };"#;
+        let mut resolve = |spec: &str| Some(format!("/node_modules/{spec}/index.js"));
+        let out = wrap_cjs(Path::new("d.js"), "/n/d.js", src, &mut resolve).unwrap();
+        assert_eq!(out.imports, vec!["/node_modules/dep/index.js".to_string()]);
+        assert!(out.code.contains("__oj_dep_0"));
+        assert!(!out.code.contains("__oj_dep_1"), "second require must dedupe: {}", out.code);
+    }
+
+    #[test]
+    fn invalid_identifier_export_keys_are_dropped() {
+        let src = r#"module.exports = { good: 1, "bad-name": 2, "with space": 3 };"#;
+        let mut resolve = |_: &str| None;
+        let out = wrap_cjs(Path::new("k.js"), "/n/k.js", src, &mut resolve).unwrap();
+        // the valid key becomes a named export; the invalid keys get no `as`
+        // clause (the raw keys still appear in the wrapped body, so assert on the
+        // export-alias form, not the literal).
+        assert!(out.code.contains("as good }"), "valid key exported: {}", out.code);
+        assert!(!out.code.contains("as bad-name"), "hyphenated key not exported: {}", out.code);
+        assert!(!out.code.contains("as with space"), "spaced key not exported: {}", out.code);
+        // only one export binding was emitted (index 0), so the bad keys added none
+        assert!(!out.code.contains("__oj_export_1"), "only the valid key exported: {}", out.code);
+        // the object is still reachable whole via the default export
+        assert!(out.code.contains("export default"), "{}", out.code);
+    }
+
+    #[test]
+    fn wrapper_injects_filename_and_dirname_from_url() {
+        let src = r#"exports.here = __dirname; exports.file = __filename;"#;
+        let mut resolve = |_: &str| None;
+        let out = wrap_cjs(Path::new("x.js"), "/node_modules/pkg/sub/x.js", src, &mut resolve).unwrap();
+        assert!(out.code.contains(r#"const __filename = "/node_modules/pkg/sub/x.js""#), "{}", out.code);
+        assert!(out.code.contains(r#"const __dirname = "/node_modules/pkg/sub""#), "{}", out.code);
+    }
 }
