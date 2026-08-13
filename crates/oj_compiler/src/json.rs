@@ -102,4 +102,51 @@ mod tests {
     fn invalid_json_errors() {
         assert!(to_esm("{ not json", "/bad.json").is_err());
     }
+
+    #[test]
+    fn filters_reserved_and_non_identifier_named_exports() {
+        let out = to_esm(
+            r#"{"class":1,"import":2,"await":3,"$ok":4,"_ok":5,"1bad":6,"a-b":7,"ok":8}"#,
+            "/k.json",
+        )
+        .unwrap();
+        // default plus exactly the three valid identifiers
+        assert_eq!(out.matches("export ").count(), 4, "only default + 3 valid keys: {out}");
+        for ok in ["$ok", "_ok", "ok"] {
+            assert!(out.contains(&format!("export const {ok} = __oj_json[")), "{ok} should export: {out}");
+        }
+    }
+
+    #[test]
+    fn nested_objects_and_scalars_export_only_default() {
+        // only the top-level key is a named export; inner keys never leak
+        let nested = to_esm(r#"{"outer":{"inner":1}}"#, "/n.json").unwrap();
+        assert!(nested.contains("export const outer ="), "{nested}");
+        assert!(!nested.contains("export const inner ="), "nested keys must not leak: {nested}");
+        assert_eq!(nested.matches("export ").count(), 2, "default + outer only: {nested}");
+
+        // scalar and null JSON have a default export and nothing else
+        for (src, label) in [("\"hello\"", "string"), ("42", "number"), ("true", "bool"), ("null", "null")] {
+            let out = to_esm(src, "/s.json").unwrap();
+            assert_eq!(out.matches("export ").count(), 1, "{label} has only default: {out}");
+            assert!(out.contains("export default __oj_json"), "{label}: {out}");
+        }
+    }
+
+    #[test]
+    fn factory_body_filters_invalid_and_reserved_keys() {
+        let out = to_factory_body(r#"{"ok":1,"bad-key":2,"default":3}"#, "/f.json").unwrap();
+        assert!(out.contains(r#""ok": () => __oj_json["ok"]"#), "valid key getter: {out}");
+        assert!(!out.contains(r#""bad-key": () =>"#), "invalid key gets no getter: {out}");
+        // the only `default` getter is the module default, not the JSON key
+        assert_eq!(out.matches(r#""default": () =>"#).count(), 1, "one default getter: {out}");
+    }
+
+    #[test]
+    fn raw_json_formatting_is_preserved() {
+        let src = "{\n  \"a\": 1,\n  \"b\": 2\n}";
+        let out = to_esm(src, "/fmt.json").unwrap();
+        // the parsed source is emitted verbatim (trimmed), not re-serialized
+        assert!(out.contains(src), "raw formatting must be preserved: {out}");
+    }
 }
