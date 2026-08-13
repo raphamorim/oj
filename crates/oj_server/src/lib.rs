@@ -1121,24 +1121,19 @@ async fn ensure_module(
 
     // Server functions: a `*.server.*` module never reaches the client; it is
     // replaced by stubs that RPC to /__oj_fn (served by the SSR dev server).
+    // The stub is a pure function of the source, so it rides the same
+    // content-addressed cache as every other module (its own `server` mode)
+    // rather than being re-derived — re-parsing exports included — per request.
     let is_dep_early = url.contains("/node_modules/") || url.starts_with("/@fs/");
-    if is_server_module(file) && !is_dep_early && !state.bundle {
-        let code = server_fn_stub(&oj_compiler::exports(&source, file), url);
-        let module = Arc::new(CachedModule {
-            is_boundary: false,
-            kind: String::new(),
-            code,
-            map_data_url: None,
-            imports: Vec::new(),
-            require_map: Vec::new(),
-            css_exports: Vec::new(),
-            fs_allow: Vec::new(),
-        });
-        register_in_graph(state, url, &module);
-        return Ok((String::new(), module));
-    }
+    let is_server = is_server_module(file) && !is_dep_early && !state.bundle;
 
-    let mode = if state.bundle { "bundle" } else { "dev" };
+    let mode = if state.bundle {
+        "bundle"
+    } else if is_server {
+        "server"
+    } else {
+        "dev"
+    };
     let key = state.cache.key(source.as_bytes(), url, mode);
 
     if let Some(module) = memory_get(state, url, &key) {
@@ -1159,6 +1154,26 @@ async fn ensure_module(
     }
     if let Some(module) = state.cache.get(&key) {
         let module = Arc::new(module);
+        memory_put(state, url, &key, &module);
+        register_in_graph(state, url, &module);
+        return Ok((key, module));
+    }
+
+    // Server-fn stub (cache miss): build once, then persist + memoize like a
+    // compiled module so repeat requests and restarts skip the export parse.
+    if is_server {
+        let code = server_fn_stub(&oj_compiler::exports(&source, file), url);
+        let module = Arc::new(CachedModule {
+            is_boundary: false,
+            kind: String::new(),
+            code,
+            map_data_url: None,
+            imports: Vec::new(),
+            require_map: Vec::new(),
+            css_exports: Vec::new(),
+            fs_allow: Vec::new(),
+        });
+        let _ = state.cache_writes.try_send((key.clone(), Arc::clone(&module)));
         memory_put(state, url, &key, &module);
         register_in_graph(state, url, &module);
         return Ok((key, module));
