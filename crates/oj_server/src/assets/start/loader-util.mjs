@@ -126,6 +126,33 @@ export function readJsonc(file) {
   }
 }
 
+// Flatten a package.json "imports" map into [pattern, target] string pairs.
+// A target may be a string or a conditional object; take the import/default/node
+// condition, in that order, and drop entries with no string target.
+export function parseImportsField(imports = {}) {
+  return Object.entries(imports)
+    .map(([pattern, target]) => [
+      pattern,
+      typeof target === "string" ? target : target?.import ?? target?.default ?? target?.node,
+    ])
+    .filter(([, t]) => typeof t === "string");
+}
+
+// Merge a resolved tsconfig `extends` chain (base first) into the `paths` rules
+// and the effective `baseDir`. Each entry is { cfg, dir }. Later configs
+// override earlier `paths`; `baseUrl` resolves against its own config's dir,
+// and with no baseUrl the base dir is that config's own dir. Path targets are
+// normalized to arrays.
+export function mergeTsConfig(chain, fallbackBaseDir) {
+  let paths = {}, baseDir = fallbackBaseDir;
+  for (const { cfg, dir } of chain) {
+    const co = cfg.compilerOptions || {};
+    if (co.paths) paths = { ...paths, ...co.paths };
+    baseDir = co.baseUrl != null ? pathResolve(dir, co.baseUrl) : dir;
+  }
+  return { rules: Object.entries(paths).map(([k, v]) => [k, Array.isArray(v) ? v : [v]]), baseDir };
+}
+
 // Match a single-`*` alias pattern (a tsconfig `paths` key or a package.json
 // `imports` subpath) against a specifier and return the target with `*` filled
 // in, or null when it does not match. A pattern without `*` matches only an

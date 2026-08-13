@@ -9,8 +9,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   probe, isCjsFile, hasEsmSyntax, nearestPkgType, cjsFacade, stripJsonc, readJsonc,
-  rewriteServerFns, substituteAlias,
+  rewriteServerFns, substituteAlias, parseImportsField, mergeTsConfig,
 } from "../../crates/oj_server/src/assets/start/loader-util.mjs";
+import { sep } from "node:path";
 
 const mk = (p) => mkdtempSync(join(tmpdir(), "oj-loader-" + p + "-"));
 
@@ -118,6 +119,49 @@ test("cjsFacade unwraps default for __esModule (transpiled ESM) modules", () => 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("parseImportsField flattens string and conditional-object targets", () => {
+  const rules = parseImportsField({
+    "#lib/*": "./src/lib/*",
+    "#env": { node: "./env.node.ts", default: "./env.ts" }, // no import -> default wins
+    "#pick-import": { import: "./esm.js", require: "./cjs.cjs" },
+    "#node-only": { node: "./env.node.ts" }, // falls through to node
+    "#no-string": { require: "./only-cjs.cjs" }, // dropped: no import/default/node
+  });
+  const map = Object.fromEntries(rules);
+  assert.equal(map["#lib/*"], "./src/lib/*");
+  assert.equal(map["#pick-import"], "./esm.js"); // import wins (import ?? default ?? node)
+  assert.equal(map["#env"], "./env.ts"); // default preferred over node
+  assert.equal(map["#node-only"], "./env.node.ts"); // node used when it is the only one
+  assert.ok(!("#no-string" in map)); // no usable string target -> dropped
+});
+
+test("parseImportsField tolerates an empty/absent map", () => {
+  assert.deepEqual(parseImportsField(), []);
+  assert.deepEqual(parseImportsField({}), []);
+});
+
+test("mergeTsConfig merges paths across an extends chain, later wins", () => {
+  const base = "/app";
+  const chain = [
+    { cfg: { compilerOptions: { paths: { "@a/*": ["./base-a/*"], "@keep/*": ["./keep/*"] } } }, dir: "/app" },
+    { cfg: { compilerOptions: { paths: { "@a/*": ["./over-a/*"] } } }, dir: "/app" }, // overrides @a
+  ];
+  const { rules, baseDir } = mergeTsConfig(chain, base);
+  const map = Object.fromEntries(rules);
+  assert.deepEqual(map["@a/*"], ["./over-a/*"]); // child overrides base
+  assert.deepEqual(map["@keep/*"], ["./keep/*"]); // base-only survives
+  assert.equal(baseDir, "/app"); // no baseUrl -> the config's own dir
+});
+
+test("mergeTsConfig resolves baseUrl against its config dir and arrays targets", () => {
+  const chain = [
+    { cfg: { compilerOptions: { baseUrl: "./src", paths: { "@x": "./x.ts" } } }, dir: "/app" },
+  ];
+  const { rules, baseDir } = mergeTsConfig(chain, "/app");
+  assert.equal(baseDir, ["/app", "src"].join(sep)); // baseUrl joined to dir
+  assert.deepEqual(Object.fromEntries(rules)["@x"], ["./x.ts"]); // string -> [string]
 });
 
 test("substituteAlias fills a trailing-star pattern (tsconfig + imports style)", () => {

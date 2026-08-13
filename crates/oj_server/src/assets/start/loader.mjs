@@ -11,6 +11,7 @@ import { transformGlob } from "./glob-transform.mjs";
 import {
   EXTS, isFile, JS_TO_TS, probe, RESERVED, nearestPkgType,
   hasEsmSyntax, isCjsFile, cjsFacade, stripJsonc, readJsonc, rewriteServerFns, substituteAlias,
+  parseImportsField, mergeTsConfig,
 } from "./loader-util.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -54,10 +55,7 @@ const ALIASES = {
 // extensionless, bundler-style imports -- so mirror the map here with probing.
 const IMPORT_RULES = (() => {
   try {
-    const imports = JSON.parse(readFileSync(pathResolve(APP, "package.json"), "utf8")).imports ?? {};
-    return Object.entries(imports)
-      .map(([pattern, target]) => [pattern, typeof target === "string" ? target : target?.import ?? target?.default ?? target?.node])
-      .filter(([, t]) => typeof t === "string");
+    return parseImportsField(JSON.parse(readFileSync(pathResolve(APP, "package.json"), "utf8")).imports ?? {});
   } catch {
     return [];
   }
@@ -86,13 +84,7 @@ const TS = (() => {
       ? pathResolve(dirname(file), cfg.extends.endsWith(".json") ? cfg.extends : cfg.extends + ".json")
       : null;
   }
-  let paths = {}, baseDir = APP;
-  for (const { cfg, dir } of chain) {
-    const co = cfg.compilerOptions || {};
-    if (co.paths) paths = { ...paths, ...co.paths };
-    baseDir = co.baseUrl != null ? pathResolve(dir, co.baseUrl) : dir;
-  }
-  return { rules: Object.entries(paths).map(([k, v]) => [k, Array.isArray(v) ? v : [v]]), baseDir };
+  return mergeTsConfig(chain, APP);
 })();
 function resolveTsPaths(spec) {
   for (const [pattern, targets] of TS.rules) {
