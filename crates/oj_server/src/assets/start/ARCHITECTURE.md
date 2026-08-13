@@ -46,10 +46,10 @@ Shared build helpers:
   direct deps as anchors). Also exports `viteEnvDefine` for `import.meta.env`.
 - `esbuild-assets.mjs` holds the esbuild building blocks shared by dev and prod:
   `assetsPlugin` (Vite-style `?url` / `?raw` / `?inline` / bare-asset / css
-  imports), `makeVitePlugins` (routes `virtual:` ids, `.mdx`, and `.svg`
-  through the plugin container), `nodeBuiltinShims`, `pnpmStorePaths`,
-  `workspaceRoot`, and `contentHashEmitter` (a content-addressed asset emitter
-  that rewrites css `url()` refs).
+  imports), `makeVitePlugins` (routes `virtual:` ids, `.mdx`, bare `.svg`, and
+  the `.svg?react` query through the plugin container), `nodeBuiltinShims`,
+  `pnpmStorePaths`, `workspaceRoot`, and `contentHashEmitter` (a
+  content-addressed asset emitter that rewrites css `url()` refs).
 - `vite-plugin-bridge.mjs` is the plugin container. See below.
 - `glob-transform.mjs` expands `import.meta.glob` into a literal map.
 - `cf-server.mjs` is the dev/prod shim for `@cloudflare/vite-plugin/server`.
@@ -158,13 +158,34 @@ build passes the client container as a `fallback` for `load`, because some ssr
 plugins error expecting cross-environment state that Vite shares between the
 client and ssr builds and our separate containers do not.
 
+### svgr and the `?react` query
+
+svgr keys its `load` filter on the import id, so both svg import styles reach
+it as an id the plugin recognizes:
+
+- Bare `import Logo from "./logo.svg"`. esbuild resolves the file normally and
+  `makeVitePlugins` runs its `.svg` `load` for the resolved path. svgr claims
+  it when configured with `exportType: "default"` (or an `include` that matches
+  the file); otherwise the id falls back to an asset URL.
+- Explicit `import Logo from "./logo.svg?react"`. esbuild's resolver cannot
+  find a file named `logo.svg?react`, so `makeVitePlugins` strips the query,
+  resolves the real `.svg`, parks it in an `oj-svg-react` namespace, and calls
+  `container.load(path + "?react")` so svgr sees the query it filters on. The
+  dev loader mirrors this: it resolves the file and tags the url `?ojsvg=react`,
+  then `load()` hands svgr the `path + "?react"` id. Either way the URL fallback
+  applies when no plugin claims the id.
+
+The bare `.svg` `load` is pinned to the `file` namespace so it does not also
+claim the `?react`-tagged files, which would drop the query before svgr runs.
+
 ## Resolution chain
 
 For app-owned specifiers the dev loader and the esbuild builds resolve in this
 order:
 
 1. framework aliases and the CF shim,
-2. `virtual:` ids and `.mdx` / `.svg` through the plugin container,
+2. `virtual:` ids, `.mdx`, and `.svg` (bare or `?react`) through the plugin
+   container,
 3. Vite asset conventions (`?url`, `?raw`, `?inline`, bare fonts and images),
 4. package.json `imports` subpaths (`#shared`, `#modules`) with extension
    probing,
