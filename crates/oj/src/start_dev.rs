@@ -725,4 +725,45 @@ mod tests {
         let proxy = vec!["/api".to_string()];
         assert!(matches!(classify(&req("GET", "/api/users"), &proxy), Route::Pass));
     }
+
+    #[test]
+    fn list_route_files_collects_ts_tsx_recursively() {
+        let root = tmp("routes");
+        let routes = root.join("src").join("routes");
+        std::fs::create_dir_all(routes.join("nested")).unwrap();
+        std::fs::write(routes.join("index.tsx"), "").unwrap();
+        std::fs::write(routes.join("about.ts"), "").unwrap();
+        std::fs::write(routes.join("styles.css"), "").unwrap(); // not a route
+        std::fs::write(routes.join("data.json"), "").unwrap(); // not a route
+        std::fs::write(routes.join("nested").join("deep.tsx"), "").unwrap();
+        let found = list_route_files(&root);
+        let names: Vec<String> =
+            found.iter().filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).collect();
+        assert_eq!(found.len(), 3, "only ts/tsx counted: {names:?}");
+        assert!(names.contains(&"index.tsx".to_string()));
+        assert!(names.contains(&"about.ts".to_string()));
+        assert!(names.contains(&"deep.tsx".to_string()), "recursion into subdirs: {names:?}");
+        assert!(!names.iter().any(|n| n.ends_with(".css") || n.ends_with(".json")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_route_files_missing_dir_is_empty() {
+        let root = tmp("noroutes"); // exists, but has no src/routes
+        assert!(list_route_files(&root).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn collect_headers_serializes_utf8_and_skips_non_utf8() {
+        let mut h = header::HeaderMap::new();
+        h.insert("content-type", header::HeaderValue::from_static("text/html"));
+        h.insert("x-custom", header::HeaderValue::from_static("hello"));
+        // an obs-text (non-UTF8) value is dropped rather than panicking
+        h.insert("x-bin", header::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap());
+        let out = collect_headers(&h);
+        assert!(out.contains(&("content-type".to_string(), "text/html".to_string())), "{out:?}");
+        assert!(out.contains(&("x-custom".to_string(), "hello".to_string())), "{out:?}");
+        assert!(!out.iter().any(|(k, _)| k == "x-bin"), "non-utf8 value dropped: {out:?}");
+    }
 }
