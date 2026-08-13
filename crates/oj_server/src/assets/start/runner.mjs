@@ -15,9 +15,13 @@ import readline from "node:readline";
 process.env.TSS_SERVER_FN_BASE ??= "/_serverFn/";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const ENTRY = pathToFileURL(join(HERE, "server-entry.tsx")).href;
+// The entry and loader are the assets written next to this file; both are
+// overridable so a protocol test can point them at stubs (and skip the loader's
+// esbuild bootstrap) without changing the framing behavior under test.
+const ENTRY = pathToFileURL(process.env.OJ_RUNNER_ENTRY || join(HERE, "server-entry.tsx")).href;
+const LOADER = pathToFileURL(process.env.OJ_RUNNER_LOADER || join(HERE, "loader.mjs")).href;
 const { port1, port2 } = new MessageChannel();
-register(pathToFileURL(join(HERE, "loader.mjs")).href, {
+register(LOADER, {
   parentURL: pathToFileURL(HERE + "/").href,
   data: { port: port2 },
   transferList: [port2],
