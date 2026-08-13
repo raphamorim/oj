@@ -10,7 +10,7 @@ import { loadPluginContainer } from "./vite-plugin-bridge.mjs";
 import { transformGlob } from "./glob-transform.mjs";
 import {
   EXTS, isFile, JS_TO_TS, probe, RESERVED, nearestPkgType,
-  hasEsmSyntax, isCjsFile, cjsFacade, stripJsonc, readJsonc,
+  hasEsmSyntax, isCjsFile, cjsFacade, stripJsonc, readJsonc, rewriteServerFns, substituteAlias,
 } from "./loader-util.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -64,16 +64,10 @@ const IMPORT_RULES = (() => {
 })();
 function resolveImports(spec) {
   for (const [pattern, target] of IMPORT_RULES) {
-    if (pattern.endsWith("/*") && target.endsWith("/*")) {
-      const pfx = pattern.slice(0, -1);
-      if (spec.startsWith(pfx)) {
-        const hit = probe(pathResolve(APP, target.slice(0, -1) + spec.slice(pfx.length)));
-        if (hit) return hit;
-      }
-    } else if (spec === pattern) {
-      const hit = probe(pathResolve(APP, target));
-      if (hit) return hit;
-    }
+    const sub = substituteAlias(pattern, target, spec);
+    if (sub == null) continue;
+    const hit = probe(pathResolve(APP, sub));
+    if (hit) return hit;
   }
   return null;
 }
@@ -102,20 +96,11 @@ const TS = (() => {
 })();
 function resolveTsPaths(spec) {
   for (const [pattern, targets] of TS.rules) {
-    if (pattern.includes("*")) {
-      const [pre, post = ""] = pattern.split("*");
-      if (spec.startsWith(pre) && spec.endsWith(post) && spec.length >= pre.length + post.length) {
-        const mid = spec.slice(pre.length, spec.length - post.length);
-        for (const t of targets) {
-          const hit = probe(pathResolve(TS.baseDir, t.replace("*", mid)));
-          if (hit) return hit;
-        }
-      }
-    } else if (spec === pattern) {
-      for (const t of targets) {
-        const hit = probe(pathResolve(TS.baseDir, t));
-        if (hit) return hit;
-      }
+    for (const t of targets) {
+      const sub = substituteAlias(pattern, t, spec);
+      if (sub == null) continue;
+      const hit = probe(pathResolve(TS.baseDir, sub));
+      if (hit) return hit;
     }
   }
   return null;
@@ -196,31 +181,12 @@ export async function resolve(spec, context, next) {
   return r;
 }
 
-// createServerFn provider transform (server side). A bare `.handler(fn)`
-// leaves the runtime's `extractedFn` returning the raw value, but it expects
-// `{ result }`. Rewrite each top-level `const NAME = createServerFn(...).handler(FN)`
-// to the provider shape so `NAME()` runs the handler in-process during SSR:
-//   const NAME_createServerFn_handler = createServerRpc({id,name,filename},
-//     (opts) => NAME.__executeServer(opts));
-//   const NAME = createServerFn(...).handler(NAME_createServerFn_handler, FN);
+// createServerFn provider transform (server side). The app root turns the file
+// path into the relative id `rewriteServerFns` bakes into each handler; see
+// loader-util for the transform itself.
 function transformServerFns(code, path) {
-  if (!code.includes("createServerFn")) return code;
   const rel = path.startsWith(APP) ? path.slice(APP.length).replace(/^\//, "") : path;
-  const re =
-    /(^|[\n;])([ \t]*)((?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*createServerFn\b[\s\S]*?\.handler\s*\()/g;
-  let changed = false;
-  const out = code.replace(re, (_m, pre, indent, decl, name) => {
-    changed = true;
-    const id = JSON.stringify(Buffer.from(`${rel}#${name}`).toString("base64url"));
-    const meta = `{ id: ${id}, name: ${JSON.stringify(name)}, filename: ${JSON.stringify(rel)} }`;
-    // Exported so the server-fn resolver can import it for HTTP dispatch.
-    const rpc =
-      `${indent}export const ${name}_createServerFn_handler = createServerRpc(${meta}, ` +
-      `(opts) => ${name}.__executeServer(opts));\n`;
-    return `${pre}${rpc}${indent}${decl}${name}_createServerFn_handler, `;
-  });
-  if (!changed) return code;
-  return `import { createServerRpc } from "@tanstack/react-start/server-rpc";\n${out}`;
+  return rewriteServerFns(code, rel);
 }
 
 export async function load(url, context, next) {

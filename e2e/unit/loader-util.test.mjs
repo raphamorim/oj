@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   probe, isCjsFile, hasEsmSyntax, nearestPkgType, cjsFacade, stripJsonc, readJsonc,
+  rewriteServerFns, substituteAlias,
 } from "../../crates/oj_server/src/assets/start/loader-util.mjs";
 
 const mk = (p) => mkdtempSync(join(tmpdir(), "oj-loader-" + p + "-"));
@@ -117,6 +118,65 @@ test("cjsFacade unwraps default for __esModule (transpiled ESM) modules", () => 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("substituteAlias fills a trailing-star pattern (tsconfig + imports style)", () => {
+  assert.equal(substituteAlias("@app/*", "./src/*", "@app/lib/format"), "./src/lib/format");
+  assert.equal(substituteAlias("#lib/*", "./src/lib/*", "#lib/format"), "./src/lib/format");
+  // deep subpaths keep the whole tail
+  assert.equal(substituteAlias("@app/*", "./src/*", "@app/a/b/c"), "./src/a/b/c");
+});
+
+test("substituteAlias handles a star in the middle of pattern and target", () => {
+  assert.equal(substituteAlias("@ui/*/styles", "./comp/*/css", "@ui/button/styles"), "./comp/button/css");
+  // prefix or suffix mismatch does not match
+  assert.equal(substituteAlias("@ui/*/styles", "./comp/*/css", "@ui/button/other"), null);
+});
+
+test("substituteAlias allows an empty star match (maps to the directory)", () => {
+  // spec equal to the pattern minus `*` leaves an empty tail, mapping to the
+  // target directory (probing then resolves its index).
+  assert.equal(substituteAlias("@app/*", "./src/*", "@app/"), "./src/");
+  // but the prefix must still be present
+  assert.equal(substituteAlias("@app/*", "./src/*", "other/x"), null);
+});
+
+test("substituteAlias without a star matches only the exact specifier", () => {
+  assert.equal(substituteAlias("#env", "./env.ts", "#env"), "./env.ts");
+  assert.equal(substituteAlias("#env", "./env.ts", "#env/extra"), null);
+  assert.equal(substituteAlias("#env", "./env.ts", "#en"), null);
+});
+
+test("rewriteServerFns leaves code without createServerFn untouched", () => {
+  const code = "export const x = 1;\nconst f = () => 2;";
+  assert.equal(rewriteServerFns(code, "src/x.ts"), code);
+});
+
+test("rewriteServerFns rewrites a handler to the provider shape", () => {
+  const rel = "src/server/data.ts";
+  const code = 'const getGreeting = createServerFn({ method: "GET" }).handler(async () => ({ ok: true }));';
+  const out = rewriteServerFns(code, rel);
+  const id = Buffer.from(`${rel}#getGreeting`).toString("base64url");
+  // prepends the createServerRpc import
+  assert.match(out, /^import \{ createServerRpc \} from "@tanstack\/react-start\/server-rpc";/);
+  // emits the exported provider bound to the module-relative id + name + filename
+  assert.ok(out.includes(`export const getGreeting_createServerFn_handler = createServerRpc({ id: ${JSON.stringify(id)}, name: "getGreeting", filename: ${JSON.stringify(rel)} }, (opts) => getGreeting.__executeServer(opts));`));
+  // injects the provider as the first .handler() argument, keeping the original fn
+  assert.match(out, /\.handler\(getGreeting_createServerFn_handler, async \(\) => \(\{ ok: true \}\)\)/);
+});
+
+test("rewriteServerFns handles an exported const and multiple functions", () => {
+  const code = [
+    'export const a = createServerFn().handler(() => 1);',
+    'const b = createServerFn({ method: "POST" }).handler(() => 2);',
+  ].join("\n");
+  const out = rewriteServerFns(code, "src/fns.ts");
+  assert.ok(out.includes("export const a_createServerFn_handler = createServerRpc("));
+  assert.ok(out.includes("export const b_createServerFn_handler = createServerRpc("));
+  // the export keyword on `a` is preserved after the injected provider line
+  assert.match(out, /export const a = createServerFn\(\)\.handler\(a_createServerFn_handler, /);
+  // only one import is prepended regardless of function count
+  assert.equal(out.match(/from "@tanstack\/react-start\/server-rpc"/g).length, 1);
 });
 
 test("stripJsonc + readJsonc tolerate comments and trailing commas", () => {

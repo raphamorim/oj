@@ -125,3 +125,46 @@ export function readJsonc(file) {
     return null;
   }
 }
+
+// Match a single-`*` alias pattern (a tsconfig `paths` key or a package.json
+// `imports` subpath) against a specifier and return the target with `*` filled
+// in, or null when it does not match. A pattern without `*` matches only an
+// exact specifier. Mirrors how esbuild and Node substitute these aliases so the
+// SSR loader resolves the same ids the bundler does.
+export function substituteAlias(pattern, target, spec) {
+  if (pattern.includes("*")) {
+    const [pre, post = ""] = pattern.split("*");
+    if (!spec.startsWith(pre) || !spec.endsWith(post) || spec.length < pre.length + post.length) return null;
+    return target.replace("*", spec.slice(pre.length, spec.length - post.length));
+  }
+  return spec === pattern ? target : null;
+}
+
+// createServerFn provider transform (server side). A bare `.handler(fn)` leaves
+// the runtime's `extractedFn` returning the raw value, but it expects
+// `{ result }`. Rewrite each top-level `const NAME = createServerFn(...).handler(FN)`
+// to the provider shape so `NAME()` runs the handler in-process during SSR:
+//   export const NAME_createServerFn_handler = createServerRpc({id,name,filename},
+//     (opts) => NAME.__executeServer(opts));
+//   const NAME = createServerFn(...).handler(NAME_createServerFn_handler, FN);
+// `rel` is the app-relative module path; it seeds the base64url handler id the
+// server-fn resolver dispatches on. Returns the code unchanged when there is no
+// createServerFn to rewrite.
+export function rewriteServerFns(code, rel) {
+  if (!code.includes("createServerFn")) return code;
+  const re =
+    /(^|[\n;])([ \t]*)((?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*createServerFn\b[\s\S]*?\.handler\s*\()/g;
+  let changed = false;
+  const out = code.replace(re, (_m, pre, indent, decl, name) => {
+    changed = true;
+    const id = JSON.stringify(Buffer.from(`${rel}#${name}`).toString("base64url"));
+    const meta = `{ id: ${id}, name: ${JSON.stringify(name)}, filename: ${JSON.stringify(rel)} }`;
+    // Exported so the server-fn resolver can import it for HTTP dispatch.
+    const rpc =
+      `${indent}export const ${name}_createServerFn_handler = createServerRpc(${meta}, ` +
+      `(opts) => ${name}.__executeServer(opts));\n`;
+    return `${pre}${rpc}${indent}${decl}${name}_createServerFn_handler, `;
+  });
+  if (!changed) return code;
+  return `import { createServerRpc } from "@tanstack/react-start/server-rpc";\n${out}`;
+}
