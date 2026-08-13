@@ -122,6 +122,9 @@ struct ServerState {
     /// packages etc). /@fs/ requests are served only from this set, so the
     /// scheme cannot be used for directory traversal.
     fs_allow: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+    /// Cached directory listings for relative-import resolution (see
+    /// `is_file_cached`); cleared wholesale on any watcher burst.
+    dir_cache: Arc<Mutex<DirCache>>,
     /// Monotonic patch counter; the client detects a gap in the sequence
     /// (a dropped WS frame after a backgrounded tab / reconnect) and reloads
     /// rather than applying patches onto a diverged module graph.
@@ -362,6 +365,7 @@ impl DevServer {
             tailwind_urls: Mutex::new(std::collections::HashSet::new()),
             has_postcss: has_postcss_config(&root),
             fs_allow: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            dir_cache: Arc::new(Mutex::new(DirCache::new())),
             patch_seq: std::sync::atomic::AtomicU64::new(0),
             chunk_cache: Mutex::new(None),
             cache_writes: write_tx,
@@ -1169,6 +1173,7 @@ async fn ensure_module(
     let root = state.root.clone();
     let resolver = Arc::clone(&state.resolver);
     let fs_allow = Arc::clone(&state.fs_allow);
+    let dir_cache = Arc::clone(&state.dir_cache);
     let virtual_ids: std::collections::BTreeSet<String> =
         state.virtual_modules.keys().cloned().collect();
     let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -1230,7 +1235,7 @@ async fn ensure_module(
             if virtual_ids.contains(spec) {
                 return Some(format!("/@virtual/{spec}"));
             }
-            if let Some(url) = rewrite_specifier(&root, &dir, &resolver, &fs_allow, spec, !bundle) {
+            if let Some(url) = rewrite_specifier(&root, &dir, &resolver, &fs_allow, &dir_cache, spec, !bundle) {
                 return Some(url);
             }
             // Unresolvable bare specifier: defer to plugin resolveId/load.
@@ -1508,6 +1513,41 @@ function $RefreshSig$() {{ return RefreshRuntime.createSignatureFunctionForTrans
     )
 }
 
+/// Per-directory listing cache: `dir -> { filename -> is_regular_file }`.
+/// Collapses the relative-import extension probe (up to ~6 `is_file` syscalls
+/// per extensionless import) into one `read_dir` per directory, amortized
+/// across every sibling import during the cold-start crawl. Cleared wholesale
+/// on any watcher burst (see `spawn_watcher`), so a newly created/removed file
+/// is picked up on the next resolve.
+type DirCache = std::collections::HashMap<PathBuf, std::sync::Arc<std::collections::HashMap<std::ffi::OsString, bool>>>;
+
+/// `path.is_file()`, answered from a cached directory listing. Falls back to a
+/// direct stat only for symlinked entries (rare in app source; node_modules
+/// goes through the resolver, not this path).
+fn is_file_cached(cache: &Mutex<DirCache>, path: &Path) -> bool {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return path.is_file();
+    };
+    if let Some(entries) = cache.lock().unwrap().get(dir) {
+        return entries.get(name).copied().unwrap_or(false);
+    }
+    let mut map = std::collections::HashMap::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let is_file = match e.file_type() {
+                Ok(ft) if ft.is_file() => true,
+                Ok(ft) if ft.is_symlink() => e.path().is_file(), // follow the link
+                _ => false,
+            };
+            map.insert(e.file_name(), is_file);
+        }
+    }
+    let arc = std::sync::Arc::new(map);
+    let result = arc.get(name).copied().unwrap_or(false);
+    cache.lock().unwrap().insert(dir.to_path_buf(), arc);
+    result
+}
+
 /// `./App` from `<root>/src` becomes `/src/App.tsx`; `react` becomes the
 /// resolved node_modules entry as a rooted URL. Rooted/virtual/absolute-URL
 /// specifiers pass through untouched.
@@ -1516,6 +1556,7 @@ fn rewrite_specifier(
     dir: &Path,
     resolver: &OjResolver,
     fs_allow: &Mutex<std::collections::HashSet<PathBuf>>,
+    dir_cache: &Mutex<DirCache>,
     spec: &str,
     css_import_marker: bool,
 ) -> Option<String> {
@@ -1529,7 +1570,7 @@ fn rewrite_specifier(
     // factory).
     if let Some((base, query)) = spec.split_once('?') {
         if matches!(query, "url" | "raw" | "inline" | "worker" | "sharedworker") {
-            let resolved = rewrite_specifier(root, dir, resolver, fs_allow, base, false)
+            let resolved = rewrite_specifier(root, dir, resolver, fs_allow, dir_cache, base, false)
                 .or_else(|| {
                     resolver.resolve(dir, base).ok().map(|p| {
                         fs_allow.lock().unwrap().insert(package_root(&p));
@@ -1544,12 +1585,12 @@ fn rewrite_specifier(
         let mut joined = normalize(&dir.join(spec));
         // TS convention: `import "./x.js"` resolves the sibling `./x.ts`
         // (also .tsx/.jsx). If the literal .js/.jsx target is absent, retarget.
-        if !joined.is_file() {
+        if !is_file_cached(dir_cache, &joined) {
             if let Some(ext) = joined.extension().and_then(|e| e.to_str()) {
                 if ext == "js" || ext == "jsx" {
                     for cand in ["ts", "tsx"] {
                         let alt = joined.with_extension(cand);
-                        if alt.is_file() {
+                        if is_file_cached(dir_cache, &alt) {
                             joined = alt;
                             break;
                         }
@@ -1557,10 +1598,10 @@ fn rewrite_specifier(
                 }
             }
         }
-        let quick = if joined.is_file() {
+        let quick = if is_file_cached(dir_cache, &joined) {
             Some(joined)
         } else if joined.extension().is_none() {
-            COMPILABLE.iter().map(|ext| joined.with_extension(ext)).find(|c| c.is_file())
+            COMPILABLE.iter().map(|ext| joined.with_extension(ext)).find(|c| is_file_cached(dir_cache, c))
         } else {
             None
         };
@@ -1735,10 +1776,11 @@ async fn serve_oj_routes(State(state): State<Arc<ServerState>>) -> Response {
     let root = state.root.clone();
     let resolver = Arc::clone(&state.resolver);
     let fs_allow = Arc::clone(&state.fs_allow);
+    let dir_cache = Arc::clone(&state.dir_cache);
     let synthetic = root.join("oj-routes.tsx");
     let compiled = tokio::task::spawn_blocking(move || {
         let dir = root.clone();
-        let mut rewrite = |s: &str| rewrite_specifier(&root, &dir, &resolver, &fs_allow, s, true);
+        let mut rewrite = |s: &str| rewrite_specifier(&root, &dir, &resolver, &fs_allow, &dir_cache, s, true);
         oj_compiler::compile_module(
             &synthetic,
             OJ_ROUTES_JS,
@@ -1784,8 +1826,9 @@ async fn serve_plugin_id(state: &Arc<ServerState>, spec: &str, importer: &str) -
     let root = state.root.clone();
     let resolver = Arc::clone(&state.resolver);
     let fs_allow = Arc::clone(&state.fs_allow);
+    let dir_cache = Arc::clone(&state.dir_cache);
     let compiled = tokio::task::spawn_blocking(move || {
-        let mut rewrite = |s: &str| rewrite_specifier(&root, &root, &resolver, &fs_allow, s, true);
+        let mut rewrite = |s: &str| rewrite_specifier(&root, &root, &resolver, &fs_allow, &dir_cache, s, true);
         oj_compiler::compile_module(
             Path::new("plugin.tsx"),
             &source,
@@ -2242,8 +2285,10 @@ fn spawn_watcher(state: Arc<ServerState>) {
             if messages.is_empty() {
                 continue;
             }
-            // Anything changed: the assembled chunk is stale.
+            // Anything changed: the assembled chunk is stale, and a created or
+            // removed file may change how relative imports resolve.
             *state.chunk_cache.lock().unwrap() = None;
+            state.dir_cache.lock().unwrap().clear();
             for message in messages {
                 let _ = state.reload_tx.send(message);
             }
