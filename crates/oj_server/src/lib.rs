@@ -54,6 +54,7 @@ const START_ASSETS: &[(&str, &str)] = &[
     ("vite-plugin-bridge.mjs", include_str!("assets/start/vite-plugin-bridge.mjs")),
     ("glob-transform.mjs", include_str!("assets/start/glob-transform.mjs")),
     ("cf-server.mjs", include_str!("assets/start/cf-server.mjs")),
+    ("css-host.mjs", include_str!("assets/start/css-host.mjs")),
     ("loader.mjs", include_str!("assets/start/loader.mjs")),
     ("runner.mjs", include_str!("assets/start/runner.mjs")),
     ("generate.mjs", include_str!("assets/start/generate.mjs")),

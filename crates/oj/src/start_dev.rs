@@ -45,6 +45,9 @@ struct StartState {
     workspace_root: PathBuf,
     /// Fires after a rebuild so the injected client reloads the page.
     reload_tx: broadcast::Sender<()>,
+    /// Persistent CSS compiler (PostCSS + Tailwind v4). Absent when the app has
+    /// no `@tailwindcss/postcss`; then css is served raw.
+    css_host: Option<Arc<tokio::sync::Mutex<Runner>>>,
 }
 
 pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
@@ -60,6 +63,16 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
     // Reuse the dev server for module/asset serving; the document route sits on top.
     let built = oj_server::DevServer { root: root.clone(), port, bundle: false }.build_app().await?;
     let runner = spawn_start_runner(&root, &cache).await?;
+    // Only spawn the CSS compiler when the app actually uses Tailwind's PostCSS
+    // plugin; otherwise css is served as-is.
+    let css_host = if app_uses_tailwind(&root) {
+        spawn_node_service(&root, &cache.join("css-host.mjs"))
+            .await
+            .ok()
+            .map(|r| Arc::new(tokio::sync::Mutex::new(r)))
+    } else {
+        None
+    };
     let (reload_tx, _) = broadcast::channel::<()>(16);
     let state = Arc::new(StartState {
         proxy_prefixes: built.proxy_prefixes.clone(),
@@ -68,6 +81,7 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
         live_reload: cache.join("live-reload.js"),
         workspace_root: workspace_root(&root),
         reload_tx: reload_tx.clone(),
+        css_host,
     });
 
     // Watch src/: on change, regenerate the route tree, rebuild the client, and
@@ -290,8 +304,14 @@ fn run_node(root: &Path, script: &Path, what: &str) -> anyhow::Result<()> {
 }
 
 async fn spawn_start_runner(root: &Path, cache: &Path) -> anyhow::Result<Runner> {
+    spawn_node_service(root, &cache.join("runner.mjs")).await
+}
+
+/// Spawn a persistent Node service (`runner.mjs`, `css-host.mjs`) that speaks
+/// JSON lines over stdio. stderr is inherited so its logs are visible.
+async fn spawn_node_service(root: &Path, script: &Path) -> anyhow::Result<Runner> {
     let mut child = tokio::process::Command::new("node")
-        .arg(cache.join("runner.mjs"))
+        .arg(script)
         .env("OJ_APP_ROOT", root)
         .env("NODE_ENV", "development")
         .current_dir(root)
@@ -300,10 +320,39 @@ async fn spawn_start_runner(root: &Path, cache: &Path) -> anyhow::Result<Runner>
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| anyhow::anyhow!("could not spawn start runner (node): {e}"))?;
+        .map_err(|e| anyhow::anyhow!("could not spawn node service {}: {e}", script.display()))?;
     let stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
     Ok(Runner { stdin, lines: BufReader::new(stdout).lines(), _child: child })
+}
+
+/// Whether the app depends on `@tailwindcss/postcss` (Tailwind v4 via PostCSS),
+/// so css served in dev needs compiling rather than passing through raw.
+fn app_uses_tailwind(root: &Path) -> bool {
+    std::fs::read_to_string(root.join("package.json"))
+        .map(|s| s.contains("@tailwindcss/postcss"))
+        .unwrap_or(false)
+}
+
+/// True when a stylesheet needs Tailwind/PostCSS compilation (v4 `@import
+/// "tailwindcss"` or the `@tailwind` / `@plugin` / `@apply` at-rules).
+fn needs_css_compile(src: &str) -> bool {
+    src.contains("tailwindcss") || src.contains("@tailwind") || src.contains("@plugin") || src.contains("@apply")
+}
+
+/// Compile a css file through the CSS host. Returns None on any failure so the
+/// caller can fall back to serving the raw file.
+async fn compile_css(host: &Arc<tokio::sync::Mutex<Runner>>, path: &Path) -> Option<String> {
+    let mut guard = host.lock().await;
+    let req = serde_json::json!({ "path": path.to_string_lossy() });
+    guard.stdin.write_all(format!("{req}\n").as_bytes()).await.ok()?;
+    guard.stdin.flush().await.ok()?;
+    let line = tokio::time::timeout(std::time::Duration::from_secs(30), guard.lines.next_line())
+        .await
+        .ok()?
+        .ok()??;
+    let v: serde_json::Value = serde_json::from_str(&line).ok()?;
+    v.get("css").and_then(|c| c.as_str()).map(|s| s.to_owned())
 }
 
 enum Route {
@@ -424,6 +473,23 @@ async fn serve_fs_asset(state: &StartState, abs: &str) -> Response {
     };
     if !canon.starts_with(&state.workspace_root) {
         return (StatusCode::FORBIDDEN, "oj start: asset outside workspace").into_response();
+    }
+    // Tailwind/PostCSS stylesheets are compiled by the CSS host before serving;
+    // everything else (and any compile failure) is served as-is.
+    if canon.extension().and_then(|e| e.to_str()) == Some("css") {
+        if let Some(host) = &state.css_host {
+            if let Ok(src) = tokio::fs::read_to_string(&canon).await {
+                if needs_css_compile(&src) {
+                    if let Some(css) = compile_css(host, &canon).await {
+                        return (
+                            [(header::CONTENT_TYPE, "text/css; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")],
+                            css,
+                        )
+                            .into_response();
+                    }
+                }
+            }
+        }
     }
     match tokio::fs::read(&canon).await {
         Ok(bytes) => {
