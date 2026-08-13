@@ -98,6 +98,9 @@ pub struct DevServer {
 
 struct ServerState {
     root: PathBuf,
+    /// Where static assets are served from at the URL root (Vite's publicDir);
+    /// defaults to `<root>/public`, overridden by config/vite `publicDir`.
+    public_dir: PathBuf,
     bundle: bool,
     reload_tx: broadcast::Sender<String>,
     graph: Mutex<ModuleGraph>,
@@ -324,8 +327,16 @@ impl DevServer {
         let (crawl_tx, crawl_rx) = tokio::sync::watch::channel(false);
         let (write_tx, mut write_rx) =
             tokio::sync::mpsc::channel::<(String, Arc<CachedModule>)>(65536);
+        // publicDir: config/vite value resolved against root (an absolute value
+        // wins), else the default `<root>/public`.
+        let public_dir = config
+            .public_dir
+            .as_ref()
+            .map(|p| root.join(p))
+            .unwrap_or_else(|| root.join("public"));
         let state = Arc::new(ServerState {
             root: root.clone(),
+            public_dir,
             bundle,
             reload_tx,
             graph: Mutex::new(ModuleGraph::new()),
@@ -903,7 +914,7 @@ async fn serve_path(
         }
         candidate
     } else {
-        match locate(&state.root, rel) {
+        match locate(&state.root, &state.public_dir, rel) {
             Some(file) => file,
             None => {
                 // A plugin's configureServer middleware may own this route
@@ -948,7 +959,7 @@ async fn serve_path(
         return serve_compiled(&state, &file, &url, uri.query(), &headers).await;
     }
     // JSON imported from JS becomes a module; JSON under publicDir stays raw.
-    if ext == "json" && !file.starts_with(state.root.join("public")) {
+    if ext == "json" && !file.starts_with(&state.public_dir) {
         let url = url_of(&state.root, &file);
         return serve_compiled(&state, &file, &url, uri.query(), &headers).await;
     }
@@ -1606,7 +1617,7 @@ fn normalize(path: &Path) -> PathBuf {
 
 /// Map a URL path to a file under root, refusing traversal and probing
 /// TS-first extensions for extensionless imports (`/src/App` finds `App.tsx`).
-fn locate(root: &Path, rel: &str) -> Option<PathBuf> {
+fn locate(root: &Path, public_dir: &Path, rel: &str) -> Option<PathBuf> {
     if rel.split('/').any(|seg| seg == "..") {
         return None;
     }
@@ -1622,8 +1633,8 @@ fn locate(root: &Path, rel: &str) -> Option<PathBuf> {
             }
         }
     }
-    // Vite-style publicDir: assets under <root>/public are served at root.
-    let public = root.join("public").join(rel);
+    // Vite-style publicDir: assets under the public dir are served at root.
+    let public = public_dir.join(rel);
     if public.is_file() {
         return Some(public);
     }
@@ -2031,7 +2042,7 @@ async fn registration_for(state: &Arc<ServerState>, url: &str) -> Result<String,
         PathBuf::from(abs)
     } else {
         let rel = url.trim_start_matches('/');
-        locate(&state.root, rel).ok_or_else(|| format!("no such module: {url}"))?
+        locate(&state.root, &state.public_dir, rel).ok_or_else(|| format!("no such module: {url}"))?
     };
     let (_, module) = ensure_module(state, &file, url).await?;
     let deps: serde_json::Map<String, serde_json::Value> = module
@@ -2123,7 +2134,7 @@ fn spawn_crawl(state: Arc<ServerState>, done_tx: tokio::sync::watch::Sender<bool
                     f
                 } else {
                     let rel = url.trim_start_matches('/').to_string();
-                    match locate(&state.root, &rel) { Some(f) => f, None => continue }
+                    match locate(&state.root, &state.public_dir, &rel) { Some(f) => f, None => continue }
                 };
                 let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
                 if !COMPILABLE.contains(&ext) && !matches!(ext, "css" | "scss" | "sass" | "json") {

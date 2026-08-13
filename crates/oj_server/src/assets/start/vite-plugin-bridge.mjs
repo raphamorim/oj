@@ -161,5 +161,6 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
     }
   }
 
-  return { resolveId, load, transform, generateBundle, pluginCount: plugins.length };
+  const publicDir = typeof loaded?.config?.publicDir === "string" ? loaded.config.publicDir : null;
+  return { resolveId, load, transform, generateBundle, publicDir, pluginCount: plugins.length };
 }

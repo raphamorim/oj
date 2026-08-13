@@ -66,6 +66,7 @@ try {
   process.stdout.write(
     JSON.stringify({
       base: typeof c.base === "string" ? c.base : null,
+      publicDir: typeof c.publicDir === "string" ? c.publicDir : null,
       port: typeof c.server?.port === "number" ? c.server.port : null,
       host: typeof c.server?.host === "string" ? c.server.host : null,
       define: c.define && typeof c.define === "object" ? c.define : null,

@@ -862,10 +862,11 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
     }
     fs::write(out_dir.join("index.html"), rewritten_html)?;
 
-    // Vite-style publicDir: copy <root>/public/* verbatim to the output root
-    // (favicon.ico, robots.txt, static assets). The dev server serves these
-    // live; the build must ship them.
-    copy_public_dir(&root.join("public"), &out_dir)?;
+    // Vite-style publicDir: copy the public dir (config/vite `publicDir`, else
+    // <root>/public) verbatim to the output root (favicon.ico, robots.txt,
+    // static assets). The dev server serves these live; the build must ship them.
+    let public_dir = config.public_dir.as_ref().map(|p| root.join(p)).unwrap_or_else(|| root.join("public"));
+    copy_public_dir(&public_dir, &out_dir)?;
 
     println!("oj build: {} in {:?}", out_dir.display(), started.elapsed());
     emitted.sort_by(|a, b| b.1.cmp(&a.1));

@@ -46,7 +46,7 @@ const SERVER = [
   'const HERE = dirname(fileURLToPath(import.meta.url));',
   'const CLIENT = join(HERE, "client");',
   'const PORT = process.env.PORT || 3000;',
-  'const MIME = { ".html":"text/html; charset=utf-8", ".js":"text/javascript", ".css":"text/css", ".json":"application/json", ".wasm":"application/wasm", ".ico":"image/x-icon", ".png":"image/png", ".svg":"image/svg+xml", ".woff2":"font/woff2" };',
+  'const MIME = { ".html":"text/html; charset=utf-8", ".js":"text/javascript", ".css":"text/css", ".json":"application/json", ".wasm":"application/wasm", ".ico":"image/x-icon", ".png":"image/png", ".svg":"image/svg+xml", ".webp":"image/webp", ".avif":"image/avif", ".gif":"image/gif", ".jpg":"image/jpeg", ".jpeg":"image/jpeg", ".woff2":"font/woff2", ".woff":"font/woff", ".ttf":"font/ttf", ".otf":"font/otf", ".txt":"text/plain; charset=utf-8", ".xml":"application/xml", ".webmanifest":"application/manifest+json" };',
   'function readBody(req){ return new Promise((r)=>{ const c=[]; req.on("data",(d)=>c.push(d)); req.on("end",()=>r(Buffer.concat(c))); }); }',
   'createServer(async (req, res) => {',
   '  const url = new URL(req.url, "http://" + (req.headers.host || "localhost"));',
@@ -270,8 +270,10 @@ writeFileSync(
     '}\n',
 );
 
-// 5. Copy public/.
-if (existsSync(join(APP, "public"))) cpSync(join(APP, "public"), CLIENT, { recursive: true });
+// 5. Copy the public dir (Vite's `publicDir`, resolved against the app root; an
+// absolute config value wins) into the client output.
+const publicDir = resolve(APP, clientContainer?.publicDir ?? "public");
+if (existsSync(publicDir)) cpSync(publicDir, CLIENT, { recursive: true });
 
 // 6. Prerender (SSG): render each configured route to a static HTML file the
 // server serves before falling back to SSR. Routes come from build.prerender.

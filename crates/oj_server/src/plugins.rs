@@ -67,6 +67,7 @@ pub fn plugin_source(root: &Path) -> Option<PluginSource> {
 #[derive(Debug, Default)]
 pub struct ViteValues {
     pub base: Option<String>,
+    pub public_dir: Option<String>,
     pub port: Option<u16>,
     pub host: Option<String>,
     pub define: Option<serde_json::Map<String, serde_json::Value>>,
@@ -103,6 +104,7 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
     Some(ViteValues {
         base: json.get("base").and_then(|v| v.as_str()).map(str::to_string),
+        public_dir: json.get("publicDir").and_then(|v| v.as_str()).map(str::to_string),
         port: json.get("port").and_then(|v| v.as_u64()).map(|p| p as u16),
         host: json.get("host").and_then(|v| v.as_str()).map(str::to_string),
         define: json.get("define").and_then(|v| v.as_object()).cloned(),
@@ -122,6 +124,9 @@ pub fn adopt_vite_config_values(config: &mut oj_config::OjConfig, root: &Path) {
     };
     if config.base.is_none() {
         config.base = v.base;
+    }
+    if config.public_dir.is_none() {
+        config.public_dir = v.public_dir;
     }
     if let Some(vdef) = v.define {
         let def = config.define.get_or_insert_with(Default::default);
