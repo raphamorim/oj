@@ -56,12 +56,43 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("app root not found: {}: {e}", root.display()))?;
     let cache = root.join(".oj-cache").join("start");
     oj_server::write_start_assets(&cache)?;
-    generate_route_tree(&root, &cache)?;
-    run_node(&root, &cache.join("gen-resolver.mjs"), "server-fn resolver")?;
-    bundle_client_entry(&root, &cache)?;
 
+    // Cold start, parallelized. These are otherwise-idle `node` spawns that used
+    // to run strictly back to back. Only two real dependencies constrain them:
+    // the client bundle esbuild's the router, which imports `routeTree.gen.ts`,
+    // and the runner imports the server entry (route tree + server-fn resolver)
+    // and the bundle's manifest. Everything else overlaps.
+    //
+    //   route-tree gen ─┬─────────────────┐
+    //   resolver gen ───┼──(both done)────┴─> client bundle ─┐
+    //                   └──> build_app (Rust) ───────────────┴─> runner
+    //
+    // Route-tree and resolver generation are independent node processes: launch
+    // both at once instead of one, then the other.
+    let route_tree = {
+        let (root, cache) = (root.clone(), cache.clone());
+        tokio::task::spawn_blocking(move || generate_route_tree(&root, &cache))
+    };
+    let resolver = {
+        let (root, cache) = (root.clone(), cache.clone());
+        tokio::task::spawn_blocking(move || {
+            run_node(&root, &cache.join("gen-resolver.mjs"), "server-fn resolver")
+        })
+    };
+    // The client bundle needs the route tree; the Rust dev-server build overlaps
+    // it (build_app crawls the same source but writes nothing the bundle reads).
+    route_tree.await??;
+    let bundle = {
+        let (root, cache) = (root.clone(), cache.clone());
+        tokio::task::spawn_blocking(move || bundle_client_entry(&root, &cache))
+    };
     // Reuse the dev server for module/asset serving; the document route sits on top.
-    let built = oj_server::DevServer { root: root.clone(), port, bundle: false }.build_app().await?;
+    let built_fut = oj_server::DevServer { root: root.clone(), port, bundle: false }.build_app();
+    let (bundle_res, built_res) = tokio::join!(bundle, built_fut);
+    bundle_res??;
+    resolver.await??;
+    let built = built_res?;
+    // Runner needs the route tree, resolver, and the bundle's manifest — all done.
     let runner = spawn_start_runner(&root, &cache).await?;
     // Only spawn the CSS compiler when the app actually uses Tailwind's PostCSS
     // plugin; otherwise css is served as-is.
