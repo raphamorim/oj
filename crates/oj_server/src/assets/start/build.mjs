@@ -254,7 +254,9 @@ await esbuild.build({
     ...viteEnvDefine({ ssr: true, mode: "production" }),
   },
   // CJS deps bundled into ESM need a working `require` for node builtins.
-  banner: { js: "import { createRequire as ___cr } from 'node:module'; const require = ___cr(import.meta.url);" },
+  // `import.meta.url` is undefined on Cloudflare Workers (workerd); fall back to
+  // a valid file url so createRequire never receives undefined and crashes init.
+  banner: { js: "import { createRequire as ___cr } from 'node:module'; const require = ___cr(import.meta.url || 'file:///worker.js');" },
   plugins: [
     makeVitePlugins({ container: serverContainer, fallback: clientContainer, appRoot: APP, mode: "prod", emit }),
     serverFnPlugin,
