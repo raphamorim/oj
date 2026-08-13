@@ -116,6 +116,27 @@ test("emit compiles CSS via compileCss before rewriting when it needs it", async
   }
 });
 
+test("emit records emitted stylesheet urls (not other assets)", async () => {
+  const base = tmp("cssurls");
+  try {
+    const dir = join(base, "s");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "a.css"), ".a{color:red}");
+    writeFileSync(join(dir, "b.css"), ".b{color:blue}");
+    writeFileSync(join(dir, "logo.png"), "PNG");
+    const emit = contentHashEmitter(join(base, "client"));
+    const aUrl = await emit(join(dir, "a.css"));
+    await emit(join(dir, "logo.png")); // not a stylesheet
+    const bUrl = await emit(join(dir, "b.css"));
+    await emit(join(dir, "a.css")); // idempotent, no duplicate
+    const urls = emit.cssUrls();
+    assert.deepEqual(urls, [aUrl, bUrl], "only stylesheets, in order, deduped");
+    assert.ok(!urls.some((u) => u.endsWith(".png")), "non-css assets excluded");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
 test("emit does not compile plain CSS (no markers)", async () => {
   const base = tmp("plain");
   try {

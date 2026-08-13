@@ -214,10 +214,17 @@ if (clientContainer) {
   });
 }
 
-// 2. Manifest pointing at the hashed client entry.
+// 2. Manifest: the hashed client entry, plus the emitted stylesheets on the
+// root route so HeadContent links them in the SSR <head> (no flash of unstyled
+// content on first paint; the client bundle no longer injects them).
+const rootManifest = {
+  preloads: [clientUrl],
+  css: emit.cssUrls(),
+  scripts: [{ attrs: { type: "module", async: true, src: clientUrl } }],
+};
 writeFileSync(
   join(HERE, "manifest.ts"),
-  `export const tsrStartManifest = () => ({ routes: { __root__: { preloads: [${JSON.stringify(clientUrl)}], scripts: [{ attrs: { type: "module", async: true, src: ${JSON.stringify(clientUrl)} } }] } } });\n`,
+  `export const tsrStartManifest = () => (${JSON.stringify({ routes: { __root__: rootManifest } })});\n`,
 );
 
 // 3. Server bundle (Node, fully bundled so the framework `#`-import aliases

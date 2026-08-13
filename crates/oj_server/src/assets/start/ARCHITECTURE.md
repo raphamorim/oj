@@ -225,7 +225,10 @@ about 40ms instead of respawning the process.
 Client and server builds emit assets through the same `contentHashEmitter`, so
 both produce identical `/assets/<hash>` URLs for identical bytes with no shared
 manifest. CSS is emitted with its `url()` references rewritten and its
-referenced fonts and images emitted alongside.
+referenced fonts and images emitted alongside. The emitter records the
+stylesheet urls, which the manifest lists under the root route's `css` so
+`HeadContent` links them in the SSR `<head>` (no flash of unstyled content); the
+client bundle no longer injects the link in production.
 
 ### The two esbuild passes
 

@@ -123,6 +123,14 @@ async function prodPhase() {
   try {
     await waitUp(port);
     await assertApp(port, "start-prod");
+    // no flash of unstyled content: the emitted stylesheet is linked in the SSR
+    // <head> (via the manifest), not injected client-side.
+    const home = await get(port, "/");
+    const head = home.body.slice(0, home.body.indexOf("</head>"));
+    if (!/<link[^>]*rel="stylesheet"[^>]*\.css/.test(head)) {
+      throw new Error("prod: stylesheet not linked in the SSR head (FOUC)");
+    }
+    console.log("start-prod: stylesheet linked in SSR head (no FOUC) ok");
   } finally {
     srv.kill("SIGKILL");
   }

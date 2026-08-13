@@ -132,6 +132,20 @@ it("css import is a no-op on the server and a <link> on the dev client", async (
   assert.match(client.text, /rel = "stylesheet"|rel="stylesheet"/, "the link should be a stylesheet");
 });
 
+it("prod client css import emits the stylesheet but injects no link", async () => {
+  const files = {
+    "styles.css": ".a{color:red}",
+    "entry.js": 'import "./styles.css"; export const ok = 1;',
+  };
+  const emitted = [];
+  const spyEmit = async (abs) => (emitted.push(abs), "/assets/" + basename(abs));
+  const out = await bundle(files, () => [assetsPlugin({ mode: "prod", server: false, emit: spyEmit })]);
+  // no runtime <link> injection: the manifest links it in the SSR head instead
+  assert.doesNotMatch(out.text, /createElement\("link"\)/, "prod client must not inject a link");
+  // but the stylesheet was still emitted (so it can be linked from the head)
+  assert.ok(emitted.some((p) => p.endsWith("styles.css")), "css still emitted in prod");
+});
+
 it("routes virtual: ids and .mdx through the plugin container", async () => {
   const files = {
     "doc.mdx": "# Title\nmdx body",

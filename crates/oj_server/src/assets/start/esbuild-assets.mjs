@@ -74,9 +74,12 @@ export function assetsPlugin({ mode = "dev", server = false, fsBase = "/@oj-star
       build.onLoad({ filter: /.*/, namespace: "oj-css" }, async (a) => {
         // Styling is a client concern; on the server a css import is a no-op.
         if (server) return { contents: "export default {};", loader: "js" };
-        // Inject a <link> to the stylesheet (dev-served or emitted), which keeps
-        // relative url() refs resolving against the file's own directory.
+        // Emit / resolve the stylesheet either way (prod records the url on the
+        // emitter). In prod the SSR head links it via the manifest, so the
+        // client import stays a no-op and avoids a duplicate <link>. In dev
+        // there is no manifest css, so inject the <link> at runtime.
         const href = await urlFor(a.path);
+        if (mode !== "dev") return { contents: "export default {};", loader: "js" };
         return {
           contents:
             `const l=document.createElement("link");l.rel="stylesheet";` +
@@ -227,6 +230,9 @@ export function contentHashEmitter(clientDir, compileCss) {
   const assetsDir = join(clientDir, "assets");
   const seen = new Set();
   const emitting = new Set();
+  // Top-level stylesheet urls, in emit order. The prod build feeds these into
+  // the manifest so the SSR head links them (no flash of unstyled content).
+  const cssUrls = [];
 
   const write = (absPath, buf) => {
     const ext = extname(absPath);
@@ -246,7 +252,9 @@ export function contentHashEmitter(clientDir, compileCss) {
       try {
         let css = readFileSync(absPath, "utf8");
         if (compileCss && needsCssCompile(css)) css = await compileCss(absPath, css);
-        return write(absPath, Buffer.from(await rewriteCss(css, dirname(absPath)), "utf8"));
+        const url = write(absPath, Buffer.from(await rewriteCss(css, dirname(absPath)), "utf8"));
+        if (!cssUrls.includes(url)) cssUrls.push(url);
+        return url;
       } finally {
         emitting.delete(absPath);
       }
@@ -273,6 +281,8 @@ export function contentHashEmitter(clientDir, compileCss) {
     return out + css.slice(last);
   }
 
+  // The stylesheets emitted so far (top-level `.css` imports, not url() refs).
+  emit.cssUrls = () => cssUrls.slice();
   return emit;
 }
 
