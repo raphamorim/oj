@@ -44,6 +44,8 @@ oxc_resolver = "11.24.2"
 
 anyhow = "1.0.104"
 blake3 = "1.8.6"
+memchr = "2.8.3"
+simdutf8 = "0.1.5"
 thiserror = "2.0.20"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

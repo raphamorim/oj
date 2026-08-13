@@ -31,6 +31,22 @@ use oj_graph::{HmrDecision, ModuleGraph};
 use oj_resolver::OjResolver;
 use tokio::sync::broadcast;
 
+/// Turn freshly-read file bytes into a `String`, validating UTF-8 with SIMD
+/// (`simdutf8`) instead of the standard library's scalar check, then reusing the
+/// validated buffer directly (no re-validation, no copy). Every module read on
+/// the cold-start crawl goes through here. On invalid UTF-8 it returns the same
+/// `InvalidData` error `read_to_string` would.
+fn bytes_to_string(bytes: Vec<u8>) -> std::io::Result<String> {
+    match simdutf8::basic::from_utf8(&bytes) {
+        // SAFETY: simdutf8 fully validated `bytes` as UTF-8 on this branch.
+        Ok(_) => Ok(unsafe { String::from_utf8_unchecked(bytes) }),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )),
+    }
+}
+
 const CLIENT_JS: &str = include_str!("assets/client.js");
 /// Built-in `virtual:oj-routes` module: a file-based route manifest globbed
 /// from `<root>/src/routes`. Shared by the dev server and `oj build`.
@@ -504,7 +520,7 @@ async fn ssr_module(
     let path = PathBuf::from(id);
     // Real file, or (for a plugin-resolved id with no file, a virtual module)
     // the "ssr" plugin host's load hook.
-    let (source, from_plugin) = match std::fs::read_to_string(&path) {
+    let (source, from_plugin) = match std::fs::read(&path).and_then(bytes_to_string) {
         Ok(s) => (s, false),
         Err(read_err) => match ssr_plugin_host(&state).await {
             Some(host) => match host.load(id).await {
@@ -1083,9 +1099,10 @@ async fn ensure_module(
     file: &Path,
     url: &str,
 ) -> Result<(String, Arc<CachedModule>), String> {
-    let source = tokio::fs::read_to_string(file)
-        .await
-        .map_err(|err| format!("read error for {url}: {err}"))?;
+    let source = bytes_to_string(
+        tokio::fs::read(file).await.map_err(|err| format!("read error for {url}: {err}"))?,
+    )
+    .map_err(|err| format!("read error for {url}: {err}"))?;
     if file.extension().and_then(|e| e.to_str()) == Some("css") && is_tailwind_css(&source) {
         let css = compile_tailwind(state, url, &source).await?;
         let module = Arc::new(CachedModule {

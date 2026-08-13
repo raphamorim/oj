@@ -15,7 +15,9 @@ pub mod glob;
 pub mod json;
 
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
+use memchr::memmem::Finder;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{Program, Statement, StringLiteral};
 use oxc_codegen::{Codegen, CodegenOptions, CodegenReturn};
@@ -28,6 +30,14 @@ use oxc_transformer_plugins::{ReplaceGlobalDefines, ReplaceGlobalDefinesConfig};
 /// Maps an import specifier to a replacement (e.g. `./App` becomes
 /// `/src/App.tsx`). Returning `None` leaves the specifier untouched.
 pub type ImportRewriter<'r> = dyn FnMut(&str) -> Option<String> + 'r;
+
+// SIMD substring finders for the per-module gating prescans. `str::contains`
+// with a multi-byte needle is the scalar Two-Way algorithm; `memmem::Finder`
+// is SIMD-accelerated and its shift table is built once here, not per call.
+// Every compiled module runs these three scans over its full source/output.
+static F_IMPORT_META_ENV: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new("import.meta.env"));
+static F_IMPORT_META_GLOB: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new("import.meta.glob"));
+static F_REFRESH_REG: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new("$RefreshReg$("));
 
 /// `import.meta.env.*` define pairs, set once at dev/build startup from the
 /// app's `.env` files. Unset (e.g. in unit tests) falls back to built-ins.
@@ -103,7 +113,7 @@ impl CompileOutput {
     /// Whether the Fast Refresh transform registered any components here.
     /// Modules where this is true are HMR boundary candidates.
     pub fn has_refresh_registrations(&self) -> bool {
-        self.code.contains("$RefreshReg$(")
+        F_REFRESH_REG.find(self.code.as_bytes()).is_some()
     }
 }
 
@@ -223,7 +233,7 @@ pub fn compile_module(
     // Static define replacement (import.meta.env plus config/env `define`),
     // gated on a substring test so modules without defines pay nothing.
     let defines = import_meta_env_defines(opts.dev);
-    let needs_defines = source_text.contains("import.meta.env")
+    let needs_defines = F_IMPORT_META_ENV.find(source_text.as_bytes()).is_some()
         || defines
             .iter()
             .any(|(k, _)| !k.starts_with("import.meta") && source_text.contains(k.as_str()));
@@ -237,7 +247,7 @@ pub fn compile_module(
 
     // Expand import.meta.glob before specifier rewriting, so the generated
     // import()/import statements get canonicalized to URLs by the rewriter.
-    if source_text.contains("import.meta.glob") {
+    if F_IMPORT_META_GLOB.find(source_text.as_bytes()).is_some() {
         let dir = path.parent().unwrap_or(path);
         glob::expand(&allocator, dir, &mut program);
     }
