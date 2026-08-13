@@ -168,6 +168,33 @@ overridable with `OJ_RUNNER_ENTRY` and `OJ_RUNNER_LOADER`, which the protocol
 test uses to drive the framing against stubs without the loader's esbuild
 bootstrap.
 
+### The watcher
+
+A dedicated OS thread runs a `notify` recursive watcher on `src/` and bridges
+its events into the tokio runtime. The thread keeps `prev_routes`, the route
+file set from the last pass, so it can tell a structural change from a content
+edit.
+
+Each pass:
+
+1. Debounce. On the first event it collects the changed paths, then keeps
+   draining events on a 50ms timeout, coalescing every path into one batch. This
+   collapses an editor's save-storm (or a multi-file change) into a single
+   rebuild.
+2. Ignore its own output. A batch that only touches the generated
+   `routeTree.gen.ts` is skipped, so regenerating the tree cannot trigger
+   another pass.
+3. Regenerate conditionally, because both generators cost more as the app grows:
+   - the route tree only when the route file SET changed (add / remove / rename),
+     compared against `prev_routes`; a content edit leaves the tree alone.
+   - the server-fn resolver only when a `.ts`/`.tsx` file that contains
+     `createServerFn` was added, removed, or edited (or when the routes changed).
+4. Rebuild and reload, concurrently: the client entry re-bundles on a blocking
+   task while `reload_runner` warm-reloads the SSR process (`{cmd:"reload"}` over
+   its stdin, awaiting the ack). Both are awaited together with `tokio::join`.
+5. Signal the page. A broadcast on `reload_tx` reaches every `/@oj-start/hmr`
+   WebSocket, which tells the live-reload client to snapshot state and reload.
+
 ### Warm reload
 
 On a rebuild the runner bumps a version counter and re-imports the server entry
