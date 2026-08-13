@@ -322,14 +322,33 @@ plugin container, glob, env, assets, and shims.
 
 ## Server functions
 
-`createServerFn(...).handler(fn)` is transformed on both sides. The server side
-rewrites it to a provider shape (`createServerRpc(meta, opts => NAME.__executeServer(opts))`)
-so the handler runs in process during SSR. The client side replaces the handler
-with `createClientRpc(id)` so the browser makes an HTTP RPC. The id is
-`base64url(<relpath>#<name>)`, identical across the loader, the resolver, and
-the client transform. RPC requests hit `/_serverFn/<id>`, are dispatched by the
-framework's `handleServerAction` through the generated resolver, and enforce a
-same-origin CSRF check.
+`createServerFn(...).handler(fn)` compiles to different code on each side, tied
+together by one id: `base64url(<app-relative path>#<name>)`, computed identically
+everywhere so a browser call can find its handler.
+
+Three transform sites share that id:
+
+- Server (SSR). The dev loader (`rewriteServerFns`) and the prod build's server
+  pass rewrite `const NAME = createServerFn(...).handler(FN)` to pass
+  `createServerRpc(meta, (opts) => NAME.__executeServer(opts))` as the first
+  `.handler` argument and to export `NAME_createServerFn_handler`. The handler
+  runs in process during SSR, and the export is importable by the resolver.
+- Client. The dev client bundle and the prod build's client pass replace that
+  first argument with `createClientRpc(id)`. The runtime treats argument one as
+  the extracted function, so the browser makes an HTTP RPC to `/_serverFn/<id>`
+  instead of running the handler.
+- The resolver. `gen-resolver.mjs` scans `src/` for the same declarations and
+  writes a manifest mapping each id to its module's exported handler, using
+  static relative imports so it resolves in both the dev loader hook and the
+  bundled prod server (a runtime `import` of a `.ts` would fail in the bundle).
+  It exports `getServerFnById(id)` behind the `#tanstack-start-server-fn-resolver`
+  alias.
+
+An RPC hits `/_serverFn/<id>`; the framework's `handleServerAction` looks the id
+up through the resolver, runs the handler, and returns the result. In dev the
+request loop forwards `/_serverFn/` requests whole (method, headers, body) to the
+runner; in prod the server bundle handles them directly. Both build the request
+origin from the Host header so the framework's same-origin CSRF check passes.
 
 ## Testing
 
