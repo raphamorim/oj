@@ -37,7 +37,37 @@ pub type ImportRewriter<'r> = dyn FnMut(&str) -> Option<String> + 'r;
 // Every compiled module runs these three scans over its full source/output.
 static F_IMPORT_META_ENV: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new("import.meta.env"));
 static F_IMPORT_META_GLOB: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new("import.meta.glob"));
-static F_REFRESH_REG: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new("$RefreshReg$("));
+
+/// Whether a transformed program contains a `$RefreshReg$(...)` registration
+/// call — the semantic signal that Fast Refresh instrumented a component in this
+/// module, so it can be an HMR boundary. Detected by walking the AST rather than
+/// scanning the generated text, so a literal `$RefreshReg$(` inside a string or
+/// comment can never produce a false boundary (and over-invalidate on edit).
+pub(crate) fn detect_refresh_registrations(program: &Program) -> bool {
+    use oxc_ast::ast::{CallExpression, Expression};
+    use oxc_ast_visit::{Visit, walk};
+
+    struct Detector {
+        found: bool,
+    }
+    impl<'a> Visit<'a> for Detector {
+        fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+            if self.found {
+                return;
+            }
+            if let Expression::Identifier(id) = &call.callee {
+                if id.name == "$RefreshReg$" {
+                    self.found = true;
+                    return;
+                }
+            }
+            walk::walk_call_expression(self, call);
+        }
+    }
+    let mut detector = Detector { found: false };
+    detector.visit_program(program);
+    detector.found
+}
 
 /// `import.meta.env.*` define pairs, set once at dev/build startup from the
 /// app's `.env` files. Unset (e.g. in unit tests) falls back to built-ins.
@@ -99,6 +129,10 @@ pub struct CompileOutput {
     /// Final specifiers of static imports and re-exports, post-rewrite.
     /// Type-only imports are already erased and never appear here.
     pub imports: Vec<String>,
+    /// Whether the Fast Refresh transform emitted a `$RefreshReg$` registration.
+    /// Detected on the transformed AST (see `detect_refresh_registrations`), not
+    /// by scanning the generated text.
+    pub is_refresh_boundary: bool,
 }
 
 impl CompileOutput {
@@ -113,7 +147,7 @@ impl CompileOutput {
     /// Whether the Fast Refresh transform registered any components here.
     /// Modules where this is true are HMR boundary candidates.
     pub fn has_refresh_registrations(&self) -> bool {
-        F_REFRESH_REG.find(self.code.as_bytes()).is_some()
+        self.is_refresh_boundary
     }
 }
 
@@ -254,6 +288,11 @@ pub fn compile_module(
 
     let imports = rewrite_module_specifiers(&allocator, &mut program, &mut rewriter);
 
+    // Fast Refresh boundary, decided semantically on the transformed AST (only
+    // when the refresh transform ran). Cheaper than it looks: no separate text
+    // scan, and precise where a string scan would over-invalidate.
+    let is_refresh_boundary = opts.refresh && detect_refresh_registrations(&program);
+
     let codegen_options = CodegenOptions {
         source_map_path: opts.sourcemap.then(|| path.to_path_buf()),
         ..CodegenOptions::default()
@@ -261,7 +300,7 @@ pub fn compile_module(
     let CodegenReturn { code, map, .. } =
         Codegen::new().with_options(codegen_options).build(&program);
 
-    Ok(CompileOutput { code, map_data_url: map.map(|m| m.to_data_url()), imports })
+    Ok(CompileOutput { code, map_data_url: map.map(|m| m.to_data_url()), imports, is_refresh_boundary })
 }
 
 /// Collect (and optionally rewrite) the source specifiers of all static

@@ -46,11 +46,13 @@ pub struct FactoryOutput {
     /// in-factory `require`.
     pub require_map: Vec<(String, String)>,
     pub kind: FactoryKind,
+    /// Fast Refresh registered a component (AST-detected, ESM only).
+    pub is_refresh_boundary: bool,
 }
 
 impl FactoryOutput {
     pub fn is_boundary(&self) -> bool {
-        self.kind == FactoryKind::Esm && self.code.contains("$RefreshReg$(")
+        self.kind == FactoryKind::Esm && self.is_refresh_boundary
     }
 }
 
@@ -86,7 +88,13 @@ fn compile_cjs_factory(
             require_map.push((spec.clone(), target));
         }
     }
-    Ok(FactoryOutput { code: analyzed.body, imports, require_map, kind: FactoryKind::Cjs })
+    Ok(FactoryOutput {
+        code: analyzed.body,
+        imports,
+        require_map,
+        kind: FactoryKind::Cjs,
+        is_refresh_boundary: false,
+    })
 }
 
 struct Replacement {
@@ -134,6 +142,10 @@ fn compile_esm_factory(
             ret.diagnostics.into_iter().map(|d| format!("{d:?}")).collect::<Vec<_>>().join("\n");
         return Err(CompileError::Transform { path: path.to_path_buf(), message });
     }
+
+    // Fast Refresh boundary, decided on the transformed AST before the factory
+    // rewrite mangles the body (semantic, not a text scan of the output).
+    let is_refresh_boundary = refresh && crate::detect_refresh_registrations(&program);
 
     // import.meta.env static replacement: the factory is a plain function
     // where `import.meta` is invalid, so it must be replaced away here.
@@ -334,7 +346,13 @@ fn compile_esm_factory(
     program.body = new_body;
 
     let code = Codegen::new().build(&program).code;
-    Ok(FactoryOutput { code, imports: import_vars, require_map: Vec::new(), kind: FactoryKind::Esm })
+    Ok(FactoryOutput {
+        code,
+        imports: import_vars,
+        require_map: Vec::new(),
+        kind: FactoryKind::Esm,
+        is_refresh_boundary,
+    })
 }
 
 /// `__oj_default = <placeholder>` with the real expression transplanted in.
