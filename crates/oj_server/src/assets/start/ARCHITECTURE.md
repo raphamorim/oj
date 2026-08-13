@@ -227,6 +227,35 @@ both produce identical `/assets/<hash>` URLs for identical bytes with no shared
 manifest. CSS is emitted with its `url()` references rewritten and its
 referenced fonts and images emitted alongside.
 
+### The two esbuild passes
+
+The client pass targets the browser: minified, hashed, code-split, with browser
+conditions and the node-builtin shims, entered at the hydration `client-entry`.
+The server pass targets Node: `platform: node`, node builtins external, fully
+bundled so the framework's `#`-import aliases resolve at build time, and
+code-split rather than single-file because the framework's server module uses
+top-level await that esbuild's single-file lazy-init wrapper cannot always
+propagate. Both passes run the same plugin container (svgr, mdx, virtuals) and
+the same asset plugins; the server container falls back to the client one for
+`load`, since some ssr plugins expect cross-environment state Vite would share.
+
+### The prod server entrypoints
+
+The build writes two runtime entrypoints wrapping the same `server-bundle.mjs`.
+
+`server.mjs` is a Node `http` server, for `node dist/server.mjs`. It first
+registers `cf-loader.mjs`, a resolve hook that maps the framework's runtime,
+variable `import("@cloudflare/vite-plugin/server")` (which escapes the
+build-time alias) to the bundled `cf-server.mjs` shim. On a GET it tries the
+exact static file and then the prerendered `<path>/index.html` under
+`dist/client` before falling back to the handler's `fetch`; a request for
+`.../index.html` is folded to `.../` so the router matches the directory route.
+
+`worker.mjs` is the edge Web `fetch` handler for a Cloudflare Worker. It needs
+neither the loader nor the shim, because a real deployment gets its bindings
+from `cloudflare:workers`. (See Known limits for why a large app's worker can
+exceed the size cap.)
+
 ## The plugin container (`vite-plugin-bridge.mjs`)
 
 `loadPluginContainer(app, { command, mode, environment })` loads the app's
