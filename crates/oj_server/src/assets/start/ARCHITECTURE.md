@@ -105,6 +105,41 @@ pipeline. `/@oj-start/` owns the live-reload WebSocket, the client entry, and
 `/@oj-start/fs/<abspath>` (asset files served from the workspace root, so
 relative `url()` refs inside CSS resolve).
 
+### The request loop
+
+The adapter is a single axum `from_fn` middleware (`start_route`) layered over
+the normal oj dev server's router. Every request passes through it; SSR is an
+interception and anything the middleware does not claim falls through to the
+base dev pipeline (module compilation, asset serving) via `next.run`.
+
+The middleware handles, in order:
+
+1. `/@oj-start/hmr`: upgrade to the live-reload WebSocket. It subscribes to a
+   broadcast channel and sends `reload` on every rebuild.
+2. `/@oj-start/client-entry.js` and `/@oj-start/live-reload.js`: serve the two
+   cached dev scripts (`no-cache`, so a rebuild always wins).
+3. `/@oj-start/fs<abspath>`: `serve_fs_asset`. The path after the prefix is the
+   file's real absolute path; it is percent-decoded, canonicalized, and rejected
+   with 403 if it escapes the workspace root. A Tailwind stylesheet is compiled
+   by the CSS host before serving; everything else is streamed as-is with a
+   `Content-Type` from its extension.
+4. `/_serverFn/...`: a server-function RPC. The whole request (method, headers,
+   body, capped at 4MB) is forwarded to the runner, which dispatches it through
+   the framework's `handleServerAction`.
+5. Otherwise `classify` decides: a GET for an extensionless path or `index.html`
+   (and not a proxied prefix) is a `Document`, forwarded to the runner as a GET
+   with `document_url` applied (`.../index.html` becomes `.../`); everything else
+   is `Pass`, handed to the base dev server.
+
+`forward` is the one path to the runner. Because there is a single runner
+process with one stdin/stdout, calls are serialized behind an async mutex and
+run in a detached task, so a client that disconnects mid-request still drains
+the runner's reply line and the protocol stays in frame. On the way back it
+rebuilds the axum response: the status, the headers (minus the framing ones,
+`content-length` / `content-encoding` / `transfer-encoding`, since the body is
+re-sent verbatim), and the body, with the live-reload client injected before
+`</body>` for HTML documents.
+
 ### The runner protocol (`runner.mjs`)
 
 `start_dev` and the runner talk over the runner's stdio in newline-delimited
