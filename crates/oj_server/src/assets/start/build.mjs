@@ -186,7 +186,10 @@ const client = await esbuild.build({
     "@tanstack/start-fn-stubs": join(HERE, "fn-stubs.mjs"),
   },
   define: {
-    "process.env.NODE_ENV": '"production"', "process.env.TSS_SERVER_FN_BASE": '"/_serverFn/"',
+    // Whole-object replacement so any framework `process.env.X` read inlines
+    // (unknown keys -> undefined) instead of touching the global at runtime; a
+    // split chunk can evaluate before the entry banner sets it. See bundle-client.
+    "process.env": '{"NODE_ENV":"production","TSS_SERVER_FN_BASE":"/_serverFn/"}',
     global: "globalThis", ...viteEnvDefine({ ssr: false, mode: "production" }),
   },
   banner: { js: 'globalThis.process=globalThis.process||{env:{NODE_ENV:"production",TSS_SERVER_FN_BASE:"/_serverFn/"}};globalThis.global=globalThis.global||globalThis;' },

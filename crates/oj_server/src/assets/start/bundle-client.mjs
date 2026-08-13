@@ -89,8 +89,12 @@ await esbuild.build({
     "@tanstack/start-fn-stubs": join(HERE, "fn-stubs.mjs"),
   },
   define: {
-    "process.env.NODE_ENV": '"development"',
-    "process.env.TSS_SERVER_FN_BASE": JSON.stringify(SERVER_FN_BASE),
+    // Replace the whole `process.env` object so any framework read
+    // (TSS_ROUTER_BASEPATH, TSS_INLINE_CSS_ENABLED, ...) inlines to a value.
+    // A dotted define would leave unknown keys as a runtime `process.env`
+    // access, which throws in a split chunk that ESM evaluates before the entry
+    // banner runs. Missing keys become `undefined`, which the framework accepts.
+    "process.env": JSON.stringify({ NODE_ENV: "development", TSS_SERVER_FN_BASE: SERVER_FN_BASE }),
     global: "globalThis",
     ...viteEnvDefine({ ssr: false }),
   },

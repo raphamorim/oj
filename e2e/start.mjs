@@ -115,6 +115,17 @@ async function prodPhase() {
   for (const f of ["server.mjs", "server-bundle.mjs", "client"]) {
     if (!fs.existsSync(path.join(dist, f))) throw new Error(`prod: dist/${f} missing`);
   }
+  // process.env is defined as an object, so no bare `process.env.X` runtime
+  // access survives to crash hydration (e.g. process.env.TSS_ROUTER_BASEPATH).
+  const clientDir = path.join(dist, "client", "assets");
+  const clientJs = fs
+    .readdirSync(clientDir)
+    .filter((f) => f.startsWith("client-") && f.endsWith(".js"))
+    .map((f) => fs.readFileSync(path.join(clientDir, f), "utf8"))
+    .join("");
+  if (/process\.env\.[A-Za-z_]/.test(clientJs)) {
+    throw new Error("prod: client bundle has a bare process.env access (would crash hydration)");
+  }
   const port = 3098;
   // cwd is the app root so the Cloudflare shim finds wrangler.jsonc.
   const srv = spawn("node", [path.join(dist, "server.mjs")], {
