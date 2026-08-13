@@ -92,7 +92,15 @@ async function assertApp(port, label) {
   if (!asset.body.includes("public-dir-marker")) {
     throw new Error(`${label}: publicDir asset not served`);
   }
-  console.log(`${label}: ${want.length} features + /about + publicDir ok`);
+
+  // No flash of unstyled content: the app's stylesheet is linked in the SSR
+  // <head> (via the manifest) in both dev and prod, not injected client-side.
+  const head = h.slice(0, h.indexOf("</head>"));
+  if (!/<link[^>]*rel="stylesheet"[^>]*\.css/.test(head)) {
+    throw new Error(`${label}: stylesheet not linked in the SSR head (FOUC)`);
+  }
+
+  console.log(`${label}: ${want.length} features + /about + publicDir + css-in-head ok`);
 }
 
 async function devPhase() {
@@ -134,14 +142,6 @@ async function prodPhase() {
   try {
     await waitUp(port);
     await assertApp(port, "start-prod");
-    // no flash of unstyled content: the emitted stylesheet is linked in the SSR
-    // <head> (via the manifest), not injected client-side.
-    const home = await get(port, "/");
-    const head = home.body.slice(0, home.body.indexOf("</head>"));
-    if (!/<link[^>]*rel="stylesheet"[^>]*\.css/.test(head)) {
-      throw new Error("prod: stylesheet not linked in the SSR head (FOUC)");
-    }
-    console.log("start-prod: stylesheet linked in SSR head (no FOUC) ok");
   } finally {
     srv.kill("SIGKILL");
   }

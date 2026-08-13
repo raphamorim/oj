@@ -117,7 +117,7 @@ it("?url resolves to the dev fs route in dev mode", async () => {
   assert.doesNotMatch(text, /\/assets\/logo\.png/, "dev should not emit a hashed /assets url");
 });
 
-it("css import is a no-op on the server and a <link> on the dev client", async () => {
+it("css import is a no-op module and records the url (dev client)", async () => {
   const files = {
     "styles.css": ".a{color:red}",
     "entry.js": 'import "./styles.css"; export const ok = 1;',
@@ -125,11 +125,14 @@ it("css import is a no-op on the server and a <link> on the dev client", async (
   const server = await bundle(files, () => [assetsPlugin({ mode: "prod", server: true, emit })]);
   assert.doesNotMatch(server.text, /createElement\("link"\)/, "server css import must not touch the DOM");
 
+  // The dev client no longer injects a <link> at runtime; it records the url so
+  // the SSR head links it (via the manifest). The import itself is a no-op.
+  const cssUrls = [];
   const client = await bundle(files, () => [
-    assetsPlugin({ mode: "dev", server: false, fsBase: "/@oj-start/fs" }),
+    assetsPlugin({ mode: "dev", server: false, fsBase: "/@oj-start/fs", cssUrls }),
   ]);
-  assert.match(client.text, /createElement\("link"\)/, "dev client css import should inject a <link>");
-  assert.match(client.text, /rel = "stylesheet"|rel="stylesheet"/, "the link should be a stylesheet");
+  assert.doesNotMatch(client.text, /createElement\("link"\)/, "dev client must not inject a link");
+  assert.ok(cssUrls.some((u) => u.startsWith("/@oj-start/fs") && u.endsWith("styles.css")), `recorded: ${cssUrls}`);
 });
 
 it("prod client css import emits the stylesheet but injects no link", async () => {

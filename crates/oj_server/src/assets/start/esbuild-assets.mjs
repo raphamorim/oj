@@ -28,7 +28,7 @@ const ASSET_EXT = /\.(png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|eot|mp4|webm|wa
 // it resolves immediately to the /@oj-start/fs URL.
 const makeUrlFor = ({ mode, fsBase, emit }) => async (abs) => (mode === "dev" ? fsBase + abs : emit(abs));
 
-export function assetsPlugin({ mode = "dev", server = false, fsBase = "/@oj-start/fs", emit } = {}) {
+export function assetsPlugin({ mode = "dev", server = false, fsBase = "/@oj-start/fs", emit, cssUrls } = {}) {
   const urlFor = makeUrlFor({ mode, fsBase, emit });
   const urlModule = async (abs) => `export default ${JSON.stringify(await urlFor(abs))};`;
   return {
@@ -74,18 +74,13 @@ export function assetsPlugin({ mode = "dev", server = false, fsBase = "/@oj-star
       build.onLoad({ filter: /.*/, namespace: "oj-css" }, async (a) => {
         // Styling is a client concern; on the server a css import is a no-op.
         if (server) return { contents: "export default {};", loader: "js" };
-        // Emit / resolve the stylesheet either way (prod records the url on the
-        // emitter). In prod the SSR head links it via the manifest, so the
-        // client import stays a no-op and avoids a duplicate <link>. In dev
-        // there is no manifest css, so inject the <link> at runtime.
+        // Emit / resolve the stylesheet and record its url (prod also records it
+        // on the emitter). The SSR head links it via the manifest, so the client
+        // import stays a no-op in both dev and prod: no runtime <link> injection,
+        // no flash, and no dependency on hydration succeeding.
         const href = await urlFor(a.path);
-        if (mode !== "dev") return { contents: "export default {};", loader: "js" };
-        return {
-          contents:
-            `const l=document.createElement("link");l.rel="stylesheet";` +
-            `l.href=${JSON.stringify(href)};document.head.appendChild(l);`,
-          loader: "js",
-        };
+        if (cssUrls && !cssUrls.includes(href)) cssUrls.push(href);
+        return { contents: "export default {};", loader: "js" };
       });
     },
   };

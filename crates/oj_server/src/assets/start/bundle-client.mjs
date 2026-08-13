@@ -3,7 +3,7 @@
 // with the framework aliases resolved (a browser can't run a Node loader hook),
 // everything bundled, NODE_ENV defined, node: builtins shimmed, and the app's
 // vite plugins / assets / import.meta.glob handled. Output: client-entry.js.
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { importPkg, viteEnvDefine } from "./resolve-pkg.mjs";
@@ -71,6 +71,9 @@ function routerEntry() {
 // (svgr load) resolve. Absent config/Vite -> null -> the plugin is a no-op.
 const container = await loadPluginContainer(APP, { command: "serve", environment: "client" });
 
+// Stylesheet urls the app imports; linked in the dev SSR head via the manifest.
+const cssUrls = [];
+
 await esbuild.build({
   entryPoints: [join(HERE, "client-entry.tsx")],
   bundle: true,
@@ -105,7 +108,7 @@ await esbuild.build({
   },
   plugins: [
     makeVitePlugins({ container, appRoot: APP, mode: "dev" }),
-    assetsPlugin({ mode: "dev" }),
+    assetsPlugin({ mode: "dev", cssUrls }),
     serverFnClient,
     nodeBuiltinShims,
   ],
@@ -113,4 +116,21 @@ await esbuild.build({
   outfile: join(HERE, "client-entry.js"),
   logLevel: "silent",
 });
+
+// Dev manifest: link the app's stylesheets in the SSR <head> (via the root
+// route's css) so the first paint is styled and does not depend on hydration.
+// The runner re-reads this on every warm reload, so edits stay styled.
+const devManifest = {
+  routes: {
+    __root__: {
+      preloads: ["/@oj-start/client-entry.js"],
+      css: cssUrls,
+      scripts: [{ attrs: { type: "module", async: true, src: "/@oj-start/client-entry.js" } }],
+    },
+  },
+};
+writeFileSync(
+  join(HERE, "manifest.ts"),
+  `export const tsrStartManifest = () => (${JSON.stringify(devManifest)});\n`,
+);
 process.stderr.write("oj: client entry bundled\n");
