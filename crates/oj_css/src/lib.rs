@@ -103,6 +103,25 @@ mod tests {
     }
 
     #[test]
+    fn is_css_module_matches_only_the_filename() {
+        assert!(is_css_module("/src/app.module.css"));
+        assert!(is_css_module("app.module.scss"));
+        assert!(is_css_module("/a/b.module.css?used")); // query kept, still matches
+        assert!(!is_css_module("/src/styles.css")); // plain css
+        // ".module." in a directory name must not count -- only the filename does
+        assert!(!is_css_module("/module.styles/app.css"));
+    }
+
+    #[test]
+    fn is_sass_strips_query_and_checks_extension() {
+        assert!(is_sass("/src/theme.scss"));
+        assert!(is_sass("vars.sass"));
+        assert!(is_sass("/a/theme.scss?inline")); // query stripped before the check
+        assert!(!is_sass("/a/theme.css"));
+        assert!(!is_sass("/a/scss.ts")); // extension, not a substring, decides
+    }
+
+    #[test]
     fn css_modules_scope_and_export_class_names() {
         let out = compile_css(
             "/src/Counter.module.css",
