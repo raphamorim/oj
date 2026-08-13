@@ -1,0 +1,7 @@
+@import "tailwindcss";
+
+/* A custom utility so the compiled output has a deterministic marker the
+   integration test can assert on (proves Tailwind actually compiled). */
+.fixture-heading {
+  @apply text-3xl font-bold;
+}

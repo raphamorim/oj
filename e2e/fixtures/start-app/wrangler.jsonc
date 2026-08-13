@@ -1,0 +1,9 @@
+{
+  // A wrangler config with a `vars` table; oj's dev Cloudflare shim reads these
+  // into env, so getCloudflareContext().env.EDITION resolves on the server.
+  "name": "oj-start-fixture",
+  "compatibility_date": "2024-01-01",
+  "vars": {
+    "EDITION": "fixture-edition"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "name": "oj-start-fixture",
+  "private": true,
+  "type": "module",
+  "imports": {
+    "#lib/*": "./src/lib/*"
+  },
+  "dependencies": {
+    "@tanstack/react-router": "^1.170.0",
+    "@tanstack/react-start": "^1.168.0",
+    "legacy-cjs": "file:./packages/legacy-cjs",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@mdx-js/rollup": "^3.1.0",
+    "@tailwindcss/postcss": "^4.2.0",
+    "@vitejs/plugin-react": "^6.0.0",
+    "esbuild": "^0.27.0",
+    "postcss": "^8.4.0",
+    "tailwindcss": "^4.2.0",
+    "vite": "^8.2.0",
+    "vite-plugin-svgr": "^4.3.0"
+  }
+}
