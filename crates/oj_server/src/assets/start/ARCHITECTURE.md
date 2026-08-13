@@ -105,6 +105,34 @@ pipeline. `/@oj-start/` owns the live-reload WebSocket, the client entry, and
 `/@oj-start/fs/<abspath>` (asset files served from the workspace root, so
 relative `url()` refs inside CSS resolve).
 
+### The runner protocol (`runner.mjs`)
+
+`start_dev` and the runner talk over the runner's stdio in newline-delimited
+JSON. One JSON object per line goes in on stdin; one JSON object per line comes
+back on stdout, so `oj` can pair replies by reading a line per request.
+
+There are two request shapes:
+
+- A render request `{ id, method, url, headers, body }`. The runner builds a
+  `Request` (origin from `headers.host`, body only for non-GET/HEAD), awaits the
+  entry's `fetch`, and replies `{ id, status, headers, body }`. A handler that
+  throws is framed as `{ id, status: 500, body: <error text> }` rather than
+  crashing the process.
+- A reload command `{ cmd: "reload" }`. The runner bumps the version, re-imports
+  the entry (see below), and replies `{ reloaded: true }`, or
+  `{ reloaded: false, error }` if the re-import failed.
+
+stdout is the protocol channel, so app code writing to it (via `console.log` or
+`process.stdout.write`) would interleave with and corrupt the frames. The runner
+captures the real stdout writer for protocol frames on startup, then redirects
+`process.stdout.write` to stderr. App logs and the `oj start runner: ready`
+banner therefore surface on stderr, keeping stdout pure JSON.
+
+The entry and loader paths default to the assets beside `runner.mjs` but are
+overridable with `OJ_RUNNER_ENTRY` and `OJ_RUNNER_LOADER`, which the protocol
+test uses to drive the framing against stubs without the loader's esbuild
+bootstrap.
+
 ### Warm reload
 
 On a rebuild the runner bumps a version counter and re-imports the server entry
@@ -245,6 +273,9 @@ comes from the fixture; the suite skips cleanly when it is not installed):
   temp files with a stub plugin container, asserting the `?url` / `?raw` /
   `?inline` / bare-asset / css routing, the `virtual:` / `.mdx` / `.svg` (bare
   and `?react`) container routing, and the node-builtin shims.
+- `runner-protocol` spawns the real `runner.mjs` (entry and loader pointed at
+  stubs) and drives the stdio protocol: render round-trips, the Host-derived
+  origin, warm reload, 500 error framing, and the stdout-diversion guard.
 
 The integration test is `node e2e/start.mjs`. It runs oj against a self-contained
 Start app (`e2e/fixtures/start-app`) in dev and prod and asserts a server-rendered
