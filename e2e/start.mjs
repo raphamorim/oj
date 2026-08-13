@@ -70,7 +70,8 @@ async function assertApp(port, label) {
     ["plugin virtual module", "fixture-virtual-ok"],
     ["import.meta.glob", "Alpha Widget, Beta Widget"],
     ["?raw import", "raw-notes-marker"],
-    ["svgr component", "<rect"],
+    ["svgr bare .svg component", "<rect"],
+    ["svgr ?react component", "<polygon"],
     ["mdx module", "mdx-content-marker"],
   ];
   for (const [what, marker] of want) {

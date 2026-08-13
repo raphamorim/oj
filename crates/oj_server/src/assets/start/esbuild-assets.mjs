@@ -99,14 +99,31 @@ export function makeVitePlugins({ container, fallback, appRoot, mode = "dev", fs
   return {
     name: "oj-vite-plugins",
     setup(build) {
-      // Registered unconditionally so .svg always has a loader.
-      build.onLoad({ filter: /\.svg$/ }, async (args) => {
+      const svgModule = async (path, id) => {
         if (container) {
-          const code = await container.load(args.path);
-          if (code != null) return { contents: code, loader: "js", resolveDir: dirname(args.path) };
+          const code = await container.load(id);
+          if (code != null) return { contents: code, loader: "js", resolveDir: dirname(path) };
         }
-        return { contents: `export default ${JSON.stringify(await urlFor(args.path))};`, loader: "js" };
+        return { contents: `export default ${JSON.stringify(await urlFor(path))};`, loader: "js" };
+      };
+      // Bare `.svg` in the default (file) namespace. Registered unconditionally
+      // so .svg always has a loader. The explicit namespace keeps it from also
+      // claiming the ?react-tagged files parked in the oj-svg-react namespace.
+      build.onLoad({ filter: /\.svg$/, namespace: "file" }, (args) => svgModule(args.path, args.path));
+      // svgr's explicit-component query `foo.svg?react`: esbuild's resolver
+      // can't find the queried path, so strip the query, resolve the real .svg,
+      // and hand the ?react id to the container so svgr emits a component.
+      build.onResolve({ filter: /\.svg\?react$/ }, async (args) => {
+        if (args.pluginData?.ojSvg) return undefined;
+        const r = await build.resolve(args.path.slice(0, -"?react".length), {
+          kind: args.kind, resolveDir: args.resolveDir, importer: args.importer,
+          pluginData: { ojSvg: true },
+        });
+        return r.errors.length ? { errors: r.errors } : { path: r.path, namespace: "oj-svg-react" };
       });
+      build.onLoad({ filter: /.*/, namespace: "oj-svg-react" }, (args) =>
+        svgModule(args.path, args.path + "?react"),
+      );
       if (!container) return;
       const resolveVirtual = async (args) => {
         const rid = await container.resolveId(args.path, args.importer);

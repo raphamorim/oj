@@ -154,6 +154,23 @@ export async function resolve(spec, context, next) {
     }
     if (abs) return { url: pathToFileURL(abs).href + `?ojasset=${kind}`, shortCircuit: true };
   }
+  // svgr's explicit-component query: resolve the real .svg, then tag it so
+  // load() runs svgr with the ?react id (svgr keys on the query for a component).
+  if (/\.svg\?react$/.test(spec)) {
+    const clean = spec.replace(/\?react$/, "");
+    let abs = null;
+    if (clean.startsWith(".") && context.parentURL) {
+      abs = probe(pathResolve(dirname(fileURLToPath(context.parentURL)), clean));
+    } else if (clean.startsWith("#")) {
+      abs = resolveImports(clean);
+    } else if (!clean.startsWith("/")) {
+      abs = resolveTsPaths(clean);
+    }
+    if (!abs) {
+      try { abs = fileURLToPath(stripQ((await next(clean, context)).url)); } catch {}
+    }
+    if (abs) return { url: pathToFileURL(abs).href + "?ojsvg=react", shortCircuit: true };
+  }
   if (ALIASES[spec]) {
     const hit = probe(ALIASES[spec]);
     if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true };
@@ -247,7 +264,9 @@ export async function load(url, context, next) {
   // serve it as a URL like any other asset.
   if (clean.endsWith(".svg")) {
     const path = fileURLToPath(clean);
-    const loaded = container ? await container.load(path) : null;
+    // A ?react-tagged svg (see resolve) is handed to svgr with the query.
+    const id = /[?&]ojsvg=react/.test(url) ? path + "?react" : path;
+    const loaded = container ? await container.load(id) : null;
     const src = loaded != null ? loaded : `export default ${JSON.stringify("/@oj-start/fs" + path)};`;
     return { format: "module", source: src, shortCircuit: true };
   }

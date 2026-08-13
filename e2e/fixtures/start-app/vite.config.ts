@@ -29,8 +29,9 @@ export default defineConfig({
     buildInfoPlugin(),
     // .mdx before react/tanstack so its output is plain JSX for them to handle.
     mdx(),
-    // exportType:"default" means a bare `.svg` import yields the component.
-    svgr({ svgrOptions: { exportType: "default" }, include: ["src/**/*.svg"] }),
+    // exportType:"default" makes a bare `.svg` import a component; the second
+    // include pattern also claims the explicit `foo.svg?react` query form.
+    svgr({ svgrOptions: { exportType: "default" }, include: ["src/**/*.svg", "src/**/*.svg?react"] }),
     tanstackStart(),
     react(),
   ],

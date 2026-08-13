@@ -14,8 +14,10 @@ import { badge } from "legacy-cjs";
 // A plugin-owned virtual module (resolved via oj's plugin-container bridge).
 import { buildTag } from "virtual:build-info";
 
-// svgr: a bare .svg import yields a React component (exportType "default").
+// svgr: a bare .svg import yields a React component (exportType "default")...
 import Logo from "../logo.svg";
+// ...and the explicit `?react` query yields one regardless of exportType.
+import Star from "../star.svg?react";
 
 // MDX compiled to a component by @mdx-js/rollup (a plugin `transform` hook).
 import Welcome from "../content/welcome.mdx";
@@ -54,6 +56,7 @@ function Index() {
       <p data-testid="raw">{notes.trim()}</p>
       <img data-testid="url" src={heroUrl} alt="hero" />
       <span data-testid="svg"><Logo /></span>
+      <span data-testid="svg-react"><Star /></span>
       <section data-testid="mdx"><Welcome /></section>
     </main>
   );
