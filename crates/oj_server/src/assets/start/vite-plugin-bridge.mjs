@@ -164,3 +164,6 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
   const publicDir = typeof loaded?.config?.publicDir === "string" ? loaded.config.publicDir : null;
   return { resolveId, load, transform, generateBundle, publicDir, pluginCount: plugins.length };
 }
+
+// Pure gating helpers exposed for unit tests; not part of the runtime contract.
+export const __test = { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter };

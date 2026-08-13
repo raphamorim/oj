@@ -56,6 +56,7 @@ const START_ASSETS: &[(&str, &str)] = &[
     ("cf-server.mjs", include_str!("assets/start/cf-server.mjs")),
     ("css-host.mjs", include_str!("assets/start/css-host.mjs")),
     ("loader.mjs", include_str!("assets/start/loader.mjs")),
+    ("loader-util.mjs", include_str!("assets/start/loader-util.mjs")),
     ("runner.mjs", include_str!("assets/start/runner.mjs")),
     ("generate.mjs", include_str!("assets/start/generate.mjs")),
     ("gen-resolver.mjs", include_str!("assets/start/gen-resolver.mjs")),
@@ -2488,5 +2489,73 @@ mod tests {
         assert!(!is_spa_navigation("@vite/client", &html));
         assert!(!is_spa_navigation("src/does-not-exist.tsx", &html));
         assert!(!is_spa_navigation("node_modules/react/missing.js", &html));
+    }
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::*;
+
+    fn tmp(label: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("oj-srv-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn is_tanstack_start_app_requires_routes_and_dep() {
+        let base = tmp("ts");
+        let app = base.join("app");
+        std::fs::create_dir_all(app.join("src").join("routes")).unwrap();
+        // routes dir present but no react-start dep -> not a start app
+        std::fs::write(app.join("package.json"), r#"{"dependencies":{"react":"19"}}"#).unwrap();
+        assert!(!is_tanstack_start_app(&app));
+        // add the dep -> detected
+        std::fs::write(app.join("package.json"), r#"{"dependencies":{"@tanstack/react-start":"1"}}"#).unwrap();
+        assert!(is_tanstack_start_app(&app));
+        // dep but no src/routes -> not a start app
+        let app2 = base.join("app2");
+        std::fs::create_dir_all(app2.join("src")).unwrap();
+        std::fs::write(app2.join("package.json"), r#"{"dependencies":{"@tanstack/react-start":"1"}}"#).unwrap();
+        assert!(!is_tanstack_start_app(&app2));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn locate_prefers_root_then_public_dir() {
+        let base = tmp("locate");
+        let root = base.join("root");
+        let public = base.join("shared-public");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(public.join("img")).unwrap();
+        std::fs::write(root.join("src").join("App.tsx"), "x").unwrap();
+        std::fs::write(public.join("img").join("logo.webp"), "y").unwrap();
+
+        // extensionless import resolves TS-first under root
+        assert_eq!(locate(&root, &public, "src/App"), Some(root.join("src/App.tsx")));
+        // a public asset resolves from the configured public dir
+        assert_eq!(locate(&root, &public, "img/logo.webp"), Some(public.join("img/logo.webp")));
+        // missing -> None; traversal refused
+        assert_eq!(locate(&root, &public, "img/missing.webp"), None);
+        assert_eq!(locate(&root, &public, "../secret"), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn is_spa_navigation_rules() {
+        let empty = HeaderMap::new();
+        // extensionless client routes fall back to index.html
+        assert!(is_spa_navigation("dashboard", &empty));
+        assert!(is_spa_navigation("projects/abc", &empty));
+        // assets and oj-internal namespaces do not
+        assert!(!is_spa_navigation("main.js", &empty));
+        assert!(!is_spa_navigation("@vite/client", &empty));
+        assert!(!is_spa_navigation("src/App.tsx", &empty));
+        assert!(!is_spa_navigation("node_modules/react/index.js", &empty));
+        // an html navigation with an extension still falls back (accept header)
+        let mut html = HeaderMap::new();
+        html.insert(header::ACCEPT, "text/html,*/*".parse().unwrap());
+        assert!(is_spa_navigation("some.thing", &html));
     }
 }

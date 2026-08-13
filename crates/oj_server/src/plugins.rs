@@ -102,7 +102,13 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
         eprint!("{}", String::from_utf8_lossy(&out.stderr));
     }
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    Some(ViteValues {
+    Some(parse_vite_values(&json))
+}
+
+/// Parse the JSON that `vite-extract.mjs` prints into typed values (pure, so it
+/// is unit-testable without spawning node).
+fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
+    ViteValues {
         base: json.get("base").and_then(|v| v.as_str()).map(str::to_string),
         public_dir: json.get("publicDir").and_then(|v| v.as_str()).map(str::to_string),
         port: json.get("port").and_then(|v| v.as_u64()).map(|p| p as u16),
@@ -110,7 +116,7 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
         define: json.get("define").and_then(|v| v.as_object()).cloned(),
         alias: json.get("alias").and_then(|v| v.as_object()).cloned(),
         headers: json.get("headers").and_then(|v| v.as_object()).cloned(),
-    })
+    }
 }
 
 /// Merge an app's `vite.config` values into `config` for any field oj.config
@@ -122,6 +128,12 @@ pub fn adopt_vite_config_values(config: &mut oj_config::OjConfig, root: &Path) {
     let Some(v) = extract_vite_values(root) else {
         return;
     };
+    merge_vite_values(config, v);
+}
+
+/// Merge extracted vite values into `config` for any field oj.config left unset
+/// (config always wins). Pure, so it is unit-testable.
+fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
     if config.base.is_none() {
         config.base = v.base;
     }
@@ -459,5 +471,78 @@ impl PluginHost {
                 })
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod vite_values_tests {
+    use super::*;
+
+    #[test]
+    fn parse_reads_all_fields() {
+        let json = serde_json::json!({
+            "base": "/app/",
+            "publicDir": "/abs/shared/public",
+            "port": 3010,
+            "host": "0.0.0.0",
+            "define": { "__X__": "1" },
+            "alias": { "@": "/src" },
+            "headers": { "x-a": "b" }
+        });
+        let v = parse_vite_values(&json);
+        assert_eq!(v.base.as_deref(), Some("/app/"));
+        assert_eq!(v.public_dir.as_deref(), Some("/abs/shared/public"));
+        assert_eq!(v.port, Some(3010));
+        assert_eq!(v.host.as_deref(), Some("0.0.0.0"));
+        assert!(v.define.unwrap().contains_key("__X__"));
+        assert!(v.alias.unwrap().contains_key("@"));
+        assert!(v.headers.unwrap().contains_key("x-a"));
+    }
+
+    #[test]
+    fn parse_tolerates_nulls_and_missing() {
+        let v = parse_vite_values(&serde_json::json!({ "base": null, "port": null }));
+        assert!(v.base.is_none());
+        assert!(v.public_dir.is_none());
+        assert!(v.port.is_none());
+        assert!(v.define.is_none());
+    }
+
+    #[test]
+    fn merge_adopts_only_unset_fields() {
+        let mut config = oj_config::OjConfig::default();
+        let v = ViteValues {
+            base: Some("/vite-base/".into()),
+            public_dir: Some("shared/public".into()),
+            port: Some(3010),
+            host: Some("localhost".into()),
+            define: None,
+            alias: None,
+            headers: None,
+        };
+        merge_vite_values(&mut config, v);
+        assert_eq!(config.base.as_deref(), Some("/vite-base/"));
+        assert_eq!(config.public_dir.as_deref(), Some("shared/public"));
+        assert_eq!(config.server.unwrap().port, Some(3010));
+    }
+
+    #[test]
+    fn merge_never_overrides_config() {
+        let mut config = oj_config::OjConfig::default();
+        config.base = Some("/oj-base/".into());
+        config.public_dir = Some("my-public".into());
+        let v = ViteValues {
+            base: Some("/vite-base/".into()),
+            public_dir: Some("shared/public".into()),
+            port: None,
+            host: None,
+            define: None,
+            alias: None,
+            headers: None,
+        };
+        merge_vite_values(&mut config, v);
+        // config values win over vite's
+        assert_eq!(config.base.as_deref(), Some("/oj-base/"));
+        assert_eq!(config.public_dir.as_deref(), Some("my-public"));
     }
 }

@@ -94,7 +94,8 @@ cargo run -p oj -- dev                          # dev server for ./playground on
 cargo run -p oj -- dev --bundle                 # registry-runtime bundle mode
 cargo run -p oj -- dev --ssr src/entry-server.tsx  # streaming SSR + hydration
 cargo run -p oj -- build playground             # production build into playground/dist
-cargo test --workspace                          # unit tests
+cargo test --workspace                          # rust unit tests
+node --test e2e/unit/*.test.mjs                 # js unit tests (adapter helpers)
 node e2e/run.mjs                                # browser e2e suite (add --bundle for bundle mode)
 node e2e/ssr-dev.mjs                            # SSR dev e2e; e2e/ssr-prod.mjs for the built server
 node bench/generate.mjs 1000                    # generate a benchmark app (then npm i inside it)

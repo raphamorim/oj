@@ -607,3 +607,122 @@ async fn forward(
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj start: {e}")).into_response(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(label: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("oj-startdev-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn req(method: &str, path: &str) -> Request {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn document_url_rewrites_index_html_to_directory() {
+        assert_eq!(document_url("/"), "/");
+        assert_eq!(document_url("/index.html"), "/");
+        assert_eq!(document_url("/guides/index.html"), "/guides/");
+        assert_eq!(document_url("/a/b/index.html"), "/a/b/");
+        assert_eq!(document_url("/index.html?tab=1"), "/?tab=1");
+        assert_eq!(document_url("/a/index.html?x=y&z=1"), "/a/?x=y&z=1");
+        // non-index documents pass through untouched
+        assert_eq!(document_url("/about"), "/about");
+        assert_eq!(document_url("/guides/foo"), "/guides/foo");
+        // only a whole `/index.html` segment is rewritten
+        assert_eq!(document_url("/notindex.html"), "/notindex.html");
+    }
+
+    #[test]
+    fn percent_decode_handles_escapes_and_partials() {
+        assert_eq!(percent_decode("/plain/path.css"), "/plain/path.css");
+        assert_eq!(percent_decode("/a%20b"), "/a b");
+        assert_eq!(percent_decode("%2Fx"), "/x");
+        assert_eq!(percent_decode("%41%42"), "AB");
+        // incomplete / trailing escapes are left verbatim
+        assert_eq!(percent_decode("a%"), "a%");
+        assert_eq!(percent_decode("a%2"), "a%2");
+        assert_eq!(percent_decode("a%zz"), "a%zz");
+    }
+
+    #[test]
+    fn asset_mime_maps_types() {
+        assert_eq!(asset_mime("css"), "text/css; charset=utf-8");
+        assert_eq!(asset_mime("js"), "text/javascript");
+        assert_eq!(asset_mime("svg"), "image/svg+xml");
+        assert_eq!(asset_mime("webp"), "image/webp");
+        assert_eq!(asset_mime("woff2"), "font/woff2");
+        assert_eq!(asset_mime("json"), "application/json");
+        assert_eq!(asset_mime("weirdext"), "application/octet-stream");
+    }
+
+    #[test]
+    fn needs_css_compile_detects_tailwind_markers() {
+        assert!(needs_css_compile("@import \"tailwindcss\";"));
+        assert!(needs_css_compile("@tailwind base;"));
+        assert!(needs_css_compile("@plugin \"@tailwindcss/typography\";"));
+        assert!(needs_css_compile(".btn { @apply px-2; }"));
+        assert!(!needs_css_compile(".a { color: red }"));
+        assert!(!needs_css_compile("@font-face { src: url(x.woff2) }"));
+    }
+
+    #[test]
+    fn workspace_root_finds_farthest_node_modules() {
+        let base = tmp("ws");
+        std::fs::create_dir_all(base.join("node_modules")).unwrap();
+        std::fs::create_dir_all(base.join("web").join("src")).unwrap();
+        std::fs::create_dir_all(base.join("web").join("node_modules")).unwrap();
+        // ancestor `base` has node_modules, so it wins over the app dir
+        assert_eq!(workspace_root(&base.join("web")), base);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn workspace_root_defaults_to_app_without_ancestor_modules() {
+        let base = tmp("ws2");
+        let app = base.join("solo");
+        std::fs::create_dir_all(&app).unwrap();
+        assert_eq!(workspace_root(&app), app);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn app_uses_tailwind_reads_package_json() {
+        let base = tmp("tw");
+        std::fs::write(base.join("package.json"), r#"{"devDependencies":{"@tailwindcss/postcss":"4"}}"#).unwrap();
+        assert!(app_uses_tailwind(&base));
+        std::fs::write(base.join("package.json"), r#"{"dependencies":{"react":"19"}}"#).unwrap();
+        assert!(!app_uses_tailwind(&base));
+        let none = tmp("tw-none");
+        assert!(!app_uses_tailwind(&none));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&none);
+    }
+
+    #[test]
+    fn classify_documents_vs_passes() {
+        let no_proxy: Vec<String> = vec![];
+        // extensionless GETs and index.html are document (SSR) routes
+        assert!(matches!(classify(&req("GET", "/"), &no_proxy), Route::Document));
+        assert!(matches!(classify(&req("GET", "/about"), &no_proxy), Route::Document));
+        assert!(matches!(classify(&req("GET", "/index.html"), &no_proxy), Route::Document));
+        assert!(matches!(classify(&req("GET", "/guides/index.html"), &no_proxy), Route::Document));
+        // assets, dev namespaces, non-GET, and proxied paths pass through
+        assert!(matches!(classify(&req("GET", "/main.js"), &no_proxy), Route::Pass));
+        assert!(matches!(classify(&req("GET", "/styles.css"), &no_proxy), Route::Pass));
+        assert!(matches!(classify(&req("GET", "/@oj-start/hmr"), &no_proxy), Route::Pass));
+        assert!(matches!(classify(&req("GET", "/__health"), &no_proxy), Route::Pass));
+        assert!(matches!(classify(&req("POST", "/about"), &no_proxy), Route::Pass));
+        let proxy = vec!["/api".to_string()];
+        assert!(matches!(classify(&req("GET", "/api/users"), &proxy), Route::Pass));
+    }
+}

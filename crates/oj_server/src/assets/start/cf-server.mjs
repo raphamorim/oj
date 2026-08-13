@@ -35,39 +35,33 @@ function stripJsonc(s) {
   return out;
 }
 
-function wranglerVars() {
-  for (const f of ["wrangler.jsonc", "wrangler.json"]) {
-    const p = join(APP, f);
-    if (!existsSync(p)) continue;
-    try {
-      const cfg = JSON.parse(stripJsonc(readFileSync(p, "utf8")).replace(/,(\s*[}\]])/g, "$1"));
-      return cfg.vars && typeof cfg.vars === "object" ? cfg.vars : {};
-    } catch {
-      return {};
-    }
+// Parse the `vars` table out of a wrangler.jsonc/.json string.
+function parseWranglerJsonVars(text) {
+  try {
+    const cfg = JSON.parse(stripJsonc(text).replace(/,(\s*[}\]])/g, "$1"));
+    return cfg.vars && typeof cfg.vars === "object" ? cfg.vars : {};
+  } catch {
+    return {};
   }
-  // wrangler.toml: a minimal [vars] scan (KEY = "value").
-  const toml = join(APP, "wrangler.toml");
-  if (existsSync(toml)) {
-    const vars = {};
-    let inVars = false;
-    for (const line of readFileSync(toml, "utf8").split("\n")) {
-      const t = line.trim();
-      if (t.startsWith("[")) { inVars = t === "[vars]"; continue; }
-      const m = inVars && t.match(/^([A-Za-z_][\w]*)\s*=\s*"([^"]*)"/);
-      if (m) vars[m[1]] = m[2];
-    }
-    return vars;
+}
+
+// Minimal [vars] scan of a wrangler.toml string (KEY = "value").
+function parseWranglerTomlVars(text) {
+  const vars = {};
+  let inVars = false;
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (t.startsWith("[")) { inVars = t === "[vars]"; continue; }
+    const m = inVars && t.match(/^([A-Za-z_][\w]*)\s*=\s*"([^"]*)"/);
+    if (m) vars[m[1]] = m[2];
   }
-  return {};
+  return vars;
 }
 
 // .dev.vars is dotenv-style (KEY=VALUE, optional quotes, # comments).
-function devVars() {
-  const p = join(APP, ".dev.vars");
-  if (!existsSync(p)) return {};
+function parseDevVars(text) {
   const vars = {};
-  for (const line of readFileSync(p, "utf8").split("\n")) {
+  for (const line of text.split("\n")) {
     const t = line.trim();
     if (!t || t.startsWith("#")) continue;
     const eq = t.indexOf("=");
@@ -77,6 +71,22 @@ function devVars() {
     vars[t.slice(0, eq).trim()] = v;
   }
   return vars;
+}
+
+function wranglerVars() {
+  for (const f of ["wrangler.jsonc", "wrangler.json"]) {
+    const p = join(APP, f);
+    if (existsSync(p)) return parseWranglerJsonVars(readFileSync(p, "utf8"));
+  }
+  const toml = join(APP, "wrangler.toml");
+  if (existsSync(toml)) return parseWranglerTomlVars(readFileSync(toml, "utf8"));
+  return {};
+}
+
+function devVars() {
+  const p = join(APP, ".dev.vars");
+  if (!existsSync(p)) return {};
+  return parseDevVars(readFileSync(p, "utf8"));
 }
 
 // A Workers static-assets binding backed by dist/client: apps read published
@@ -107,3 +117,6 @@ export async function getCloudflareContext() {
 }
 
 export default { getCloudflareContext };
+
+// Pure parsers exposed for unit tests; not part of the runtime contract.
+export const __test = { stripJsonc, parseWranglerJsonVars, parseWranglerTomlVars, parseDevVars };
