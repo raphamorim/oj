@@ -62,7 +62,11 @@ export function Footer() {
     <footer className="foot">
       <div className="wrap foot__row">
         <span className="foot__note">
-          oj is an open-source project. This site is built with oj and deployed on Cloudflare.
+          oj is an open-source project by{" "}
+          <a className="foot__by" href="https://github.com/raphamorim" target="_blank" rel="noreferrer">
+            Raphael Amorim
+          </a>
+          . This site is built with oj and deployed on Cloudflare.
         </span>
         <div className="foot__links">
           <a className="foot__link" href="#start">Get started</a>
