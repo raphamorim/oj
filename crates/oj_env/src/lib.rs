@@ -192,6 +192,26 @@ mod tests {
     }
 
     #[test]
+    fn expansion_boundary_undefined_base_and_unclosed_brace() {
+        let mut b = base();
+        b.insert("FROM_ENV".into(), "envval".into()); // stands in for a process-env var
+        let src = "A=first\n\
+                   UNBRACED=$A/x\n\
+                   MISSING=[$NOPE]\n\
+                   FROMBASE=${FROM_ENV}\n\
+                   UNCLOSED=${OOPS\n";
+        let map: std::collections::HashMap<_, _> = parse(src, &b).into_iter().collect();
+        // unbraced $A expands and stops at the non-identifier '/'
+        assert_eq!(map["UNBRACED"], "first/x");
+        // an undefined variable expands to the empty string
+        assert_eq!(map["MISSING"], "[]");
+        // a base (process env) variable is available to expansion
+        assert_eq!(map["FROMBASE"], "envval");
+        // an unterminated ${ is emitted literally rather than swallowing the rest
+        assert_eq!(map["UNCLOSED"], "${OOPS");
+    }
+
+    #[test]
     fn missing_files_yield_empty() {
         let d = std::env::temp_dir().join("oj-env-none");
         assert!(load(&d, "development").is_empty());

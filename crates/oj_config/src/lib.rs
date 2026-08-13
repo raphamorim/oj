@@ -268,6 +268,62 @@ mod tests {
     }
 
     #[test]
+    fn default_config_resolver_fallbacks() {
+        let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let cfg = load(std::path::Path::new("/nonexistent-oj-root")).unwrap();
+        assert!(config_defines(&cfg).is_empty());
+        assert!(environment_defines(&cfg, "ssr").is_empty());
+        assert!(resolve_alias(&cfg, "client").is_empty());
+        assert_eq!(environment_build_bool(&cfg, "client", "minify"), None);
+        // built-in condition defaults differ by environment
+        assert_eq!(resolve_conditions(&cfg, "ssr"), s(&["node", "import", "module", "default"]));
+        assert_eq!(resolve_conditions(&cfg, "client"), s(&["browser", "import", "module", "default"]));
+    }
+
+    #[test]
+    fn per_environment_resolution_and_precedence() {
+        let cfg = eval_config_in(
+            "env-resolvers",
+            "export default {\n\
+               define: { __FLAG__: \"true\", __COUNT__: 3 },\n\
+               resolve: { conditions: [\"custom\"], alias: { \"@\": \"/src\", \"old\": \"/legacy\" } },\n\
+               environments: {\n\
+                 ssr: {\n\
+                   build: { minify: false },\n\
+                   resolve: { conditions: [\"node-only\"], alias: { \"old\": \"/ssr-legacy\" } },\n\
+                   define: { __SSR__: true },\n\
+                 },\n\
+               },\n\
+             };\n",
+        );
+        // define_value: string values pass through raw (JS expressions), others JSON
+        let defines: std::collections::BTreeMap<_, _> = config_defines(&cfg).into_iter().collect();
+        assert_eq!(defines.get("__FLAG__").unwrap(), "true");
+        assert_eq!(defines.get("__COUNT__").unwrap(), "3");
+
+        // conditions: env override wins for ssr; top-level used for an env without one
+        assert_eq!(resolve_conditions(&cfg, "ssr"), vec!["node-only".to_string()]);
+        assert_eq!(resolve_conditions(&cfg, "client"), vec!["custom".to_string()]);
+
+        // alias: env merged over top-level (sorted); "old" overridden only for ssr
+        assert_eq!(
+            resolve_alias(&cfg, "ssr"),
+            vec![("@".to_string(), "/src".to_string()), ("old".to_string(), "/ssr-legacy".to_string())]
+        );
+        assert_eq!(
+            resolve_alias(&cfg, "client"),
+            vec![("@".to_string(), "/src".to_string()), ("old".to_string(), "/legacy".to_string())]
+        );
+
+        // per-environment build override and defines
+        assert_eq!(environment_build_bool(&cfg, "ssr", "minify"), Some(false));
+        assert_eq!(environment_build_bool(&cfg, "ssr", "sourcemap"), None);
+        let ssr_defines: std::collections::BTreeMap<_, _> = environment_defines(&cfg, "ssr").into_iter().collect();
+        assert_eq!(ssr_defines.get("__SSR__").unwrap(), "true");
+        assert!(environment_defines(&cfg, "client").is_empty());
+    }
+
+    #[test]
     fn json_config_loads_directly() {
         let dir = std::env::temp_dir().join(format!("oj-cfg-json-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

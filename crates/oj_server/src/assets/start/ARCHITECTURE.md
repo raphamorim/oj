@@ -212,6 +212,48 @@ the client transform. RPC requests hit `/_serverFn/<id>`, are dispatched by the
 framework's `handleServerAction` through the generated resolver, and enforce a
 same-origin CSRF check.
 
+## Testing
+
+The adapter is covered at three levels.
+
+Rust unit tests live beside the code they exercise:
+
+- `oj_server/src/lib.rs` (`adapter_tests`): `is_tanstack_start_app` detection,
+  `locate` preferring the app root then the publicDir, and the SPA-navigation
+  rule.
+- `oj_server/src/plugins.rs`: `parse_vite_values` / `merge_vite_values` (the
+  vite.config values oj adopts, including publicDir), asserting config never
+  overrides an explicit oj setting.
+- `oj/src/start_dev.rs`: `document_url`, `percent_decode`, `asset_mime`,
+  `needs_css_compile`, `workspace_root`, `app_uses_tailwind`, and `classify`.
+
+JS unit tests are `node --test e2e/unit/*.test.mjs` (esbuild for the harness
+comes from the fixture; the suite skips cleanly when it is not installed):
+
+- `glob-transform` expands `import.meta.glob`; `esbuild-assets` covers the
+  content-hash emitter, css `url()` rewriting, the Tailwind compile hook,
+  `workspaceRoot`, and `pnpmStorePaths`; `resolve-pkg` covers `viteEnvDefine`
+  and the pnpm-anchor resolver.
+- `plugin-gating` covers the plugin-container gating (`apply`, id filters,
+  enforce order, hook shapes); `cf-vars` covers the Cloudflare shim's
+  JSONC / toml / dotenv var parsers.
+- `loader-util` covers the SSR loader's pure helpers: extension probing, CJS
+  detection and the CJS-to-ESM facade, JSONC parsing, the server-fn rewrite,
+  single-`*` alias matching, and the package `imports` / tsconfig-chain parsers.
+- `asset-routing` is a build-level harness: it drives `assetsPlugin`,
+  `makeVitePlugins`, and `nodeBuiltinShims` through a real esbuild bundle over
+  temp files with a stub plugin container, asserting the `?url` / `?raw` /
+  `?inline` / bare-asset / css routing, the `virtual:` / `.mdx` / `.svg` (bare
+  and `?react`) container routing, and the node-builtin shims.
+
+The integration test is `node e2e/start.mjs`. It runs oj against a self-contained
+Start app (`e2e/fixtures/start-app`) in dev and prod and asserts a server-rendered
+`/` wires together routing, server functions, `import.meta.glob`, `?raw` / `?url`,
+svgr (bare and `?react`), MDX, Tailwind, a plugin virtual module, tsconfig paths
+and package `imports` aliases, a CommonJS dep, the Cloudflare context, and a
+non-default publicDir. The fixture's dependencies are not vendored; the test
+skips when they are not installed (`cd e2e/fixtures/start-app && npm install`).
+
 ## Known limits
 
 - The prod server is fully bundled and code-split because of the framework

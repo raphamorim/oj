@@ -297,4 +297,26 @@ mod tests {
         assert!(out.contains("import.meta.glob(p)"), "dynamic arg must be left as-is: {out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn empty_glob_yields_empty_object() {
+        let dir = fixture_dir("empty");
+        let out = expand_source(&dir, "const m = import.meta.glob('./nope/*.json');\n");
+        assert!(out.contains("= {}"), "no matches must expand to an empty object: {out}");
+        assert!(!out.contains("import.meta.glob"), "call must be replaced: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recursive_double_star_matches_nested_files() {
+        let dir = std::env::temp_dir().join(format!("oj-glob-{}-recursive", std::process::id()));
+        std::fs::create_dir_all(dir.join("content").join("posts")).unwrap();
+        std::fs::write(dir.join("content").join("top.md"), "").unwrap();
+        std::fs::write(dir.join("content").join("posts").join("nested.md"), "").unwrap();
+        let out = expand_source(&dir, "const m = import.meta.glob('./content/**/*.md');\n");
+        // `**` reaches into subdirectories
+        assert!(out.contains("./content/posts/nested.md"), "recursive match missing: {out}");
+        assert!(out.contains("./content/top.md"), "top-level match missing: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
