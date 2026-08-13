@@ -193,6 +193,36 @@
 .cmd { display: inline-flex; align-items: center; gap: 0.7rem; font-family: var(--font-mono); font-size: 0.8rem; border: 1px solid var(--color-line); padding: 0.65rem 0.9rem; color: var(--color-ink); }
 .cmd__prompt { color: var(--color-accent); }
 
+/* ---------------------------------------------------------------- benchmark */
+.bench { border: 1px solid var(--color-rule); margin-top: clamp(2rem, 5vw, 3rem); }
+.bench__meta {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.6rem 1.5rem;
+  padding: 0.9rem 1.2rem; border-bottom: 1px solid var(--color-line);
+  font-family: var(--font-mono);
+}
+.bench__metric { text-transform: uppercase; font-size: 0.78rem; letter-spacing: 0.1em; }
+.bench__ratio { color: var(--color-accent); font-weight: 600; font-size: 0.95rem; }
+.bench__ms { color: var(--color-muted); font-size: 0.78rem; margin-left: auto; }
+.bench__ms b { color: var(--color-ink); font-weight: 600; }
+.bench__canvas { display: block; width: 100%; height: 240px; }
+
+.benchtable { width: 100%; border-collapse: collapse; margin-top: clamp(2rem, 5vw, 3rem); font-size: 0.9rem; }
+.benchtable th, .benchtable td {
+  text-align: right; padding: 0.7rem 0.5rem; border-bottom: 1px solid var(--color-line);
+  font-variant-numeric: tabular-nums;
+}
+.benchtable th:first-child, .benchtable td:first-child { text-align: left; }
+.benchtable thead th {
+  font-family: var(--font-mono); font-size: 0.68rem; text-transform: uppercase;
+  letter-spacing: 0.08em; color: var(--color-faint); font-weight: 500;
+}
+.benchtable tbody td { color: var(--color-muted); }
+.benchtable tbody td:first-child { font-family: var(--font-mono); font-size: 0.8rem; }
+.benchtable tr[data-oj="true"] td { color: var(--color-ink); font-weight: 500; }
+.benchtable tr[data-oj="true"] td:first-child { color: var(--color-accent); }
+.bench__note { margin-top: 1.25rem; color: var(--color-faint); font-size: 0.82rem; line-height: 1.55; max-width: 64ch; }
+.bench__note code { color: var(--color-muted); }
+
 /* -------------------------------------------------------------------- foot */
 .foot { border-top: 1px solid var(--color-rule); padding-block: 2.5rem 3.5rem; }
 .foot__row { display: flex; flex-wrap: wrap; gap: 1.25rem; align-items: center; justify-content: space-between; }

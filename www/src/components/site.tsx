@@ -4,6 +4,7 @@ const GITHUB = "https://github.com/raphamorim/oj";
 
 const SECTIONS = [
   { id: "process", label: "How it works" },
+  { id: "benchmark", label: "Benchmark" },
   { id: "features", label: "Features" },
   { id: "architecture", label: "Architecture" },
   { id: "start", label: "Get started" },

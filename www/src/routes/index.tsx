@@ -2,6 +2,7 @@ import { createRoute } from "@tanstack/react-router";
 
 import { rootRoute } from "./__root";
 import { PixelField } from "../components/PixelField";
+import { BenchRace } from "../components/BenchRace";
 
 const GITHUB = "https://github.com/raphamorim/oj";
 
@@ -91,6 +92,45 @@ function Home() {
               </div>
             ))}
           </div>
+        </div>
+      </section>
+
+      {/* benchmark */}
+      <section id="benchmark" className="section">
+        <div className="wrap">
+          <div className="section__head">
+            <p className="label label--accent">Benchmark</p>
+            <h2 className="section__title">Save to paint, measured.</h2>
+            <p className="section__sub">
+              A 10,000-component dev server, save-to-paint latency (p50), on an
+              M-series Mac. Watch a real edit reach the screen — oj against Vite 8.2.
+            </p>
+          </div>
+          <BenchRace />
+          <table className="benchtable">
+            <thead>
+              <tr>
+                <th>Tool</th><th>Cold</th><th>Warm</th><th>HMR</th><th>Reload</th><th>Server RAM</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr data-oj="true">
+                <td>oj --bundle</td><td>1427ms</td><td>996ms</td><td>49ms</td><td>234ms</td><td>107MB</td>
+              </tr>
+              <tr>
+                <td>vite (bundled dev)</td><td>1425ms</td><td>1427ms</td><td>69ms</td><td>277ms</td><td>1752MB</td>
+              </tr>
+              <tr>
+                <td>vite (default)</td><td>5532ms</td><td>5045ms</td><td>153ms</td><td>1639ms</td><td>1520MB</td>
+              </tr>
+            </tbody>
+          </table>
+          <p className="bench__note">
+            p50 save-to-paint on a generated 10k-component app, M-series Mac, Vite
+            8.2 (default and experimental bundled dev). oj's fused oxc pipeline and
+            persistent cache also hold roughly 16× less memory. Reproducible:{" "}
+            <code>node bench/run.mjs 1000</code>.
+          </p>
         </div>
       </section>
 
