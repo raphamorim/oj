@@ -9,7 +9,7 @@ export const rootRoute = createRootRoute({
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "oj — Rust-native builds for React" },
+      { title: "oj: Rust-native builds for React" },
       {
         name: "description",
         content:

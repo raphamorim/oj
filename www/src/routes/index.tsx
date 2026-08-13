@@ -51,7 +51,7 @@ function Home() {
             <div>
               <p className="masthead__tag">
                 A fast dev server, server rendering with TanStack Start, Tailwind,
-                and one-command Cloudflare deploys — built with a Rust core.
+                and one-command Cloudflare deploys, built with a Rust core.
               </p>
               <div className="masthead__actions">
                 <a href="#start" className="btn btn--solid">Get started</a>
@@ -103,7 +103,7 @@ function Home() {
             <h2 className="section__title">Save to paint, measured.</h2>
             <p className="section__sub">
               A 10,000-component dev server, save-to-paint latency (p50), on an
-              M-series Mac. Watch a real edit reach the screen — oj against Vite 8.2.
+              M-series Mac. Watch a real edit reach the screen: oj against Vite 8.2.
             </p>
           </div>
           <BenchRace />
