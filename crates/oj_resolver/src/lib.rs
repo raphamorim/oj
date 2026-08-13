@@ -157,4 +157,38 @@ mod tests {
         assert!(browser.resolve(&dir, "dual-pkg").unwrap().ends_with("browser.js"));
         assert!(node.resolve(&dir, "dual-pkg").unwrap().ends_with("node.js"));
     }
+
+    #[test]
+    fn default_condition_resolves_the_fallback_export() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/dual");
+        // with only `default`, neither the browser nor node condition matches
+        let resolver = OjResolver::with_conditions(&dir, &["default".to_string()]);
+        assert!(resolver.resolve(&dir, "dual-pkg").unwrap().ends_with("default.js"));
+    }
+
+    #[test]
+    fn resolves_package_subpath_exports_and_enforces_encapsulation() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/subpath");
+        let resolver = OjResolver::new(&dir);
+        // the `.` and a named subpath both resolve through the exports map
+        assert!(resolver.resolve(&dir, "sub-pkg").unwrap().ends_with("index.js"));
+        assert!(resolver.resolve(&dir, "sub-pkg/feature").unwrap().ends_with("feature.js"));
+        // a real file not listed in `exports` is blocked (encapsulation)
+        assert!(resolver.resolve(&dir, "sub-pkg/internal").is_err(), "unlisted subpath must not resolve");
+    }
+
+    #[test]
+    fn resolves_json_css_and_explicit_extensions() {
+        let resolver = OjResolver::new(&playground_root());
+        let src = playground_src();
+        // .json is in the probe list
+        assert!(resolver.resolve(&src, "./data.json").unwrap().ends_with("data.json"));
+        // an explicit extension resolves the exact file
+        assert!(resolver.resolve(&src, "./App.tsx").unwrap().ends_with("App.tsx"));
+        // a non-probed extension (.css) still resolves when the exact file exists
+        assert!(
+            resolver.resolve(&src, "./Counter.module.css").unwrap().ends_with("Counter.module.css"),
+            "exact-path .css should resolve",
+        );
+    }
 }

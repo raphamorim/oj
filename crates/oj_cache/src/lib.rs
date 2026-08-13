@@ -103,8 +103,10 @@ impl PersistentCache {
 mod tests {
     use super::*;
 
-    fn temp_cache() -> PersistentCache {
-        let dir = std::env::temp_dir().join(format!("oj-cache-test-{}", std::process::id()));
+    // Unique dir per test (by label) so parallel tests never wipe each other's
+    // entries; the process id keeps concurrent test binaries separate too.
+    fn temp_cache(label: &str) -> PersistentCache {
+        let dir = std::env::temp_dir().join(format!("oj-cache-test-{}-{label}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         PersistentCache::new(dir, "0.0.1-test")
     }
@@ -124,7 +126,7 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let cache = temp_cache();
+        let cache = temp_cache("roundtrip");
         let key = cache.key(b"source", "/src/App.tsx", "dev");
         assert_eq!(cache.get(&key), None);
         cache.put(&key, &sample());
@@ -133,7 +135,7 @@ mod tests {
 
     #[test]
     fn every_input_changes_the_key() {
-        let cache = temp_cache();
+        let cache = temp_cache("keys");
         let base = cache.key(b"source", "/src/App.tsx", "dev");
         assert_ne!(base, cache.key(b"source2", "/src/App.tsx", "dev"), "content");
         assert_ne!(base, cache.key(b"source", "/src/Other.tsx", "dev"), "url");
@@ -144,7 +146,7 @@ mod tests {
 
     #[test]
     fn corrupt_entries_are_dropped_not_served() {
-        let cache = temp_cache();
+        let cache = temp_cache("corrupt");
         let key = cache.key(b"s", "/u", "dev");
         cache.put(&key, &sample());
         let path = cache.path_for(&key);
@@ -155,7 +157,7 @@ mod tests {
 
     #[test]
     fn shards_by_key_prefix_and_leaves_no_temp_file() {
-        let cache = temp_cache();
+        let cache = temp_cache("shard");
         let key = cache.key(b"s", "/u", "dev");
         cache.put(&key, &sample());
         let path = cache.path_for(&key);
@@ -168,7 +170,7 @@ mod tests {
 
     #[test]
     fn field_separators_prevent_key_collisions() {
-        let cache = temp_cache();
+        let cache = temp_cache("sep");
         // Without the \0 separators between fields these would hash the same
         // concatenation ("a" + "bc" == "ab" + "c").
         let a = cache.key(b"bc", "a", "dev");
