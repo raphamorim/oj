@@ -406,4 +406,105 @@ export function Root() {
             .unwrap_err();
         assert!(matches!(err, CompileError::Parse { .. }));
     }
+
+    #[test]
+    fn replaces_import_meta_env_flags_per_mode() {
+        let src = "export const mode = import.meta.env.MODE;\n\
+                   export const dev = import.meta.env.DEV;\n\
+                   export const prod = import.meta.env.PROD;";
+        let prod = compile(Path::new("env.ts"), src, &CompileOptions::prod()).unwrap();
+        // every define is substituted, nothing left referencing import.meta.env
+        assert!(!prod.code.contains("import.meta.env"), "defines must be replaced:\n{}", prod.code);
+        assert!(prod.code.contains("\"production\""), "MODE is production:\n{}", prod.code);
+        assert!(prod.code.contains("prod = true"), "PROD is true in prod:\n{}", prod.code);
+        assert!(prod.code.contains("dev = false"), "DEV is false in prod:\n{}", prod.code);
+
+        let dev = compile(Path::new("env.ts"), src, &CompileOptions::dev()).unwrap();
+        assert!(dev.code.contains("\"development\""), "MODE is development:\n{}", dev.code);
+        assert!(dev.code.contains("dev = true"), "DEV is true in dev:\n{}", dev.code);
+        assert!(dev.code.contains("prod = false"), "PROD is false in dev:\n{}", dev.code);
+    }
+
+    #[test]
+    fn erases_type_only_imports_from_code_and_collected_imports() {
+        let src = r#"
+import type { A } from "./types";
+import { type B, c } from "./mixed";
+import { d } from "./real";
+export const used: A extends B ? number : number = c + d;
+"#;
+        let out = compile(Path::new("m.ts"), src, &CompileOptions::prod()).unwrap();
+        // a fully type-only import is elided, so its specifier never surfaces
+        assert!(!out.imports.iter().any(|i| i.contains("types")), "type-only import erased: {:?}", out.imports);
+        assert!(!out.code.contains("./types"), "type-only source gone:\n{}", out.code);
+        // an import with a value binding survives; the inline `type` specifier is dropped
+        assert!(out.imports.iter().any(|i| i.contains("mixed")), "mixed import kept: {:?}", out.imports);
+        assert!(!out.code.contains("type B"), "inline type specifier erased:\n{}", out.code);
+        assert!(out.imports.iter().any(|i| i.contains("real")));
+    }
+
+    #[test]
+    fn rewrites_dynamic_import_specifiers() {
+        let src = r#"export async function load() { return import("./chunk"); }"#;
+        let mut rewrite = |s: &str| -> Option<String> {
+            s.starts_with('.').then(|| format!("/res{}", s.trim_start_matches('.')))
+        };
+        let out =
+            compile_module(Path::new("d.ts"), src, &CompileOptions::prod(), Some(&mut rewrite)).unwrap();
+        assert!(out.code.contains("import(\"/res/chunk\")"), "dynamic import rewritten:\n{}", out.code);
+        assert!(out.imports.contains(&"/res/chunk".to_string()), "dynamic spec collected: {:?}", out.imports);
+    }
+
+    #[test]
+    fn fast_refresh_only_in_dev_with_refresh_enabled() {
+        // prod: never instrumented
+        let prod = compile(Path::new("C.tsx"), APP_TSX, &CompileOptions::prod()).unwrap();
+        assert!(!prod.has_refresh_registrations());
+        // dev with refresh disabled: still the dev jsx runtime, but no instrumentation
+        let dev_no_refresh = compile_module(
+            Path::new("C.tsx"),
+            APP_TSX,
+            &CompileOptions { dev: true, refresh: false, sourcemap: false },
+            None,
+        )
+        .unwrap();
+        assert!(!dev_no_refresh.has_refresh_registrations());
+        assert!(dev_no_refresh.code.contains("jsx-dev-runtime"), "dev runtime regardless of refresh");
+    }
+
+    #[test]
+    fn rejects_unsupported_file_types() {
+        let err = compile(Path::new("styles.css"), "body{}", &CompileOptions::prod()).unwrap_err();
+        assert!(matches!(err, CompileError::UnsupportedFileType(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn sourcemap_toggle_and_inline_map_helper() {
+        let no_map = compile_module(
+            Path::new("a.ts"),
+            "export const x = 1;",
+            &CompileOptions { dev: false, refresh: false, sourcemap: false },
+            None,
+        )
+        .unwrap();
+        assert!(no_map.map_data_url.is_none());
+        // with no map, the inline-map helper returns the code untouched
+        assert_eq!(no_map.code_with_inline_map(), no_map.code);
+
+        let with_map = compile(Path::new("a.ts"), "export const x = 1;", &CompileOptions::prod()).unwrap();
+        assert!(with_map.map_data_url.is_some());
+        assert!(with_map.code_with_inline_map().contains("sourceMappingURL="));
+    }
+
+    #[test]
+    fn exports_handles_reexports_and_never_panics() {
+        // local named exports (no `from`)
+        let mut local = exports(r#"export const a = 1; export { a as b };"#, Path::new("m.ts"));
+        local.sort();
+        assert_eq!(local, ["a", "b"]);
+        // a parse failure yields an empty list rather than a panic
+        assert!(exports("export { = ;", Path::new("bad.ts")).is_empty());
+        // an unsupported extension also yields empty, never an error
+        assert!(exports("body{}", Path::new("x.css")).is_empty());
+    }
 }
