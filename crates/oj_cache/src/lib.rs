@@ -152,4 +152,27 @@ mod tests {
         assert_eq!(cache.get(&key), None);
         assert!(!path.exists(), "corrupt entry must be removed");
     }
+
+    #[test]
+    fn shards_by_key_prefix_and_leaves_no_temp_file() {
+        let cache = temp_cache();
+        let key = cache.key(b"s", "/u", "dev");
+        cache.put(&key, &sample());
+        let path = cache.path_for(&key);
+        // the entry lives under a shard directory named by the key's first two chars
+        assert_eq!(path.parent().unwrap().file_name().unwrap().to_str().unwrap(), &key[..2]);
+        assert!(path.exists());
+        // the write-then-rename leaves no `.tmp` sibling behind
+        assert!(!path.with_extension("tmp").exists(), "temp file must be renamed away");
+    }
+
+    #[test]
+    fn field_separators_prevent_key_collisions() {
+        let cache = temp_cache();
+        // Without the \0 separators between fields these would hash the same
+        // concatenation ("a" + "bc" == "ab" + "c").
+        let a = cache.key(b"bc", "a", "dev");
+        let b = cache.key(b"c", "ab", "dev");
+        assert_ne!(a, b, "url/source boundary must be unambiguous");
+    }
 }

@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { viteEnvDefine, makeResolver } from "../../crates/oj_server/src/assets/start/resolve-pkg.mjs";
+import { viteEnvDefine, makeResolver, importPkg } from "../../crates/oj_server/src/assets/start/resolve-pkg.mjs";
 
 test("viteEnvDefine builds import.meta.env with the standard flags", () => {
   process.env.VITE_ONLY_FOR_TEST = "hello";
@@ -74,6 +74,74 @@ test("makeResolver throws a clear error for a missing package", () => {
     writeFileSync(join(root, "package.json"), '{"name":"app"}');
     const resolve = makeResolver(root);
     assert.throws(() => resolve("does-not-exist"), /cannot resolve/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function writePkg(root, name, files) {
+  const dir = join(root, "node_modules", name);
+  mkdirSync(dir, { recursive: true });
+  for (const [f, contents] of Object.entries(files)) writeFileSync(join(dir, f), contents);
+}
+
+test("importPkg imports a CJS package and unwraps module.exports", async () => {
+  const root = mkdtempSync(join(tmpdir(), "oj-import-cjs-"));
+  try {
+    writeFileSync(join(root, "package.json"), '{"name":"app"}');
+    writePkg(root, "cjspkg", {
+      "package.json": '{"name":"cjspkg","main":"index.js"}',
+      "index.js": 'module.exports = { version: "1.0", build: () => "built" };',
+    });
+    // the `default` (CJS module.exports) is unwrapped so callers get the object
+    const mod = await importPkg(root, "cjspkg");
+    assert.equal(mod.version, "1.0");
+    assert.equal(typeof mod.build, "function");
+    assert.equal(mod.build(), "built");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("importPkg imports an ESM package and returns its namespace", async () => {
+  const root = mkdtempSync(join(tmpdir(), "oj-import-esm-"));
+  try {
+    writeFileSync(join(root, "package.json"), '{"name":"app"}');
+    writePkg(root, "esmpkg", {
+      "package.json": '{"name":"esmpkg","main":"index.mjs"}',
+      // no default export, so importPkg returns the module namespace
+      "index.mjs": 'export const value = 42; export function greet() { return "hi"; }',
+    });
+    const mod = await importPkg(root, "esmpkg");
+    assert.equal(mod.value, 42);
+    assert.equal(mod.greet(), "hi");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("importPkg reaches a transitive dep through a preferred anchor", async () => {
+  const root = mkdtempSync(join(tmpdir(), "oj-import-anchor-"));
+  try {
+    writeFileSync(join(root, "package.json"), '{"name":"app"}');
+    writePkg(root, "anchor", { "package.json": '{"name":"anchor"}' });
+    writePkg(root, join("anchor", "node_modules", "dep"), {
+      "package.json": '{"name":"dep","main":"index.js"}',
+      "index.js": 'module.exports = { ok: true };',
+    });
+    // not a direct dep of the app; only reachable via the anchor
+    const mod = await importPkg(root, "dep", ["anchor"]);
+    assert.equal(mod.ok, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("importPkg rejects when the package cannot be resolved", async () => {
+  const root = mkdtempSync(join(tmpdir(), "oj-import-miss-"));
+  try {
+    writeFileSync(join(root, "package.json"), '{"name":"app"}');
+    await assert.rejects(importPkg(root, "not-installed"), /cannot resolve/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
