@@ -24,11 +24,13 @@ const ASSET_EXT = /\.(png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|eot|mp4|webm|wa
 // dev: the file is streamed by the server's /@oj-start/fs route (relative url()
 // refs resolve against the same dir). prod: the file is emitted into
 // dist/client/assets under a content hash and referenced absolutely.
-const makeUrlFor = ({ mode, fsBase, emit }) => (abs) => (mode === "dev" ? fsBase + abs : emit(abs));
+// Async because the prod emitter may compile the asset (Tailwind css). In dev
+// it resolves immediately to the /@oj-start/fs URL.
+const makeUrlFor = ({ mode, fsBase, emit }) => async (abs) => (mode === "dev" ? fsBase + abs : emit(abs));
 
 export function assetsPlugin({ mode = "dev", server = false, fsBase = "/@oj-start/fs", emit } = {}) {
   const urlFor = makeUrlFor({ mode, fsBase, emit });
-  const urlModule = (abs) => `export default ${JSON.stringify(urlFor(abs))};`;
+  const urlModule = async (abs) => `export default ${JSON.stringify(await urlFor(abs))};`;
   return {
     name: "oj-assets",
     setup(build) {
@@ -59,22 +61,26 @@ export function assetsPlugin({ mode = "dev", server = false, fsBase = "/@oj-star
         loader: "js",
       }));
 
-      build.onLoad({ filter: /.*/, namespace: "oj-url" }, (a) => ({ contents: urlModule(a.path), loader: "js" }));
+      build.onLoad({ filter: /.*/, namespace: "oj-url" }, async (a) => ({
+        contents: await urlModule(a.path),
+        loader: "js",
+      }));
 
       build.onLoad({ filter: /.*/, namespace: "oj-inline" }, (a) => ({
         contents: readFileSync(a.path),
         loader: "dataurl",
       }));
 
-      build.onLoad({ filter: /.*/, namespace: "oj-css" }, (a) => {
+      build.onLoad({ filter: /.*/, namespace: "oj-css" }, async (a) => {
         // Styling is a client concern; on the server a css import is a no-op.
         if (server) return { contents: "export default {};", loader: "js" };
         // Inject a <link> to the stylesheet (dev-served or emitted), which keeps
         // relative url() refs resolving against the file's own directory.
+        const href = await urlFor(a.path);
         return {
           contents:
             `const l=document.createElement("link");l.rel="stylesheet";` +
-            `l.href=${JSON.stringify(urlFor(a.path))};document.head.appendChild(l);`,
+            `l.href=${JSON.stringify(href)};document.head.appendChild(l);`,
           loader: "js",
         };
       });
@@ -99,7 +105,7 @@ export function makeVitePlugins({ container, fallback, appRoot, mode = "dev", fs
           const code = await container.load(args.path);
           if (code != null) return { contents: code, loader: "js", resolveDir: dirname(args.path) };
         }
-        return { contents: `export default ${JSON.stringify(urlFor(args.path))};`, loader: "js" };
+        return { contents: `export default ${JSON.stringify(await urlFor(args.path))};`, loader: "js" };
       });
       if (!container) return;
       const resolveVirtual = async (args) => {
@@ -196,10 +202,11 @@ export function workspaceRoot(app) {
 // under a name that includes an 8-char hash of its bytes and returns the
 // absolute URL. Client and server builds independently produce identical URLs
 // for identical bytes, so no shared manifest is needed. CSS is special-cased:
-// its relative url() references (fonts, images, @import) are emitted too and
-// rewritten to the hashed URLs, otherwise they'd 404 (the flat /assets layout
-// doesn't preserve the source's relative directory structure).
-export function contentHashEmitter(clientDir) {
+// Tailwind/PostCSS stylesheets are compiled first (via `compileCss`), then their
+// relative url() references (fonts, images) are emitted too and rewritten to the
+// hashed URLs, otherwise they'd 404 (the flat /assets layout doesn't preserve
+// the source's relative directory structure). Async because compilation is.
+export function contentHashEmitter(clientDir, compileCss) {
   const assetsDir = join(clientDir, "assets");
   const seen = new Set();
   const emitting = new Set();
@@ -216,11 +223,13 @@ export function contentHashEmitter(clientDir) {
     return "/assets/" + name;
   };
 
-  function emit(absPath) {
+  async function emit(absPath) {
     if (extname(absPath).toLowerCase() === ".css" && !emitting.has(absPath)) {
       emitting.add(absPath);
       try {
-        return write(absPath, Buffer.from(rewriteCss(readFileSync(absPath, "utf8"), dirname(absPath)), "utf8"));
+        let css = readFileSync(absPath, "utf8");
+        if (compileCss && needsCssCompile(css)) css = await compileCss(absPath, css);
+        return write(absPath, Buffer.from(await rewriteCss(css, dirname(absPath)), "utf8"));
       } finally {
         emitting.delete(absPath);
       }
@@ -230,17 +239,28 @@ export function contentHashEmitter(clientDir) {
 
   // Rewrite url(...) references relative to the CSS file: emit each referenced
   // asset and substitute its hashed URL. Skips data:, absolute, and rooted refs.
-  function rewriteCss(css, dir) {
-    return css.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (m, _q, ref) => {
-      const t = ref.trim();
-      if (/^(data:|https?:|\/\/|#|\/)/.test(t)) return m;
+  async function rewriteCss(css, dir) {
+    const re = /url\(\s*(['"]?)([^'")]+)\1\s*\)/g;
+    let out = "", last = 0, m;
+    while ((m = re.exec(css))) {
+      out += css.slice(last, m.index);
+      last = m.index + m[0].length;
+      const t = m[2].trim();
+      if (/^(data:|https?:|\/\/|#|\/)/.test(t)) { out += m[0]; continue; }
       const clean = t.replace(/[?#].*$/, "");
       const suffix = t.slice(clean.length);
       const abs = resolve(dir, clean);
-      if (!existsSync(abs)) return m;
-      return `url(${JSON.stringify(emit(abs) + suffix)})`;
-    });
+      if (!existsSync(abs)) { out += m[0]; continue; }
+      out += `url(${JSON.stringify((await emit(abs)) + suffix)})`;
+    }
+    return out + css.slice(last);
   }
 
   return emit;
+}
+
+// A stylesheet needs Tailwind/PostCSS compilation (v4 `@import "tailwindcss"` or
+// the `@tailwind` / `@plugin` / `@apply` at-rules).
+export function needsCssCompile(src) {
+  return src.includes("tailwindcss") || src.includes("@tailwind") || src.includes("@plugin") || src.includes("@apply");
 }

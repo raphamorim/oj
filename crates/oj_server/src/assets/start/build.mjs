@@ -155,7 +155,19 @@ mkdirSync(CLIENT, { recursive: true });
 // Shared across both builds: a content-hash asset emitter (client and server
 // produce matching /assets/<hash> URLs) and the app's vite plugin container
 // (build command; client vs ssr environment changes plugin behavior).
-const emit = contentHashEmitter(CLIENT);
+// Compile Tailwind/PostCSS stylesheets during emit, so prod css is real css
+// (not raw `@import "tailwindcss"`). Null when the app has no PostCSS/Tailwind.
+const compileCss = await (async () => {
+  try {
+    const postcss = await importPkg(APP, "postcss", []);
+    const twMod = await importPkg(APP, "@tailwindcss/postcss", ["tailwindcss"]);
+    const tailwind = twMod.default ?? twMod;
+    return async (from, src) => (await postcss([tailwind()]).process(src, { from })).css;
+  } catch {
+    return null;
+  }
+})();
+const emit = contentHashEmitter(CLIENT, compileCss);
 const NODE_PATHS = pnpmStorePaths(WORKSPACE);
 const clientContainer = await loadPluginContainer(APP, { command: "build", environment: "client" });
 const serverContainer = await loadPluginContainer(APP, { command: "build", environment: "ssr" });
