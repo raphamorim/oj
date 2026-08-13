@@ -99,27 +99,25 @@ impl ModuleGraph {
 
     /// Decide what to do about a change to `changed`.
     ///
-    /// Mirrors Vite's `propagateUpdate`: walk each importer chain upward;
-    /// a chain ending at a non-accepting entry or looping back on itself
-    /// (circular import) means full reload.
-    /// TODO(perf): memoize per-module outcomes; per-chain DFS is
-    /// exponential on dense diamond graphs.
+    /// Mirrors Vite's `propagateUpdate`: climb the importer edges upward looking
+    /// for accepting boundaries; a path ending at a non-accepting entry, or a
+    /// circular import among non-accepting modules, means full reload. The climb
+    /// colors each module once (see `collect_boundaries`), so a dense diamond is
+    /// walked in O(V+E), not once per distinct root-to-node path.
     pub fn propagate_update(&self, changed: &Path) -> HmrDecision {
         if !self.modules.contains_key(changed) {
             return HmrDecision::FullReload {
                 reason: format!("{} is not in the module graph", changed.display()),
             };
         }
-
-        let mut boundaries: Vec<PathBuf> = Vec::new();
-        let mut chain: Vec<&Path> = vec![changed];
-        if let Err(reason) = self.walk_importers(changed, &mut boundaries, &mut chain) {
-            return HmrDecision::FullReload { reason };
+        match self.collect_boundaries(&[changed], &[]) {
+            Ok(mut boundaries) => {
+                boundaries.sort();
+                boundaries.dedup();
+                HmrDecision::Update { boundaries }
+            }
+            Err(reason) => HmrDecision::FullReload { reason },
         }
-
-        boundaries.sort();
-        boundaries.dedup();
-        HmrDecision::Update { boundaries }
     }
 
     /// Bundle-mode patch planning: like `propagate_update`, but also returns
@@ -167,52 +165,95 @@ impl ModuleGraph {
             };
         }
 
-        let mut boundaries: Vec<PathBuf> = Vec::new();
-        for importer in &node.importers {
-            let mut chain: Vec<&Path> = vec![changed, importer];
-            if let Err(reason) = self.walk_importers(importer, &mut boundaries, &mut chain) {
-                return HmrDecision::FullReload { reason };
+        // Seed the walk at `changed`'s importers with `changed` itself already
+        // on the stack (gray), so a cycle back into it is caught and it is never
+        // re-expanded as a boundary (it just rejected its own update).
+        let seeds: Vec<&Path> = node.importers.iter().map(PathBuf::as_path).collect();
+        match self.collect_boundaries(&seeds, &[changed]) {
+            Ok(mut boundaries) => {
+                boundaries.sort();
+                boundaries.dedup();
+                HmrDecision::Update { boundaries }
             }
+            Err(reason) => HmrDecision::FullReload { reason },
         }
-        boundaries.sort();
-        boundaries.dedup();
-        HmrDecision::Update { boundaries }
     }
 
-    fn walk_importers<'a>(
+    /// Climb importer edges from every seed, recording each self-accepting
+    /// module as a boundary and stopping there. A single coloring visits each
+    /// module at most once: `Gray` marks a module on the current DFS stack, so
+    /// reaching one is a back-edge — a cycle among non-accepting modules, which
+    /// forces a full reload; `Black` marks a fully-resolved module whose upward
+    /// closure is already cycle-free and boundary-terminated, so it is skipped
+    /// on any later path. A non-accepting module with no importers is an entry
+    /// dead-end. `pre_stack` modules start gray (the changed module for the
+    /// `hot.invalidate` walk): a cycle back into them is caught, and they are
+    /// never treated as boundaries. This is the same decision the old per-chain
+    /// DFS made, computed in O(V+E) instead of once per distinct path.
+    fn collect_boundaries<'a>(
+        &'a self,
+        seeds: &[&'a Path],
+        pre_stack: &[&'a Path],
+    ) -> Result<Vec<PathBuf>, String> {
+        let mut colors: HashMap<&'a Path, Color> = HashMap::new();
+        for module in pre_stack {
+            colors.insert(module, Color::Gray);
+        }
+        let mut boundaries: Vec<PathBuf> = Vec::new();
+        for seed in seeds {
+            self.climb(seed, &mut colors, &mut boundaries)?;
+        }
+        Ok(boundaries)
+    }
+
+    fn climb<'a>(
         &'a self,
         current: &'a Path,
+        colors: &mut HashMap<&'a Path, Color>,
         boundaries: &mut Vec<PathBuf>,
-        chain: &mut Vec<&'a Path>,
     ) -> Result<(), String> {
+        match colors.get(current) {
+            // Already fully resolved: its boundaries were recorded on first
+            // visit and its closure is clean, so nothing to redo.
+            Some(Color::Black) => return Ok(()),
+            // Back-edge onto the current stack: an import cycle among
+            // non-accepting modules.
+            Some(Color::Gray) => {
+                return Err(format!("circular import involving {}", current.display()));
+            }
+            None => {}
+        }
         let node = &self.modules[current];
-
         if node.is_self_accepting {
             boundaries.push(current.to_path_buf());
+            colors.insert(current, Color::Black);
             return Ok(());
         }
-
         if node.importers.is_empty() {
             return Err(format!(
                 "update reached entry {} with no accepting boundary",
                 current.display()
             ));
         }
-
-        for importer in &node.importers {
-            if chain.iter().any(|p| *p == importer.as_path()) {
-                return Err(format!(
-                    "circular import involving {}",
-                    importer.display()
-                ));
-            }
-            chain.push(importer);
-            let result = self.walk_importers(importer, boundaries, chain);
-            chain.pop();
-            result?;
+        colors.insert(current, Color::Gray);
+        // Deterministic order so a full-reload reason (first cycle/entry hit) is
+        // stable across runs.
+        let mut importers: Vec<&Path> = node.importers.iter().map(PathBuf::as_path).collect();
+        importers.sort();
+        for importer in importers {
+            self.climb(importer, colors, boundaries)?;
         }
+        colors.insert(current, Color::Black);
         Ok(())
     }
+}
+
+/// DFS coloring for `collect_boundaries`: `Gray` is on the current stack (a
+/// back-edge to it is a cycle), `Black` is fully resolved (skip on revisit).
+#[derive(Clone, Copy, PartialEq)]
+enum Color {
+    Gray,
+    Black,
 }
 
 #[cfg(test)]
@@ -328,6 +369,32 @@ mod tests {
         );
         let plan = g.update_plan(&p("shared.ts")).unwrap();
         assert_eq!(plan.dirty, vec![p("A.tsx"), p("B.tsx"), p("shared.ts")]);
+    }
+
+    #[test]
+    fn diamond_ladder_is_linear_not_exponential() {
+        // A ladder of stacked diamonds: leaf M0 is imported by A0 and B0, both
+        // imported by M1, imported by A1/B1, ... up to Mn under an accepting
+        // Root. There are 2^n distinct paths from M0 to Root, so the old
+        // per-chain DFS could not finish; the colored walk visits each node once.
+        let n = 60;
+        let mut g = ModuleGraph::new();
+        let m = |i: usize| p(&format!("M{i}.ts"));
+        for i in 0..n {
+            for side in ["A", "B"] {
+                let mid = p(&format!("{side}{i}.ts"));
+                g.add_import(&mid, &m(i)); // mid imports Mi
+                g.add_import(&m(i + 1), &mid); // M(i+1) imports mid
+            }
+        }
+        g.add_import(&p("Root.tsx"), &m(n));
+        g.set_self_accepting(&p("Root.tsx"), true);
+
+        // Resolves (fast) to the single boundary, no exponential blow-up.
+        assert_eq!(
+            g.propagate_update(&m(0)),
+            HmrDecision::Update { boundaries: vec![p("Root.tsx")] }
+        );
     }
 
     #[test]
