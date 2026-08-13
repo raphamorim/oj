@@ -228,9 +228,10 @@ pub fn compile_module(
             .iter()
             .any(|(k, _)| !k.starts_with("import.meta") && source_text.contains(k.as_str()));
     if needs_defines {
-        let scoping = SemanticBuilder::new().build(&program).semantic.into_scoping();
+        // Reuse the scoping the transformer already produced for the transformed
+        // program, instead of running a second full SemanticBuilder pass over it.
         if let Ok(config) = ReplaceGlobalDefinesConfig::new(&defines) {
-            let _ = ReplaceGlobalDefines::new(&allocator, config).build(scoping, &mut program);
+            let _ = ReplaceGlobalDefines::new(&allocator, config).build(transform_ret.scoping, &mut program);
         }
     }
 
