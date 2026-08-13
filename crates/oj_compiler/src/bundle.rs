@@ -583,4 +583,13 @@ export function Thing() { return import.meta.url; }
         assert!(out.code.contains(r#"return "/src/Mod.tsx""#), "{}", out.code);
         assert!(out.is_boundary(), "component module registers refresh");
     }
+
+    #[test]
+    fn plain_esm_module_without_a_component_is_not_a_boundary() {
+        // no component, so Fast Refresh registers nothing and the module is a
+        // non-boundary even though it is ESM.
+        let out = factory("export const x = 1; export function add(a, b) { return a + b; }");
+        assert_eq!(out.kind, FactoryKind::Esm);
+        assert!(!out.is_boundary(), "no $RefreshReg$ means no boundary: {}", out.code);
+    }
 }

@@ -438,4 +438,29 @@ exports.named = 1;
         assert!(out.code.contains("export const x = 1"));
         assert!(!out.code.contains("__cjs_exports"));
     }
+
+    #[test]
+    fn has_module_syntax_detects_only_statement_import_export() {
+        let p = Path::new("x.js");
+        // any top-level import/export statement counts as ESM
+        assert!(has_module_syntax_pub(p, "import x from 'y';"));
+        assert!(has_module_syntax_pub(p, "export const a = 1;"));
+        assert!(has_module_syntax_pub(p, "export { a } from './m';"));
+        assert!(has_module_syntax_pub(p, "export * from './m';"));
+        assert!(has_module_syntax_pub(p, "export default 1;"));
+        // CJS and dynamic import() are not module syntax
+        assert!(!has_module_syntax_pub(p, "module.exports = { a: 1 };"));
+        assert!(!has_module_syntax_pub(p, "const x = require('y');"));
+        assert!(!has_module_syntax_pub(p, "const p = import('y');"));
+    }
+
+    #[test]
+    fn is_valid_export_name_filters_reserved_and_internal() {
+        for ok in ["foo", "_bar", "$x", "a1_$", "React"] {
+            assert!(is_valid_export_name(ok), "{ok} should be valid");
+        }
+        for bad in ["default", "__cjs_exports", "__oj_glob_0", "1foo", "foo-bar", "", "a.b"] {
+            assert!(!is_valid_export_name(bad), "{bad:?} should be rejected");
+        }
+    }
 }
