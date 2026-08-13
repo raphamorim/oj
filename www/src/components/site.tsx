@@ -1,46 +1,51 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { Link, useRouterState } from "@tanstack/react-router";
 
 const GITHUB = "https://github.com/raphamorim/oj";
 
-export function Wordmark() {
-  return (
-    <Link to="/" className="mark" aria-label="oj home">
-      oj<span className="mark__dot">.</span>
-    </Link>
-  );
-}
-
-const NAV = [
-  { to: "/getting-started", label: "Get started" },
-  { to: "/architecture", label: "Architecture" },
-  { to: "/features", label: "Features" },
+const SECTIONS = [
+  { id: "process", label: "How it works" },
+  { id: "features", label: "Features" },
+  { id: "architecture", label: "Architecture" },
+  { id: "start", label: "Get started" },
 ] as const;
 
 export function Nav() {
-  const pathname = useRouterState({ select: (s) => s.location.pathname });
+  const [active, setActive] = useState("");
   const [scrolled, setScrolled] = useState(false);
+
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 8);
     onScroll();
     window.addEventListener("scroll", onScroll, { passive: true });
-    return () => window.removeEventListener("scroll", onScroll);
+
+    // Scroll-spy: highlight the section nearest the middle of the viewport.
+    const obs = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) if (e.isIntersecting) setActive(e.target.id);
+      },
+      { rootMargin: "-45% 0px -50% 0px" },
+    );
+    for (const s of SECTIONS) {
+      const el = document.getElementById(s.id);
+      if (el) obs.observe(el);
+    }
+    return () => {
+      window.removeEventListener("scroll", onScroll);
+      obs.disconnect();
+    };
   }, []);
 
   return (
     <header className="nav" data-scrolled={scrolled}>
       <div className="wrap nav__inner">
-        <Wordmark />
+        <a href="#top" className="mark" aria-label="oj">
+          oj<span className="mark__dot">.</span>
+        </a>
         <nav className="nav__links">
-          {NAV.map((item) => (
-            <Link
-              key={item.to}
-              to={item.to}
-              className="nav__link"
-              data-active={pathname === item.to}
-            >
-              {item.label}
-            </Link>
+          {SECTIONS.map((s) => (
+            <a key={s.id} href={`#${s.id}`} className="nav__link" data-active={active === s.id}>
+              {s.label}
+            </a>
           ))}
           <a className="nav__link" href={GITHUB} target="_blank" rel="noreferrer">
             GitHub
@@ -56,10 +61,10 @@ export function Footer() {
     <footer className="foot">
       <div className="wrap foot__row">
         <span className="foot__note">
-          oj is an open-source project. Built with oj, deployed on Cloudflare.
+          oj is an open-source project. This site is built with oj and deployed on Cloudflare.
         </span>
         <div className="foot__links">
-          <Link to="/getting-started" className="foot__link">Docs</Link>
+          <a className="foot__link" href="#start">Get started</a>
           <a className="foot__link" href={GITHUB} target="_blank" rel="noreferrer">GitHub</a>
           <a className="foot__link" href={`${GITHUB}/issues`} target="_blank" rel="noreferrer">Issues</a>
         </div>
@@ -75,45 +80,5 @@ export function Cmd({ children }: { children: ReactNode }) {
       <span className="cmd__prompt">$</span>
       <span>{children}</span>
     </span>
-  );
-}
-
-const DOC_NAV = [
-  {
-    label: "Start",
-    links: [{ to: "/getting-started", label: "Getting started" }],
-  },
-  {
-    label: "Reference",
-    links: [
-      { to: "/architecture", label: "Architecture" },
-      { to: "/features", label: "Features" },
-    ],
-  },
-] as const;
-
-export function DocsLayout({ children }: { children: ReactNode }) {
-  const pathname = useRouterState({ select: (s) => s.location.pathname });
-  return (
-    <div className="wrap docs">
-      <aside className="sidebar">
-        {DOC_NAV.map((group) => (
-          <div key={group.label} className="sidebar__group">
-            <div className="sidebar__label">{group.label}</div>
-            {group.links.map((link) => (
-              <Link
-                key={link.to}
-                to={link.to}
-                className="sidebar__link"
-                data-active={pathname === link.to}
-              >
-                {link.label}
-              </Link>
-            ))}
-          </div>
-        ))}
-      </aside>
-      <main className="prose">{children}</main>
-    </div>
   );
 }
