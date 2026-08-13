@@ -125,9 +125,12 @@ pub fn compile(
     compile_module(path, source_text, opts, None)
 }
 
-/// The module's exported binding names (named exports and re-export specifiers;
-/// `default` when a default export is present). Used to generate client stubs
-/// for server-only (`*.server.*`) modules. Returns empty on a parse failure.
+/// The module's exported binding names: named exports, re-export specifiers
+/// (`export { a } from "..."`), the namespace of an `export * as ns from "..."`,
+/// and `default` when a default export is present. Used to generate client
+/// stubs for server-only (`*.server.*`) modules. A bare `export * from "..."`
+/// re-exports names that cannot be known without resolving the target module,
+/// so it contributes none. Returns empty on a parse failure.
 pub fn exports(source_text: &str, path: &Path) -> Vec<String> {
     let Ok(source_type) = SourceType::from_path(path) else { return Vec::new() };
     let allocator = Allocator::default();
@@ -146,6 +149,19 @@ pub fn exports(source_text: &str, path: &Path) -> Vec<String> {
             Statement::ExportNamedDeclaration(decl) => {
                 for spec in &decl.specifiers {
                     names.push(bundle::export_name(&spec.exported));
+                }
+            }
+            // `export { a, b as c } from "./mod"`
+            Statement::ExportFromDeclaration(decl) => {
+                for spec in &decl.specifiers {
+                    names.push(bundle::export_name(&spec.exported));
+                }
+            }
+            // `export * as ns from "./mod"` binds `ns`; bare `export *` cannot
+            // be enumerated statically, so it adds nothing.
+            Statement::ExportAllDeclaration(decl) => {
+                if let Some(exported) = &decl.exported {
+                    names.push(bundle::export_name(exported));
                 }
             }
             Statement::ExportDefaultDeclaration(_) => names.push("default".to_string()),
@@ -506,5 +522,26 @@ export const used: A extends B ? number : number = c + d;
         assert!(exports("export { = ;", Path::new("bad.ts")).is_empty());
         // an unsupported extension also yields empty, never an error
         assert!(exports("body{}", Path::new("x.css")).is_empty());
+    }
+
+    #[test]
+    fn exports_captures_reexport_from_and_namespace_star() {
+        // `export { a, b as c } from "./mod"` contributes the exported names
+        let mut names = exports(r#"export { a, b as c } from "./mod";"#, Path::new("m.ts"));
+        names.sort();
+        assert_eq!(names, ["a", "c"]);
+        // `export * as ns from "./mod"` binds the namespace name
+        assert_eq!(exports(r#"export * as ns from "./mod";"#, Path::new("m.ts")), ["ns"]);
+        // bare `export * from "./mod"` cannot be enumerated statically -> none
+        assert!(exports(r#"export * from "./mod";"#, Path::new("m.ts")).is_empty());
+        // a mix: local default + re-export-from are all present
+        let mut mixed = exports(
+            r#"export default function () {}
+export { x } from "./a";
+export * as z from "./b";"#,
+            Path::new("m.ts"),
+        );
+        mixed.sort();
+        assert_eq!(mixed, ["default", "x", "z"]);
     }
 }
