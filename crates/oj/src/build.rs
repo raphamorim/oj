@@ -1776,4 +1776,57 @@ mod tests {
         let srcs = module_script_srcs(html);
         assert_eq!(srcs, vec!["/src/main.tsx"]);
     }
+
+    #[test]
+    fn is_server_module_path_matches_server_suffixes() {
+        for yes in ["api.server.ts", "a/b/auth.server.tsx", "x.server.js", "y.server.jsx"] {
+            assert!(is_server_module_path(yes), "{yes} should be a server module");
+        }
+        for no in ["api.ts", "server.ts", "api.server.css", "a.serverx.ts", "note.server.md"] {
+            assert!(!is_server_module_path(no), "{no} should not be a server module");
+        }
+    }
+
+    #[test]
+    fn server_fn_prod_stub_emits_an_rpc_per_export() {
+        let out = server_fn_prod_stub(&["getUser".into(), "default".into()], "/api.server.ts");
+        assert!(out.contains("const __ojCall ="), "the fetch helper is inlined: {out}");
+        assert!(
+            out.contains(r#"export const getUser = (...a) => __ojCall("/api.server.ts", "getUser", a);"#),
+            "named export stub: {out}"
+        );
+        assert!(
+            out.contains(r#"export default (...a) => __ojCall("/api.server.ts", "default", a);"#),
+            "default export stub: {out}"
+        );
+        // with no exports, only the helper is emitted (no export statements)
+        let empty = server_fn_prod_stub(&[], "/x.server.ts");
+        assert!(empty.contains("__ojCall"));
+        assert!(!empty.contains("export "), "no exports means no stubs: {empty}");
+    }
+
+    #[test]
+    fn human_bytes_scales_by_threshold() {
+        assert_eq!(human_bytes(0), "0B");
+        assert_eq!(human_bytes(512), "512B");
+        assert_eq!(human_bytes(1023), "1023B");
+        assert_eq!(human_bytes(1024), "1.0kB");
+        assert_eq!(human_bytes(1536), "1.5kB");
+        assert_eq!(human_bytes(1_048_575), "1024.0kB"); // just below the MB threshold
+        assert_eq!(human_bytes(1_048_576), "1.0MB");
+        assert_eq!(human_bytes(3_145_728), "3.0MB");
+    }
+
+    #[test]
+    fn link_hrefs_collects_only_absolute_hrefs() {
+        let html = r#"<html><head>
+          <link rel="stylesheet" href="/assets/app.css">
+          <link rel="icon" href="favicon.ico">
+          <link rel="modulepreload" href="/assets/chunk.js">
+        </head></html>"#;
+        let hrefs = link_hrefs(html);
+        assert!(hrefs.contains(&"/assets/app.css".to_string()), "{hrefs:?}");
+        assert!(hrefs.contains(&"/assets/chunk.js".to_string()), "{hrefs:?}");
+        assert!(!hrefs.iter().any(|h| h.contains("favicon")), "relative href filtered: {hrefs:?}");
+    }
 }
