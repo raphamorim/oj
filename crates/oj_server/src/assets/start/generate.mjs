@@ -17,6 +17,9 @@ const config = getConfig(
     routesDirectory: "./src/routes",
     generatedRouteTree: "./src/routeTree.gen.ts",
     autoCodeSplitting: false,
+    // Colocated tests/stories/type-decls under src/routes are not routes;
+    // ignore them so the generator neither includes nor warns about them.
+    routeFileIgnorePattern: "\\.(test|spec|stories|bench)\\.|\\.d\\.ts$",
   },
   root,
 );
