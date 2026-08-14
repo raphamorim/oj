@@ -23,22 +23,6 @@ const FEATURES = [
   { title: "Your vite.config, honored", body: "oj loads your plugins and runs their hooks with Vite's gating: apply, id filters, enforce order, and per-environment application. Virtual modules and framework plugins work as written." },
 ];
 
-const CRATES = [
-  { name: "oj", desc: "the CLI and the dev-server request loop" },
-  { name: "oj_server", desc: "the dev server and the framework adapters" },
-  { name: "oj_compiler", desc: "TS/JSX transform, Fast Refresh, glob, CJS interop, on oxc" },
-  { name: "oj_resolver", desc: "extensions, exports/imports conditions, tsconfig paths" },
-  { name: "oj_css", desc: "CSS, CSS Modules, and Sass compilation" },
-  { name: "oj_graph", desc: "the module graph and HMR update propagation" },
-  { name: "oj_config", desc: "the config schema and per-environment resolution" },
-  { name: "oj_cache", desc: "a content-addressed cache for compiled output" },
-];
-
-const STACK = [
-  "TanStack Start", "React 19", "Tailwind v4", "Cloudflare Workers", "TypeScript",
-  "Server functions", "import.meta.glob", "CSS Modules", "svgr", "MDX", "CommonJS interop",
-];
-
 function Home() {
   return (
     <div className="wrap" id="top">
@@ -129,28 +113,6 @@ function Home() {
               <div className="row__val">{f.body}</div>
             </div>
           ))}
-        </div>
-      </section>
-
-      {/* architecture */}
-      <section id="architecture">
-        <h2 className="head">Architecture</h2>
-        <p className="section__sub">
-          A small Rust workspace owns the hot path; a thin JavaScript adapter runs
-          your vite.config plugins and speaks the framework's protocols. The same
-          app builds in dev and prod and deploys to a Worker with no separate
-          runtime.
-        </p>
-        <div className="rows">
-          {CRATES.map((c) => (
-            <div key={c.name} className="row">
-              <div className="row__key row__key--mono">{c.name}</div>
-              <div className="row__val">{c.desc}</div>
-            </div>
-          ))}
-        </div>
-        <div className="chips">
-          {STACK.map((s) => <span key={s} className="chip">{s}</span>)}
         </div>
       </section>
 
