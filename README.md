@@ -7,9 +7,10 @@
 
 A Rust-native build tool for React apps. One oxc parse per file does the TS
 strip, JSX, and Fast Refresh instrumentation; on top of that: React Fast
-Refresh, CJS to ESM interop, content-addressed persistent caching, an
-experimental registry-runtime dev bundle mode (`--bundle`), production builds
-via embedded Rolldown, CSS Modules on Lightning CSS, and a Tailwind v4 sidecar.
+Refresh, CJS to ESM interop, content-addressed persistent caching, lazy
+compilation of dynamic `import()` boundaries, an experimental registry-runtime
+dev bundle mode (`--bundle`), production builds via embedded Rolldown, CSS
+Modules on Lightning CSS, and a Tailwind v4 sidecar.
 
 It optimizes for memory and cold start, where running many builds (CI, agents,
 multi-tenant) under Vite gets expensive.
@@ -103,6 +104,29 @@ node bench/generate.mjs 1000                    # generate a benchmark app (then
 node bench/run.mjs 1000                         # p50/p95 benchmark vs vite
 node bench/card.mjs                             # render bench/card.html to oj-benchmarks.png
 ```
+
+## Lazy compilation
+
+Dynamic `import()` targets are treated as lazy boundaries, not eager
+dependencies: the eager crawl follows only static imports, so a code-split app
+compiles the shell plus the route you open, not the whole graph. Nested
+`import()`s inside a lazy subtree stay their own boundaries. In `--bundle` mode
+the main chunk excludes lazy subtrees; `import()` compiles to `__oj_import_lazy`,
+which fetches the subtree on demand from `/@oj/lazy.js` and registers it into the
+same runtime registry (shared React — no duplicate instance), sending only the
+modules a client does not already hold.
+
+On a generated 24-route app (~1,000 modules, landing route eager, the rest
+lazy), cold start (spawn to landing painted) versus compiling every route
+eagerly, M-series Mac:
+
+| mode | eager | lazy | crawl (eager modules) |
+|---|---|---|---|
+| unbundled | 296ms | **140ms** | 996 -> **53** |
+| `--bundle` | 217ms | **139ms** | 996 -> **53** |
+
+Reproduce with `node bench/generate-routes.mjs && node bench/measure-lazy.mjs`
+(add `--bundle`).
 
 ## Benchmarks
 

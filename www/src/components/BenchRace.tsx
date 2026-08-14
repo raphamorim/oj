@@ -1,17 +1,17 @@
 import { useEffect, useRef, useState } from "react";
 
 // A "spawn -> paint" race, visualized. Each lane is a pixelated wavefront that
-// sweeps to PAINT at a speed proportional to the REAL measured latency
-// (bench/run.mjs: 10k-component dev server, p50, oj --bundle vs Vite 8.2's
-// default dev, M-series Mac). oj reaches paint first; the ratio is the story.
-// Numbers are the project's committed benchmark, reproducible in bench/.
+// sweeps to PAINT at a speed proportional to the REAL measured latency. Like
+// for like: both tools in their DEFAULT (unbundled) dev mode, 10k-component app,
+// p50, M-series Mac (bench/run.mjs). oj reaches paint first; the ratio is the
+// story. Numbers are the project's committed benchmark, reproducible in bench/.
 
 type Metric = { key: string; label: string; oj: number; vite: number };
 
 const METRICS: Metric[] = [
-  { key: "cold", label: "Cold start", oj: 1569, vite: 5468 },
-  { key: "warm", label: "Warm start", oj: 1408, vite: 4957 },
-  { key: "reload", label: "Full reload", oj: 231, vite: 1604 },
+  { key: "cold", label: "Cold start", oj: 2589, vite: 5468 },
+  { key: "warm", label: "Warm start", oj: 2184, vite: 4957 },
+  { key: "hmr", label: "HMR edit", oj: 64, vite: 114 },
 ];
 
 const OJ_MS = 900; // oj lane always takes this long on screen; vite scales by ratio

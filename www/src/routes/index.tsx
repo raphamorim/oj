@@ -14,6 +14,7 @@ const STEPS = [
 
 const FEATURES = [
   { title: "Rust-native compile", body: "TypeScript and JSX are transformed by oxc: types erased, the automatic JSX runtime used, Fast Refresh instrumented in dev, and every output cached content-addressed." },
+  { title: "Lazy compilation", body: "Dynamic import() boundaries compile on demand, so cold start scales with the route you open, not the whole app. A 24-route app cold-starts ~2x faster than compiling everything eagerly, unbundled or bundled." },
   { title: "SSR & server functions", body: "Streaming server rendering through TanStack Start, with hydration and SPA navigation. createServerFn() runs in process during a render and becomes an HTTP RPC in the browser, behind a same-origin CSRF check." },
   { title: "Cloudflare on the edge", body: "One build emits a Worker and its static assets. Wrangler vars and .dev.vars are read in dev through a context shim, so getCloudflareContext() resolves the same way it will in production." },
   { title: "Tailwind v4, no wiring", body: "Compiled through @tailwindcss/postcss on demand in dev and emitted in prod, linked into the SSR head so the first paint is already styled." },
@@ -85,8 +86,9 @@ function Home() {
       <section id="benchmark">
         <h2 className="head">Benchmark</h2>
         <p className="section__sub">
-          A 10,000-component app: cold start, warm start, and full reload (p50),
-          on an M-series Mac. oj --bundle against Vite 8.2's default dev.
+          Like for like: the race below is oj and Vite 8.2 both in their default
+          (unbundled) dev mode — 10,000 components, p50, M-series Mac. The table
+          adds oj's --bundle mode and Vite's experimental bundled dev.
         </p>
         <BenchRace />
         <table className="benchtable">
