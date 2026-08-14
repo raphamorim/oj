@@ -129,6 +129,10 @@ pub struct CompileOutput {
     /// Final specifiers of static imports and re-exports, post-rewrite.
     /// Type-only imports are already erased and never appear here.
     pub imports: Vec<String>,
+    /// Final specifiers of dynamic `import("literal")` targets, post-rewrite.
+    /// Kept separate from `imports` so the crawl and bundler can treat these as
+    /// lazy boundaries (compiled on demand) rather than eager dependencies.
+    pub dynamic_imports: Vec<String>,
     /// Whether the Fast Refresh transform emitted a `$RefreshReg$` registration.
     /// Detected on the transformed AST (see `detect_refresh_registrations`), not
     /// by scanning the generated text.
@@ -286,7 +290,7 @@ pub fn compile_module(
         glob::expand(&allocator, dir, &mut program);
     }
 
-    let imports = rewrite_module_specifiers(&allocator, &mut program, &mut rewriter);
+    let (imports, dynamic_imports) = rewrite_module_specifiers(&allocator, &mut program, &mut rewriter);
 
     // Fast Refresh boundary, decided semantically on the transformed AST (only
     // when the refresh transform ran). Cheaper than it looks: no separate text
@@ -300,7 +304,13 @@ pub fn compile_module(
     let CodegenReturn { code, map, .. } =
         Codegen::new().with_options(codegen_options).build(&program);
 
-    Ok(CompileOutput { code, map_data_url: map.map(|m| m.to_data_url()), imports, is_refresh_boundary })
+    Ok(CompileOutput {
+        code,
+        map_data_url: map.map(|m| m.to_data_url()),
+        imports,
+        dynamic_imports,
+        is_refresh_boundary,
+    })
 }
 
 /// Collect (and optionally rewrite) the source specifiers of all static
@@ -315,7 +325,7 @@ pub(crate) fn rewrite_module_specifiers_pub<'a>(
     allocator: &'a Allocator,
     program: &mut Program<'a>,
     rewriter: &mut ImportRewriter,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<String>) {
     let mut opt: Option<&mut ImportRewriter> = Some(rewriter);
     rewrite_module_specifiers(allocator, program, &mut opt)
 }
@@ -324,8 +334,9 @@ fn rewrite_module_specifiers<'a>(
     allocator: &'a Allocator,
     program: &mut Program<'a>,
     rewriter: &mut Option<&mut ImportRewriter>,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<String>) {
     let mut imports = Vec::new();
+    let mut dynamic_imports = Vec::new();
     for stmt in program.body.iter_mut() {
         let source: Option<&mut StringLiteral> = match stmt {
             Statement::ImportDeclaration(decl) => Some(&mut decl.source),
@@ -344,19 +355,20 @@ fn rewrite_module_specifiers<'a>(
         imports.push(lit.value.to_string());
     }
     // Dynamic import("literal") gets the same canonicalization (needed for
-    // bare specifiers, which the browser cannot resolve).
+    // bare specifiers, which the browser cannot resolve), but is collected
+    // separately: these are lazy boundaries, not eager dependencies.
     if let Some(rewriter) = rewriter.as_deref_mut() {
-        let mut dyn_rewriter = DynamicImportRewriter { allocator, rewriter, imports: &mut imports };
+        let mut dyn_rewriter = DynamicImportRewriter { allocator, rewriter, dynamic: &mut dynamic_imports };
         use oxc_ast_visit::VisitMut;
         dyn_rewriter.visit_program(program);
     }
-    imports
+    (imports, dynamic_imports)
 }
 
 struct DynamicImportRewriter<'a, 'b> {
     allocator: &'a Allocator,
     rewriter: &'b mut ImportRewriter<'b>,
-    imports: &'b mut Vec<String>,
+    dynamic: &'b mut Vec<String>,
 }
 
 impl<'a> oxc_ast_visit::VisitMut<'a> for DynamicImportRewriter<'a, '_> {
@@ -366,7 +378,7 @@ impl<'a> oxc_ast_visit::VisitMut<'a> for DynamicImportRewriter<'a, '_> {
                 lit.value = self.allocator.alloc_str(&new_spec).into();
                 lit.raw = None;
             }
-            self.imports.push(lit.value.to_string());
+            self.dynamic.push(lit.value.to_string());
         }
         oxc_ast_visit::walk_mut::walk_import_expression(self, it);
     }
@@ -518,7 +530,13 @@ export const used: A extends B ? number : number = c + d;
         let out =
             compile_module(Path::new("d.ts"), src, &CompileOptions::prod(), Some(&mut rewrite)).unwrap();
         assert!(out.code.contains("import(\"/res/chunk\")"), "dynamic import rewritten:\n{}", out.code);
-        assert!(out.imports.contains(&"/res/chunk".to_string()), "dynamic spec collected: {:?}", out.imports);
+        // Dynamic targets are collected separately from static imports (lazy).
+        assert!(
+            out.dynamic_imports.contains(&"/res/chunk".to_string()),
+            "dynamic spec collected: {:?}",
+            out.dynamic_imports
+        );
+        assert!(!out.imports.contains(&"/res/chunk".to_string()), "dynamic not in static imports");
     }
 
     #[test]

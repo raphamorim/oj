@@ -46,6 +46,9 @@ pub struct FactoryOutput {
     /// in-factory `require`.
     pub require_map: Vec<(String, String)>,
     pub kind: FactoryKind,
+    /// Dynamic `import("literal")` targets (post-rewrite): lazy boundaries the
+    /// chunk assembler excludes from the eager bundle.
+    pub dynamic_imports: Vec<String>,
     /// Fast Refresh registered a component (AST-detected, ESM only).
     pub is_refresh_boundary: bool,
 }
@@ -93,6 +96,7 @@ fn compile_cjs_factory(
         imports,
         require_map,
         kind: FactoryKind::Cjs,
+        dynamic_imports: Vec::new(),
         is_refresh_boundary: false,
     })
 }
@@ -164,8 +168,9 @@ fn compile_esm_factory(
         crate::glob::expand(&allocator, path.parent().unwrap_or(path), &mut program);
     }
 
-    // Canonicalize specifiers to urls (shared with unbundled mode).
-    let _ = crate::rewrite_module_specifiers_pub(&allocator, &mut program, resolve);
+    // Canonicalize specifiers to urls (shared with unbundled mode). Dynamic
+    // import() targets come back separately as lazy boundaries.
+    let (_, dynamic_imports) = crate::rewrite_module_specifiers_pub(&allocator, &mut program, resolve);
 
     // Fresh semantic over the transformed program for reference resolution.
     // `with_build_nodes`: reference node-ids must be resolvable to spans.
@@ -351,6 +356,7 @@ fn compile_esm_factory(
         imports: import_vars,
         require_map: Vec::new(),
         kind: FactoryKind::Esm,
+        dynamic_imports,
         is_refresh_boundary,
     })
 }

@@ -222,7 +222,13 @@ export default (module.exports && module.exports.__esModule) ? module.exports["d
         ));
     }
 
-    Ok(CompileOutput { code: out, map_data_url: None, imports: resolved_imports, is_refresh_boundary: false })
+    Ok(CompileOutput {
+        code: out,
+        map_data_url: None,
+        imports: resolved_imports,
+        dynamic_imports: Vec::new(),
+        is_refresh_boundary: false,
+    })
 }
 
 fn is_valid_export_name(name: &str) -> bool {
