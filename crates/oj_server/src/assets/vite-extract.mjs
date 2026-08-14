@@ -7,24 +7,66 @@
 // the plugin host uses to read the `plugins` array.
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
-import { writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { writeFileSync, readFileSync } from "node:fs";
 
 const configPath = process.argv[2];
 const appRoot = process.argv[3];
 const command = process.argv[4] || "serve";
 const mode = process.argv[5] || "development";
-const req = createRequire(appRoot + "/package.json");
+
+// Resolve a package from an app that may use pnpm's strict, non-hoisted layout,
+// where a transitive dep (vite's esbuild, etc.) isn't reachable from the app
+// root: try the app root, then each direct dep as an anchor. Returns null when
+// unresolvable (mirrors start/resolve-pkg).
+const appRequire = createRequire(pathToFileURL(appRoot + "/package.json").href);
+let directDeps = [];
+try {
+  const pkg = JSON.parse(readFileSync(appRoot + "/package.json", "utf8"));
+  directDeps = Object.keys({ ...pkg.dependencies, ...pkg.devDependencies });
+} catch {}
+function resolvePkg(spec) {
+  try {
+    return appRequire.resolve(spec);
+  } catch {}
+  for (const anchor of directDeps) {
+    let dir;
+    try {
+      dir = dirname(appRequire.resolve(anchor + "/package.json"));
+    } catch {
+      continue;
+    }
+    try {
+      return appRequire.resolve(spec, { paths: [dir] });
+    } catch {}
+  }
+  return null;
+}
 
 async function loadConfig() {
-  try {
-    const vite = await import(req.resolve("vite"));
-    if (typeof vite.loadConfigFromFile === "function") {
-      const loaded = await vite.loadConfigFromFile({ command, mode }, configPath, appRoot);
-      if (loaded && loaded.config) return loaded.config;
+  // Preferred: Vite's own loader. It handles TS/local imports/defineConfig and
+  // uses Vite's bundled esbuild, so the app need not depend on esbuild itself.
+  let viteErr = null;
+  const vitePath = resolvePkg("vite");
+  if (vitePath) {
+    try {
+      const vite = await import(pathToFileURL(vitePath).href);
+      if (typeof vite.loadConfigFromFile === "function") {
+        const loaded = await vite.loadConfigFromFile({ command, mode }, configPath, appRoot);
+        if (loaded && loaded.config) return loaded.config;
+      }
+    } catch (e) {
+      viteErr = e; // real config error — surfaced below if there is no fallback
     }
-  } catch {}
+  }
   if (/\.(ts|tsx|mts|cts)$/.test(configPath)) {
-    const esbuild = await import(req.resolve("esbuild"));
+    // Fallback only when esbuild is actually installed; otherwise surface the
+    // real Vite error rather than a misleading "Cannot find module 'esbuild'".
+    const esbuildPath = resolvePkg("esbuild");
+    if (!esbuildPath) {
+      throw viteErr ?? new Error("no vite or esbuild available to load the TS vite.config");
+    }
+    const esbuild = await import(pathToFileURL(esbuildPath).href);
     const r = await esbuild.build({
       entryPoints: [configPath], bundle: true, platform: "node", format: "esm",
       packages: "external", write: false, logLevel: "silent", absWorkingDir: appRoot,
