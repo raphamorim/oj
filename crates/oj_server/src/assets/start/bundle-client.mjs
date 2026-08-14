@@ -133,4 +133,5 @@ writeFileSync(
   join(HERE, "manifest.ts"),
   `export const tsrStartManifest = () => (${JSON.stringify(devManifest)});\n`,
 );
-process.stderr.write("oj: client entry bundled\n");
+const OJ = process.stderr.isTTY && !process.env.NO_COLOR ? "\x1b[1;38;2;42;51;212moj\x1b[0m" : "oj";
+process.stderr.write(`${OJ}: client entry bundled\n`);

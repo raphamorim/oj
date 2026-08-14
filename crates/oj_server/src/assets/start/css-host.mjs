@@ -26,7 +26,8 @@ async function compile(path) {
   return result.css;
 }
 
-process.stderr.write("oj css host: ready\n");
+const OJ = process.stderr.isTTY && !process.env.NO_COLOR ? "\x1b[1;38;2;42;51;212moj\x1b[0m" : "oj";
+process.stderr.write(`${OJ} css host: ready\n`);
 const rl = readline.createInterface({ input: process.stdin });
 for await (const line of rl) {
   let msg;

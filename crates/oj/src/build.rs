@@ -868,7 +868,7 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
     let public_dir = config.public_dir.as_ref().map(|p| root.join(p)).unwrap_or_else(|| root.join("public"));
     copy_public_dir(&public_dir, &out_dir)?;
 
-    println!("oj build: {} in {:?}", out_dir.display(), started.elapsed());
+    println!("{} build: {} in {:?}", oj_server::cobalt("oj"), out_dir.display(), started.elapsed());
     emitted.sort_by(|a, b| b.1.cmp(&a.1));
     for (name, bytes) in emitted.iter().take(12) {
         println!("  {:>9}  {}", human_bytes(*bytes), name);

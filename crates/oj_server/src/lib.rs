@@ -31,6 +31,24 @@ use oj_graph::{HmrDecision, ModuleGraph};
 use oj_resolver::OjResolver;
 use tokio::sync::broadcast;
 
+/// oj's brand cobalt (`#2a33d4`, the docs-site accent) as a bold truecolor ANSI
+/// wrap. Applied only to an interactive stdout with `NO_COLOR` unset; otherwise
+/// the string is returned unchanged, so piped and CI output stay plain.
+pub fn cobalt(s: &str) -> String {
+    use std::io::IsTerminal;
+    if std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal() {
+        format!("\x1b[1;38;2;42;51;212m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+
+/// The colored `oj` brand token followed by a plain `: ` — the prefix on oj's
+/// own status lines.
+fn oj_tag() -> String {
+    format!("{}:", cobalt("oj"))
+}
+
 /// Turn freshly-read file bytes into a `String`, validating UTF-8 with SIMD
 /// (`simdutf8`) instead of the standard library's scalar check, then reusing the
 /// validated buffer directly (no re-validation, no copy). Every module read on
@@ -213,9 +231,9 @@ impl DevServer {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("cannot bind {addr}"))?;
-        println!("  oj dev server");
+        println!("  {} dev server", cobalt("oj"));
         println!("  root: {}", built.root.display());
-        println!("  http://localhost:{}/", built.port);
+        println!("  {}", cobalt(&format!("http://localhost:{}/", built.port)));
         if !built.proxy_prefixes.is_empty() {
             println!("  proxy: {}", built.proxy_prefixes.join(", "));
         }
@@ -632,9 +650,9 @@ pub async fn preview(
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("cannot bind {addr}"))?;
-    println!("  oj preview");
+    println!("  {} preview", cobalt("oj"));
     println!("  serving: {}", dir.display());
-    println!("  http://localhost:{port}/");
+    println!("  {}", cobalt(&format!("http://localhost:{port}/")));
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -2322,7 +2340,7 @@ fn spawn_crawl(state: Arc<ServerState>, done_tx: tokio::sync::watch::Sender<bool
         }
 
         let paths = state.graph.lock().unwrap().module_paths();
-        println!("oj: eager graph ready: {} modules in {:?}", paths.len(), started.elapsed());
+        println!("{} eager graph ready: {} modules in {:?}", oj_tag(), paths.len(), started.elapsed());
         save_graph_snapshot(&state.root, &paths);
         let _ = done_tx.send(true);
     });
