@@ -17,6 +17,7 @@ window.clearImmediate ??= (id) => clearTimeout(id);
 
 const registry = new Map(); // url -> { kind, deps, factory }
 const instances = new Map(); // url -> { module, exports, ns }
+let socket = null; // set by connect(); used to escalate hot.invalidate
 
 window.__oj_register = (url, kind, deps, factory) => {
   registry.set(url, { kind, deps: deps || {}, factory });
@@ -144,10 +145,23 @@ function makeHot(url) {
     data: {},
     accept() {}, // registry-mode acceptance is driven by the server plan
     dispose() {},
+    // A rejected boundary escalates to its importers on the server (a patch
+    // that re-executes them with the already-registered factory), instead of a
+    // full reload; only fall back to reload if the socket is gone.
     invalidate() {
-      location.reload();
+      escalateInvalidate(url);
     },
   };
+}
+
+// Ask the server to re-plan from `url`'s importers. Falls back to a reload only
+// when the socket is unavailable.
+function escalateInvalidate(url) {
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: "invalidate", path: url }));
+  } else {
+    location.reload();
+  }
 }
 
 let lastPatchSeq = 0;
@@ -185,10 +199,16 @@ async function applyPatch(msg) {
           next
         );
         if (invalidate) {
-          console.warn(`[oj] ${boundary}: ${invalidate}, reloading`);
-          location.reload();
+          console.warn(`[oj] ${boundary}: ${invalidate}, escalating to importers`);
+          escalateInvalidate(boundary);
           return;
         }
+      } else {
+        // The boundary's instance was already discarded by a prior patch (an
+        // escalated `invalidate`): there is no previous export shape to validate
+        // against, but it just re-instantiated fresh, so schedule a refresh to
+        // let React swap in the new component families.
+        RefreshRuntime.enqueueUpdate();
       }
     }
     clearOverlay();
@@ -237,6 +257,7 @@ function clearOverlay() {
 
 (function connect() {
   const ws = new WebSocket("ws://" + location.host + "/__ws");
+  socket = ws;
   ws.addEventListener("message", (event) => {
     let msg;
     try {

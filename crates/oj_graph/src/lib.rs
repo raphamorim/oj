@@ -128,26 +128,46 @@ impl ModuleGraph {
         match self.propagate_update(changed) {
             HmrDecision::FullReload { reason } => Err(reason),
             HmrDecision::Update { boundaries } => {
-                // Re-walk collecting the visited chain (boundaries stop it).
-                let mut dirty: Vec<PathBuf> = vec![changed.to_path_buf()];
-                let mut queue = vec![changed.to_path_buf()];
-                let mut seen: HashSet<PathBuf> = queue.iter().cloned().collect();
-                while let Some(current) = queue.pop() {
-                    let node = &self.modules[&current];
-                    if node.is_self_accepting && current != changed {
-                        continue; // boundary: re-executes, but stop climbing
-                    }
-                    for importer in &node.importers {
-                        if seen.insert(importer.clone()) {
-                            dirty.push(importer.clone());
-                            queue.push(importer.clone());
-                        }
-                    }
-                }
-                dirty.sort();
-                Ok(UpdatePlan { dirty, boundaries })
+                Ok(UpdatePlan { dirty: self.dirty_closure(changed), boundaries })
             }
         }
+    }
+
+    /// Bundle-mode escalation of `hot.invalidate`: the module rejected its own
+    /// update at runtime (a non-component export changed), so plan a patch from
+    /// its importers instead of full-reloading — the same boundaries
+    /// `propagate_update_from_importers` finds, plus the dirty set to discard.
+    pub fn update_plan_from_importers(&self, changed: &Path) -> Result<UpdatePlan, String> {
+        match self.propagate_update_from_importers(changed) {
+            HmrDecision::FullReload { reason } => Err(reason),
+            HmrDecision::Update { boundaries } => {
+                Ok(UpdatePlan { dirty: self.dirty_closure(changed), boundaries })
+            }
+        }
+    }
+
+    /// Every module on the paths from `changed` up to its accepting boundaries
+    /// (inclusive of both `changed` and the boundaries), whose instances must be
+    /// discarded before the boundaries re-execute. `changed` is always included
+    /// even when self-accepting, so the invalidate walk climbs past it.
+    fn dirty_closure(&self, changed: &Path) -> Vec<PathBuf> {
+        let mut dirty: Vec<PathBuf> = vec![changed.to_path_buf()];
+        let mut queue = vec![changed.to_path_buf()];
+        let mut seen: HashSet<PathBuf> = queue.iter().cloned().collect();
+        while let Some(current) = queue.pop() {
+            let Some(node) = self.modules.get(&current) else { continue };
+            if node.is_self_accepting && current != changed {
+                continue; // boundary: re-executes, but stop climbing
+            }
+            for importer in &node.importers {
+                if seen.insert(importer.clone()) {
+                    dirty.push(importer.clone());
+                    queue.push(importer.clone());
+                }
+            }
+        }
+        dirty.sort();
+        dirty
     }
 
     /// Propagation for `hot.invalidate`: the module rejected its own update
@@ -369,6 +389,19 @@ mod tests {
         );
         let plan = g.update_plan(&p("shared.ts")).unwrap();
         assert_eq!(plan.dirty, vec![p("A.tsx"), p("B.tsx"), p("shared.ts")]);
+    }
+
+    #[test]
+    fn invalidate_plan_escalates_to_importer_boundaries() {
+        // main -> App(accepting) -> Button(accepting). Button rejects its own
+        // update (a non-component export changed): escalate to App, discarding
+        // both instances so App re-executes with the new Button.
+        let plan = graph().update_plan_from_importers(&p("Button.tsx")).unwrap();
+        assert_eq!(plan.boundaries, vec![p("App.tsx")]);
+        assert!(plan.dirty.contains(&p("Button.tsx")), "changed module is dirty");
+        assert!(plan.dirty.contains(&p("App.tsx")), "importer boundary is dirty");
+        // App rejecting reaches main (a non-accepting entry): full reload.
+        assert!(graph().update_plan_from_importers(&p("App.tsx")).is_err());
     }
 
     #[test]

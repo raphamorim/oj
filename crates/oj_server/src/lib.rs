@@ -1464,26 +1464,51 @@ fn handle_client_message(state: &Arc<ServerState>, text: &str) {
     let Ok(msg) = serde_json::from_str::<serde_json::Value>(text) else { return };
     if msg["type"] == "invalidate" {
         let Some(path) = msg["path"].as_str() else { return };
-        let decision =
-            state.graph.lock().unwrap().propagate_update_from_importers(Path::new(path));
-        let reply = match decision {
-            HmrDecision::Update { boundaries } => {
-                println!("oj: invalidate {path} -> update {boundaries:?}");
-                let timestamp = now_millis() as u64;
-                let updates: Vec<_> = boundaries
-                    .iter()
-                    .map(|b| {
-                        serde_json::json!({
-                            "path": format!("{}", b.display()),
-                            "timestamp": timestamp,
-                        })
+        // Bundle mode escalates as a patch (re-execute the importer boundaries
+        // with the already-registered factory); unbundled as an update (re-import
+        // the boundary module urls). Both replace the old full-reload fallback.
+        let reply = if state.bundle {
+            match state.graph.lock().unwrap().update_plan_from_importers(Path::new(path)) {
+                Ok(plan) => {
+                    println!("oj: invalidate {path} -> patch {:?}", plan.boundaries);
+                    let seq =
+                        state.patch_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    let to_urls =
+                        |v: &[PathBuf]| -> Vec<String> { v.iter().map(|p| p.display().to_string()).collect() };
+                    serde_json::json!({
+                        "type": "patch",
+                        "changed": [],
+                        "dirty": to_urls(&plan.dirty),
+                        "boundaries": to_urls(&plan.boundaries),
+                        "timestamp": now_millis() as u64,
+                        "seq": seq,
                     })
-                    .collect();
-                serde_json::json!({ "type": "update", "updates": updates })
+                }
+                Err(reason) => {
+                    println!("oj: invalidate {path} -> full-reload ({reason})");
+                    serde_json::json!({ "type": "full-reload", "reason": reason })
+                }
             }
-            HmrDecision::FullReload { reason } => {
-                println!("oj: invalidate {path} -> full-reload ({reason})");
-                serde_json::json!({ "type": "full-reload", "reason": reason })
+        } else {
+            match state.graph.lock().unwrap().propagate_update_from_importers(Path::new(path)) {
+                HmrDecision::Update { boundaries } => {
+                    println!("oj: invalidate {path} -> update {boundaries:?}");
+                    let timestamp = now_millis() as u64;
+                    let updates: Vec<_> = boundaries
+                        .iter()
+                        .map(|b| {
+                            serde_json::json!({
+                                "path": format!("{}", b.display()),
+                                "timestamp": timestamp,
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({ "type": "update", "updates": updates })
+                }
+                HmrDecision::FullReload { reason } => {
+                    println!("oj: invalidate {path} -> full-reload ({reason})");
+                    serde_json::json!({ "type": "full-reload", "reason": reason })
+                }
             }
         };
         let _ = state.reload_tx.send(reply.to_string());

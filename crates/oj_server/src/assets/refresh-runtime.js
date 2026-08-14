@@ -604,7 +604,7 @@ const hooks = []
 window.__registerBeforePerformReactRefresh = (cb) => {
   hooks.push(cb)
 }
-const enqueueUpdate = debounce(async () => {
+export const enqueueUpdate = debounce(async () => {
   if (hooks.length) await Promise.all(hooks.map((cb) => cb()))
   performReactRefresh()
 }, 16)
