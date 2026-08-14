@@ -2294,6 +2294,17 @@ fn spawn_watcher(state: Arc<ServerState>) {
         // the last send" debounce loses a second edit whose event lands in
         // the shadow of the first's trailing event.
         use std::sync::mpsc::RecvTimeoutError;
+        // Trailing-drain window: after the last event of a save's burst, wait
+        // this long for the next before processing. It sits directly on the HMR
+        // critical path (a single-event save waits exactly this long before the
+        // recompile even starts), so it is kept just long enough to coalesce a
+        // burst — editor writes land within ~1-2ms, so 10ms coalesces reliably
+        // while shaving ~20ms off save-to-paint versus the old 30ms. Tunable via
+        // OJ_HMR_DEBOUNCE_MS. Never drops an event: any event resets the timer.
+        let debounce_ms: u64 = std::env::var("OJ_HMR_DEBOUNCE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
         loop {
             // Block for the first event of a burst.
             let first = match rx.recv() {
@@ -2305,7 +2316,7 @@ fn spawn_watcher(state: Arc<ServerState>) {
                 first.paths.into_iter().collect();
             // Drain the rest of the burst until things go quiet.
             loop {
-                match rx.recv_timeout(Duration::from_millis(30)) {
+                match rx.recv_timeout(Duration::from_millis(debounce_ms)) {
                     Ok(Ok(ev)) => paths.extend(ev.paths),
                     Ok(Err(_)) => {}
                     Err(RecvTimeoutError::Timeout) => break,
