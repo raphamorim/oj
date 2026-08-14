@@ -19,4 +19,4 @@ tokio.workspace = true
 notify.workspace = true
 serde_json.workspace = true
 simdutf8.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
