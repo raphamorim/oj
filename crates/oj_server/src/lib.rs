@@ -202,6 +202,19 @@ struct ServerState {
     /// Prebuilt config JSON for the "ssr" host (identical to the client host's
     /// but `environment.name` is "ssr").
     ssr_plugin_config: String,
+    /// Files plugins registered via `this.addWatchFile` during a module's
+    /// `transform`, cached per-module (`CachedModule.watch_files`) and merged
+    /// here on every serve, cache hits included. The dev watcher unions this
+    /// with the live host set so a plugin's watches survive a warm-cache
+    /// restart (where transform does not re-run to re-register them).
+    plugin_watched: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+    /// Whether any plugin defines `moduleParsed`. Gates the per-module replay on
+    /// warm-cache serves so the common case (no such plugin) pays nothing.
+    plugins_use_module_parsed: bool,
+    /// Module keys whose `moduleParsed` has already fired this session (via a
+    /// live transform or a warm-cache replay), so the replay runs at most once
+    /// per module per session.
+    parsed_fired: Mutex<std::collections::HashSet<String>>,
     /// Runtime handle so the sync file-watcher thread can call async plugin
     /// hooks (handleHotUpdate).
     rt: tokio::runtime::Handle,
@@ -359,6 +372,12 @@ impl DevServer {
         if let Some(p) = plugin_mw_port {
             println!("  plugin middleware: forwarding unmatched requests to :{p}");
         }
+        // Query once: whether any plugin observes the module graph via
+        // moduleParsed. Only then does oj replay the hook on warm-cache serves.
+        let plugins_use_module_parsed = match &plugin_host {
+            Some(host) => host.has_module_parsed().await,
+            None => false,
+        };
 
         let started = Instant::now();
         let (reload_tx, _) = broadcast::channel::<String>(64);
@@ -411,6 +430,9 @@ impl DevServer {
             plugin_mw_port,
             plugins_ssr: tokio::sync::OnceCell::new(),
             ssr_plugin_config,
+            plugin_watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            plugins_use_module_parsed,
+            parsed_fired: Mutex::new(std::collections::HashSet::new()),
             rt: tokio::runtime::Handle::current(),
             base: config.base.clone().filter(|b| b != "/"),
         });
@@ -567,7 +589,9 @@ async fn ssr_module(
     // applyToEnvironment("ssr") plugins execute on server modules (the client
     // host, a different environment, transforms the browser copy separately).
     let source = match ssr_plugin_host(&state).await {
-        Some(host) => host.transform(&source, id).await.unwrap_or(source),
+        // SSR module loading is not cached across restarts, so the watch-file
+        // metadata isn't needed here; keep the transformed code only.
+        Some(host) => host.transform(&source, id).await.map(|(code, _)| code).unwrap_or(source),
         None => source,
     };
     // A virtual id has no usable file extension; compile it as TSX so the JS/TS
@@ -1133,6 +1157,7 @@ async fn ensure_module(
             require_map: Vec::new(),
             css_exports: Vec::new(),
             fs_allow: Vec::new(),
+            watch_files: Vec::new(),
         });
         register_in_graph(state, url, &module);
         return Ok((String::new(), module));
@@ -1175,6 +1200,9 @@ async fn ensure_module(
         let module = Arc::new(module);
         memory_put(state, url, &key, &module);
         register_in_graph(state, url, &module);
+        // Warm-cache hit: transform did not re-run, so replay moduleParsed for
+        // graph-observing plugins (no-op unless one defines the hook).
+        replay_module_parsed(state, file, &key, is_dep_early, is_server).await;
         return Ok((key, module));
     }
 
@@ -1191,6 +1219,7 @@ async fn ensure_module(
             require_map: Vec::new(),
             css_exports: Vec::new(),
             fs_allow: Vec::new(),
+            watch_files: Vec::new(),
         });
         let _ = state.cache_writes.try_send((key.clone(), Arc::clone(&module)));
         memory_put(state, url, &key, &module);
@@ -1203,10 +1232,18 @@ async fn ensure_module(
     // are skipped to avoid a per-node_modules-module round trip). The `id` is
     // the absolute file path (Rollup convention, and what prod passes), so a
     // plugin's this.resolve gets a usable importer in both dev and prod.
+    // Files the plugins' transform registered via this.addWatchFile for this
+    // module: cached on the module and re-applied on every serve (cache hits
+    // included), so the watch survives a warm-cache restart.
+    let mut plugin_watch_files: Vec<String> = Vec::new();
     let source = match &state.plugins {
-        Some(host) if !is_dep => {
-            host.transform(&source, &file.to_string_lossy()).await.unwrap_or(source)
-        }
+        Some(host) if !is_dep => match host.transform(&source, &file.to_string_lossy()).await {
+            Ok((code, watches)) => {
+                plugin_watch_files = watches;
+                code
+            }
+            Err(_) => source,
+        },
         _ => source,
     };
 
@@ -1256,6 +1293,7 @@ async fn ensure_module(
                 require_map: Vec::new(),
                 css_exports: Vec::new(),
                 fs_allow: Vec::new(),
+                watch_files: Vec::new(),
             });
         }
         if is_css {
@@ -1275,6 +1313,7 @@ async fn ensure_module(
                 require_map: Vec::new(),
                 css_exports: output.exports.unwrap_or_default(),
                 fs_allow: Vec::new(),
+                watch_files: Vec::new(),
             });
         }
         let mut rewrite = |spec: &str| {
@@ -1308,6 +1347,7 @@ async fn ensure_module(
                 code: factory.code,
                 map_data_url: None,
                 fs_allow: fs_allow_from(&factory.imports),
+                watch_files: Vec::new(),
                 imports: factory.imports,
                 require_map: factory.require_map,
                 css_exports: Vec::new(),
@@ -1329,6 +1369,7 @@ async fn ensure_module(
                 code: output.code,
                 map_data_url: output.map_data_url,
                 fs_allow: fs_allow_from(&output.imports),
+                watch_files: Vec::new(),
                 imports: output.imports,
                 kind: String::new(),
                 require_map: Vec::new(),
@@ -1339,7 +1380,12 @@ async fn ensure_module(
     .await;
 
     let module = match compiled {
-        Ok(Ok(module)) => Arc::new(module),
+        Ok(Ok(mut module)) => {
+            // Only the app-source paths (dev/bundle) run transform; json/css
+            // leave this empty, matching the fact that they never watched.
+            module.watch_files = plugin_watch_files;
+            Arc::new(module)
+        }
         Ok(Err(err)) => return Err(err),
         Err(join_err) => return Err(format!("compiler task failed: {join_err}")),
     };
@@ -1350,7 +1396,33 @@ async fn ensure_module(
     let _ = state.cache_writes.try_send((key.clone(), Arc::clone(&module)));
     memory_put(state, url, &key, &module);
     register_in_graph(state, url, &module);
+    // The transform above already fired moduleParsed in the host; record it so a
+    // later warm re-load (memory eviction) does not replay it a second time.
+    if state.plugins_use_module_parsed && !is_dep && !is_server {
+        state.parsed_fired.lock().unwrap().insert(key.clone());
+    }
     Ok((key, module))
+}
+
+/// Replay `moduleParsed` for a warm-cache serve where `transform` (which
+/// normally fires it) did not re-run. No-op unless a plugin observes the graph,
+/// and fires at most once per module per session.
+async fn replay_module_parsed(
+    state: &Arc<ServerState>,
+    file: &Path,
+    key: &str,
+    is_dep: bool,
+    is_server: bool,
+) {
+    if !state.plugins_use_module_parsed || is_dep || is_server {
+        return;
+    }
+    if !state.parsed_fired.lock().unwrap().insert(key.to_string()) {
+        return; // already fired this session
+    }
+    if let Some(host) = &state.plugins {
+        let _ = host.module_parsed(&file.to_string_lossy()).await;
+    }
 }
 
 fn memory_get(state: &ServerState, url: &str, key: &str) -> Option<Arc<CachedModule>> {
@@ -1395,6 +1467,14 @@ fn register_in_graph(state: &ServerState, url: &str, module: &CachedModule) {
         let mut allow = state.fs_allow.lock().unwrap();
         for p in &module.fs_allow {
             allow.insert(PathBuf::from(p));
+        }
+    }
+    // Re-apply this module's plugin addWatchFile registrations (cache hits too),
+    // so the dev watcher keeps watching them after a warm-cache restart.
+    if !module.watch_files.is_empty() {
+        let mut watched = state.plugin_watched.lock().unwrap();
+        for p in &module.watch_files {
+            watched.insert(PathBuf::from(p));
         }
     }
     let mut graph = state.graph.lock().unwrap();
@@ -2442,15 +2522,20 @@ fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
     // Files plugins registered via this.addWatchFile: a change to one forces a
     // full reload even if oj would otherwise ignore the file. Fetched once per
     // burst (canonicalized so /tmp vs /private/tmp style aliases still match).
-    let plugin_watched: std::collections::HashSet<PathBuf> = match &state.plugins {
-        Some(host) => state
-            .rt
-            .block_on(host.watch_files())
-            .unwrap_or_default()
-            .into_iter()
+    let plugin_watched: std::collections::HashSet<PathBuf> = {
+        // Live host set (this session's transforms) unioned with the per-module
+        // cached registrations re-applied on serve, so warm-cache modules whose
+        // transform never re-ran still contribute their watches.
+        let mut raw: Vec<String> = match &state.plugins {
+            Some(host) => state.rt.block_on(host.watch_files()).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        raw.extend(
+            state.plugin_watched.lock().unwrap().iter().map(|p| p.to_string_lossy().into_owned()),
+        );
+        raw.into_iter()
             .map(|p| std::fs::canonicalize(&p).unwrap_or_else(|_| PathBuf::from(p)))
-            .collect(),
-        None => Default::default(),
+            .collect()
     };
 
     // Any source change can mint new utility classes: refresh tailwind css.

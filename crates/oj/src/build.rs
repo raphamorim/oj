@@ -397,8 +397,10 @@ impl Plugin for OjUserPlugin {
         let code = args.code.to_string();
         let id = args.id.to_string();
         async move {
+            // The prod build uses the transformed code only; addWatchFile
+            // metadata is a dev-watcher concern.
             match host.transform(&code, &id).await {
-                Ok(out) if out != code => Ok(Some(HookTransformOutput {
+                Ok((out, _)) if out != code => Ok(Some(HookTransformOutput {
                     code: Some(out),
                     ..Default::default()
                 })),

@@ -5,53 +5,11 @@
 2. It was created out of frustration with agents running vite build when I was working on rioterm-js repository. Each build process was carrying 2gb.
 3. If anyone want to move the project upstream, please contact me via email. Currently working mostly to fix my own problems.
 
-A Rust-native build tool for React apps. One oxc parse per file does the TS
-strip, JSX, and Fast Refresh instrumentation; on top of that: React Fast
-Refresh, CJS to ESM interop, content-addressed persistent caching, lazy
-compilation of dynamic `import()` boundaries, an experimental registry-runtime
-dev bundle mode (`--bundle`), production builds via embedded Rolldown, CSS
-Modules on Lightning CSS, and a Tailwind v4 sidecar.
+OJ is a Rust-native build tool for React apps.
 
-It optimizes for memory and cold start, where running many builds (CI, agents,
-multi-tenant) under Vite gets expensive.
+It optimizes for memory and cold start, where running many builds (CI, agents, multi-tenant) under Vite gets expensive.
 
-## Server rendering
-
-There is an SSR mode: `oj dev --ssr src/entry-server.tsx` in dev, and
-`oj build --ssr` for production. It streams the HTML out with
-`renderToReadableStream` instead of buffering, and the client hydrates through
-the normal dev pipeline, so Fast Refresh and HMR keep working over a
-server-rendered page. In dev the server modules run in a small persistent Node
-process (a module runner using `vm.SourceTextModule`) that re-evaluates only
-what changed, instead of rebuilding a bundle per request.
-
-The playground app also carries a small file-based router built on top of all
-this: a `src/routes/` directory, nested `layout.tsx` files, `$param` segments,
-per-route data loaders and form actions, error and pending states, route code
-splitting, and link prefetching. Most of that is example-app code, not the tool
-itself. It is there to show the primitives compose, not to be a framework.
-
-## Plugins
-
-Vite/Rollup-style plugins run through a persistent Node plugin host. Drop an
-`oj.plugins.mjs` at the app root that default-exports a plugin array, or let oj
-read an app's `vite.config.{ts,js,mjs}` and pick up its `plugins` array
-directly. A TypeScript config (including one that imports local `.ts` files) is
-loaded via Vite's own config loader when Vite is installed, or bundled with the
-app's esbuild otherwise. From a `vite.config` oj also adopts the app's `base`,
-`server.port`/`host`, `define`, and `resolve.alias` for any field its own config
-leaves unset; alias entries resolve alongside tsconfig `paths`, in both `oj dev`
-and `oj build`. The dev
-server and `oj build` run `transform`, `resolveId`, `load`, `config`,
-`configResolved`, `transformIndexHtml`, `handleHotUpdate`, `buildStart`,
-`buildEnd`, `renderStart`, `renderChunk`, `generateBundle`, `writeBundle`,
-`closeBundle`, and `configureServer`; honor `enforce`,
-`apply`, and `applyToEnvironment` ordering; and give hooks a plugin context with
-`this.resolve`, `this.load`, `this.emitFile`, `this.getModuleInfo`,
-`this.getModuleIds`, and `this.addWatchFile`. Plugins run in both the client and
-SSR environments, in dev and in the production build. Still missing are
-whole-graph module info and per-environment build outputs, so a plugin that
-drives several build environments at once will not work yet.
+This project is alpha, so expect bugs. For real.
 
 ## Goals
 
@@ -77,6 +35,22 @@ The work ahead, roughly in priority order:
 - More of the module-graph plugin API. The `moduleParsed` and `watchChange`
   hooks fire today; still ahead is a synchronous whole-graph `getModuleInfo`
   (oj's plugin host is out of process, so cross-graph lookups are async).
+  
+## Server rendering
+
+There is an SSR mode: `oj dev --ssr src/entry-server.tsx` in dev, and `oj build --ssr` for production. It streams the HTML out with `renderToReadableStream` instead of buffering, and the client hydrates through
+the normal dev pipeline, so Fast Refresh and HMR keep working over a server-rendered page.
+
+In dev the server modules run in a small persistent Node process (a module runner using `vm.SourceTextModule`) that re-evaluates only what changed, instead of rebuilding a bundle per request.
+
+## Plugins
+
+Vite/Rollup-style plugins run through a persistent Node plugin host. Drop an `oj.plugins.mjs` at the app root that default-exports a plugin array, or let oj read an app's `vite.config.{ts,js,mjs}` and pick up its `plugins` array directly.
+
+A TypeScript config (including one that imports local `.ts` files) is loaded via Vite's own config loader when Vite is installed, or bundled with the app's esbuild otherwise. From a `vite.config` oj also adopts the app's `base`, `server.port`/`host`, `define`, and `resolve.alias` for any field its own config
+leaves unset; alias entries resolve alongside tsconfig `paths`, in both `oj dev` and `oj build`.
+
+The dev server and `oj build` run `transform`, `resolveId`, `load`, `config`, `configResolved`, `transformIndexHtml`, `handleHotUpdate`, `buildStart`, `buildEnd`, `renderStart`, `renderChunk`, `generateBundle`, `writeBundle`, `closeBundle`, and `configureServer`; honor `enforce`, `apply`, and `applyToEnvironment` ordering; and give hooks a plugin context with `this.resolve`, `this.load`, `this.emitFile`, `this.getModuleInfo`, `this.getModuleIds`, and `this.addWatchFile`. Plugins run in both the client and SSR environments, in dev and in the production build. Still missing are whole-graph module info and per-environment build outputs, so a plugin that drives several build environments at once will not work yet.
 
 ## Quickstart
 

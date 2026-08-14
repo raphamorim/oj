@@ -41,6 +41,12 @@ pub struct CachedModule {
     /// so a cached module's /@fs/ imports stay servable across restarts.
     #[serde(default)]
     pub fs_allow: Vec<String>,
+    /// Files a plugin registered via `this.addWatchFile` during this module's
+    /// `transform`. Re-applied to the dev watcher's plugin-watch set on every
+    /// serve (cache hits too), so those watches survive a warm-cache restart
+    /// even though the transform hook does not re-run on a cache hit.
+    #[serde(default)]
+    pub watch_files: Vec<String>,
 }
 
 pub struct PersistentCache {

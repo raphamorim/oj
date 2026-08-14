@@ -347,9 +347,39 @@ impl PluginHost {
         }
     }
 
-    /// Run the plugins' `transform` hooks; returns the (possibly) transformed code.
-    pub async fn transform(&self, code: &str, id: &str) -> Result<String, String> {
-        Ok(self.call("transform", &[code, id]).await?.unwrap_or_else(|| code.to_string()))
+    /// Run the plugins' `transform` hooks. Returns the (possibly) transformed
+    /// code plus the files those hooks registered via `this.addWatchFile` (so
+    /// the caller can cache + re-apply the watch across warm-cache restarts).
+    /// The host replies with a `{ code, watchFiles }` JSON envelope.
+    pub async fn transform(&self, code: &str, id: &str) -> Result<(String, Vec<String>), String> {
+        let Some(raw) = self.call("transform", &[code, id]).await? else {
+            return Ok((code.to_string(), Vec::new()));
+        };
+        match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(v) => {
+                let out = v.get("code").and_then(|c| c.as_str()).unwrap_or(code).to_string();
+                let watch = v
+                    .get("watchFiles")
+                    .and_then(|w| w.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                Ok((out, watch))
+            }
+            // A host that predates the envelope (or any non-JSON) returns raw code.
+            Err(_) => Ok((raw, Vec::new())),
+        }
+    }
+
+    /// Whether any loaded plugin defines `moduleParsed`. Queried once so oj only
+    /// replays the hook on warm-cache serves when a plugin actually observes it.
+    pub async fn has_module_parsed(&self) -> bool {
+        matches!(self.call("hasModuleParsed", &[]).await, Ok(Some(s)) if s == "true")
+    }
+
+    /// Replay `moduleParsed` for a module served from oj's warm cache, where the
+    /// `transform` hook (which normally fires it) did not re-run.
+    pub async fn module_parsed(&self, id: &str) -> Result<(), String> {
+        self.call("replayModuleParsed", &[id]).await.map(|_| ())
     }
 
     /// Run `resolveId`; `Ok(None)` = no plugin owns this specifier.

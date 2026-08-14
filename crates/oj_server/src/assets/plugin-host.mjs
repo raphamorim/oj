@@ -10,6 +10,7 @@ import { writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import readline from "node:readline";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 const pluginsPath = process.argv[2];
 const initial = JSON.parse(process.argv[3] ?? "{}");
@@ -165,6 +166,13 @@ const moduleInfoCache = new Map();
 
 // Files a plugin registered via this.addWatchFile (dev watcher pulls these).
 const watchedFiles = new Set();
+// Per-transform attribution of addWatchFile calls: each transform() runs its
+// hook chain inside a fresh bucket so oj can cache exactly the files THIS
+// module watched (concurrent transforms interleave at awaits, so a plain
+// module-scoped var would cross-contaminate -- AsyncLocalStorage scopes it to
+// the call chain). Enables re-applying the watch on a warm-cache serve, where
+// transform does not re-run.
+const transformWatchStore = new AsyncLocalStorage();
 // Module ids the host has observed (every transform id + this.load-ed id).
 // getModuleIds returns this: a subset of Rollup's whole-graph view, only the
 // modules the plugin host has actually seen.
@@ -218,8 +226,13 @@ const ctx = {
     return moduleInfoCache.get(typeof id === "string" ? id : id.id) ?? null;
   },
   // this.addWatchFile(id): watch an extra file; a change forces a dev reload.
+  // Also record it in the current transform's bucket (if any) for per-module
+  // caching, so the watch survives a warm-cache restart.
   addWatchFile(id) {
-    if (id) watchedFiles.add(String(id));
+    if (!id) return;
+    watchedFiles.add(String(id));
+    const bucket = transformWatchStore.getStore();
+    if (bucket) bucket.add(String(id));
   },
   // this.getModuleIds() returns an iterator over observed module ids (Rollup shape).
   getModuleIds() {
@@ -325,26 +338,47 @@ async function setupConfigureServer() {
 // in `build` also avoids leaving an http.Server that keeps this process alive.
 if (env.command !== "build") await setupConfigureServer();
 
-// transform chains through all plugins (Rollup semantics); returns the final code.
+// transform chains through all plugins (Rollup semantics). Returns a JSON
+// envelope { code, watchFiles }: the final code plus the files this module's
+// hooks registered via this.addWatchFile, so oj can cache + re-apply the watch
+// on a warm-cache serve (where transform does not re-run).
 async function transform(code, id) {
+  const bucket = new Set();
+  return transformWatchStore.run(bucket, async () => {
+    if (id) seenIds.add(id);
+    let current = code;
+    for (const p of plugins) {
+      if (typeof p.transform !== "function") continue;
+      const r = await p.transform.call(ctx, current, id);
+      if (r == null) continue;
+      current = typeof r === "string" ? r : (r.code ?? current);
+    }
+    // moduleParsed: the module has been transformed. Fire with a minimal
+    // ModuleInfo (id + final code); getModuleInfo caches it for later lookup.
+    const info = { id, code: current, importedIds: [] };
+    moduleInfoCache.set(id, info);
+    seenIds.add(id);
+    for (const p of plugins) {
+      if (typeof p.moduleParsed === "function") await p.moduleParsed.call(ctx, info);
+    }
+    return JSON.stringify({ code: current, watchFiles: [...bucket] });
+  });
+}
+
+// Replay `moduleParsed` for a module served from oj's warm cache (transform did
+// not re-run). Fires with a minimal ModuleInfo so graph-tracking plugins see
+// the module. Only invoked by oj when a plugin actually defines the hook.
+async function replayModuleParsed(id) {
   if (id) seenIds.add(id);
-  let current = code;
-  for (const p of plugins) {
-    if (typeof p.transform !== "function") continue;
-    const r = await p.transform.call(ctx, current, id);
-    if (r == null) continue;
-    current = typeof r === "string" ? r : (r.code ?? current);
-  }
-  // moduleParsed: the module has been transformed. Fire with a minimal
-  // ModuleInfo (id + final code); getModuleInfo caches it for later lookup.
-  const info = { id, code: current, importedIds: [] };
+  const info = moduleInfoCache.get(id) ?? { id, code: "", importedIds: [] };
   moduleInfoCache.set(id, info);
-  seenIds.add(id);
   for (const p of plugins) {
     if (typeof p.moduleParsed === "function") await p.moduleParsed.call(ctx, info);
   }
-  return current;
+  return null;
 }
+
+const anyModuleParsed = () => plugins.some((p) => typeof p.moduleParsed === "function");
 
 // watchChange: a watched file changed (dev). Fire each plugin's hook.
 async function watchChange(id, event) {
@@ -503,6 +537,10 @@ async function run(hook, args) {
   }
   // Files registered via this.addWatchFile, for the dev watcher.
   if (hook === "getWatchFiles") return JSON.stringify([...watchedFiles]);
+  // Whether any plugin defines moduleParsed: oj only pays the per-module replay
+  // cost on a warm cache when a plugin actually observes the graph.
+  if (hook === "hasModuleParsed") return String(anyModuleParsed());
+  if (hook === "replayModuleParsed") return replayModuleParsed(args[0]);
   if (hook === "hasGenerateBundle") {
     return String(plugins.some((p) => typeof (p.generateBundle?.handler ?? p.generateBundle) === "function"));
   }

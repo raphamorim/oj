@@ -39,6 +39,9 @@ jobs:
       - run: npx --prefix e2e playwright install --with-deps chromium
       - name: run e2e suite
         run: node e2e/run.mjs ${{ matrix.mode == 'bundle' && '--bundle' || '' }}
+      - name: warm-cache plugin side effects
+        if: matrix.mode == 'unbundled'
+        run: node e2e/warm-cache.mjs
       - name: ssr dev + hydration
         if: matrix.mode == 'unbundled'
         run: node e2e/ssr-dev.mjs
