@@ -115,35 +115,36 @@ its default dev mode (vite) and its experimental bundled dev mode
 
 | tool | cold start | warm start | reload | HMR | server RSS |
 |---|---|---|---|---|---|
-| **oj --bundle** | **354/354ms** | **354/359ms** | **41/42ms** | **76/94ms** | **46MB** |
-| oj (unbundled) | 438/966ms | 458/463ms | 174/175ms | 78/95ms | 46MB |
-| vite | 696/707ms | 644/668ms | 172/174ms | 56/94ms | 420MB |
-| vite-fbm | 302/329ms | 315/323ms | 49/52ms | 58/61ms | 354MB |
+| **oj --bundle** | **343/346ms** | **334/350ms** | **41/42ms** | **57/59ms** | **47MB** |
+| oj (unbundled) | 445/948ms | 452/459ms | 175/178ms | 57/60ms | 46MB |
+| vite | 701/709ms | 653/660ms | 172/175ms | 54/94ms | 445MB |
+| vite-fbm | 300/304ms | 301/371ms | 49/50ms | 55/58ms | 361MB |
 
 **5,000 components (p50/p95):**
 
 | tool | cold start | warm start | reload | HMR | server RSS |
 |---|---|---|---|---|---|
-| **oj --bundle** | **855/871ms** | **711/726ms** | **128/129ms** | **82/85ms** | **87MB** |
-| oj (unbundled) | 1286/1304ms | 1159/1166ms | 763/811ms | 81/86ms | 67MB |
-| vite | 2604/2643ms | 2399/2424ms | 747/764ms | 58/136ms | 904MB |
-| vite-fbm | 971/976ms | 973/976ms | 176/180ms | 61/65ms | 974MB |
+| **oj --bundle** | **893/945ms** | **725/727ms** | **133/134ms** | **56/97ms** | **81MB** |
+| oj (unbundled) | 1367/1508ms | 1188/1676ms | 792/945ms | 62/63ms | 63MB |
+| vite | 2726/2774ms | 2490/2603ms | 791/856ms | 56/79ms | 910MB |
+| vite-fbm | 917/934ms | 911/916ms | 168/169ms | 57/63ms | 973MB |
 
 **10,000 components (p50/p95):**
 
 | tool | cold start | warm start | reload | HMR | server RSS |
 |---|---|---|---|---|---|
-| **oj --bundle** | **1570/1597ms** | **1231/1278ms** | **220/222ms** | **94/186ms** | **121MB** |
-| oj (unbundled) | 2438/2499ms | 2080/2132ms | 1484/1509ms | 88/194ms | 96MB |
-| vite | 5333/5395ms | 4914/4945ms | 1585/1598ms | 58/176ms | 1499MB |
-| vite-fbm | 1376/1402ms | 1385/1390ms | 272/291ms | 66/68ms | 1739MB |
+| **oj --bundle** | **1569/1618ms** | **1408/1429ms** | **231/241ms** | **69/216ms** | **122MB** |
+| oj (unbundled) | 2589/2889ms | 2184/2238ms | 1576/1607ms | 64/170ms | 100MB |
+| vite | 5468/5537ms | 4957/4980ms | 1604/1649ms | 114/173ms | 1504MB |
+| vite-fbm | 1415/1442ms | 1417/1438ms | 277/291ms | 64/68ms | 1738MB |
 
 Bundle-mode oj wins cold start, warm start, and reload against Vite's default
 dev at every size (3-7x at 10k), and beats Vite's experimental bundled dev on
-warm start and reload. The two are close on cold start (vite-fbm edges oj at
-10k), and Vite keeps a small lead on raw HMR latency — where oj also runs the
-app's `@vitejs/plugin-react`. oj's decisive, consistent win is memory: 46-121MB
-against Vite's 354MB-1.7GB, an 8-14x gap that widens with app size.
+warm start and reload. On HMR oj now matches Vite's bundled dev (within a few
+ms) and is ~2x faster than Vite's default dev at 10k. The two bundled modes are
+close on cold start (vite-fbm edges oj at 10k). oj's decisive, consistent win is
+memory: 47-122MB against Vite's 361MB-1.7GB, an 8-14x gap that widens with app
+size.
 
 Production builds (`oj build` vs `vite build`) land at parity: same engine
 (Rolldown), byte-identical output sizes.

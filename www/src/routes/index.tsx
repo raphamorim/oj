@@ -97,21 +97,21 @@ function Home() {
           </thead>
           <tbody>
             <tr data-oj="true">
-              <td>oj --bundle</td><td>1570ms</td><td>1231ms</td><td>94ms</td><td>220ms</td><td>121MB</td>
+              <td>oj --bundle</td><td>1569ms</td><td>1408ms</td><td>69ms</td><td>231ms</td><td>122MB</td>
             </tr>
             <tr>
-              <td>vite (bundled dev)</td><td>1376ms</td><td>1385ms</td><td>66ms</td><td>272ms</td><td>1739MB</td>
+              <td>vite (bundled dev)</td><td>1415ms</td><td>1417ms</td><td>64ms</td><td>277ms</td><td>1738MB</td>
             </tr>
             <tr>
-              <td>vite (default)</td><td>5333ms</td><td>4914ms</td><td>58ms</td><td>1585ms</td><td>1499MB</td>
+              <td>vite (default)</td><td>5468ms</td><td>4957ms</td><td>114ms</td><td>1604ms</td><td>1504MB</td>
             </tr>
           </tbody>
         </table>
         <p className="bench__note">
           p50 on a generated 10k-component app, M-series Mac, Vite 8.2 (default
           and experimental bundled dev). oj wins cold, warm, and reload against
-          default Vite by 3–7×, and holds 12–14× less server memory than either
-          Vite mode; Vite keeps a slight edge on raw HMR. Reproducible:{" "}
+          default Vite by 3–7×, holds 12–14× less server memory than either Vite
+          mode, and now matches Vite's bundled dev on HMR. Reproducible:{" "}
           <code>node bench/run.mjs 10000</code>.
         </p>
       </section>

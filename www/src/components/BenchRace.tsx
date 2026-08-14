@@ -9,9 +9,9 @@ import { useEffect, useRef, useState } from "react";
 type Metric = { key: string; label: string; oj: number; vite: number };
 
 const METRICS: Metric[] = [
-  { key: "cold", label: "Cold start", oj: 1570, vite: 5333 },
-  { key: "warm", label: "Warm start", oj: 1231, vite: 4914 },
-  { key: "reload", label: "Full reload", oj: 220, vite: 1585 },
+  { key: "cold", label: "Cold start", oj: 1569, vite: 5468 },
+  { key: "warm", label: "Warm start", oj: 1408, vite: 4957 },
+  { key: "reload", label: "Full reload", oj: 231, vite: 1604 },
 ];
 
 const OJ_MS = 900; // oj lane always takes this long on screen; vite scales by ratio
