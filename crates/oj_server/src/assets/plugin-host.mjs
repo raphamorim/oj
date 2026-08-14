@@ -20,6 +20,11 @@ const initial = JSON.parse(process.argv[3] ?? "{}");
 process.env.VITE_CONFIG_NATIVE_IGNORE_WARNING ??= "true";
 const env = initial.env ?? { command: "serve", mode: "development" };
 
+// The `oj` brand token as a badge: navy foreground on white-background cells,
+// so it stays legible on any terminal theme (plain `oj` when piped / NO_COLOR).
+const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
+const OJ = _ojTTY ? "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m" : "oj";
+
 // Vite's `configResolved` and later hooks receive a fully-resolved
 // `ResolvedConfig`, so real plugins read fields Vite always fills in — e.g.
 // @vitejs/plugin-react reads `config.experimental.bundledDev`. oj only has the
@@ -79,7 +84,7 @@ async function loadViteConfig(configPath) {
       if (loaded && loaded.config) return loaded.config;
     }
   } catch (e) {
-    process.stderr.write(`oj: vite.loadConfigFromFile unavailable (${e}); bundling config directly\n`);
+    process.stderr.write(`${OJ}${_ojTTY ? "" : ":"} vite.loadConfigFromFile unavailable (${e}); bundling config directly\n`);
   }
   // Fallback for apps without a usable vite install.
   let mod;
@@ -135,10 +140,10 @@ try {
   const rank = (p) => (p.enforce === "pre" ? -1 : p.enforce === "post" ? 1 : 0);
   plugins.sort((a, b) => rank(a) - rank(b));
   process.stderr.write(
-    `oj plugin host: ${plugins.length} plugin(s) active for ${env.command}: ${plugins.map((p) => `${p.name}[${p.enforce ?? "-"}]`).join(",")}\n`,
+    `${OJ} plugin host: ${plugins.length} plugin(s) active for ${env.command}: ${plugins.map((p) => `${p.name}[${p.enforce ?? "-"}]`).join(",")}\n`,
   );
 } catch (e) {
-  process.stderr.write(`oj plugin host: failed to load ${pluginsPath}: ${(e && e.stack) || e}\n`);
+  process.stderr.write(`${OJ} plugin host: failed to load ${pluginsPath}: ${(e && e.stack) || e}\n`);
 }
 
 // Reverse RPC (Node to Rust): a plugin's this.resolve asks oj's own resolver
@@ -332,7 +337,7 @@ async function setupConfigureServer() {
   });
   await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
   middlewarePort = srv.address().port;
-  process.stderr.write(`oj plugin host: configureServer middleware on :${middlewarePort}\n`);
+  process.stderr.write(`${OJ} plugin host: configureServer middleware on :${middlewarePort}\n`);
 }
 // configureServer is a dev-server hook (Vite runs it only in dev). Skipping it
 // in `build` also avoids leaving an http.Server that keeps this process alive.

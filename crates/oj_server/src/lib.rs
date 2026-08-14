@@ -43,10 +43,38 @@ pub fn cobalt(s: &str) -> String {
     }
 }
 
-/// The colored `oj` brand token followed by a plain `: ` — the prefix on oj's
-/// own status lines.
+/// The `oj` brand token as a badge: bold navy foreground on white-background
+/// cells (a space of padding each side), so it stays legible on any terminal
+/// theme. Falls back to plain `oj` when piped / `NO_COLOR`.
+pub fn oj_brand() -> String {
+    use std::io::IsTerminal;
+    if std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal() {
+        // 48;2;255;255;255 = white bg cells; 1;38;2;42;51;212 = bold navy fg.
+        "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m".to_string()
+    } else {
+        "oj".to_string()
+    }
+}
+
+/// Wrap `text` in an OSC 8 hyperlink pointing at `url`, so terminals that
+/// support it render clickable links. Plain `text` when piped / `NO_COLOR`.
+pub fn link(url: &str, text: &str) -> String {
+    use std::io::IsTerminal;
+    if std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal() {
+        format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
+    } else {
+        text.to_string()
+    }
+}
+
+/// The `oj` brand badge as a status-line prefix (plain `oj:` when piped).
 fn oj_tag() -> String {
-    format!("{}:", cobalt("oj"))
+    use std::io::IsTerminal;
+    if std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal() {
+        format!("{} ", oj_brand())
+    } else {
+        "oj:".to_string()
+    }
 }
 
 /// Turn freshly-read file bytes into a `String`, validating UTF-8 with SIMD
@@ -244,9 +272,10 @@ impl DevServer {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("cannot bind {addr}"))?;
-        println!("  {} dev server", cobalt("oj"));
+        println!("  {} dev server", oj_brand());
         println!("  root: {}", built.root.display());
-        println!("  {}", cobalt(&format!("http://localhost:{}/", built.port)));
+        let url = format!("http://localhost:{}/", built.port);
+        println!("  {}", link(&url, &cobalt(&url)));
         if !built.proxy_prefixes.is_empty() {
             println!("  proxy: {}", built.proxy_prefixes.join(", "));
         }
@@ -674,9 +703,10 @@ pub async fn preview(
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("cannot bind {addr}"))?;
-    println!("  {} preview", cobalt("oj"));
+    println!("  {} preview", oj_brand());
     println!("  serving: {}", dir.display());
-    println!("  {}", cobalt(&format!("http://localhost:{port}/")));
+    let url = format!("http://localhost:{port}/");
+    println!("  {}", link(&url, &cobalt(&url)));
     axum::serve(listener, app).await?;
     Ok(())
 }

@@ -140,5 +140,6 @@ writeFileSync(
   join(HERE, "manifest.ts"),
   `export const tsrStartManifest = () => (${JSON.stringify(devManifest)});\n`,
 );
-const OJ = process.stderr.isTTY && !process.env.NO_COLOR ? "\x1b[1;38;2;42;51;212moj\x1b[0m" : "oj";
-process.stderr.write(`${OJ}: client entry bundled\n`);
+const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
+const OJ = _ojTTY ? "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m" : "oj";
+process.stderr.write(`${OJ}${_ojTTY ? "" : ":"} client entry bundled\n`);

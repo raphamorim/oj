@@ -61,5 +61,6 @@ export async function getServerFnById(id) {
 }
 `;
 writeFileSync(join(HERE, "server-fn-resolver.mjs"), out);
-const OJ = process.stderr.isTTY && !process.env.NO_COLOR ? "\x1b[1;38;2;42;51;212moj\x1b[0m" : "oj";
-process.stderr.write(`${OJ}: server-fn resolver (${entries.length} function(s))\n`);
+const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
+const OJ = _ojTTY ? "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m" : "oj";
+process.stderr.write(`${OJ}${_ojTTY ? "" : ":"} server-fn resolver (${entries.length} function(s))\n`);

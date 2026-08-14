@@ -127,8 +127,9 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| anyhow::anyhow!("cannot bind {addr}: {e}"))?;
-    println!("  {} dev (tanstack start)", oj_server::cobalt("oj"));
-    println!("  {}", oj_server::cobalt(&format!("http://localhost:{}/", built.port)));
+    println!("  {} dev (tanstack start)", oj_server::oj_brand());
+    let url = format!("http://localhost:{}/", built.port);
+    println!("  {}", oj_server::link(&url, &oj_server::cobalt(&url)));
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -305,7 +306,7 @@ pub async fn start_build(root: PathBuf) -> anyhow::Result<()> {
     if !status.success() {
         anyhow::bail!("production build failed");
     }
-    println!("  {} build (tanstack start) -> {}/dist", oj_server::cobalt("oj"), root.display());
+    println!("  {} build (tanstack start) -> {}/dist", oj_server::oj_brand(), root.display());
     println!("  run: node dist/server.mjs");
     Ok(())
 }

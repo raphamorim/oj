@@ -6,7 +6,8 @@
 import { importPkg } from "./resolve-pkg.mjs";
 
 const root = process.env.OJ_APP_ROOT ?? process.cwd();
-const OJ = process.stderr.isTTY && !process.env.NO_COLOR ? "\x1b[1;38;2;42;51;212moj\x1b[0m" : "oj";
+const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
+const OJ = _ojTTY ? "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m" : "oj";
 
 // Quiet the router-generator's noise: a Node process warning about
 // `replaceRouteChunk` (a harmless circular-dependency access in its internals),
@@ -58,8 +59,8 @@ for (const k of Object.keys(origConsole)) console[k] = origConsole[k];
 
 if (skipped.length) {
   process.stderr.write(
-    `${OJ}: route tree generated (${skipped.length} file(s) under src/routes export no Route, skipped)\n`,
+    `${OJ}${_ojTTY ? "" : ":"} route tree generated (${skipped.length} file(s) under src/routes export no Route, skipped)\n`,
   );
 } else {
-  process.stderr.write(`${OJ}: route tree generated\n`);
+  process.stderr.write(`${OJ}${_ojTTY ? "" : ":"} route tree generated\n`);
 }

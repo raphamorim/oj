@@ -82,13 +82,14 @@ pub async fn ssr_dev(root: PathBuf, entry: String, port: Option<u16>) -> anyhow:
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| anyhow::anyhow!("cannot bind {addr}: {e}"))?;
-    println!("  oj dev (ssr + module runner)");
+    println!("  {} dev (ssr + module runner)", oj_server::oj_brand());
     println!("  entry:  {entry}");
     match &client_url {
         Some(u) => println!("  client: {u} (hydration + hmr on)"),
         None => println!("  client: none (SSR only; add a *-client entry to hydrate)"),
     }
-    println!("  http://localhost:{}/", built.port);
+    let url = format!("http://localhost:{}/", built.port);
+    println!("  {}", oj_server::link(&url, &oj_server::cobalt(&url)));
     axum::serve(listener, app).await?;
     Ok(())
 }

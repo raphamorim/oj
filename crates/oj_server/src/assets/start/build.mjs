@@ -15,6 +15,9 @@ import { transformGlob } from "./glob-transform.mjs";
 
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
 const esbuild = await importPkg(APP, "esbuild", ["vite", "@tanstack/react-start"]);
+// The `oj` brand token as a badge: navy fg on white-bg cells (plain when piped).
+const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
+const OJ = _ojTTY ? "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m" : "oj";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DIST = join(APP, "dist");
@@ -300,7 +303,7 @@ if (prerender.length) {
     mkdirSync(dirname(outFile), { recursive: true });
     writeFileSync(outFile, html);
   }
-  process.stderr.write(`oj: prerendered ${prerender.length} route(s)\n`);
+  process.stderr.write(`${OJ}${_ojTTY ? "" : ":"} prerendered ${prerender.length} route(s)\n`);
 }
 
-process.stderr.write(`oj: built dist (client ${clientUrl})\n`);
+process.stderr.write(`${OJ}${_ojTTY ? "" : ":"} built dist (client ${clientUrl})\n`);
