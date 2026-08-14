@@ -1,10 +1,4 @@
 @import "tailwindcss";
-
-/* ------------------------------------------------------------------ tokens
-   Inspired by rapha.land: white page, Palatino serif body, EB Garamond italic
-   headings, a single cobalt accent. Restrained and editorial. The --color-*
-   and --font-mono vars are also read by BenchRace's canvas via getComputedStyle,
-   so keep those names stable. */
 :root {
   --color-bg: #ffffff;
   --color-ink: rgba(0, 0, 0, 0.85);
@@ -24,7 +18,6 @@
   --wrap: 860px;
 }
 
-/* -------------------------------------------------------------------- base */
 @layer base {
   html {
     -webkit-text-size-adjust: 100%;
@@ -75,7 +68,6 @@
   }
 }
 
-/* ----------------------------------------------------------------- layout */
 .wrap {
   width: var(--wrap);
   max-width: 90%;
@@ -86,7 +78,6 @@
   padding: 20px 0 100px;
 }
 
-/* --------------------------------------------------------------------- nav */
 .nav {
   position: sticky;
   top: 0;
@@ -144,8 +135,6 @@
     display: none;
   }
 }
-
-/* ---------------------------------------------------------------- headings */
 .masthead-title {
   display: flex;
   align-items: center;
@@ -162,7 +151,6 @@ h1.display {
   letter-spacing: -0.01em;
   margin: 0;
 }
-/* Small upright pill tagging the release stage, centered beside the title. */
 .badge {
   font-family: var(--font-mono);
   font-size: clamp(0.7rem, 1.3vw, 0.82rem);
@@ -193,7 +181,6 @@ h2.head {
   max-width: 58ch;
 }
 
-/* ----------------------------------------------------------------- prose */
 .lede {
   font-size: clamp(20px, 2.4vw, 23px);
   line-height: 1.5;
@@ -227,8 +214,6 @@ a:hover {
   padding: 0 12px;
   color: var(--color-faint);
 }
-
-/* --------------------------------------------------------- section lists */
 .rows {
   margin-top: 30px;
 }
@@ -276,8 +261,6 @@ a:hover {
     flex-basis: auto;
   }
 }
-
-/* ------------------------------------------------------------------ chips */
 .chips {
   display: flex;
   flex-wrap: wrap;
@@ -291,8 +274,6 @@ a:hover {
   border: 1px solid var(--color-line);
   border-radius: 999px;
 }
-
-/* -------------------------------------------------------------- benchmark */
 .bench {
   margin-top: 30px;
   border: 1px solid var(--color-line);
@@ -378,8 +359,6 @@ a:hover {
   color: var(--color-muted);
   max-width: 64ch;
 }
-
-/* --------------------------------------------------------------- code ui */
 .code-block {
   margin: 22px 0;
   padding: 16px 18px;
@@ -406,7 +385,7 @@ a:hover {
   max-width: 62ch;
 }
 
-/* ---------------------------------------------------------------- footer */
+
 .foot {
   margin-top: 90px;
   border-top: 1px solid var(--color-line);
@@ -436,8 +415,6 @@ a:hover {
 .foot__link:hover {
   color: var(--color-accent);
 }
-
-/* ----------------------------------------------------- mouse trail (desktop) */
 svg.trail {
   position: fixed;
   top: 0;

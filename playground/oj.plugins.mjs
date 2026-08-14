@@ -1,11 +1,6 @@
 import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-// buildStart / buildEnd lifecycle hooks. Captures the command from the resolved
-// config, then drops marker files at each phase so the runtime can prove they
-// fired: buildStart at dev-server start and at the top of the prod build,
-// buildEnd once the prod build's module graph is complete. The host runs with
-// the app root as its cwd, so .oj-cache/ (created for the host script) is here.
 function lifecyclePlugin() {
   let command = "";
   return {
@@ -22,11 +17,6 @@ function lifecyclePlugin() {
   };
 }
 
-// Uses the full plugin context: this.resolve (resolve a specifier through oj's
-// own resolver — here the tsconfig `@/` alias, proving it isn't plain Node
-// resolution) and this.emitFile (emit an asset into the build output). The
-// resolved module's basename is injected into App.tsx; the emitted file lands
-// in dist/assets/ during the prod build.
 function ctxPlugin() {
   return {
     name: "oj-ctx",
@@ -42,9 +32,6 @@ function ctxPlugin() {
         out = out.replace("__RESOLVED__", base);
       }
       if (out.includes("__MODINFO__")) {
-        // this.load fetches Counter's code + imports; getModuleInfo then reads
-        // the cached info synchronously. Counter's imports post-compile are
-        // react, its css module, and the auto-injected react/jsx-runtime (3).
         const r = await this.resolve("@/Counter", id);
         const loaded = r ? await this.load({ id: r.id }) : null;
         const info = r ? this.getModuleInfo(r.id) : null;
@@ -53,8 +40,6 @@ function ctxPlugin() {
         out = out.replace("__MODINFO__", `${n}:${hasHook}`);
       }
       if (out.includes("__MODULEIDS__")) {
-        // getModuleIds returns every id the host has observed. App.tsx is here
-        // (it's being transformed) and Counter once this.load-ed -> expect 2.
         const r = await this.resolve("@/Counter", id);
         if (r) await this.load({ id: r.id });
         const ids = [...this.getModuleIds()];
@@ -66,9 +51,6 @@ function ctxPlugin() {
   };
 }
 
-// Uses this.addWatchFile to watch an external, non-source file. oj ignores a
-// plain .txt change by default, but because the plugin registered it during
-// transform, the dev watcher forces a full reload when it changes.
 function watchPlugin() {
   return {
     name: "oj-watch",
@@ -80,10 +62,6 @@ function watchPlugin() {
   };
 }
 
-// Uses configureServer to add dev-server middleware: a Connect-style
-// (req, res, next) handler that owns a route oj doesn't serve. Requests oj
-// can't resolve are forwarded to this middleware; unhandled ones call next()
-// and fall back through to oj.
 function middlewarePlugin() {
   return {
     name: "oj-middleware",
@@ -100,10 +78,6 @@ function middlewarePlugin() {
   };
 }
 
-// Vite Environment API. envNamePlugin reads this.environment.name in a hook;
-// envPlugin(name, marker) is gated to one environment via applyToEnvironment, so
-// only the plugin matching oj's current environment ("client") runs — the
-// "ssr"-gated one is dropped and its marker is left untouched.
 function envNamePlugin() {
   return {
     name: "oj-env-name",
@@ -127,15 +101,9 @@ function envPlugin(name, marker) {
   };
 }
 
-// Uses the output-phase generateBundle hook: reads the finished bundle (emits a
-// report asset counting the JS chunks) and mutates it (prepends a banner to the
-// entry chunk). Exercises read + this.emitFile + mutation in one hook.
 function reportPlugin() {
   return {
     name: "oj-report",
-    // renderChunk: per-chunk code transform. Prepend a side-effect statement to
-    // the entry (a comment would be stripped by minification, which runs after
-    // renderChunk; a globalThis assignment survives).
     renderChunk(code, chunk) {
       if (!chunk.isEntry) return null;
       return { code: `globalThis.__OJ_RC="oj-rc-ran";${code}` };
@@ -147,13 +115,9 @@ function reportPlugin() {
         if (bundle[f].isEntry) bundle[f].code = "/*oj-gb-banner*/" + bundle[f].code;
       }
     },
-    // renderStart / closeBundle: output-phase lifecycle bookends. Each drops a
-    // marker so the runtime can prove they fired (and in order).
     renderStart() {
       writeFileSync(".oj-cache/plugin-renderstart", "render-start");
     },
-    // writeBundle: post-write side effect. Files are on disk; write a sibling
-    // marker with the emitted file names (proves the hook ran after write).
     writeBundle(_options, bundle) {
       writeFileSync(".oj-cache/plugin-writebundle", Object.keys(bundle).sort().join(","));
     },
@@ -163,9 +127,6 @@ function reportPlugin() {
   };
 }
 
-// Whole-graph / watch hooks: moduleParsed records every module the host parses
-// (exposed via a configureServer endpoint for the test), and watchChange fires
-// when a watched file changes, dropping a marker.
 function graphPlugin() {
   const parsed = new Set();
   return {
@@ -189,9 +150,6 @@ function graphPlugin() {
   };
 }
 
-// A Vite/Rollup-style plugin: a factory returning a `{ name, transform }`
-// object, exactly the shape npm plugins use. oj's plugin host loads this and
-// runs the transform hook against the compile pipeline.
 function markerPlugin() {
   return {
     name: "oj-marker",
@@ -203,8 +161,6 @@ function markerPlugin() {
   };
 }
 
-// A virtual-module plugin using resolveId + load (the classic `virtual:` id
-// pattern real plugins use).
 function virtualPlugin() {
   const VIRTUAL_ID = "\0virtual:plugin-greeting";
   return {
@@ -220,19 +176,16 @@ function virtualPlugin() {
   };
 }
 
-// Uses config() to contribute a value and configResolved() to capture the
-// merged config, then injects a config-derived string via transform — the
-// standard "capture config for later hooks" pattern.
 function configPlugin() {
   let resolved = null;
   return {
     name: "oj-config",
     config(_config, env) {
-      // Contribute to the config; the merged result is what configResolved sees.
       return { define: { __OJ_BUILT_BY__: "oj-plugin" } };
     },
     configResolved(config) {
-      resolved = config; // { root, base, mode, command, define, server }
+      // { root, base, mode, command, define, server }
+      resolved = config;
     },
     transform(code, id) {
       if (!id.endsWith(".tsx") || !code.includes("__OJ_CONFIG_MARKER__")) return null;
@@ -242,8 +195,6 @@ function configPlugin() {
   };
 }
 
-// Uses handleHotUpdate to override HMR: this file self-accepts (Fast Refresh)
-// by default, but the plugin forces a full reload for it.
 function hmrPlugin() {
   return {
     name: "oj-hmr",
@@ -254,8 +205,6 @@ function hmrPlugin() {
   };
 }
 
-// Uses transformIndexHtml to inject a meta tag into the document head (the
-// tag-descriptor form), plus a string rewrite.
 function htmlPlugin() {
   return {
     name: "oj-html",
@@ -268,8 +217,6 @@ function htmlPlugin() {
   };
 }
 
-// enforce ordering: appends to data-order. Listed post-then-pre below, but
-// enforce sorts them pre -> post, so the result is "base-pre-post".
 function orderPlugin(tag, enforce) {
   return {
     name: `oj-order-${tag}`,
@@ -281,8 +228,6 @@ function orderPlugin(tag, enforce) {
   };
 }
 
-// apply gating: only the plugin matching the command ("serve"/"build") runs, so
-// data-apply is "serve-only" in dev and "build-only" in the prod build.
 function applyPlugin(tag, apply) {
   return {
     name: `oj-apply-${tag}`,
