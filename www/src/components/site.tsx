@@ -39,7 +39,7 @@ export function Nav() {
   return (
     <header className="nav" data-scrolled={scrolled}>
       <div className="wrap nav__inner">
-        <a href="#top" className="mark" aria-label="oj — home">
+        <a href="#top" className="mark" aria-label="oj home">
           <span className="mark__dot" />
           <span className="mark__word">oj</span>
         </a>
@@ -85,7 +85,7 @@ export function Footer() {
   );
 }
 
-// A cobalt line that chases the cursor — the signature flourish from rapha.land,
+// A cobalt line that chases the cursor; the signature flourish from rapha.land,
 // ported to a React effect. Skipped for touch and reduced-motion (via CSS).
 export function Trail() {
   const svgRef = useRef<SVGSVGElement | null>(null);

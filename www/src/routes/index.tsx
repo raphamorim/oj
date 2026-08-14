@@ -46,7 +46,7 @@ function Home() {
 
       <p className="lede">
         A Rust-native build tool for React apps. Your build tool should be{" "}
-        <em>invisible</em> — oj puts a Rust core under the app you already have.
+        <em>invisible</em>. oj puts a Rust core under the app you already have.
       </p>
       <p className="body">
         A fast dev server, server rendering with TanStack Start, Tailwind, and
@@ -87,7 +87,7 @@ function Home() {
         <h2 className="head">Benchmark</h2>
         <p className="section__sub">
           Like for like: the race below is oj and Vite 8.2 both in their default
-          (unbundled) dev mode — 10,000 components, p50, M-series Mac. The table
+          (unbundled) dev mode, 10,000 components, p50, M-series Mac. The table
           adds oj's --bundle mode and Vite's experimental bundled dev.
         </p>
         <BenchRace />
