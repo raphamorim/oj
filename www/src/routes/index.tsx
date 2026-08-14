@@ -85,8 +85,8 @@ function Home() {
       <section id="benchmark">
         <h2 className="head">Benchmark</h2>
         <p className="section__sub">
-          A 10,000-component dev server, save-to-paint latency (p50), on an
-          M-series Mac. Watch a real edit reach the screen — oj against Vite 8.2.
+          A 10,000-component app: cold start, warm start, and full reload (p50),
+          on an M-series Mac. oj --bundle against Vite 8.2's default dev.
         </p>
         <BenchRace />
         <table className="benchtable">
@@ -97,20 +97,21 @@ function Home() {
           </thead>
           <tbody>
             <tr data-oj="true">
-              <td>oj --bundle</td><td>1427ms</td><td>1070ms</td><td>49ms</td><td>234ms</td><td>107MB</td>
+              <td>oj --bundle</td><td>1570ms</td><td>1231ms</td><td>94ms</td><td>220ms</td><td>121MB</td>
             </tr>
             <tr>
-              <td>vite (bundled dev)</td><td>1425ms</td><td>1427ms</td><td>68ms</td><td>277ms</td><td>1752MB</td>
+              <td>vite (bundled dev)</td><td>1376ms</td><td>1385ms</td><td>66ms</td><td>272ms</td><td>1739MB</td>
             </tr>
             <tr>
-              <td>vite (default)</td><td>5532ms</td><td>5045ms</td><td>42ms</td><td>1639ms</td><td>1520MB</td>
+              <td>vite (default)</td><td>5333ms</td><td>4914ms</td><td>58ms</td><td>1585ms</td><td>1499MB</td>
             </tr>
           </tbody>
         </table>
         <p className="bench__note">
-          p50 save-to-paint on a generated 10k-component app, M-series Mac, Vite
-          8.2 (default and experimental bundled dev). oj's fused oxc pipeline and
-          persistent cache also hold roughly 16× less memory. Reproducible:{" "}
+          p50 on a generated 10k-component app, M-series Mac, Vite 8.2 (default
+          and experimental bundled dev). oj wins cold, warm, and reload against
+          default Vite by 3–7×, and holds 12–14× less server memory than either
+          Vite mode; Vite keeps a slight edge on raw HMR. Reproducible:{" "}
           <code>node bench/run.mjs 10000</code>.
         </p>
       </section>
