@@ -15,6 +15,11 @@ const appRoot = process.argv[3];
 const command = process.argv[4] || "serve";
 const mode = process.argv[5] || "development";
 
+// oj loads the config as tooling, not as the app author: Vite's native-loader
+// "import without a file extension" advisories are noise here (and not
+// actionable in oj's context), so suppress them as the warning itself suggests.
+process.env.VITE_CONFIG_NATIVE_IGNORE_WARNING ??= "true";
+
 // Resolve a package from an app that may use pnpm's strict, non-hoisted layout,
 // where a transitive dep (vite's esbuild, etc.) isn't reachable from the app
 // root: try the app root, then each direct dep as an anchor. Returns null when

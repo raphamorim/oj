@@ -13,6 +13,10 @@ import readline from "node:readline";
 
 const pluginsPath = process.argv[2];
 const initial = JSON.parse(process.argv[3] ?? "{}");
+
+// Suppress Vite's native config-loader "import without a file extension"
+// advisories: oj loads the config as tooling, so they are noise here.
+process.env.VITE_CONFIG_NATIVE_IGNORE_WARNING ??= "true";
 const env = initial.env ?? { command: "serve", mode: "development" };
 
 // Vite's `configResolved` and later hooks receive a fully-resolved
