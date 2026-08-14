@@ -1403,10 +1403,6 @@ if (import.meta.hot) {{
     throw new Error("oj: Fast Refresh preamble missing; was index.html served by oj?");
   }}
   const currentExports = __oj_currentExports;
-  // Register synchronously during module evaluation (NOT in a microtask):
-  // a fast second edit must find the accept callback the instant the first
-  // edit's dynamic import resolves, or it snapshots an empty list and is
-  // silently dropped. This mirrors Vite's shared/hmr.ts.
   RefreshRuntime.registerExportsForReactRefresh({url:?}, currentExports);
   import.meta.hot.accept((nextExports) => {{
     if (!nextExports) return;
