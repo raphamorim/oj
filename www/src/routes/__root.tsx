@@ -1,6 +1,5 @@
 import { createRootRoute, HeadContent, Outlet, Scripts } from "@tanstack/react-router";
 
-// Pulls the design system into the client graph (Tailwind v4 + tokens).
 import "../../styles/app.css";
 import { Nav, Footer, Trail } from "../components/site";
 

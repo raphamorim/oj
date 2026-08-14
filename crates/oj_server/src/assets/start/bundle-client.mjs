@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Bundle the TanStack Start client hydration entry for the browser: esbuild
-// with the framework aliases resolved (a browser can't run a Node loader hook),
-// everything bundled, NODE_ENV defined, node: builtins shimmed, and the app's
-// vite plugins / assets / import.meta.glob handled. Output: client-entry.js.
+
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, relative } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,12 +14,6 @@ const esbuild = await importPkg(APP, "esbuild", ["vite", "@tanstack/react-start"
 const WORKSPACE = workspaceRoot(APP);
 const SERVER_FN_BASE = process.env.TSS_SERVER_FN_BASE ?? "/_serverFn/";
 
-// App-source transform for the client: expand `import.meta.glob`, then rewrite
-// each top-level `const NAME = createServerFn(...).handler(FN)` to inject
-// `createClientRpc(id)` as the first handler arg. The runtime uses arg 1 as the
-// extractedFn, so the browser makes an HTTP RPC to /_serverFn/<id> instead of
-// running the handler. `id` must match the server resolver's manifest (same
-// `<relpath>#<name>`). node_modules is left to esbuild's native loader.
 const serverFnClient = {
   name: "server-fn-client",
   setup(build) {
@@ -30,8 +21,6 @@ const serverFnClient = {
       if (args.path.includes("/node_modules/")) return null;
       const loader = args.path.endsWith("tsx") ? "tsx" : "ts";
       let code = readFileSync(args.path, "utf8");
-      // Run the app's own plugin transforms (i18n, macros, ...) -- symmetric
-      // with the SSR loader -- before oj's glob + server-fn client rewrites.
       if (container) {
         const t = await container.transformUserCode(code, args.path);
         if (t != null) code = t;
@@ -43,7 +32,7 @@ const serverFnClient = {
       const edits = [];
       let m;
       while ((m = re.exec(code))) {
-        const open = m.index + m[0].length; // just after `.handler(`
+        const open = m.index + m[0].length;
         let depth = 1;
         let i = open;
         for (; i < code.length && depth > 0; i++) {
@@ -74,11 +63,8 @@ function routerEntry() {
   return resolve(APP, "src/router.tsx");
 }
 
-// The app's vite.config plugins, so `virtual:*`, .mdx (transform) and .svg
-// (svgr load) resolve. Absent config/Vite -> null -> the plugin is a no-op.
 const container = await loadPluginContainer(APP, { command: "serve", environment: "client" });
 
-// Stylesheet urls the app imports; linked in the dev SSR head via the manifest.
 const cssUrls = [];
 
 await esbuild.build({
@@ -92,18 +78,10 @@ await esbuild.build({
     "#tanstack-router-entry": routerEntry(),
     "#tanstack-start-entry": join(HERE, "start-entry.ts"),
     "#tanstack-start-plugin-adapters": join(HERE, "plugin-adapters.ts"),
-    // The router manifest virtual (start-server-core can be pulled into the
-    // client graph before tree-shaking drops it).
     "tanstack-start-manifest:v": join(HERE, "manifest.ts"),
-    // Runtime isomorphic-fn impl (the stubs default to the server impl).
     "@tanstack/start-fn-stubs": join(HERE, "fn-stubs.mjs"),
   },
   define: {
-    // Replace the whole `process.env` object so any framework read
-    // (TSS_ROUTER_BASEPATH, TSS_INLINE_CSS_ENABLED, ...) inlines to a value.
-    // A dotted define would leave unknown keys as a runtime `process.env`
-    // access, which throws in a split chunk that ESM evaluates before the entry
-    // banner runs. Missing keys become `undefined`, which the framework accepts.
     "process.env": JSON.stringify({ NODE_ENV: "development", TSS_SERVER_FN_BASE: SERVER_FN_BASE }),
     global: "globalThis",
     ...viteEnvDefine({ ssr: false }),
@@ -124,9 +102,6 @@ await esbuild.build({
   logLevel: "silent",
 });
 
-// Dev manifest: link the app's stylesheets in the SSR <head> (via the root
-// route's css) so the first paint is styled and does not depend on hydration.
-// The runner re-reads this on every warm reload, so edits stay styled.
 const devManifest = {
   routes: {
     __root__: {

@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Scan src/ for `createServerFn().handler()` declarations and generate the
-// server-fn resolver module (#tanstack-start-server-fn-resolver): a manifest
-// mapping functionId -> a dynamic import of the module's exported handler.
-// The functionId must match the client transform's createClientRpc(id).
+
 import { readdirSync, statSync, readFileSync, writeFileSync } from "node:fs";
 import { join, dirname, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -37,9 +34,6 @@ function walk(dir) {
 }
 walk(SRC);
 
-// Static relative imports so this resolves in BOTH the dev loader hook and the
-// bundled production server (esbuild follows the imports; a runtime
-// `import(.ts)` would fail in the bundle).
 const imports = entries.map((e, i) => {
   const spec = relative(HERE, e.path).replace(/\\/g, "/");
   return { ...e, var: `__m${i}`, spec: spec.startsWith(".") ? spec : `./${spec}` };

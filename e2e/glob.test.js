@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// import.meta.glob: the playground eagerly globs ./pages/*.ts (2 files) and
-// renders the match count into data-pages. Verifies the compile-time
-// expansion + that the generated eager imports resolve and load.
 const { chromium } = require("playwright");
 (async () => {
   const browser = await chromium.launch();

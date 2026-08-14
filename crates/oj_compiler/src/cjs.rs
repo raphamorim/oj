@@ -1,30 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-//! CJS to ESM interop for dependencies served to a native-ESM browser.
-//!
-//! Scope is deliberate: make the common npm dist shape work (react,
-//! react-dom, scheduler and friends), fail loudly on the rest.
-//!
-//! Pipeline per CJS file:
-//! 1. `process.env.NODE_ENV` becomes `"development"` (AST-aware, via
-//!    oxc ReplaceGlobalDefines); load-bearing for React.
-//! 2. Dead-branch elimination (oxc DCE), so the
-//!    `if (NODE_ENV === "production") require("./prod.js")` pattern drops the
-//!    production graph entirely instead of importing both builds.
-//! 3. Static analysis: `require("lit")` calls, `exports.NAME =` /
-//!    `module.exports.NAME =` assignments at any depth (React assigns inside
-//!    an IIFE), `module.exports = require("x")` re-export chains, and
-//!    `module.exports = {...}` object shapes.
-//! 4. Wrap: requires become static imports of the dep wrappers, the body runs
-//!    in a closure with `module`/`exports`/`require` in scope, and the
-//!    detected names become real ESM named exports (snapshotted after the
-//!    body runs; live-binding CJS mutation after module eval is not
-//!    supported yet).
-//!
-//! Known-unsupported (fail loud or documented): dynamic `require(expr)`,
-//! `Object.defineProperty(exports, ...)` shapes, CJS import cycles.
-
 use std::path::Path;
 
 use oxc_allocator::Allocator;
@@ -42,8 +18,6 @@ use oxc_transformer_plugins::{ReplaceGlobalDefines, ReplaceGlobalDefinesConfig};
 
 use crate::{CompileError, CompileOutput};
 
-/// Compile a node_modules file for the dev server: ESM passes through the
-/// normal pipeline's specifier rewriting; CJS gets the interop wrapper.
 pub fn compile_dep(
     path: &Path,
     url: &str,
@@ -59,14 +33,10 @@ pub fn compile_dep(
     }
 }
 
-/// Exposed for bundle mode's dep-kind decision.
 pub fn has_module_syntax_pub(path: &Path, source_text: &str) -> bool {
     has_module_syntax(path, source_text)
 }
 
-/// Bundle mode: CJS body prepared for a registry factory (NODE_ENV replaced,
-/// dead branches gone) plus its raw require specifiers. The runtime maps
-/// specifiers to urls, so no ESM wrapper is generated.
 pub struct CjsFactoryAnalysis {
     pub body: String,
     pub requires: Vec<String>,
@@ -88,7 +58,7 @@ fn has_module_syntax(_path: &Path, source_text: &str) -> bool {
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source_text, SourceType::mjs()).parse();
     if parsed.panicked {
-        return false; // didn't parse as ESM; let the CJS path report properly
+        return false;
     }
     parsed.program.body.iter().any(|stmt| {
         matches!(
@@ -120,16 +90,13 @@ fn lower_and_analyze(
     }
     let mut program = parsed.program;
 
-    // 1. NODE_ENV replacement (needs scoping).
     let scoping = SemanticBuilder::new().build(&program).semantic.into_scoping();
     let config = ReplaceGlobalDefinesConfig::new(&[("process.env.NODE_ENV", "'development'")])
         .expect("static define config");
     let _ = ReplaceGlobalDefines::new(&allocator, config).build(scoping, &mut program);
 
-    // 2. Drop the now-dead production branches.
     Compressor::new(&allocator).dead_code_elimination(&mut program, CompressOptions::dce());
 
-    // 3. Analyze requires and export shape.
     let mut analysis = CjsAnalyzer::default();
     analysis.visit_program(&program);
 
@@ -144,7 +111,6 @@ pub fn wrap_cjs(
 ) -> Result<CompileOutput, CompileError> {
     let (body, analysis) = lower_and_analyze(path, source_text)?;
 
-    // 4. Assemble the wrapper.
     let mut out = String::new();
     let mut deps = String::new();
     let mut resolved_imports: Vec<String> = Vec::new();
@@ -170,8 +136,6 @@ pub fn wrap_cjs(
         }
     }
     if analysis.has_dynamic_require {
-        // Fail loud at the point of use, not at import time: DCE usually
-        // removed the call, and if it didn't, the throw names the module.
         out.push_str(&format!(
             "console.warn(\"[oj] {url} contains dynamic require(); calls will throw\");\n"
         ));
@@ -197,8 +161,6 @@ export default (module.exports && module.exports.__esModule) ? module.exports["d
         dirname = url.rsplit_once('/').map(|(d, _)| d).unwrap_or(""),
     ));
 
-    // Star re-exports for `module.exports = require("x")` chains
-    // (e.g. react/index.js after DCE). Transitive without shape analysis.
     for spec in &analysis.reexport_requires {
         if let Some(dep_url) = resolve(spec) {
             out.push_str(&format!("export * from {dep_url:?};\n"));
@@ -208,8 +170,6 @@ export default (module.exports && module.exports.__esModule) ? module.exports["d
         }
     }
 
-    // Named exports, snapshotted after body execution. Aliased export form
-    // so reserved words and wrapper locals can't collide with bindings.
     let mut seen = std::collections::HashSet::new();
     for (i, name) in analysis
         .named_exports
@@ -259,7 +219,6 @@ fn require_specifier<'a>(call: &'a CallExpression) -> Option<&'a str> {
     }
 }
 
-/// `exports` or `module.exports`
 fn is_exports_expression(expr: &Expression) -> bool {
     match expr {
         Expression::Identifier(id) => id.name == "exports",
@@ -287,13 +246,11 @@ impl<'a> Visit<'a> for CjsAnalyzer {
     fn visit_assignment_expression(&mut self, it: &AssignmentExpression<'a>) {
         if it.operator == AssignmentOperator::Assign {
             match &it.left {
-                // exports.NAME = ... | module.exports.NAME = ...
                 AssignmentTarget::StaticMemberExpression(member)
                     if is_exports_expression(&member.object) =>
                 {
                     self.named_exports.push(member.property.name.to_string());
                 }
-                // module.exports = <right>
                 AssignmentTarget::StaticMemberExpression(member)
                     if member.property.name == "exports"
                         && matches!(&member.object, Expression::Identifier(id) if id.name == "module") =>
@@ -340,7 +297,6 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    /// The exact shape react/index.js ships.
     #[test]
     fn node_env_branch_becomes_single_star_reexport() {
         let src = r#"
@@ -365,7 +321,6 @@ if (process.env.NODE_ENV === 'production') {
         assert!(out.imports.iter().all(|i| !i.contains("production")));
     }
 
-    /// The shape of react.development.js: exports assigned inside an IIFE.
     #[test]
     fn detects_named_exports_at_depth_and_wraps_body() {
         let src = r#"
@@ -404,7 +359,6 @@ exports.render = function () { return react && scheduler; };
         assert_eq!(out.imports.len(), 2);
     }
 
-    /// Babel-compiled "fake ESM": default must honor __esModule.
     #[test]
     fn fake_esm_default_honors_esmodule_flag() {
         let src = r#"
@@ -448,13 +402,11 @@ exports.named = 1;
     #[test]
     fn has_module_syntax_detects_only_statement_import_export() {
         let p = Path::new("x.js");
-        // any top-level import/export statement counts as ESM
         assert!(has_module_syntax_pub(p, "import x from 'y';"));
         assert!(has_module_syntax_pub(p, "export const a = 1;"));
         assert!(has_module_syntax_pub(p, "export { a } from './m';"));
         assert!(has_module_syntax_pub(p, "export * from './m';"));
         assert!(has_module_syntax_pub(p, "export default 1;"));
-        // CJS and dynamic import() are not module syntax
         assert!(!has_module_syntax_pub(p, "module.exports = { a: 1 };"));
         assert!(!has_module_syntax_pub(p, "const x = require('y');"));
         assert!(!has_module_syntax_pub(p, "const p = import('y');"));
@@ -473,12 +425,10 @@ exports.named = 1;
     #[test]
     fn unresolved_require_is_omitted_and_guarded_at_runtime() {
         let src = r#"var missing = require('./gone'); exports.use = function () { return missing; };"#;
-        let mut resolve = |_: &str| None; // nothing resolves
+        let mut resolve = |_: &str| None;
         let out = wrap_cjs(Path::new("u.js"), "/n/u.js", src, &mut resolve).unwrap();
-        // the unresolved dep is neither imported nor a graph edge
         assert!(!out.code.contains("__oj_dep_0"), "unresolved dep must not import: {}", out.code);
         assert!(out.imports.is_empty(), "unresolved dep is not an edge: {:?}", out.imports);
-        // the runtime require() still throws a named error if the call survives DCE
         assert!(out.code.contains("unresolved require("), "runtime guard present: {}", out.code);
     }
 
@@ -497,15 +447,10 @@ exports.named = 1;
         let src = r#"module.exports = { good: 1, "bad-name": 2, "with space": 3 };"#;
         let mut resolve = |_: &str| None;
         let out = wrap_cjs(Path::new("k.js"), "/n/k.js", src, &mut resolve).unwrap();
-        // the valid key becomes a named export; the invalid keys get no `as`
-        // clause (the raw keys still appear in the wrapped body, so assert on the
-        // export-alias form, not the literal).
         assert!(out.code.contains("as good }"), "valid key exported: {}", out.code);
         assert!(!out.code.contains("as bad-name"), "hyphenated key not exported: {}", out.code);
         assert!(!out.code.contains("as with space"), "spaced key not exported: {}", out.code);
-        // only one export binding was emitted (index 0), so the bad keys added none
         assert!(!out.code.contains("__oj_export_1"), "only the valid key exported: {}", out.code);
-        // the object is still reachable whole via the default export
         assert!(out.code.contains("export default"), "{}", out.code);
     }
 

@@ -55,8 +55,6 @@ impl Plugin for OjCssPlugin {
                 return Ok(Some(HookResolveIdOutput::from_id(routes_id)));
             }
             if let Some(base) = url_base {
-                // Resolve through Rolldown's resolver (honors alias/tsconfig),
-                // then re-attach `?url` so `load` recognizes it.
                 if let Ok(Ok(resolved)) = ctx.resolve(&base, importer.as_deref(), None).await {
                     let id = format!("{}?url", resolved.id.as_str());
                     return Ok(Some(HookResolveIdOutput::from_id(id)));
@@ -96,8 +94,6 @@ impl Plugin for OjCssPlugin {
         let routes_id = root.join("oj-routes.tsx").to_string_lossy().into_owned();
         let client = self.client;
         async move {
-            // Vite `?url` asset import: emit the real file as a build asset and
-            // resolve the module to its final (hashed, base-prefixed) URL.
             if let Some(file) = id.strip_suffix("?url") {
                 let bytes = std::fs::read(file)
                     .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
@@ -126,8 +122,6 @@ impl Plugin for OjCssPlugin {
                 }));
             }
             let path = id.split('?').next().unwrap_or(&id);
-            // Server functions: in the client build, a `*.server.*` module is
-            // replaced by RPC stubs so its real code never reaches the browser.
             if client && is_server_module_path(path) {
                 let source = std::fs::read_to_string(path)
                     .map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
@@ -142,7 +136,6 @@ impl Plugin for OjCssPlugin {
                     ..Default::default()
                 }));
             }
-            // Built-in route manifest (transform expands its glob afterwards).
             if path == routes_id {
                 return Ok(Some(rolldown_plugin::HookLoadOutput {
                     code: arcstr::ArcStr::from(oj_server::OJ_ROUTES_JS),
@@ -155,21 +148,15 @@ impl Plugin for OjCssPlugin {
             }
             let mut source = std::fs::read_to_string(path)
                 .map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
-            // Sass/SCSS to CSS first (sibling @use/@import resolve from dir).
             if oj_css::is_sass(path) {
                 let dir = std::path::Path::new(path).parent();
                 source = oj_css::compile_sass(&source, dir).map_err(|e| anyhow::anyhow!(e))?;
             }
-            // Run css through the CSS sidecar (the app's postcss.config or the
-            // Tailwind v4 API), as the dev server does: always for Tailwind-
-            // flagged css, and for any .css when the app has a postcss.config.
-            // Plain css with no postcss config goes straight to Lightning below.
             if oj_server::sidecar::is_tailwind_css(&source)
                 || (self.has_postcss && path.ends_with(".css"))
             {
                 source = expand_css_via_sidecar(&root, std::path::Path::new(path))?;
             }
-            // Hash class names from the dev server's root-relative id form.
             let css_id = match std::path::Path::new(path).strip_prefix(&root) {
                 Ok(rel) => format!("/{}", rel.display()),
                 Err(_) => path.to_string(),
@@ -196,9 +183,6 @@ impl Plugin for OjCssPlugin {
     }
 }
 
-/// Expand `@tailwind`/`@apply` (and any `postcss.config.*` plugins) in a CSS
-/// file via oj's one-shot CSS sidecar, the same one the dev server runs, so
-/// `oj dev` and `oj build` produce identical Tailwind output.
 fn expand_css_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String> {
     let script = root.join(".oj-cache").join("css-sidecar.mjs");
     if let Some(parent) = script.parent() {
@@ -212,8 +196,6 @@ fn expand_css_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String
             css_file.to_str().unwrap(),
             root.to_str().unwrap(),
         ])
-        // cwd = app root so Tailwind v3 finds tailwind.config.* + content globs
-        // (matches the persistent dev sidecar's current_dir(root)).
         .current_dir(root)
         .output()
         .context("node not found for tailwind/postcss build")?;
@@ -223,10 +205,6 @@ fn expand_css_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Build Rolldown's `resolve.alias` from the app's `resolve.alias` config for
-/// an environment (client/ssr). Relative replacements (`./src`) become absolute
-/// against `root`, matching oj's own resolver. Returns `None` when there are no
-/// aliases, so Rolldown keeps its defaults (including tsconfig `paths`).
 fn rolldown_resolve(
     root: &Path,
     config: &oj_config::OjConfig,
@@ -250,13 +228,10 @@ fn rolldown_resolve(
     Some(rolldown_common::ResolveOptions { alias: Some(alias), ..Default::default() })
 }
 
-/// Whether a module path is a server-function module (`*.server.{ts,tsx,js,jsx}`).
 fn is_server_module_path(path: &str) -> bool {
     [".server.ts", ".server.tsx", ".server.js", ".server.jsx"].iter().any(|s| path.ends_with(s))
 }
 
-/// Client-build stub for a server-function module: each export RPCs to /__oj_fn
-/// (the helper is inlined so the stub needs no runtime import in the bundle).
 fn server_fn_prod_stub(exports: &[String], url: &str) -> String {
     let mut out = String::from(
         "const __ojCall = (m, n, a) => fetch(\"/__oj_fn\", { method: \"POST\", \
@@ -274,9 +249,6 @@ fn server_fn_prod_stub(exports: &[String], url: &str) -> String {
     out
 }
 
-/// Recursively copy the contents of `src` into `dest` (Vite's publicDir copy).
-/// No-op if `src` doesn't exist. Existing files (e.g. a generated index.html)
-/// are not clobbered by same-named public files.
 fn copy_public_dir(src: &Path, dest: &Path) -> anyhow::Result<()> {
     if !src.is_dir() {
         return Ok(());
@@ -630,7 +602,7 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         if let Err(e) = host.build_start().await {
             eprintln!("oj build: plugin buildStart failed: {e}");
         }
-        oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host)))); // before oj:build
+        oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host))));
     }
     oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(&root), client: true }));
     let mut bundler = BundlerBuilder::default()
@@ -642,8 +614,6 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         resolve: rolldown_resolve(&root, &config, "client"),
         entry_filenames: Some("assets/[name]-[hash].js".to_string().into()),
         chunk_filenames: Some("assets/[name]-[hash].js".to_string().into()),
-        // Per-environment build output: the "client" environment may override
-        // minify/sourcemap (Vite Environment API environments.client.build).
         minify: Some(RawMinifyOptions::Bool(
             oj_config::environment_build_bool(&config, "client", "minify").unwrap_or(minify),
         )),
@@ -651,9 +621,6 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
             .unwrap_or(sourcemap)
             .then_some(SourceMapType::File),
         define: Some({
-            // NODE_ENV plus the app's .env-derived import.meta.env.* values,
-            // loaded in production mode. BASE_URL reflects the configured base.
-            // Then config `define` + the "client" environment's define overrides.
             let env = oj_env::load(&root, "production");
             let mut pairs: Vec<(String, String)> =
                 vec![("process.env.NODE_ENV".into(), "'production'".into())];
@@ -692,7 +659,6 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
     }
 
     for warning in &output.warnings {
-        // oj's transform plugins don't emit sourcemaps yet!!
         if format!("{warning:?}").contains("SOURCEMAP_BROKEN") {
             continue;
         }
@@ -709,7 +675,6 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
                 continue;
             }
             let Some(facade) = &chunk.facade_module_id else { continue };
-            // Root-relative source path is the Vite manifest key.
             let src = Path::new(facade.as_ref())
                 .strip_prefix(&root)
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
@@ -734,8 +699,6 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         }
     }
 
-    // Stylesheets and other <link href> statics are copied through as-is
-    // (hashed CSS pipeline is future work).
     for href in link_hrefs(&html) {
         let src = root.join(href.trim_start_matches('/'));
         if src.is_file() {
@@ -745,7 +708,6 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
             }
             let source = fs::read_to_string(&src)?;
             if oj_server::sidecar::is_tailwind_css(&source) {
-                // Expand via the CSS sidecar (postcss config / Tailwind v4).
                 let css = expand_css_via_sidecar(&root, &src)?;
                 let minified = oj_css::compile_css(href.as_str(), &css, true).map_err(|e| anyhow::anyhow!(e))?;
                 fs::write(&dest, minified.css)?;
@@ -755,7 +717,6 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         }
     }
 
-    // Emit collected css (imports, incl. CSS Modules) as one stylesheet.
     let mut css_entries = collected_css.lock().unwrap().clone();
     if !css_entries.is_empty() {
         css_entries.sort();
@@ -776,21 +737,17 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
             Some(idx) => format!("{}{}\n{}", &rewritten_html[..idx], link, &rewritten_html[idx..]),
             None => format!("{link}\n{rewritten_html}"),
         };
-        // The app's css belongs to every entry (no per-entry css splitting yet).
         for entry in &mut manifest_entries {
             entry.css.push(css_name.clone());
         }
     }
 
-    // Vite-compatible manifest for backend integrations (Laravel/Rails/etc.),
-    // at the location their plugins expect: dist/.vite/manifest.json.
     fs::create_dir_all(out_dir.join(".vite"))?;
     fs::write(
         out_dir.join(".vite").join("manifest.json"),
         serde_json::to_string_pretty(&build_manifest(&manifest_entries))?,
     )?;
 
-    // Plugin transformIndexHtml runs on the finished document.
     if let Some(host) = &plugin_host {
         if let Ok(out) = host.transform_index_html(&rewritten_html).await {
             rewritten_html = out;
@@ -798,9 +755,6 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
     }
     fs::write(out_dir.join("index.html"), rewritten_html)?;
 
-    // Vite-style publicDir: copy the public dir (config/vite `publicDir`, else
-    // <root>/public) verbatim to the output root (favicon.ico, robots.txt,
-    // static assets). The dev server serves these live; the build must ship them.
     let public_dir = config.public_dir.as_ref().map(|p| root.join(p)).unwrap_or_else(|| root.join("public"));
     copy_public_dir(&public_dir, &out_dir)?;
 
@@ -929,7 +883,6 @@ pub(crate) async fn build_ssr(
                     ("import.meta.env.MODE".to_string(), "\"production\"".to_string()),
                     ("import.meta.env.BASE_URL".to_string(), "\"/\"".to_string()),
                 ];
-                // config define + the "ssr" environment's define overrides.
                 pairs.extend(oj_config::config_defines(&config));
                 pairs.extend(oj_config::environment_defines(&config, "ssr"));
                 pairs.into_iter().collect()
@@ -978,8 +931,6 @@ export async function dispatch(url, name, args) {
 }
 "#;
 
-/// Whether the app has any `*.server.*` module under `src/` (so the production
-/// build wires the server-function dispatch + client stubs).
 fn has_server_modules(root: &Path) -> bool {
     fn walk(dir: &Path) -> bool {
         let Ok(entries) = fs::read_dir(dir) else { return false };
@@ -1015,7 +966,7 @@ async fn build_server_fns(root: &Path, out_dir: &Path) -> anyhow::Result<()> {
                 collected: Arc::clone(&collected),
                 root: root.to_path_buf(),
                 has_postcss: oj_server::has_postcss_config(root),
-                client: false, // server build: keep real server code
+                client: false,
             })])
             .with_options(BundlerOptions {
                 input: Some(vec![InputItem {
@@ -1196,11 +1147,6 @@ createServer(async (req, res) => {
 }).listen(PORT, () => console.log(`oj ssr server on http://localhost:${PORT}`));
 "#;
 
-/// Generated by `oj build --ssr`: an edge/worker SSR entry, a Web-standard
-/// `fetch` handler (Request/Response/ReadableStream, no `node:*`) for a
-/// Cloudflare-Workers / `workerd`-style runtime. Static assets are served by
-/// the platform; this handles SSR, loaders/actions, and server functions.
-/// `__CLIENT_JS__` / `__CLIENT_CSS__` are filled at build time.
 const SSR_WORKER_ENTRY: &str = r#"import * as entry from "./entry-server.mjs";
 import { dispatch as __ojDispatch } from "./_oj_server_fns.mjs";
 
@@ -1257,9 +1203,6 @@ export default {
 };
 "#;
 
-/// Derive the client hydration entry from the SSR entry by convention: swap
-/// "server" for "client" in the filename (`entry-server.tsx` becomes
-/// `entry-client.tsx`), if that sibling file exists.
 pub(crate) fn derive_client_entry(root: &Path, server_entry: &str) -> Option<String> {
     let file = Path::new(server_entry).file_name()?.to_str()?;
     if !file.contains("server") {
@@ -1273,10 +1216,6 @@ pub(crate) fn derive_client_entry(root: &Path, server_entry: &str) -> Option<Str
     root.join(&client_rel).is_file().then_some(client_rel)
 }
 
-/// Full production SSR build: the Node server bundle, a browser client bundle
-/// for hydration (from the sibling `*-client.*` entry), and a streaming
-/// `server.mjs` that ties them together. Without a client entry, only the
-/// server bundle is emitted (no runnable server, nothing to hydrate).
 pub(crate) async fn build_ssr_app(
     root: &Path,
     out_dir: &Path,
@@ -1296,9 +1235,6 @@ pub(crate) async fn build_ssr_app(
     };
     let (js, css) = build_client_entry(root, out_dir, &client_entry, minify, sourcemap).await?;
 
-    // Server functions: the client bundle above stubbed `*.server.*` modules;
-    // this bundles their real implementations into a dispatch the server runs.
-    // Always built so server.mjs's import resolves (an empty dispatch is inert).
     build_server_fns(root, out_dir).await?;
     if has_server_modules(root) {
         println!("  {:>9}  _oj_server_fns.mjs", human_bytes(OJ_SERVER_FNS_JS.len()));
@@ -1310,16 +1246,12 @@ pub(crate) async fn build_ssr_app(
     fs::write(out_dir.join("server.mjs"), server)?;
     println!("  {:>9}  server.mjs", human_bytes(SSR_PROD_SERVER.len()));
 
-    // Edge/worker entry alongside the Node server: a Web `fetch` handler for a
-    // Workers-style runtime (assets served by the platform).
     let worker = SSR_WORKER_ENTRY
         .replace("__CLIENT_JS__", &js)
         .replace("__CLIENT_CSS__", css.as_deref().unwrap_or(""));
     fs::write(out_dir.join("worker.mjs"), worker)?;
     println!("  {:>9}  worker.mjs (edge)", human_bytes(SSR_WORKER_ENTRY.len()));
 
-    // Prerender (SSG): render each configured path to static HTML, hydrated by
-    // the same client bundle. A one-shot node run over the server bundle.
     if let Some(paths) = prerender.filter(|p| !p.is_empty()) {
         let script = PRERENDER_JS
             .replace("__CLIENT_JS__", &js)
@@ -1344,10 +1276,6 @@ pub(crate) async fn build_ssr_app(
     Ok(())
 }
 
-/// Bundle one browser entry (prod, hashed, minified) into `<out>/assets`,
-/// returning the entry's `/assets/<name>-<hash>.js` url and an optional
-/// `/assets/style-<hash>.css` url for the collected CSS. Used to build the
-/// client hydration bundle for a production SSR app.
 async fn build_client_entry(
     root: &Path,
     out_dir: &Path,
@@ -1359,9 +1287,6 @@ async fn build_client_entry(
     let stem = Path::new(entry).file_stem().and_then(|s| s.to_str()).unwrap_or("client").to_string();
     let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
 
-    // User plugins run in the client hydration bundle as the "client"
-    // environment (matching the dev client pipeline), so a shared module can
-    // use plugin resolveId/load/transform on both the server and client sides.
     let mut config = oj_config::load(root).map_err(|e| anyhow::anyhow!("{e}"))?;
     oj_server::plugins::adopt_vite_config_values(&mut config, root);
     let client_base = config.base.clone().unwrap_or_else(|| "/".into());
@@ -1391,7 +1316,6 @@ async fn build_client_entry(
             resolve: rolldown_resolve(root, &config, "client"),
             entry_filenames: Some("assets/[name]-[hash].js".to_string().into()),
             chunk_filenames: Some("assets/[name]-[hash].js".to_string().into()),
-            // Per-environment build output for the "client" hydration bundle.
             minify: Some(RawMinifyOptions::Bool(
                 oj_config::environment_build_bool(&config, "client", "minify").unwrap_or(minify),
             )),
@@ -1403,7 +1327,6 @@ async fn build_client_entry(
                 let mut pairs =
                     vec![("process.env.NODE_ENV".to_string(), "'production'".to_string())];
                 pairs.extend(oj_env::import_meta_env_defines(&env, "production", false, "/", "VITE_"));
-                // client hydration bundle: config + "client" environment define.
                 pairs.extend(oj_config::config_defines(&config));
                 pairs.extend(oj_config::environment_defines(&config, "client"));
                 pairs.into_iter().collect()
@@ -1435,7 +1358,6 @@ async fn build_client_entry(
     }
     let js = js.ok_or_else(|| anyhow::anyhow!("client build produced no entry chunk"))?;
 
-    // Emit collected CSS (incl. CSS Modules) as one hashed stylesheet.
     let mut css_entries = collected_css.lock().unwrap().clone();
     let css = if css_entries.is_empty() {
         None
@@ -1456,9 +1378,6 @@ async fn build_client_entry(
     Ok((js, css))
 }
 
-/// Build a library (`build.lib`): one Rolldown pass per output format,
-/// emitting `<fileName>.<ext>` files plus a single stylesheet for any
-/// imported CSS. No HTML, no manifest.
 async fn build_library(
     root: &Path,
     out_dir: &Path,
@@ -1535,7 +1454,6 @@ async fn build_library(
         }
     }
 
-    // One stylesheet for any CSS the library imported.
     let css_entries = collected_css.lock().unwrap().clone();
     if !css_entries.is_empty() {
         let combined: String =
@@ -1554,7 +1472,6 @@ async fn build_library(
     Ok(())
 }
 
-/// Map a lib format name to its (file extension, needs-a-global-name) pair.
 fn lib_format(fmt: &str) -> Option<(&'static str, bool)> {
     match fmt {
         "es" | "esm" => Some(("js", false)),
@@ -1565,8 +1482,6 @@ fn lib_format(fmt: &str) -> Option<(&'static str, bool)> {
     }
 }
 
-/// Normalize a public base path to a leading+trailing-slash form
-/// (`"/"`, `"/app/"`). Empty/relative bases fall back to `"/"`.
 fn normalize_base(base: &str) -> String {
     if base.is_empty() || base == "./" {
         return "/".to_string();
@@ -1581,12 +1496,10 @@ fn normalize_base(base: &str) -> String {
     b
 }
 
-/// Prefix an emitted asset filename (e.g. `assets/x-hash.js`) with the base.
 fn with_base(filename: &str, base: &str) -> String {
     format!("{base}{}", filename.trim_start_matches('/'))
 }
 
-/// One entry in the Vite-compatible build manifest.
 struct ManifestEntry {
     name: String,
     file: String,
@@ -1596,9 +1509,6 @@ struct ManifestEntry {
     css: Vec<String>,
 }
 
-/// Build a Vite-compatible `manifest.json` value: keyed by root-relative
-/// source path, each row carrying the emitted file plus name/isEntry/imports/
-/// css. The shape Laravel/Rails/Django Vite plugins consume.
 fn build_manifest(entries: &[ManifestEntry]) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     for e in entries {
@@ -1712,7 +1622,6 @@ mod tests {
             out.contains(r#"export default (...a) => __ojCall("/api.server.ts", "default", a);"#),
             "default export stub: {out}"
         );
-        // with no exports, only the helper is emitted (no export statements)
         let empty = server_fn_prod_stub(&[], "/x.server.ts");
         assert!(empty.contains("__ojCall"));
         assert!(!empty.contains("export "), "no exports means no stubs: {empty}");
@@ -1725,7 +1634,7 @@ mod tests {
         assert_eq!(human_bytes(1023), "1023B");
         assert_eq!(human_bytes(1024), "1.0kB");
         assert_eq!(human_bytes(1536), "1.5kB");
-        assert_eq!(human_bytes(1_048_575), "1024.0kB"); // just below the MB threshold
+        assert_eq!(human_bytes(1_048_575), "1024.0kB");
         assert_eq!(human_bytes(1_048_576), "1.0MB");
         assert_eq!(human_bytes(3_145_728), "3.0MB");
     }

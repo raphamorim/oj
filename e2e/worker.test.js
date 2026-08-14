@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// ?worker: import a worker factory and round-trip a message through a real
-// module Worker (proves the factory + separate worker-script compilation).
-// Unbundled only (bundle registry strips query variants).
 const { chromium } = require("playwright");
 (async () => {
   if (process.env.OJ_E2E_MODE === "bundle") {

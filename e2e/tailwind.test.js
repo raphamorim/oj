@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// Tailwind v4 sidecar verification: utilities generate, and a NEWLY-USED
-// class appears via hot update (sidecar rescan) with React state intact.
 const { chromium } = require("playwright");
 const fs = require("fs");
 const APP = require("path").join(__dirname, "..", "playground") + "/src/App.tsx";
@@ -21,7 +19,6 @@ const APP = require("path").join(__dirname, "..", "playground") + "/src/App.tsx"
     const btn = page.locator("button");
     await btn.click(); await btn.click();
 
-    // Add a class tailwind has never generated for this app.
     fs.writeFileSync(APP, original.replace('className="underline"', 'className="underline italic"'));
     await page.waitForFunction(
       () => getComputedStyle(document.querySelector("h1")).fontStyle === "italic",

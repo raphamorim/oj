@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
+
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -37,9 +38,6 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
     let cache = root.join(".oj-cache").join("start");
     oj_server::write_start_assets(&cache)?;
 
-    //   route-tree gen ─┬─────────────────┐
-    //   resolver gen ───┼──(both done)────┴─> client bundle ─┐
-    //                   └──> build_app (Rust) ───────────────┴─> runner
     let route_tree = {
         let (root, cache) = (root.clone(), cache.clone());
         tokio::task::spawn_blocking(move || generate_route_tree(&root, &cache))
@@ -192,7 +190,6 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
-            // Ignore our own generated route tree to avoid a rebuild loop.
             if !paths.iter().any(|p| !p.ends_with("routeTree.gen.ts")) {
                 continue;
             }
@@ -230,7 +227,6 @@ pub async fn start_build(root: PathBuf) -> anyhow::Result<()> {
     oj_server::write_start_assets(&cache)?;
     generate_route_tree(&root, &cache)?;
     run_node(&root, &cache.join("gen-resolver.mjs"), "server-fn resolver")?;
-    // Routes to prerender (SSG) from oj.config `build.prerender`.
     let prerender = oj_config::load(&root)
         .ok()
         .and_then(|c| c.build)
@@ -519,7 +515,6 @@ async fn forward(
                 .and_then(|h| h.get("content-type"))
                 .and_then(|c| c.as_str())
                 .is_some_and(|c| c.contains("text/html"));
-            // inject the live-reload client into HTML documents
             if is_html {
                 if let Some(i) = body.rfind("</body>") {
                     body.insert_str(i, RELOAD_CLIENT);
@@ -531,7 +526,6 @@ async fn forward(
             *resp.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
             if let Some(h) = v.get("headers").and_then(|h| h.as_object()) {
                 for (k, val) in h {
-                    // Skip framing headers: the body is re-sent verbatim.
                     let lower = k.to_ascii_lowercase();
                     if lower == "content-length" || lower == "content-encoding" || lower == "transfer-encoding" {
                         continue;
@@ -576,10 +570,8 @@ mod tests {
         assert_eq!(document_url("/a/b/index.html"), "/a/b/");
         assert_eq!(document_url("/index.html?tab=1"), "/?tab=1");
         assert_eq!(document_url("/a/index.html?x=y&z=1"), "/a/?x=y&z=1");
-        // non-index documents pass through untouched
         assert_eq!(document_url("/about"), "/about");
         assert_eq!(document_url("/guides/foo"), "/guides/foo");
-        // only a whole `/index.html` segment is rewritten
         assert_eq!(document_url("/notindex.html"), "/notindex.html");
     }
 
@@ -589,7 +581,6 @@ mod tests {
         assert_eq!(percent_decode("/a%20b"), "/a b");
         assert_eq!(percent_decode("%2Fx"), "/x");
         assert_eq!(percent_decode("%41%42"), "AB");
-        // incomplete / trailing escapes are left verbatim
         assert_eq!(percent_decode("a%"), "a%");
         assert_eq!(percent_decode("a%2"), "a%2");
         assert_eq!(percent_decode("a%zz"), "a%zz");
@@ -622,7 +613,6 @@ mod tests {
         std::fs::create_dir_all(base.join("node_modules")).unwrap();
         std::fs::create_dir_all(base.join("web").join("src")).unwrap();
         std::fs::create_dir_all(base.join("web").join("node_modules")).unwrap();
-        // ancestor `base` has node_modules, so it wins over the app dir
         assert_eq!(workspace_root(&base.join("web")), base);
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -652,12 +642,10 @@ mod tests {
     #[test]
     fn classify_documents_vs_passes() {
         let no_proxy: Vec<String> = vec![];
-        // extensionless GETs and index.html are document (SSR) routes
         assert!(matches!(classify(&req("GET", "/"), &no_proxy), Route::Document));
         assert!(matches!(classify(&req("GET", "/about"), &no_proxy), Route::Document));
         assert!(matches!(classify(&req("GET", "/index.html"), &no_proxy), Route::Document));
         assert!(matches!(classify(&req("GET", "/guides/index.html"), &no_proxy), Route::Document));
-        // assets, dev namespaces, non-GET, and proxied paths pass through
         assert!(matches!(classify(&req("GET", "/main.js"), &no_proxy), Route::Pass));
         assert!(matches!(classify(&req("GET", "/styles.css"), &no_proxy), Route::Pass));
         assert!(matches!(classify(&req("GET", "/@oj-start/hmr"), &no_proxy), Route::Pass));
@@ -674,8 +662,8 @@ mod tests {
         std::fs::create_dir_all(routes.join("nested")).unwrap();
         std::fs::write(routes.join("index.tsx"), "").unwrap();
         std::fs::write(routes.join("about.ts"), "").unwrap();
-        std::fs::write(routes.join("styles.css"), "").unwrap(); // not a route
-        std::fs::write(routes.join("data.json"), "").unwrap(); // not a route
+        std::fs::write(routes.join("styles.css"), "").unwrap();
+        std::fs::write(routes.join("data.json"), "").unwrap();
         std::fs::write(routes.join("nested").join("deep.tsx"), "").unwrap();
         let found = list_route_files(&root);
         let names: Vec<String> =
@@ -690,7 +678,7 @@ mod tests {
 
     #[test]
     fn list_route_files_missing_dir_is_empty() {
-        let root = tmp("noroutes"); // exists, but has no src/routes
+        let root = tmp("noroutes");
         assert!(list_route_files(&root).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -700,7 +688,6 @@ mod tests {
         let mut h = header::HeaderMap::new();
         h.insert("content-type", header::HeaderValue::from_static("text/html"));
         h.insert("x-custom", header::HeaderValue::from_static("hello"));
-        // an obs-text (non-UTF8) value is dropped rather than panicking
         h.insert("x-bin", header::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap());
         let out = collect_headers(&h);
         assert!(out.contains(&("content-type".to_string(), "text/html".to_string())), "{out:?}");

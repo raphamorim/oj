@@ -52,7 +52,6 @@ function Home() {
         <a href="https://github.com/raphamorim" target="_blank" rel="noreferrer">Raphael Amorim</a>
       </p>
 
-      {/* how it works */}
       <section id="how">
         <h2 className="head">How it works</h2>
         <p className="section__sub">Point oj at your app and run. Four commands, start to ship.</p>
@@ -69,7 +68,6 @@ function Home() {
         </div>
       </section>
 
-      {/* benchmark */}
       <section id="benchmark">
         <h2 className="head">Benchmark</h2>
         <p className="section__sub">
@@ -105,7 +103,6 @@ function Home() {
         </p>
       </section>
 
-      {/* features */}
       <section id="features">
         <h2 className="head">Features</h2>
         <p className="section__sub">Everything a real app needs, none of the wiring.</p>
@@ -119,7 +116,6 @@ function Home() {
         </div>
       </section>
 
-      {/* get started */}
       <section id="start">
         <h2 className="head">Get started</h2>
         <p className="section__sub">Install, develop, ship.</p>

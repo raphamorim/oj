@@ -1,4 +1,3 @@
-// __root__ scripts point at the oj-served client entry so the page hydrates.
 export const tsrStartManifest = () => ({
   routes: {
     __root__: {

@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// ?raw (file contents as string) and ?inline (asset as base64 data URI).
-// Uses browser import() of query-suffixed URLs directly. Unbundled only:
-// bundle mode's registry strips query variants (a documented limitation).
 const { chromium } = require("playwright");
 
 (async () => {

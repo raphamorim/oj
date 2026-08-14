@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
@@ -50,8 +51,6 @@ pub fn oj_brand() -> String {
     cell("oj")
 }
 
-/// Wrap `text` in an OSC 8 hyperlink pointing at `url`, so terminals that
-/// support it render clickable links. Plain `text` when piped / `NO_COLOR`.
 pub fn link(url: &str, text: &str) -> String {
     use std::io::IsTerminal;
     if std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal() {
@@ -61,7 +60,6 @@ pub fn link(url: &str, text: &str) -> String {
     }
 }
 
-/// The `oj` brand badge as a status-line prefix (plain `oj:` when piped).
 fn oj_tag() -> String {
     use std::io::IsTerminal;
     if std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal() {
@@ -71,14 +69,8 @@ fn oj_tag() -> String {
     }
 }
 
-/// Turn freshly-read file bytes into a `String`, validating UTF-8 with SIMD
-/// (`simdutf8`) instead of the standard library's scalar check, then reusing the
-/// validated buffer directly (no re-validation, no copy). Every module read on
-/// the cold-start crawl goes through here. On invalid UTF-8 it returns the same
-/// `InvalidData` error `read_to_string` would.
 fn bytes_to_string(bytes: Vec<u8>) -> std::io::Result<String> {
     match simdutf8::basic::from_utf8(&bytes) {
-        // SAFETY: simdutf8 fully validated `bytes` as UTF-8 on this branch.
         Ok(_) => Ok(unsafe { String::from_utf8_unchecked(bytes) }),
         Err(_) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -88,22 +80,14 @@ fn bytes_to_string(bytes: Vec<u8>) -> std::io::Result<String> {
 }
 
 const CLIENT_JS: &str = include_str!("assets/client.js");
-/// Built-in `virtual:oj-routes` module: a file-based route manifest globbed
-/// from `<root>/src/routes`. Shared by the dev server and `oj build`.
 pub const OJ_ROUTES_JS: &str = include_str!("assets/oj-routes.js");
-/// Client runtime for server functions (the `__ojServerCall` RPC helper).
 const SERVER_FN_JS: &str = include_str!("assets/server-fn.js");
 const REFRESH_RUNTIME_JS: &str = include_str!("assets/refresh-runtime.js");
 const REFRESH_PREAMBLE_JS: &str = include_str!("assets/refresh-preamble.js");
 const BUNDLE_RUNTIME_JS: &str = include_str!("assets/bundle-runtime.js");
-/// The persistent SSR module-runner script (`oj dev --ssr`), spawned by the
-/// `oj` crate under the app root so Node resolves the app's `node_modules`.
 pub const SSR_RUNNER_JS: &str = include_str!("assets/ssr-runner.mjs");
 const COMPILABLE: &[&str] = &["tsx", "ts", "jsx", "js", "mjs"];
 
-/// TanStack Start adapter assets: a Node loader hook (resolves the framework's
-/// four alias specifiers + compiles TS/JSX), the persistent SSR runner, the
-/// route-tree generator, and the synthesized server/client/manifest entries.
 const START_ASSETS: &[(&str, &str)] = &[
     ("resolve-pkg.mjs", include_str!("assets/start/resolve-pkg.mjs")),
     ("esbuild-assets.mjs", include_str!("assets/start/esbuild-assets.mjs")),
@@ -127,7 +111,6 @@ const START_ASSETS: &[(&str, &str)] = &[
     ("manifest.ts", include_str!("assets/start/manifest.ts")),
 ];
 
-/// Write the TanStack Start adapter assets into `dir` (`.oj-cache/start`).
 pub fn write_start_assets(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     for (name, content) in START_ASSETS {
@@ -136,8 +119,6 @@ pub fn write_start_assets(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// A TanStack Start app: `@tanstack/react-start` in package.json plus a
-/// `src/routes/` directory.
 pub fn is_tanstack_start_app(root: &Path) -> bool {
     root.join("src/routes").is_dir()
         && std::fs::read_to_string(root.join("package.json"))
@@ -147,102 +128,42 @@ pub fn is_tanstack_start_app(root: &Path) -> bool {
 
 pub struct DevServer {
     pub root: PathBuf,
-    /// CLI `--port`; `None` falls back to config `server.port` then 5199.
     pub port: Option<u16>,
-    /// CLI `--bundle`; OR-ed with config `bundle`.
     pub bundle: bool,
 }
 
 struct ServerState {
     root: PathBuf,
-    /// Where static assets are served from at the URL root (Vite's publicDir);
-    /// defaults to `<root>/public`, overridden by config/vite `publicDir`.
     public_dir: PathBuf,
     bundle: bool,
     reload_tx: broadcast::Sender<String>,
     graph: Mutex<ModuleGraph>,
     resolver: Arc<OjResolver>,
-    /// Resolver for the "ssr" environment (node conditions), used by the
-    /// module-runner endpoint so server modules resolve their node variants.
     ssr_resolver: Arc<OjResolver>,
     cache: PersistentCache,
-    /// Maps url to (content key, output). Content key re-checked per request,
-    /// so this needs no watcher-driven invalidation to stay correct.
     memory: Mutex<HashMap<String, (String, Arc<CachedModule>)>>,
-    /// Per-url compile locks: concurrent requests (or crawl vs request) for
-    /// the same module coalesce into one compile.
     compile_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Flips true when the eager startup crawl has the full graph.
     crawl_done: tokio::sync::watch::Receiver<bool>,
-    /// Out-of-root files the resolver legitimately resolved (workspace
-    /// packages etc). /@fs/ requests are served only from this set, so the
-    /// scheme cannot be used for directory traversal.
     fs_allow: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
-    /// Cached directory listings for relative-import resolution (see
-    /// `is_file_cached`); cleared wholesale on any watcher burst.
     dir_cache: Arc<Mutex<DirCache>>,
-    /// Monotonic patch counter; the client detects a gap in the sequence
-    /// (a dropped WS frame after a backgrounded tab / reconnect) and reloads
-    /// rather than applying patches onto a diverged module graph.
     patch_seq: std::sync::atomic::AtomicU64,
-    /// Assembled bundle-mode chunk: (etag, bytes), memoized until the watcher
-    /// sees a change; unchanged reloads answer 304 without re-assembling.
     chunk_cache: Mutex<Option<(String, Arc<String>)>>,
-    /// Dedicated disk-cache writer (single thread, bounded queue).
     cache_writes: tokio::sync::mpsc::Sender<(String, Arc<CachedModule>)>,
-    /// Lazily-spawned Tailwind v4 Node sidecar + the css urls it owns
-    /// (regenerated whenever any source file changes).
     tailwind: tokio::sync::OnceCell<std::sync::Arc<Sidecar>>,
     tailwind_urls: Mutex<std::collections::HashSet<String>>,
-    /// The app has a `postcss.config.*`, so all css (not just Tailwind-flagged)
-    /// runs through the CSS sidecar (the app's own PostCSS plugin chain) before
-    /// Lightning, matching Vite. `false` keeps the pure-Rust Lightning path.
     has_postcss: bool,
-    /// Module list persisted by the previous session's crawl: lets a warm
-    /// start emit the full modulepreload list immediately, without HTML
-    /// ever waiting on the live crawl.
     preload_snapshot: Vec<String>,
-    /// `server.proxy` rules: (path prefix, entry). Empty = no proxying.
     proxy: Vec<(String, oj_config::ProxyEntry)>,
-    /// Client for forwarding proxied requests.
     http: reqwest::Client,
-    /// Author-provided virtual modules: import id maps to module source, served
-    /// at `/@virtual/<id>`. The first slice of the plugin pipeline.
     virtual_modules: std::collections::BTreeMap<String, String>,
-    /// Node plugin host running Vite/Rollup `transform` hooks (present when the
-    /// app has an `oj.plugins.*`).
     plugins: Option<std::sync::Arc<PluginHost>>,
-    /// Port of the plugin host's `configureServer` middleware server, if any
-    /// plugin registered dev-server middleware. Requests oj can't serve are
-    /// forwarded here before the SPA fallback / 404.
     plugin_mw_port: Option<u16>,
-    /// A second plugin host running as the "ssr" environment (Vite Environment
-    /// API), lazily spawned the first time an SSR module is compiled so plain
-    /// `oj dev` doesn't spawn it. Its transform runs on server modules, so
-    /// `applyToEnvironment("ssr")` plugins actually execute.
     plugins_ssr: tokio::sync::OnceCell<Option<std::sync::Arc<PluginHost>>>,
-    /// Prebuilt config JSON for the "ssr" host (identical to the client host's
-    /// but `environment.name` is "ssr").
     ssr_plugin_config: String,
-    /// Files plugins registered via `this.addWatchFile` during a module's
-    /// `transform`, cached per-module (`CachedModule.watch_files`) and merged
-    /// here on every serve, cache hits included. The dev watcher unions this
-    /// with the live host set so a plugin's watches survive a warm-cache
-    /// restart (where transform does not re-run to re-register them).
     plugin_watched: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
-    /// Whether any plugin defines `moduleParsed`. Gates the per-module replay on
-    /// warm-cache serves so the common case (no such plugin) pays nothing.
     plugins_use_module_parsed: bool,
-    /// Module keys whose `moduleParsed` has already fired this session (via a
-    /// live transform or a warm-cache replay), so the replay runs at most once
-    /// per module per session.
     parsed_fired: Mutex<std::collections::HashSet<String>>,
-    /// Runtime handle so the sync file-watcher thread can call async plugin
-    /// hooks (handleHotUpdate).
     rt: tokio::runtime::Handle,
-    /// Configured `base` (e.g. `/riotermjs/`). In dev, requests carrying this
-    /// prefix (app fetches built from `import.meta.env.BASE_URL`) have it
-    /// stripped before file lookup, so the app serves under `base` like Vite.
     base: Option<String>,
 }
 
@@ -283,8 +204,6 @@ impl DevServer {
         let mut config = oj_config::load(&root).map_err(|e| anyhow::anyhow!("{e}"))?;
         plugins::adopt_vite_config_values(&mut config, &root);
 
-        // Load .env files (dev mode) and install the import.meta.env defines
-        // before any module compiles. envPrefix from config overrides VITE_.
         let env_prefix = config.env_prefix.as_deref().unwrap_or("VITE_");
         let env_dir = config.env_dir.as_deref().map(|d| root.join(d)).unwrap_or_else(|| root.clone());
         let env = oj_env::load(&env_dir, "development");
@@ -295,16 +214,11 @@ impl DevServer {
             config.base.as_deref().unwrap_or("/"),
             env_prefix,
         );
-        // Config-driven `define`: the top-level `define` plus per-environment
-        // overrides (Vite Environment API). The dev server has a single compiler
-        // define table, so it holds the union of client + ssr defines; distinct
-        // keys coexist (same key across environments resolves to the last).
         defines.extend(oj_config::config_defines(&config));
         defines.extend(oj_config::environment_defines(&config, "client"));
         defines.extend(oj_config::environment_defines(&config, "ssr"));
         oj_compiler::set_import_meta_env(defines);
 
-        // Precedence: CLI flag > config > built-in default.
         let server_cfg = config.server.clone().unwrap_or_default();
         let port = self.port.or(server_cfg.port).unwrap_or(5199);
         let bundle = self.bundle || config.bundle.unwrap_or(false);
@@ -316,11 +230,6 @@ impl DevServer {
         let proxy: Vec<(String, oj_config::ProxyEntry)> =
             server_cfg.proxy.clone().unwrap_or_default().into_iter().collect();
 
-        // Where plugins come from: oj.plugins.* (array) or a vite.config.*
-        // (default export's `plugins`). The host reads them per `pluginsFormat`.
-        // A TanStack Start app's vite.config plugins are the framework's (run by
-        // the start adapter, not the plugin host), and depend on Vite internals
-        // oj does not host, so skip loading them here.
         let plugin_src = if is_tanstack_start_app(&root) {
             None
         } else {
@@ -335,10 +244,6 @@ impl DevServer {
             None => (None, "oj", String::new()),
         };
 
-        // Config the plugin hosts receive in their config()/configResolved()
-        // hooks. The client host tags itself the "client" environment; the ssr
-        // host (lazily spawned for server modules) flips it to "ssr" so
-        // applyToEnvironment("ssr") plugins run there.
         let mut plugin_cfg = serde_json::json!({
             "config": {
                 "root": root.display().to_string(),
@@ -360,9 +265,6 @@ impl DevServer {
             Some(file) => match PluginHost::spawn(&root, &file, &plugin_config).await {
                 Ok(host) => {
                     println!("  plugins: {plugins_label}");
-                    // buildStart fires once when the dev server starts (Vite
-                    // semantics; buildEnd is a prod-build hook, and the dev
-                    // server has no close lifecycle to fire it on).
                     if let Err(e) = host.build_start().await {
                         eprintln!("oj: plugin buildStart failed: {e}");
                     }
@@ -375,7 +277,6 @@ impl DevServer {
             },
             None => None,
         };
-        // Ask the host whether any plugin registered configureServer middleware.
         let plugin_mw_port = match &plugin_host {
             Some(host) => host.middleware_port().await,
             None => None,
@@ -383,8 +284,6 @@ impl DevServer {
         if let Some(p) = plugin_mw_port {
             println!("  plugin middleware: forwarding unmatched requests to :{p}");
         }
-        // Query once: whether any plugin observes the module graph via
-        // moduleParsed. Only then does oj replay the hook on warm-cache serves.
         let plugins_use_module_parsed = match &plugin_host {
             Some(host) => host.has_module_parsed().await,
             None => false,
@@ -395,8 +294,6 @@ impl DevServer {
         let (crawl_tx, crawl_rx) = tokio::sync::watch::channel(false);
         let (write_tx, mut write_rx) =
             tokio::sync::mpsc::channel::<(String, Arc<CachedModule>)>(65536);
-        // publicDir: config/vite value resolved against root (an absolute value
-        // wins), else the default `<root>/public`.
         let public_dir = config
             .public_dir
             .as_ref()
@@ -472,8 +369,6 @@ impl DevServer {
             .route("/@ssr-module", get(ssr_module))
             .route("/__ws", get(ws_upgrade))
             .fallback(get(serve_path));
-        // Configured `server.headers` (COOP/COEP, etc.) applied to every
-        // response; needed for e.g. SharedArrayBuffer-based apps.
         let extra_headers: Vec<(header::HeaderName, header::HeaderValue)> = config
             .server
             .as_ref()
@@ -490,8 +385,6 @@ impl DevServer {
                 apply_dev_headers,
             ));
         }
-        // Proxy runs ahead of routing so configured prefixes (/api, ...) are
-        // forwarded before hitting the file fallback.
         if !state.proxy.is_empty() {
             app = app.layer(axum::middleware::from_fn_with_state(
                 Arc::clone(&state),
@@ -518,7 +411,6 @@ async fn ssr_resolve(
         return (StatusCode::BAD_REQUEST, "importer and spec required").into_response();
     };
     let importer_dir = Path::new(importer).parent().unwrap_or(&state.root);
-    // Resolve with the "ssr" environment's conditions (node), not the client's.
     match state.ssr_resolver.resolve(importer_dir, spec) {
         Ok(p) => {
             let s = p.to_string_lossy();
@@ -530,15 +422,11 @@ async fn ssr_resolve(
             js_response_json(body)
         }
         Err(e) => {
-            // A plugin (ssr environment) may own this specifier (virtual
-            // modules etc). The returned id is fetched from ssr_module, which
-            // consults the plugin's load hook for the source.
             if let Some(host) = ssr_plugin_host(&state).await {
                 if let Ok(Some(id)) = host.resolve_id(spec, importer).await {
                     return js_response_json(serde_json::json!({ "id": id }));
                 }
             }
-            // Unresolvable bare specifier (e.g. a Node builtin): let Node try it.
             if !spec.starts_with('.') && !spec.starts_with('/') {
                 return js_response_json(serde_json::json!({ "external": true, "spec": spec }));
             }
@@ -551,11 +439,6 @@ fn js_response_json(v: serde_json::Value) -> Response {
     ([(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response()
 }
 
-/// Module-runner endpoint: compile one app-source module for server-side
-/// evaluation. Plain TS/JSX prod transform (no Fast Refresh, no browser HMR
-/// glue), import specifiers left raw for the runner's linker; CSS Modules
-/// become their class-name map (hashed off the root-relative id, matching the
-/// client) and JSON becomes an ESM module.
 async fn ssr_module(
     State(state): State<Arc<ServerState>>,
     Query(q): Query<HashMap<String, String>>,
@@ -564,8 +447,6 @@ async fn ssr_module(
         return (StatusCode::BAD_REQUEST, "id required").into_response();
     };
     let path = PathBuf::from(id);
-    // Real file, or (for a plugin-resolved id with no file, a virtual module)
-    // the "ssr" plugin host's load hook.
     let (source, from_plugin) = match std::fs::read(&path).and_then(bytes_to_string) {
         Ok(s) => (s, false),
         Err(read_err) => match ssr_plugin_host(&state).await {
@@ -577,7 +458,6 @@ async fn ssr_module(
         },
     };
     let ext = path.extension().and_then(|e| e.to_str());
-    // CSS/JSON handling is for real files only; virtual modules are JS.
     if !from_plugin && matches!(ext, Some("css") | Some("scss") | Some("sass")) {
         return match ssr_css_module(&state.root, &path, &source) {
             Ok(code) => js(code),
@@ -590,17 +470,10 @@ async fn ssr_module(
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
         };
     }
-    // Run user plugins' transform as the "ssr" environment before compiling, so
-    // applyToEnvironment("ssr") plugins execute on server modules (the client
-    // host, a different environment, transforms the browser copy separately).
     let source = match ssr_plugin_host(&state).await {
-        // SSR module loading is not cached across restarts, so the watch-file
-        // metadata isn't needed here; keep the transformed code only.
         Some(host) => host.transform(&source, id).await.map(|(code, _)| code).unwrap_or(source),
         None => source,
     };
-    // A virtual id has no usable file extension; compile it as TSX so the JS/TS
-    // parser runs (mirrors the client's serve_plugin_id).
     let compile_path: PathBuf =
         if from_plugin { PathBuf::from("virtual.tsx") } else { path };
     match oj_compiler::compile(&compile_path, &source, &oj_compiler::CompileOptions::prod()) {
@@ -609,8 +482,6 @@ async fn ssr_module(
     }
 }
 
-/// The lazily-spawned "ssr" environment plugin host (spawned on first use so
-/// plain `oj dev` never starts it). `None` if the app has no plugins.
 async fn ssr_plugin_host(state: &Arc<ServerState>) -> Option<std::sync::Arc<PluginHost>> {
     state
         .plugins_ssr
@@ -633,9 +504,6 @@ async fn ssr_plugin_host(state: &Arc<ServerState>) -> Option<std::sync::Arc<Plug
         .clone()
 }
 
-/// Compile a (possibly CSS-module / Sass) stylesheet into an ESM module for the
-/// runner: `export default <class map>`. Class names hash off the root-relative
-/// id, so they match the dev pipeline and the SSR markup hydrates cleanly.
 fn ssr_css_module(root: &Path, path: &Path, source: &str) -> Result<String, String> {
     let css_src = if oj_css::is_sass(&path.to_string_lossy()) {
         oj_css::compile_sass(source, path.parent())?
@@ -657,9 +525,6 @@ fn ssr_css_module(root: &Path, path: &Path, source: &str) -> Result<String, Stri
     })
 }
 
-/// Static server for a production build (`oj preview`). Serves `dir`,
-/// strips `base`, refuses traversal, and falls back to `index.html` for
-/// extensionless routes (SPA client routing).
 pub async fn preview(
     dir: PathBuf,
     port: u16,
@@ -687,8 +552,6 @@ pub async fn preview(
     Ok(())
 }
 
-/// Map a request path (with the base stripped) to a file under the build
-/// dir, or `None` for a traversal attempt. Empty becomes `index.html`.
 fn preview_rel<'a>(path: &'a str, base: &str) -> Option<String> {
     let trimmed = path.strip_prefix(base.trim_end_matches('/')).unwrap_or(path);
     let rel = trimmed.trim_start_matches('/');
@@ -709,8 +572,6 @@ async fn preview_serve(
     let file = dir.join(&rel);
     let ext = Path::new(&rel).extension().and_then(|e| e.to_str()).unwrap_or("");
 
-    // Existing file: serve it. Otherwise, extensionless routes fall back to
-    // index.html so client-side routing works on deep links.
     let (target, ctype) = if file.is_file() {
         (file, content_type(ext))
     } else if ext.is_empty() {
@@ -759,11 +620,6 @@ async fn ws_upgrade(
     })
 }
 
-/// Forward requests whose path matches a `server.proxy` prefix to the
-/// configured target (longest prefix wins), otherwise pass through. Supports
-/// `changeOrigin`, `ws` (marker only for now), and `^from -> to` rewrite.
-/// Add the app's configured `server.headers` (e.g. COOP/COEP for
-/// SharedArrayBuffer) to every dev response.
 async fn apply_dev_headers(
     State(headers): State<Arc<Vec<(header::HeaderName, header::HeaderValue)>>>,
     req: axum::extract::Request,
@@ -792,7 +648,6 @@ async fn proxy_middleware(
         return next.run(req).await;
     };
 
-    // Compose the target URL: target + (rewritten) path + query.
     let mut fwd_path = path.clone();
     if let Some((from, to)) = entry.rewrite() {
         if let Some(stripped) = from.strip_prefix('^') {
@@ -817,7 +672,6 @@ async fn proxy_middleware(
 
     let mut out = state.http.request(method, &target).body(body_bytes.to_vec());
     for (name, value) in req_headers.iter() {
-        // Host is set by reqwest per target when changeOrigin; else forward.
         if entry.change_origin() && name == header::HOST {
             continue;
         }
@@ -832,8 +686,6 @@ async fn proxy_middleware(
             let mut response = Response::new(Body::from(bytes));
             *response.status_mut() = status;
             for (name, value) in headers.iter() {
-                // reqwest already decompressed; drop framing headers that
-                // would now be wrong.
                 if name == header::TRANSFER_ENCODING || name == header::CONTENT_LENGTH {
                     continue;
                 }
@@ -849,9 +701,6 @@ async fn proxy_middleware(
     }
 }
 
-/// Serve an index.html body: run plugin transformIndexHtml, then inject oj's
-/// dev scripts / bundle scripts. Shared by the direct `/` route and the SPA
-/// history fallback.
 async fn serve_html(state: &ServerState, bytes: Vec<u8>) -> Response {
     let mut raw = String::from_utf8_lossy(&bytes).into_owned();
     if let Some(host) = &state.plugins {
@@ -867,7 +716,6 @@ async fn serve_html(state: &ServerState, bytes: Vec<u8>) -> Response {
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
 }
 
-/// Serve the app's root index.html (the SPA fallback target).
 async fn serve_index_html(state: &ServerState) -> Response {
     match tokio::fs::read(state.root.join("index.html")).await {
         Ok(bytes) => serve_html(state, bytes).await,
@@ -875,9 +723,6 @@ async fn serve_index_html(state: &ServerState) -> Response {
     }
 }
 
-/// Whether an unresolved path should fall back to index.html (client-side
-/// routing) rather than 404. True for extension-less paths and browser HTML
-/// navigations; false for oj-internal namespaces, source, and missing assets.
 fn is_spa_navigation(rel: &str, headers: &HeaderMap) -> bool {
     if rel.starts_with('@')
         || rel.starts_with("__")
@@ -895,9 +740,6 @@ fn is_spa_navigation(rel: &str, headers: &HeaderMap) -> bool {
     no_extension || accepts_html
 }
 
-/// Forward an unmatched GET to the plugin `configureServer` middleware server.
-/// Returns `Some(response)` if a middleware handled it, `None` if there's no
-/// middleware or it fell through (so oj resumes its own SPA-fallback / 404).
 async fn forward_to_plugin_middleware(
     state: &ServerState,
     uri: &Uri,
@@ -914,7 +756,6 @@ async fn forward_to_plugin_middleware(
         out = out.header(name, value);
     }
     let resp = out.send().await.ok()?;
-    // The sentinel means no middleware claimed the request: fall through.
     if resp.headers().contains_key("x-oj-fallthrough") {
         return None;
     }
@@ -937,10 +778,6 @@ async fn serve_path(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    // Serve under `base` like Vite: strip the configured base prefix from app
-    // requests (built from `import.meta.env.BASE_URL`). oj's own root-relative
-    // URLs (/@fs, /@id, /@oj, /src) don't carry the prefix, so this is a no-op
-    // for them.
     let path = state
         .base
         .as_deref()
@@ -949,7 +786,6 @@ async fn serve_path(
     let rel = path.trim_start_matches('/');
     let rel = if rel.is_empty() { "index.html" } else { rel };
 
-    // Virtual modules: serve author-provided source at /@virtual/<id>.
     if let Some(id) = uri.path().strip_prefix("/@virtual/") {
         return match state.virtual_modules.get(id) {
             Some(code) => (
@@ -961,8 +797,6 @@ async fn serve_path(
         };
     }
 
-    // Plugin-resolved modules: `/@id/<hex spec>?importer=<hex>`, a specifier
-    // oj couldn't resolve, handed to plugin resolveId + load.
     if let Some(hex) = uri.path().strip_prefix("/@id/") {
         let spec = hex_decode(hex).unwrap_or_default();
         let importer = uri
@@ -987,16 +821,9 @@ async fn serve_path(
         match locate(&state.root, &state.public_dir, rel) {
             Some(file) => file,
             None => {
-                // A plugin's configureServer middleware may own this route
-                // (dev endpoints: health checks, secrets, api stubs). Consulted
-                // only on a miss, so served modules/assets skip the round-trip.
                 if let Some(resp) = forward_to_plugin_middleware(&state, &uri, &headers).await {
                     return resp;
                 }
-                // SPA history fallback: a navigation to a client-router path
-                // (no file extension, or an HTML navigation) serves index.html
-                // so BrowserRouter/etc. can take over. Missing assets and
-                // oj-internal namespaces still 404.
                 if is_spa_navigation(rel, &headers) {
                     return serve_index_html(&state).await;
                 }
@@ -1028,7 +855,6 @@ async fn serve_path(
         let url = url_of(&state.root, &file);
         return serve_compiled(&state, &file, &url, uri.query(), &headers).await;
     }
-    // JSON imported from JS becomes a module; JSON under publicDir stays raw.
     if ext == "json" && !file.starts_with(&state.public_dir) {
         let url = url_of(&state.root, &file);
         return serve_compiled(&state, &file, &url, uri.query(), &headers).await;
@@ -1070,9 +896,6 @@ async fn serve_path(
     }
 }
 
-/// The preamble must be the first module script in the document: module
-/// scripts execute in document order, and injectIntoGlobalHook has to run
-/// before any module pulls in React.
 fn inject_dev_scripts(html: String) -> String {
     let tags = "<script type=\"module\" src=\"/@oj/refresh-preamble.js\"></script>\n\
                 <script type=\"module\" src=\"/@oj/client.js\"></script>";
@@ -1095,8 +918,6 @@ async fn serve_compiled(
     let (key, module) = match ensure_module(state, file, url).await {
         Ok(pair) => pair,
         Err(err) => {
-            // Push to the overlay too: during a hot update the failed module
-            // is fetched via dynamic import and the 500 body is never shown.
             let _ = state.reload_tx.send(
                 serde_json::json!({ "type": "error", "message": err.clone() }).to_string(),
             );
@@ -1104,8 +925,6 @@ async fn serve_compiled(
         }
     };
 
-    // The content key is the etag: reloads revalidate modules as 304s instead
-    // of re-downloading bodies. ?t= requests are one-shot HMR fetches, no etag.
     let etag = format!("\"{key}\"");
     if query.is_none() {
         if let Some(inm) = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) {
@@ -1124,7 +943,6 @@ async fn serve_compiled(
         body.push_str(&hot_glue(url, query, module.is_boundary));
     }
     if let Some(map_url) = &module.map_data_url {
-        // Glue is append-only, so original line mappings stay exact.
         body.push_str(&format!("\n//# sourceMappingURL={map_url}\n"));
     }
 
@@ -1139,10 +957,6 @@ async fn serve_compiled(
         .into_response()
 }
 
-/// Compile-or-cache one module: memory, then disk, then compile, coalescing
-/// concurrent callers (HTTP requests and the startup crawl) per url.
-/// Also re-applies the module's graph edges: the graph is in-memory only
-/// and empty after a restart, cache hits included.
 async fn ensure_module(
     state: &Arc<ServerState>,
     file: &Path,
@@ -1169,11 +983,6 @@ async fn ensure_module(
         return Ok((String::new(), module));
     }
 
-    // Server functions: a `*.server.*` module never reaches the client; it is
-    // replaced by stubs that RPC to /__oj_fn (served by the SSR dev server).
-    // The stub is a pure function of the source, so it rides the same
-    // content-addressed cache as every other module (its own `server` mode)
-    // rather than being re-derived — re-parsing exports included — per request.
     let is_dep_early = url.contains("/node_modules/") || url.starts_with("/@fs/");
     let is_server = is_server_module(file) && !is_dep_early && !state.bundle;
 
@@ -1197,7 +1006,6 @@ async fn ensure_module(
     };
     let _guard = lock.lock().await;
 
-    // A coalesced waiter arrives here after the winner finished: re-check.
     if let Some(module) = memory_get(state, url, &key) {
         register_in_graph(state, url, &module);
         return Ok((key, module));
@@ -1206,14 +1014,10 @@ async fn ensure_module(
         let module = Arc::new(module);
         memory_put(state, url, &key, &module);
         register_in_graph(state, url, &module);
-        // Warm-cache hit: transform did not re-run, so replay moduleParsed for
-        // graph-observing plugins (no-op unless one defines the hook).
         replay_module_parsed(state, file, &key, is_dep_early, is_server).await;
         return Ok((key, module));
     }
 
-    // Server-fn stub (cache miss): build once, then persist + memoize like a
-    // compiled module so repeat requests and restarts skip the export parse.
     if is_server {
         let code = server_fn_stub(&oj_compiler::exports(&source, file), url);
         let module = Arc::new(CachedModule {
@@ -1234,13 +1038,6 @@ async fn ensure_module(
     }
 
     let is_dep = url.contains("/node_modules/") || url.starts_with("/@fs/");
-    // Plugin `transform` hooks run on app source before oj compiles it (deps
-    // are skipped to avoid a per-node_modules-module round trip). The `id` is
-    // the absolute file path (Rollup convention, and what prod passes), so a
-    // plugin's this.resolve gets a usable importer in both dev and prod.
-    // Files the plugins' transform registered via this.addWatchFile for this
-    // module: cached on the module and re-applied on every serve (cache hits
-    // included), so the watch survives a warm-cache restart.
     let mut plugin_watch_files: Vec<String> = Vec::new();
     let source = match &state.plugins {
         Some(host) if !is_dep => match host.transform(&source, &file.to_string_lossy()).await {
@@ -1253,11 +1050,6 @@ async fn ensure_module(
         _ => source,
     };
 
-    // Arbitrary PostCSS: with a postcss.config, non-Tailwind .css runs through
-    // the app's PostCSS chain (sidecar) before Lightning below. Tailwind css
-    // already went through the sidecar above and returned; .scss keeps the
-    // sass-to-Lightning path. Only reached on a cache miss (key is on the raw
-    // source), so cache hits skip the round-trip.
     let source = if state.has_postcss && file.extension().and_then(|e| e.to_str()) == Some("css") {
         run_css_sidecar(state, url, &source).await.unwrap_or(source)
     } else {
@@ -1274,8 +1066,6 @@ async fn ensure_module(
     let file_owned = file.to_path_buf();
     let url_owned = url.to_string();
     let bundle = state.bundle;
-    // A bare specifier oj can't resolve, when plugins are present (dev only),
-    // is deferred to plugin resolveId/load via a `/@id/` URL served lazily.
     let plugin_fallback = state.plugins.is_some() && !bundle;
     let importer_abs = file.to_string_lossy().into_owned();
     let ext = file.extension().and_then(|e| e.to_str());
@@ -1283,7 +1073,6 @@ async fn ensure_module(
     let is_json = ext == Some("json");
     let compiled = tokio::task::spawn_blocking(move || -> Result<CachedModule, String> {
         if is_json {
-            // JSON as a module: a JS body exporting default + named keys.
             let code = if bundle {
                 oj_compiler::json::to_factory_body(&source, &url_owned)
             } else {
@@ -1303,7 +1092,6 @@ async fn ensure_module(
             });
         }
         if is_css {
-            // Sass/SCSS to CSS first (sibling @use/@import resolve from dir).
             let css_src = if oj_css::is_sass(&url_owned) {
                 oj_css::compile_sass(&source, Some(&dir))?
             } else {
@@ -1311,7 +1099,7 @@ async fn ensure_module(
             };
             let output = oj_css::compile_css(&url_owned, &css_src, false)?;
             return Ok(CachedModule {
-                is_boundary: true, // JS-imported css self-accepts its updates
+                is_boundary: true,
                 kind: "css".into(),
                 code: output.css,
                 map_data_url: None,
@@ -1323,18 +1111,15 @@ async fn ensure_module(
             });
         }
         let mut rewrite = |spec: &str| {
-            // Built-in file-based route manifest.
             if spec == "virtual:oj-routes" {
                 return Some("/@oj/routes.js".to_string());
             }
-            // Virtual modules resolve to /@virtual/<id> instead of the FS.
             if virtual_ids.contains(spec) {
                 return Some(format!("/@virtual/{spec}"));
             }
             if let Some(url) = rewrite_specifier(&root, &dir, &resolver, &fs_allow, &dir_cache, spec, !bundle) {
                 return Some(url);
             }
-            // Unresolvable bare specifier: defer to plugin resolveId/load.
             if plugin_fallback && is_bare_specifier(spec) {
                 return Some(format!("/@id/{}?importer={}", hex_encode(spec), hex_encode(&importer_abs)));
             }
@@ -1387,32 +1172,21 @@ async fn ensure_module(
 
     let module = match compiled {
         Ok(Ok(mut module)) => {
-            // Only the app-source paths (dev/bundle) run transform; json/css
-            // leave this empty, matching the fact that they never watched.
             module.watch_files = plugin_watch_files;
             Arc::new(module)
         }
         Ok(Err(err)) => return Err(err),
         Err(join_err) => return Err(format!("compiler task failed: {join_err}")),
     };
-    // Disk-cache writes go through one dedicated writer thread: keeps
-    // serialize+write+rename off the compile tasks without flooding the
-    // blocking pool (per-write spawn_blocking regressed cold start).
-    // Best-effort: a full queue just drops the write.
     let _ = state.cache_writes.try_send((key.clone(), Arc::clone(&module)));
     memory_put(state, url, &key, &module);
     register_in_graph(state, url, &module);
-    // The transform above already fired moduleParsed in the host; record it so a
-    // later warm re-load (memory eviction) does not replay it a second time.
     if state.plugins_use_module_parsed && !is_dep && !is_server {
         state.parsed_fired.lock().unwrap().insert(key.clone());
     }
     Ok((key, module))
 }
 
-/// Replay `moduleParsed` for a warm-cache serve where `transform` (which
-/// normally fires it) did not re-run. No-op unless a plugin observes the graph,
-/// and fires at most once per module per session.
 async fn replay_module_parsed(
     state: &Arc<ServerState>,
     file: &Path,
@@ -1424,7 +1198,7 @@ async fn replay_module_parsed(
         return;
     }
     if !state.parsed_fired.lock().unwrap().insert(key.to_string()) {
-        return; // already fired this session
+        return;
     }
     if let Some(host) = &state.plugins {
         let _ = host.module_parsed(&file.to_string_lossy()).await;
@@ -1444,10 +1218,6 @@ fn memory_put(state: &ServerState, url: &str, key: &str, module: &Arc<CachedModu
         .insert(url.to_string(), (key.to_string(), Arc::clone(module)));
 }
 
-/// The package a file belongs to: nearest ancestor with a package.json
-/// (fallback: the file's own directory). This is the /@fs trust boundary:
-/// pulling in one file from a resolved dependency trusts that package's
-/// shipped assets (e.g. a wasm loaded at runtime via new URL(import.meta.url)).
 fn package_root(path: &Path) -> PathBuf {
     let mut dir = path.parent();
     while let Some(d) = dir {
@@ -1459,7 +1229,6 @@ fn package_root(path: &Path) -> PathBuf {
     path.parent().unwrap_or(path).to_path_buf()
 }
 
-/// Package-root prefixes for a module's /@fs/ imports (query stripped).
 fn fs_allow_from(imports: &[String]) -> Vec<String> {
     imports
         .iter()
@@ -1475,8 +1244,6 @@ fn register_in_graph(state: &ServerState, url: &str, module: &CachedModule) {
             allow.insert(PathBuf::from(p));
         }
     }
-    // Re-apply this module's plugin addWatchFile registrations (cache hits too),
-    // so the dev watcher keeps watching them after a warm-cache restart.
     if !module.watch_files.is_empty() {
         let mut watched = state.plugin_watched.lock().unwrap();
         for p in &module.watch_files {
@@ -1494,9 +1261,6 @@ fn register_in_graph(state: &ServerState, url: &str, module: &CachedModule) {
     graph.set_self_accepting(Path::new(url), module.is_boundary);
 }
 
-/// JS-imported css: a style-injecting ES module with the scoped class map
-/// as its default export. Self-accepting, so edits hot-swap through the
-/// normal module-update flow with React state intact.
 async fn serve_css_wrapper(state: &Arc<ServerState>, file: &Path, url: &str) -> Response {
     let (_, module) = match ensure_module(state, file, url).await {
         Ok(pair) => pair,
@@ -1532,15 +1296,12 @@ async fn serve_css_wrapper(state: &Arc<ServerState>, file: &Path, url: &str) -> 
         .into_response()
 }
 
-/// Whether the app has a PostCSS config (so all css goes through the sidecar).
 pub fn has_postcss_config(root: &Path) -> bool {
     ["postcss.config.js", "postcss.config.cjs", "postcss.config.mjs"]
         .iter()
         .any(|f| root.join(f).is_file())
 }
 
-/// Run css through the (lazily-spawned) CSS sidecar: the app's PostCSS chain,
-/// or the Tailwind v4 API when there's no postcss config.
 async fn run_css_sidecar(state: &Arc<ServerState>, url: &str, source: &str) -> Result<String, String> {
     let sidecar = state
         .tailwind
@@ -1550,9 +1311,6 @@ async fn run_css_sidecar(state: &Arc<ServerState>, url: &str, source: &str) -> R
     sidecar.compile(source, url).await
 }
 
-/// Compile tailwind-flavored css through the Node sidecar. Never cached:
-/// the output depends on class candidates across the whole app, not on the
-/// css file's own content.
 async fn compile_tailwind(
     state: &Arc<ServerState>,
     url: &str,
@@ -1563,14 +1321,10 @@ async fn compile_tailwind(
     Ok(css)
 }
 
-/// Handle messages from the dev client (currently only `invalidate`).
 fn handle_client_message(state: &Arc<ServerState>, text: &str) {
     let Ok(msg) = serde_json::from_str::<serde_json::Value>(text) else { return };
     if msg["type"] == "invalidate" {
         let Some(path) = msg["path"].as_str() else { return };
-        // Bundle mode escalates as a patch (re-execute the importer boundaries
-        // with the already-registered factory); unbundled as an update (re-import
-        // the boundary module urls). Both replace the old full-reload fallback.
         let reply = if state.bundle {
             match state.graph.lock().unwrap().update_plan_from_importers(Path::new(path)) {
                 Ok(plan) => {
@@ -1617,9 +1371,6 @@ fn handle_client_message(state: &Arc<ServerState>, text: &str) {
         };
         let _ = state.reload_tx.send(reply.to_string());
     } else if msg["type"] == "custom" {
-        // A client `import.meta.hot.send(event, data)`. With no plugin system
-        // yet, broadcast it to all clients so hot.on(event) listeners (this
-        // tab and others) receive it: enough for round-trip messaging.
         if msg["event"].is_string() {
             let _ = state.reload_tx.send(
                 serde_json::json!({
@@ -1633,12 +1384,6 @@ fn handle_client_message(state: &Arc<ServerState>, text: &str) {
     }
 }
 
-/// The per-module HMR/Fast Refresh glue, following @vitejs/plugin-react's
-/// current append-only wrapper: `$RefreshReg$`/`$RefreshSig$` are hoisted
-/// function declarations, so the transform's module-body calls resolve to
-/// these locals instead of the window stubs; the module imports itself
-/// (with the same ?t query when hot-updated) to hand its export namespace
-/// to the boundary validator.
 fn hot_glue(url: &str, query: Option<&str>, is_boundary: bool) -> String {
     if !is_boundary {
         return String::new();
@@ -1675,17 +1420,8 @@ function $RefreshSig$() {{ return RefreshRuntime.createSignatureFunctionForTrans
     )
 }
 
-/// Per-directory listing cache: `dir -> { filename -> is_regular_file }`.
-/// Collapses the relative-import extension probe (up to ~6 `is_file` syscalls
-/// per extensionless import) into one `read_dir` per directory, amortized
-/// across every sibling import during the cold-start crawl. Cleared wholesale
-/// on any watcher burst (see `spawn_watcher`), so a newly created/removed file
-/// is picked up on the next resolve.
 type DirCache = std::collections::HashMap<PathBuf, std::sync::Arc<std::collections::HashMap<std::ffi::OsString, bool>>>;
 
-/// `path.is_file()`, answered from a cached directory listing. Falls back to a
-/// direct stat only for symlinked entries (rare in app source; node_modules
-/// goes through the resolver, not this path).
 fn is_file_cached(cache: &Mutex<DirCache>, path: &Path) -> bool {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return path.is_file();
@@ -1698,7 +1434,7 @@ fn is_file_cached(cache: &Mutex<DirCache>, path: &Path) -> bool {
         for e in rd.flatten() {
             let is_file = match e.file_type() {
                 Ok(ft) if ft.is_file() => true,
-                Ok(ft) if ft.is_symlink() => e.path().is_file(), // follow the link
+                Ok(ft) if ft.is_symlink() => e.path().is_file(),
                 _ => false,
             };
             map.insert(e.file_name(), is_file);
@@ -1710,9 +1446,6 @@ fn is_file_cached(cache: &Mutex<DirCache>, path: &Path) -> bool {
     result
 }
 
-/// `./App` from `<root>/src` becomes `/src/App.tsx`; `react` becomes the
-/// resolved node_modules entry as a rooted URL. Rooted/virtual/absolute-URL
-/// specifiers pass through untouched.
 fn rewrite_specifier(
     root: &Path,
     dir: &Path,
@@ -1726,10 +1459,6 @@ fn rewrite_specifier(
         return None;
     }
 
-    // Query-suffixed imports (`./x.wasm?url`, `./x.txt?raw`, `./x.png?inline`,
-    // `./w.ts?worker`): resolve the base file, keep the marker; the server
-    // answers with a JS module (url string / contents / data URI / Worker
-    // factory).
     if let Some((base, query)) = spec.split_once('?') {
         if matches!(query, "url" | "raw" | "inline" | "worker" | "sharedworker") {
             let resolved = rewrite_specifier(root, dir, resolver, fs_allow, dir_cache, base, false)
@@ -1745,8 +1474,6 @@ fn rewrite_specifier(
 
     if spec.starts_with("./") || spec.starts_with("../") {
         let mut joined = normalize(&dir.join(spec));
-        // TS convention: `import "./x.js"` resolves the sibling `./x.ts`
-        // (also .tsx/.jsx). If the literal .js/.jsx target is absent, retarget.
         if !is_file_cached(dir_cache, &joined) {
             if let Some(ext) = joined.extension().and_then(|e| e.to_str()) {
                 if ext == "js" || ext == "jsx" {
@@ -1769,8 +1496,6 @@ fn rewrite_specifier(
         };
         if let Some(p) = quick {
             let url = url_of(root, &p);
-            // JS-imported css is served as a style-injecting JS module; the
-            // ?import marker distinguishes it from <link> requests.
             if css_import_marker
                 && (url.ends_with(".css") || url.ends_with(".scss") || url.ends_with(".sass"))
             {
@@ -1778,14 +1503,11 @@ fn rewrite_specifier(
             }
             return Some(url);
         }
-        // Directories, `./x.js` to `x.ts`, etc.: let the real resolver try.
     }
 
     match resolver.resolve(dir, spec) {
         Ok(resolved) if resolved.starts_with(root) => Some(url_of(root, &resolved)),
         Ok(resolved) => {
-            // Outside the served root (workspace packages, hoisted installs):
-            // trust the whole package and serve it under /@fs/.
             fs_allow.lock().unwrap().insert(package_root(&resolved));
             Some(url_of(root, &resolved))
         }
@@ -1819,8 +1541,6 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
-/// Map a URL path to a file under root, refusing traversal and probing
-/// TS-first extensions for extensionless imports (`/src/App` finds `App.tsx`).
 fn locate(root: &Path, public_dir: &Path, rel: &str) -> Option<PathBuf> {
     if rel.split('/').any(|seg| seg == "..") {
         return None;
@@ -1837,7 +1557,6 @@ fn locate(root: &Path, public_dir: &Path, rel: &str) -> Option<PathBuf> {
             }
         }
     }
-    // Vite-style publicDir: assets under the public dir are served at root.
     let public = public_dir.join(rel);
     if public.is_file() {
         return Some(public);
@@ -1845,7 +1564,6 @@ fn locate(root: &Path, public_dir: &Path, rel: &str) -> Option<PathBuf> {
     None
 }
 
-/// Which query-suffix asset module a request wants, if any.
 fn query_asset_kind(query: Option<&str>) -> Option<&'static str> {
     let q = query?;
     for kind in ["url", "raw", "inline", "worker", "sharedworker"] {
@@ -1856,7 +1574,6 @@ fn query_asset_kind(query: Option<&str>) -> Option<&'static str> {
     None
 }
 
-/// Build the JS module for a `?url` / `?raw` / `?inline` asset import.
 async fn asset_module(file: &Path, url: &str, kind: &str) -> Result<String, String> {
     let clean_url = url.split('?').next().unwrap_or(url);
     match kind {
@@ -1874,8 +1591,6 @@ async fn asset_module(file: &Path, url: &str, kind: &str) -> Result<String, Stri
             let data_uri = format!("data:{mime};base64,{}", base64_encode(&bytes));
             Ok(format!("export default {data_uri:?};\n"))
         }
-        // `?worker` / `?sharedworker`: a factory that constructs a module
-        // Worker over the (separately compiled+served) worker script.
         "worker" | "sharedworker" => {
             let ctor = if kind == "sharedworker" { "SharedWorker" } else { "Worker" };
             Ok(format!(
@@ -1900,8 +1615,6 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// A `*.server.{ts,tsx,js,jsx}` module: its exports run only on the server and
-/// are replaced by client stubs.
 fn is_server_module(file: &Path) -> bool {
     file.file_name()
         .and_then(|n| n.to_str())
@@ -1913,8 +1626,6 @@ fn is_server_module(file: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Client stub module for a server-function module: each export becomes a call
-/// that RPCs to /__oj_fn via the server-fn runtime.
 fn server_fn_stub(exports: &[String], url: &str) -> String {
     let mut out = String::from("import { __ojServerCall } from \"/@oj/server-fn.js\";\n");
     for name in exports {
@@ -1931,9 +1642,6 @@ fn server_fn_stub(exports: &[String], url: &str) -> String {
     out
 }
 
-/// Serve the built-in `virtual:oj-routes` manifest, compiled at the app root so
-/// its `./src/routes/**` glob resolves there (and each route becomes a
-/// code-split lazy import).
 async fn serve_oj_routes(State(state): State<Arc<ServerState>>) -> Response {
     let root = state.root.clone();
     let resolver = Arc::clone(&state.resolver);
@@ -1964,9 +1672,6 @@ async fn serve_oj_routes(State(state): State<Arc<ServerState>>) -> Response {
     }
 }
 
-/// Serve a plugin-resolved module: run `resolveId(spec, importer)` then
-/// `load(id)`, compile the returned source (TS/JSX strip + import rewrite), and
-/// serve it as a JS module. This is how plugin virtual modules reach the browser.
 async fn serve_plugin_id(state: &Arc<ServerState>, spec: &str, importer: &str) -> Response {
     let Some(host) = &state.plugins else {
         return (StatusCode::NOT_FOUND, "oj: no plugin host").into_response();
@@ -2012,14 +1717,10 @@ async fn serve_plugin_id(state: &Arc<ServerState>, spec: &str, importer: &str) -
     }
 }
 
-/// A bare import specifier (not relative/absolute/URL), e.g. `virtual:foo`,
-/// `react`. Used to decide whether an unresolved import can defer to plugins.
 fn is_bare_specifier(spec: &str) -> bool {
     !spec.starts_with('.') && !spec.starts_with('/') && !spec.contains("://")
 }
 
-/// Hex encode/decode for stuffing a specifier + importer into a `/@id/` URL
-/// (path-safe, no dependency).
 fn hex_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     for b in s.bytes() {
@@ -2070,14 +1771,7 @@ fn now_millis() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
 }
 
-/// `<link rel="modulepreload">` for every known module, so the browser
-/// fetches the whole graph in parallel instead of discovering it one
-/// import-depth round trip at a time. This is what replaces bundling while
-/// dev stays native-ESM.
 fn inject_module_preloads(html: String, state: &ServerState) -> String {
-    // Live graph once the crawl finished; last session's snapshot before
-    // that. Never block HTML on compilation: a stale snapshot just means a
-    // few extra or missing preloads, and imports still resolve normally.
     let paths: Vec<String> = if *state.crawl_done.borrow() {
         state
             .graph
@@ -2096,8 +1790,6 @@ fn inject_module_preloads(html: String, state: &ServerState) -> String {
     let links: String = paths
         .iter()
         .map(|p| {
-            // Stylesheets live in the graph under their clean url but are
-            // served as JS only with the ?import marker.
             if p.ends_with(".css") || p.ends_with(".scss") || p.ends_with(".sass") {
                 format!("<link rel=\"modulepreload\" href=\"{p}?import\" />\n")
             } else {
@@ -2111,12 +1803,9 @@ fn inject_module_preloads(html: String, state: &ServerState) -> String {
     }
 }
 
-/// Bundle mode: runtime + chunk replace the app's own module script tags.
 fn inject_bundle_scripts(html: String) -> String {
     let mut out = String::with_capacity(html.len());
     let mut rest = html.as_str();
-    // Drop every `<script type="module" src="/...">...</script>` tag; the
-    // chunk executes those entries via __oj_start.
     while let Some(start) = rest.find("<script") {
         let Some(tag_close) = rest[start..].find('>') else { break };
         let tag = &rest[start..start + tag_close];
@@ -2146,13 +1835,10 @@ fn inject_bundle_scripts(html: String) -> String {
 }
 
 async fn serve_chunk(State(state): State<Arc<ServerState>>, headers: HeaderMap) -> Response {
-    // Fresh case: cached bytes + etag, so an unchanged reload is a 304 and
-    // never re-assembles.
     if let Some((etag, body)) = state.chunk_cache.lock().unwrap().clone() {
         return chunk_response(&headers, etag, body);
     }
 
-    // The chunk needs the full graph: wait for the eager crawl.
     let mut crawl_done = state.crawl_done.clone();
     if !*crawl_done.borrow() {
         let _ = crawl_done.wait_for(|done| *done).await;
@@ -2166,7 +1852,6 @@ async fn serve_chunk(State(state): State<Arc<ServerState>>, headers: HeaderMap) 
         .map(|p| p.display().to_string())
         .collect();
 
-    // Single-flight assembly: coalesce concurrent cold reloads.
     let lock = {
         let mut locks = state.compile_locks.lock().unwrap();
         Arc::clone(locks.entry("/@oj/chunk.js".into()).or_default())
@@ -2213,7 +1898,6 @@ fn chunk_response(headers: &HeaderMap, etag: String, body: Arc<String>) -> Respo
     )
         .into_response()}
 
-/// `?m=url1,url2&t=...`: re-registrations for the changed modules.
 async fn serve_patch(State(state): State<Arc<ServerState>>, uri: Uri) -> Response {
     let query = uri.query().unwrap_or("");
     let modules = query
@@ -2242,7 +1926,6 @@ async fn serve_patch(State(state): State<Arc<ServerState>>, uri: Uri) -> Respons
         .into_response()
 }
 
-/// Resolve a module url to its file path (shared by chunk + lazy assembly).
 fn locate_url(state: &ServerState, url: &str) -> Result<PathBuf, String> {
     if let Some(abs) = url.strip_prefix("/@fs") {
         Ok(PathBuf::from(abs))
@@ -2252,7 +1935,6 @@ fn locate_url(state: &ServerState, url: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// Render a module's `__oj_register(...)` statement from its compiled form.
 fn render_registration(url: &str, module: &CachedModule) -> String {
     let deps: serde_json::Map<String, serde_json::Value> = module
         .require_map
@@ -2275,8 +1957,6 @@ fn render_registration(url: &str, module: &CachedModule) -> String {
             css = serde_json::Value::String(module.code.clone()),
         );
     }
-    // Parameter names are kind-specific: CJS bodies reference
-    // `exports`/`require` directly, ESM factories the __oj_* forms.
     let params = if module.kind == "cjs" {
         "module, exports, require"
     } else {
@@ -2290,25 +1970,18 @@ fn render_registration(url: &str, module: &CachedModule) -> String {
     )
 }
 
-/// One `__oj_register(...)` statement for a module, compiling if needed.
 async fn registration_for(state: &Arc<ServerState>, url: &str) -> Result<String, String> {
     let file = locate_url(state, url)?;
     let (_, module) = ensure_module(state, &file, url).await?;
     Ok(render_registration(url, &module))
 }
 
-/// `?id=<url>&have=<csv>`: register the target's static-import closure (minus
-/// the modules this client already holds) so a lazy `import()` compiled to
-/// `__oj_import_lazy` resolves on demand. Nested dynamic imports inside the
-/// subtree stay their own lazy boundaries. Compiles subtrees the eager crawl
-/// deliberately skipped.
 async fn serve_lazy(State(state): State<Arc<ServerState>>, uri: Uri) -> Response {
     let query = uri.query().unwrap_or("");
     let field = |k: &str| query.split('&').find_map(|kv| kv.strip_prefix(k)).map(urldecode);
     let Some(id) = field("id=").filter(|s| !s.is_empty()) else {
         return (StatusCode::BAD_REQUEST, "oj: lazy: id required").into_response();
     };
-    // Modules the client already registered: never re-ship (shared React etc.).
     let mut visited: std::collections::HashSet<String> = field("have=")
         .map(|v| v.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect())
         .unwrap_or_default();
@@ -2340,11 +2013,9 @@ async fn serve_lazy(State(state): State<Arc<ServerState>>, uri: Uri) -> Response
 }
 
 fn urldecode(input: &str) -> String {
-    // Only %2F and %2C realistically appear in oj's module lists.
     input.replace("%2F", "/").replace("%2f", "/").replace("%2C", ",").replace("%2c", ",")
 }
 
-/// Module-script entry URLs from the app's index.html.
 fn html_entries(root: &Path) -> Vec<String> {
     let Ok(html) = std::fs::read_to_string(root.join("index.html")) else {
         return Vec::new();
@@ -2369,8 +2040,6 @@ fn html_entries(root: &Path) -> Vec<String> {
     entries
 }
 
-/// Startup crawl: compile the entire entry-reachable graph in parallel so
-/// first paint never waits on request-driven, depth-serialized discovery.
 fn spawn_crawl(state: Arc<ServerState>, done_tx: tokio::sync::watch::Sender<bool>) {
     tokio::spawn(async move {
         let started = Instant::now();
@@ -2469,33 +2138,19 @@ fn spawn_watcher(state: Arc<ServerState>) {
             return;
         }
 
-        // Trailing/coalescing debounce. Editor and OS writes fire several
-        // events per save; collect a burst and process it once after a short
-        // quiet gap. Never drops an event: a leading "skip if within Nms of
-        // the last send" debounce loses a second edit whose event lands in
-        // the shadow of the first's trailing event.
         use std::sync::mpsc::RecvTimeoutError;
-        // Trailing-drain window: after the last event of a save's burst, wait
-        // this long for the next before processing. It sits directly on the HMR
-        // critical path (a single-event save waits exactly this long before the
-        // recompile even starts), so it is kept just long enough to coalesce a
-        // burst — editor writes land within ~1-2ms, so 10ms coalesces reliably
-        // while shaving ~20ms off save-to-paint versus the old 30ms. Tunable via
-        // OJ_HMR_DEBOUNCE_MS. Never drops an event: any event resets the timer.
         let debounce_ms: u64 = std::env::var("OJ_HMR_DEBOUNCE_MS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10);
         loop {
-            // Block for the first event of a burst.
             let first = match rx.recv() {
                 Ok(Ok(ev)) => ev,
                 Ok(Err(_)) => continue,
-                Err(_) => break, // channel closed
+                Err(_) => break,
             };
             let mut paths: std::collections::HashSet<PathBuf> =
                 first.paths.into_iter().collect();
-            // Drain the rest of the burst until things go quiet.
             loop {
                 match rx.recv_timeout(Duration::from_millis(debounce_ms)) {
                     Ok(Ok(ev)) => paths.extend(ev.paths),
@@ -2509,8 +2164,6 @@ fn spawn_watcher(state: Arc<ServerState>) {
             if messages.is_empty() {
                 continue;
             }
-            // Anything changed: the assembled chunk is stale, and a created or
-            // removed file may change how relative imports resolve.
             *state.chunk_cache.lock().unwrap() = None;
             state.dir_cache.lock().unwrap().clear();
             for message in messages {
@@ -2520,18 +2173,11 @@ fn spawn_watcher(state: Arc<ServerState>) {
     });
 }
 
-/// Turn a batch of changed paths into HMR messages (empty if irrelevant).
 fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
     let mut messages: Vec<String> = Vec::new();
     let mut updates: Vec<serde_json::Value> = Vec::new();
 
-    // Files plugins registered via this.addWatchFile: a change to one forces a
-    // full reload even if oj would otherwise ignore the file. Fetched once per
-    // burst (canonicalized so /tmp vs /private/tmp style aliases still match).
     let plugin_watched: std::collections::HashSet<PathBuf> = {
-        // Live host set (this session's transforms) unioned with the per-module
-        // cached registrations re-applied on serve, so warm-cache modules whose
-        // transform never re-ran still contribute their watches.
         let mut raw: Vec<String> = match &state.plugins {
             Some(host) => state.rt.block_on(host.watch_files()).unwrap_or_default(),
             None => Vec::new(),
@@ -2544,7 +2190,6 @@ fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
             .collect()
     };
 
-    // Any source change can mint new utility classes: refresh tailwind css.
     let source_changed = paths.iter().any(|p| {
         !p.components().any(|c| {
             let c = c.as_os_str();
@@ -2565,8 +2210,6 @@ fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
     }
 
     for path in paths {
-        // Deps change via installs, not saves; watching them is pure noise.
-        // .oj-cache and dist are oj's own outputs.
         if path.components().any(|c| {
             let c = c.as_os_str();
             c == "node_modules" || c == ".oj-cache" || c == "dist"
@@ -2574,8 +2217,6 @@ fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
             continue;
         }
 
-        // Notify plugins the file changed (Rollup watchChange), then let them
-        // customize HMR (handleHotUpdate).
         if let Some(host) = &state.plugins {
             let file = path.display().to_string();
             let ts = now_millis() as u64;
@@ -2596,7 +2237,6 @@ fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
             }
         }
 
-        // A plugin-watched file (this.addWatchFile): force a full reload.
         if !plugin_watched.is_empty() {
             let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
             if plugin_watched.contains(&canon) {
@@ -2612,7 +2252,6 @@ fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
         if ext == "css" {
             let url = url_of(&state.root, path);
             if !state.graph.lock().unwrap().contains(Path::new(&url)) {
-                // Only referenced via <link>: hot-swap the stylesheet.
                 println!("oj: change {url} -> css-update");
                 messages.push(
                     serde_json::json!({
@@ -2624,7 +2263,6 @@ fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
                 );
                 continue;
             }
-            // JS-imported css: falls through to module propagation below.
         }
         if ext == "html" {
             println!("oj: change {} -> full-reload", path.display());
@@ -2736,10 +2374,8 @@ mod tests {
     fn preview_rel_maps_base_and_guards_traversal() {
         assert_eq!(preview_rel("/", "/").as_deref(), Some("index.html"));
         assert_eq!(preview_rel("/assets/x.js", "/").as_deref(), Some("assets/x.js"));
-        // base stripping
         assert_eq!(preview_rel("/app/assets/x.js", "/app/").as_deref(), Some("assets/x.js"));
         assert_eq!(preview_rel("/app/", "/app/").as_deref(), Some("index.html"));
-        // traversal denied
         assert_eq!(preview_rel("/../etc/passwd", "/"), None);
     }
 
@@ -2751,15 +2387,11 @@ mod tests {
             h
         };
         let empty = HeaderMap::new();
-        // Extension-less client routes fall back to index.html.
         assert!(is_spa_navigation("dashboard", &empty));
         assert!(is_spa_navigation("users/123/edit", &empty));
-        // A browser HTML navigation falls back even with dots in the path.
         assert!(is_spa_navigation("report.v2", &html));
-        // Missing assets (has extension, not an HTML nav) stay 404.
         assert!(!is_spa_navigation("missing.png", &empty));
         assert!(!is_spa_navigation("assets/app.js", &empty));
-        // oj-internal namespaces and source never fall back.
         assert!(!is_spa_navigation("@vite/client", &html));
         assert!(!is_spa_navigation("src/does-not-exist.tsx", &html));
         assert!(!is_spa_navigation("node_modules/react/missing.js", &html));
@@ -2782,13 +2414,10 @@ mod adapter_tests {
         let base = tmp("ts");
         let app = base.join("app");
         std::fs::create_dir_all(app.join("src").join("routes")).unwrap();
-        // routes dir present but no react-start dep -> not a start app
         std::fs::write(app.join("package.json"), r#"{"dependencies":{"react":"19"}}"#).unwrap();
         assert!(!is_tanstack_start_app(&app));
-        // add the dep -> detected
         std::fs::write(app.join("package.json"), r#"{"dependencies":{"@tanstack/react-start":"1"}}"#).unwrap();
         assert!(is_tanstack_start_app(&app));
-        // dep but no src/routes -> not a start app
         let app2 = base.join("app2");
         std::fs::create_dir_all(app2.join("src")).unwrap();
         std::fs::write(app2.join("package.json"), r#"{"dependencies":{"@tanstack/react-start":"1"}}"#).unwrap();
@@ -2806,11 +2435,8 @@ mod adapter_tests {
         std::fs::write(root.join("src").join("App.tsx"), "x").unwrap();
         std::fs::write(public.join("img").join("logo.webp"), "y").unwrap();
 
-        // extensionless import resolves TS-first under root
         assert_eq!(locate(&root, &public, "src/App"), Some(root.join("src/App.tsx")));
-        // a public asset resolves from the configured public dir
         assert_eq!(locate(&root, &public, "img/logo.webp"), Some(public.join("img/logo.webp")));
-        // missing -> None; traversal refused
         assert_eq!(locate(&root, &public, "img/missing.webp"), None);
         assert_eq!(locate(&root, &public, "../secret"), None);
         let _ = std::fs::remove_dir_all(&base);
@@ -2819,15 +2445,12 @@ mod adapter_tests {
     #[test]
     fn is_spa_navigation_rules() {
         let empty = HeaderMap::new();
-        // extensionless client routes fall back to index.html
         assert!(is_spa_navigation("dashboard", &empty));
         assert!(is_spa_navigation("projects/abc", &empty));
-        // assets and oj-internal namespaces do not
         assert!(!is_spa_navigation("main.js", &empty));
         assert!(!is_spa_navigation("@vite/client", &empty));
         assert!(!is_spa_navigation("src/App.tsx", &empty));
         assert!(!is_spa_navigation("node_modules/react/index.js", &empty));
-        // an html navigation with an extension still falls back (accept header)
         let mut html = HeaderMap::new();
         html.insert(header::ACCEPT, "text/html,*/*".parse().unwrap());
         assert!(is_spa_navigation("some.thing", &html));

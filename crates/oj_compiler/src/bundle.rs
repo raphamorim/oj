@@ -1,19 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-//! ESM to registry-factory transform for full bundle mode (M4).
-//!
-//! Output shape per module: a plain statement list (the factory body) that
-//! runs with `module`, `__oj_exports`, `__oj_require` in scope, provided by
-//! the client runtime. Imports become `var _oj_mN = __oj_require("url")`
-//! plus scope-aware member-access rewriting of every reference (via oxc
-//! semantic; shadowed names are untouched). Exports become getter
-//! registrations (`__oj_esm`) installed before the body runs, so circular
-//! imports and hoisted function exports behave like real ESM live bindings.
-//!
-//! Node synthesis parses tiny snippets in the same arena (via `alloc_str`,
-//! so atoms stay valid) and swaps the real AST nodes into their placeholders.
-
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -38,18 +25,11 @@ pub enum FactoryKind {
 
 #[derive(Debug)]
 pub struct FactoryOutput {
-    /// Factory body statements (no wrapper; the chunk assembler wraps).
     pub code: String,
-    /// Resolved local urls this module depends on (graph edges + crawl).
     pub imports: Vec<String>,
-    /// CJS only: raw specifier to resolved url, resolved by the runtime's
-    /// in-factory `require`.
     pub require_map: Vec<(String, String)>,
     pub kind: FactoryKind,
-    /// Dynamic `import("literal")` targets (post-rewrite): lazy boundaries the
-    /// chunk assembler excludes from the eager bundle.
     pub dynamic_imports: Vec<String>,
-    /// Fast Refresh registered a component (AST-detected, ESM only).
     pub is_refresh_boundary: bool,
 }
 
@@ -59,19 +39,12 @@ impl FactoryOutput {
     }
 }
 
-/// Entry point used by the dev server in bundle mode.
 pub fn compile_factory(
     path: &Path,
     url: &str,
     source_text: &str,
     resolve: &mut ImportRewriter,
 ) -> Result<FactoryOutput, CompileError> {
-    // A dependency is anything under a node_modules — whether served as a
-    // rooted `/node_modules/...` url or, for symlinked / workspace / monorepo
-    // layouts that resolve outside the app root, an `/@fs/...node_modules/...`
-    // one. Missing the `/@fs/` case compiles a CJS dep (e.g. react's entry,
-    // `module.exports = require(...)`) as an ESM factory, and its bare `require`
-    // is then undefined at runtime.
     let is_dep = url.starts_with("/node_modules/")
         || (url.starts_with("/@fs/") && url.contains("/node_modules/"));
     if is_dep && !crate::cjs::has_module_syntax_pub(path, source_text) {
@@ -80,8 +53,6 @@ pub fn compile_factory(
     compile_esm_factory(path, url, source_text, resolve, !is_dep)
 }
 
-/// CJS is already factory-shaped: `module`/`exports`/`require` come from the
-/// runtime. Only NODE_ENV-replace, DCE, and collect the require map.
 fn compile_cjs_factory(
     path: &Path,
     source_text: &str,
@@ -110,7 +81,6 @@ fn compile_cjs_factory(
 
 struct Replacement {
     var: String,
-    /// None = the namespace object itself; Some(name) = member access.
     member: Option<String>,
 }
 
@@ -136,7 +106,6 @@ fn compile_esm_factory(
     }
     let mut program = parsed.program;
 
-    // Standard dev pipeline: TS strip, automatic JSX, refresh instrumentation.
     let scoping = SemanticBuilder::new().with_excess_capacity(2.0).build(&program);
     let scoping = scoping.semantic.into_scoping();
     let mut transform_options = TransformOptions::default();
@@ -154,12 +123,8 @@ fn compile_esm_factory(
         return Err(CompileError::Transform { path: path.to_path_buf(), message });
     }
 
-    // Fast Refresh boundary, decided on the transformed AST before the factory
-    // rewrite mangles the body (semantic, not a text scan of the output).
     let is_refresh_boundary = refresh && crate::detect_refresh_registrations(&program);
 
-    // import.meta.env static replacement: the factory is a plain function
-    // where `import.meta` is invalid, so it must be replaced away here.
     if source_text.contains("import.meta.env") {
         use oxc_transformer_plugins::{ReplaceGlobalDefines, ReplaceGlobalDefinesConfig};
         let scoping = SemanticBuilder::new().build(&program).semantic.into_scoping();
@@ -169,25 +134,18 @@ fn compile_esm_factory(
         }
     }
 
-    // Expand import.meta.glob before specifier rewriting (eager globs become
-    // static imports the factory transform then handles).
     if source_text.contains("import.meta.glob") {
         crate::glob::expand(&allocator, path.parent().unwrap_or(path), &mut program);
     }
 
-    // Canonicalize specifiers to urls (shared with unbundled mode). Dynamic
-    // import() targets come back separately as lazy boundaries.
     let (_, dynamic_imports) = crate::rewrite_module_specifiers_pub(&allocator, &mut program, resolve);
 
-    // Fresh semantic over the transformed program for reference resolution.
-    // `with_build_nodes`: reference node-ids must be resolvable to spans.
     let semantic = SemanticBuilder::new().with_build_nodes(true).build(&program).semantic;
 
-    // ---- plan imports/exports ------------------------------------------
-    let mut import_vars: Vec<String> = Vec::new(); // url per _oj_mN
+    let mut import_vars: Vec<String> = Vec::new();
     let mut var_of_url: HashMap<String, usize> = HashMap::new();
     let mut replacements: HashMap<ReferenceId, Replacement> = HashMap::new();
-    let mut getters: Vec<(String, String)> = Vec::new(); // exported name to getter body
+    let mut getters: Vec<(String, String)> = Vec::new();
     let mut stars: Vec<usize> = Vec::new();
     let mut has_default_expr = false;
 
@@ -225,7 +183,6 @@ fn compile_esm_factory(
                     for &reference_id in
                         semantic.scoping().get_resolved_reference_ids(symbol_id)
                     {
-                        // Key by ReferenceId; spans collide after transforms.
                         replacements.insert(
                             reference_id,
                             Replacement { var: format!("_oj_m{vi}"), member: member.clone() },
@@ -276,15 +233,12 @@ fn compile_esm_factory(
     }
     drop(semantic);
 
-    // ---- rewrite references + import.meta ------------------------------
     let mut rewriter = RefRewriter { allocator: &allocator, replacements: &replacements, url };
     rewriter.visit_program(&mut program);
 
-    // ---- statement surgery ----------------------------------------------
     let old_body = std::mem::replace(&mut program.body, oxc_allocator::Vec::new_in(&&allocator));
     let mut new_body = oxc_allocator::Vec::new_in(&&allocator);
 
-    // Prologue: getters first (circular-safety), then dep requires, stars.
     let mut prologue = String::new();
     if has_default_expr {
         prologue.push_str("var __oj_default;\n");
@@ -311,9 +265,8 @@ fn compile_esm_factory(
             Statement::ImportDeclaration(_)
             | Statement::ExportNamedDeclaration(_)
             | Statement::ExportFromDeclaration(_)
-            | Statement::ExportAllDeclaration(_) => {} // handled in prologue
+            | Statement::ExportAllDeclaration(_) => {}
             Statement::ExportDeclaration(decl) => {
-                // Keep the inner declaration; getters already point at it.
                 new_body.push(Statement::from(decl.unbox().declaration));
             }
             Statement::ExportDefaultDeclaration(decl) => {
@@ -342,7 +295,6 @@ fn compile_esm_factory(
                         )?;
                     }
                     kind => {
-                        // Only expression variants remain after the arms above.
                         push_default_assignment(
                             &allocator,
                             &mut new_body,
@@ -368,7 +320,6 @@ fn compile_esm_factory(
     })
 }
 
-/// `__oj_default = <placeholder>` with the real expression transplanted in.
 fn push_default_assignment<'a>(
     allocator: &'a Allocator,
     body: &mut oxc_allocator::Vec<'a, Statement<'a>>,
@@ -391,7 +342,6 @@ fn parse_snippet<'a>(
     source: &str,
     path: &Path,
 ) -> Result<Vec<Statement<'a>>, CompileError> {
-    // Snippet text must live in the arena: the AST borrows string atoms.
     let source: &'a str = allocator.alloc_str(source);
     let parsed = Parser::new(allocator, source, SourceType::cjs()).parse();
     if parsed.panicked {
@@ -463,27 +413,18 @@ impl<'a> VisitMut<'a> for RefRewriter<'a, '_> {
                     Some(member) => format!("{}.{}", r.var, member),
                     None => r.var.clone(),
                 }),
-            // import.meta.url becomes the module's url as a string
             Expression::StaticMemberExpression(member)
                 if matches!(member.object, Expression::ImportMeta(_))
                     && member.property.name == "url" =>
             {
-                // Parenthesized: a lone string literal statement would parse
-                // as a directive and yield an empty body.
                 Some(format!("({:?})", self.url))
             }
-            // import.meta.hot becomes module.hot (provided by the runtime)
             Expression::StaticMemberExpression(member)
                 if matches!(member.object, Expression::ImportMeta(_))
                     && member.property.name == "hot" =>
             {
                 Some("module.hot".to_string())
             }
-            // Dynamic `import("url")` becomes `__oj_import_lazy("url")`: the
-            // runtime fetches + registers the target's subtree into the shared
-            // registry on demand, so it stays out of the eager chunk. The url is
-            // already canonical (specifier rewrite ran first). Non-literal
-            // `import(expr)` is left as-is (rare; no static target to defer).
             Expression::ImportExpression(imp) => match &imp.source {
                 Expression::StringLiteral(lit) => {
                     Some(format!("__oj_import_lazy({:?})", lit.value.as_str()))
@@ -502,7 +443,6 @@ impl<'a> VisitMut<'a> for RefRewriter<'a, '_> {
     }
 
     fn visit_object_property(&mut self, prop: &mut oxc_ast::ast::ObjectProperty<'a>) {
-        // `{ A }` shorthand where A is imported must become `{ A: _oj_m0.A }`.
         if prop.shorthand {
             if let Expression::Identifier(ident) = &prop.value {
                 let replaced = ident
@@ -628,8 +568,6 @@ export function Thing() { return import.meta.url; }
 
     #[test]
     fn plain_esm_module_without_a_component_is_not_a_boundary() {
-        // no component, so Fast Refresh registers nothing and the module is a
-        // non-boundary even though it is ESM.
         let out = factory("export const x = 1; export function add(a, b) { return a + b; }");
         assert_eq!(out.kind, FactoryKind::Esm);
         assert!(!out.is_boundary(), "no $RefreshReg$ means no boundary: {}", out.code);

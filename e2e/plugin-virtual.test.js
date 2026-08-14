@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// Plugin resolveId + load hooks: playground/oj.plugins.mjs resolves the bare
-// specifier `virtual:plugin-greeting` to a virtual id and loads its source.
-// src/virtual-demo.tsx imports it; the dev server rewrites the import to a
-// `/@id/` URL and serves the plugin-loaded module. Unbundled only (the bundle
-// registry doesn't register plugin virtual ids — a documented limitation).
 const base = "http://localhost:5199";
 
 (async () => {

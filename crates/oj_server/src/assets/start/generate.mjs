@@ -1,19 +1,11 @@
 // SPDX-License-Identifier: MIT
-// Generate routeTree.gen.ts from src/routes via @tanstack/router-generator.
-// The generator is build tooling that ships as a transitive dep, so under
-// pnpm's strict layout it isn't resolvable from the app root; importPkg
-// resolves it through the direct deps that depend on it.
+
 import { importPkg } from "./resolve-pkg.mjs";
 
 const root = process.env.OJ_APP_ROOT ?? process.cwd();
 const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
 const OJ = _ojTTY ? "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m" : "oj";
 
-// Quiet the router-generator's noise: a Node process warning about
-// `replaceRouteChunk` (a harmless circular-dependency access in its internals),
-// and a verbose multi-line block for every src/routes file that exports no
-// Route (common when an app wires its router manually or colocates helpers).
-// Collapse the per-file warnings into one concise summary; keep everything else.
 process.removeAllListeners("warning");
 process.on("warning", (w) => {
   const m = String(w?.message ?? w);
@@ -48,8 +40,6 @@ const config = getConfig(
     routesDirectory: "./src/routes",
     generatedRouteTree: "./src/routeTree.gen.ts",
     autoCodeSplitting: false,
-    // Colocated tests/stories/type-decls under src/routes are not routes;
-    // ignore them so the generator neither includes nor warns about them.
     routeFileIgnorePattern: "\\.(test|spec|stories|bench)\\.|\\.d\\.ts$",
   },
   root,

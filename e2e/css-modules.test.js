@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// CSS Modules verification: scoped class applied, hot edit of the module css
-// restyles the button WITHOUT losing counter state.
 const { chromium } = require("playwright");
 const fs = require("fs");
 const CSS = require("path").join(__dirname, "..", "playground") + "/src/Counter.module.css";

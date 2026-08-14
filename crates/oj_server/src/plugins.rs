@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -170,8 +171,6 @@ async fn handle_ctx_rpc(
         "resolve" => {
             let source = args.first().and_then(|v| v.as_str()).unwrap_or("");
             let importer = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
-            // Rollup's this.resolve takes the importer file; oj's resolver takes
-            // its directory. Empty importer: resolve from the app root.
             let dir = if importer.is_empty() {
                 root.to_path_buf()
             } else {
@@ -182,17 +181,12 @@ async fn handle_ctx_rpc(
                 Err(_) => serde_json::json!({ "rpcReply": rpc, "result": null }),
             }
         }
-        // Back the plugin ModuleInfo (this.load / getModuleInfo): read the
-        // module, compile it (TS/JSX stripped) for its code + static imports,
-        // and resolve each import to an absolute id via oj's resolver.
         "moduleInfo" => {
             let id = args.first().and_then(|v| v.as_str()).unwrap_or("");
             let path = Path::new(id);
             match std::fs::read_to_string(path) {
                 Ok(src) => {
                     let dir = path.parent().map(Path::to_path_buf).unwrap_or_else(|| root.to_path_buf());
-                    // Non-JS (css/json/...) modules can't be compiled; hand back
-                    // the raw source with no imports rather than erroring.
                     let (code, imports) = match oj_compiler::compile(
                         path,
                         &src,
@@ -250,8 +244,6 @@ impl PluginHost {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            // Never outlive oj: a one-shot build drops the host when done, and
-            // the dev server drops it on shutdown. Prevents leaked node procs.
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| anyhow::anyhow!("cannot spawn node for plugin host: {e}"))?;
@@ -272,17 +264,13 @@ impl PluginHost {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
-                // A plugin-context call (this.resolve, ...) coming back from Node.
                 if let Some(rpc) = msg["rpc"].as_u64() {
                     let method = msg["method"].as_str().unwrap_or("").to_string();
                     let args = msg["args"].as_array().cloned().unwrap_or_default();
-                    // Handled inline: the reader processes one line at a time and
-                    // the sending `call()` holds no stdin lock while awaiting.
                     handle_ctx_rpc(rpc, &method, &args, &resolver, &root_buf, &reader_ref.stdin).await;
                     continue;
                 }
                 let Some(id) = msg["id"].as_u64() else { continue };
-                // result is a string, or null (hook returned nothing), or error.
                 let result = if let Some(err) = msg.get("error").and_then(|e| e.as_str()) {
                     Err(err.to_string())
                 } else {
@@ -296,8 +284,6 @@ impl PluginHost {
         Ok(host)
     }
 
-    /// Call a hook with string args; `Ok(None)` means the hook returned nothing
-    /// (e.g. no plugin resolved/loaded the id).
     async fn call(&self, hook: &str, args: &[&str]) -> Result<Option<String>, String> {
         let req_id = self.counter.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
@@ -330,7 +316,6 @@ impl PluginHost {
                     .unwrap_or_default();
                 Ok((out, watch))
             }
-            // A host that predates the envelope (or any non-JSON) returns raw code.
             Err(_) => Ok((raw, Vec::new())),
         }
     }
@@ -517,7 +502,6 @@ mod vite_values_tests {
             headers: None,
         };
         merge_vite_values(&mut config, v);
-        // config values win over vite's
         assert_eq!(config.base.as_deref(), Some("/oj-base/"));
         assert_eq!(config.public_dir.as_deref(), Some("my-public"));
     }

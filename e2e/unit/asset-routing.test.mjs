@@ -1,11 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Build-level harness for the shared esbuild plugins (esbuild-assets.mjs). It
-// drives assetsPlugin / makeVitePlugins / nodeBuiltinShims through a real
-// esbuild bundle over temp files, with a STUB plugin container so no vite
-// config or svgr install is needed. This covers the asset/svg/virtual/mdx
-// routing that only runs inside a build, which the unit tests otherwise cannot
-// reach. esbuild comes from the start fixture; the whole suite skips when the
-// fixture is not installed.
+
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
@@ -29,15 +23,10 @@ try {
   esbuild = m.default ?? m;
 } catch {}
 
-// Register real tests only when esbuild is present; otherwise a single skip.
 const it = esbuild ? test : (name) => test(name, { skip: "fixture esbuild not installed" }, () => {});
 
-// A fake asset emitter: deterministic, no hashing, so assertions are stable.
 const emit = async (abs) => "/assets/" + basename(abs);
 
-// A stub plugin container standing in for the app's vite plugins (svgr, mdx, a
-// virtual module). Returns null for anything it does not own, exactly like the
-// real container, so the URL/asset fallbacks are exercised too.
 function stubContainer() {
   return {
     async resolveId(id) {
@@ -47,7 +36,7 @@ function stubContainer() {
       if (id === "\0virtual:info") return `export const info = "VIRTUAL_INFO_OK";`;
       if (id.endsWith(".svg?react")) return `export default () => "SVG_REACT_COMPONENT";`;
       if (id.endsWith("icon.svg")) return `export default () => "SVG_BARE_COMPONENT";`;
-      return null; // e.g. plain.svg -> caller falls back to a URL
+      return null;
     },
     async transform(code, id) {
       if (id.endsWith(".mdx")) return `export default () => ${JSON.stringify("MDX:" + code.trim())};`;
@@ -59,8 +48,6 @@ function stubContainer() {
   };
 }
 
-// Write `files` into a fresh temp dir, bundle `entry.js` with `plugins`, and
-// return the concatenated output text. Cleans up on the way out.
 async function bundle(files, plugins) {
   const dir = mkdtempSync(join(tmpdir(), "oj-route-"));
   try {
@@ -95,12 +82,9 @@ it("routes ?raw, ?url, ?inline, and bare-asset imports (prod)", async () => {
     ].join("\n"),
   };
   const { text } = await bundle(files, () => [assetsPlugin({ mode: "prod", server: false, emit })]);
-  // ?raw inlines the file text
   assert.ok(text.includes("RAW_FILE_MARKER contents"), "?raw should inline the text");
-  // ?url and bare assets become emitted /assets URLs
   assert.ok(text.includes("/assets/logo.png"), "?url should emit an /assets URL");
   assert.ok(text.includes("/assets/pic.png"), "bare asset should emit an /assets URL");
-  // ?inline becomes a data URI (esbuild picks base64 or url-encoding by content)
   assert.match(text, /data:image\/png[;,]/, "?inline should be a data URI");
 });
 
@@ -112,7 +96,6 @@ it("?url resolves to the dev fs route in dev mode", async () => {
   const { text } = await bundle(files, () => [
     assetsPlugin({ mode: "dev", server: false, fsBase: "/@oj-start/fs" }),
   ]);
-  // dev serves assets from the fs route at their absolute path
   assert.match(text, /\/@oj-start\/fs[^"']*logo\.png/, "dev ?url should point at the fs route");
   assert.doesNotMatch(text, /\/assets\/logo\.png/, "dev should not emit a hashed /assets url");
 });
@@ -125,8 +108,6 @@ it("css import is a no-op module and records the url (dev client)", async () => 
   const server = await bundle(files, () => [assetsPlugin({ mode: "prod", server: true, emit })]);
   assert.doesNotMatch(server.text, /createElement\("link"\)/, "server css import must not touch the DOM");
 
-  // The dev client no longer injects a <link> at runtime; it records the url so
-  // the SSR head links it (via the manifest). The import itself is a no-op.
   const cssUrls = [];
   const client = await bundle(files, () => [
     assetsPlugin({ mode: "dev", server: false, fsBase: "/@oj-start/fs", cssUrls }),
@@ -143,9 +124,7 @@ it("prod client css import emits the stylesheet but injects no link", async () =
   const emitted = [];
   const spyEmit = async (abs) => (emitted.push(abs), "/assets/" + basename(abs));
   const out = await bundle(files, () => [assetsPlugin({ mode: "prod", server: false, emit: spyEmit })]);
-  // no runtime <link> injection: the manifest links it in the SSR head instead
   assert.doesNotMatch(out.text, /createElement\("link"\)/, "prod client must not inject a link");
-  // but the stylesheet was still emitted (so it can be linked from the head)
   assert.ok(emitted.some((p) => p.endsWith("styles.css")), "css still emitted in prod");
 });
 
@@ -171,9 +150,9 @@ it("routes bare .svg and .svg?react through the container, URL fallback otherwis
     "icon.svg": "<svg><rect/></svg>",
     "plain.svg": "<svg><circle/></svg>",
     "entry.js": [
-      'import Icon from "./icon.svg";',        // container claims -> component
-      'import IconReact from "./icon.svg?react";', // container claims (?react id) -> component
-      'import plain from "./plain.svg";',      // container returns null -> URL fallback
+      'import Icon from "./icon.svg";',
+      'import IconReact from "./icon.svg?react";',
+      'import plain from "./plain.svg";',
       "export { Icon, IconReact, plain };",
     ].join("\n"),
   };
@@ -196,10 +175,7 @@ it("shims node builtins for the browser bundle", async () => {
     ].join("\n"),
   };
   const { text } = await bundle(files, () => [nodeBuiltinShims]);
-  // async_hooks gets a working synchronous AsyncLocalStorage (esbuild may render
-  // it as `var AsyncLocalStorage = class`), so assert on stable identifiers
   assert.match(text, /AsyncLocalStorage/, "async_hooks should be shimmed");
   assert.match(text, /getStore\(\)/, "the ALS shim should expose getStore");
-  // bare 'stream' resolves to the shim rather than erroring as unresolved
   assert.match(text, /PassThrough/, "bare node builtins should resolve to the stream shim");
 });

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-//! Loads `oj.config.{ts,js,mjs,json}`.
-//!
-//! `.json` is parsed directly. `.ts`/`.js`/`.mjs` have their TypeScript types
-//! stripped with oxc, then evaluate in an embedded QuickJS engine (no Node)
-//! with `defineConfig` and `process.env` shimmed, capturing the default
-//! export and reading it back as JSON. Computed values, ternaries, and
-//! `process.env` all work; the exported object must be JSON-serializable
-//! (functions/plugins are out of scope until the plugin system).
-
 use std::path::{Path, PathBuf};
 
 mod schema;
@@ -27,9 +18,6 @@ pub enum ConfigError {
 
 const CANDIDATES: &[&str] = &["oj.config.ts", "oj.config.mjs", "oj.config.js", "oj.config.json"];
 
-/// A `define` value as a JS-expression string. A JSON string is already the
-/// expression the user wrote (e.g. `JSON.stringify("x")` yields `"x"`);
-/// anything else is JSON-serialized (numbers/bools/objects are valid JS as-is).
 fn define_value(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::String(s) => s.clone(),
@@ -37,8 +25,6 @@ fn define_value(v: &serde_json::Value) -> String {
     }
 }
 
-/// Top-level `config.define` as `(name, js-expression)` pairs, applied in every
-/// environment.
 pub fn config_defines(config: &OjConfig) -> Vec<(String, String)> {
     config
         .define
@@ -47,8 +33,6 @@ pub fn config_defines(config: &OjConfig) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-/// A boolean under `environments.<name>.build.<field>` (e.g. `minify`,
-/// `sourcemap`), if set: the per-environment build-output override.
 pub fn environment_build_bool(config: &OjConfig, env_name: &str, field: &str) -> Option<bool> {
     config
         .environments
@@ -59,9 +43,6 @@ pub fn environment_build_bool(config: &OjConfig, env_name: &str, field: &str) ->
         .and_then(|v| v.as_bool())
 }
 
-/// Package `exports`/`imports` condition names for an environment. Precedence:
-/// `environments.<name>.resolve.conditions` > top-level `resolve.conditions` >
-/// the built-in default (browser for `client`, node for `ssr`).
 pub fn resolve_conditions(config: &OjConfig, env_name: &str) -> Vec<String> {
     if let Some(c) = config
         .environments
@@ -80,9 +61,6 @@ pub fn resolve_conditions(config: &OjConfig, env_name: &str) -> Vec<String> {
     [base, "import", "module", "default"].map(String::from).to_vec()
 }
 
-/// `resolve.alias` entries (`find`, `replacement`) for an environment.
-/// Precedence: `environments.<name>.resolve.alias` merged over top-level
-/// `resolve.alias`. Returns `(find, replacement)` pairs for the resolver.
 pub fn resolve_alias(config: &OjConfig, env_name: &str) -> Vec<(String, String)> {
     let mut merged: std::collections::BTreeMap<String, String> = config
         .resolve
@@ -107,8 +85,6 @@ pub fn resolve_alias(config: &OjConfig, env_name: &str) -> Vec<(String, String)>
     merged.into_iter().collect()
 }
 
-/// `config.environments.<name>.define` as `(name, js-expression)` pairs: the
-/// per-environment overrides of the Vite Environment API.
 pub fn environment_defines(config: &OjConfig, env_name: &str) -> Vec<(String, String)> {
     config
         .environments
@@ -120,7 +96,6 @@ pub fn environment_defines(config: &OjConfig, env_name: &str) -> Vec<(String, St
         .unwrap_or_default()
 }
 
-/// Load the config from `root`, or `OjConfig::default()` if none exists.
 pub fn load(root: &Path) -> Result<OjConfig, ConfigError> {
     let Some(path) = CANDIDATES.iter().map(|c| root.join(c)).find(|p| p.is_file()) else {
         return Ok(OjConfig::default());
@@ -136,8 +111,6 @@ pub fn load(root: &Path) -> Result<OjConfig, ConfigError> {
     serde_json::from_str(&json).map_err(|e| ConfigError::Schema(path, e.to_string()))
 }
 
-/// Strip TS types, then evaluate as a script in QuickJS and return the
-/// default-exported config as a JSON string.
 fn evaluate(path: &Path, source: &str) -> Result<String, ConfigError> {
     let js = strip_types(path, source)?;
     let script = to_script(&js);
@@ -148,7 +121,6 @@ fn evaluate(path: &Path, source: &str) -> Result<String, ConfigError> {
         .map_err(|e| ConfigError::Eval(path.to_path_buf(), e.to_string()))?;
 
     ctx.with(|ctx| {
-        // Inject actual process.env so `process.env.X` in configs resolves.
         let env_obj: String = std::env::vars()
             .map(|(k, v)| format!("{}:{}", serde_json::to_string(&k).unwrap(), serde_json::to_string(&v).unwrap()))
             .collect::<Vec<_>>()
@@ -195,16 +167,12 @@ fn strip_types(path: &Path, source: &str) -> Result<String, ConfigError> {
     Ok(Codegen::new().build(&program).code)
 }
 
-/// Turn ESM `import ...; export default X` into a script that assigns the
-/// config to `globalThis.__ojConfig`. Imports are stripped (only the shimmed
-/// `defineConfig`/`process` are available); `export default` becomes a
-/// capture assignment.
 fn to_script(js: &str) -> String {
     let mut out = String::with_capacity(js.len());
     for line in js.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with("import ") || trimmed.starts_with("import{") {
-            continue; // drop imports; shims supply defineConfig
+            continue;
         }
         if let Some(rest) = trimmed.strip_prefix("export default ") {
             out.push_str("globalThis.__ojConfig = ");
@@ -223,7 +191,6 @@ mod tests {
     use super::*;
 
     fn eval_config_in(label: &str, src: &str) -> OjConfig {
-        // Unique dir per call so parallel tests never share a config file.
         let dir = std::env::temp_dir().join(format!("oj-cfg-{}-{label}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(dir.join("oj.config.ts"), src).unwrap();
@@ -275,7 +242,6 @@ mod tests {
         assert!(environment_defines(&cfg, "ssr").is_empty());
         assert!(resolve_alias(&cfg, "client").is_empty());
         assert_eq!(environment_build_bool(&cfg, "client", "minify"), None);
-        // built-in condition defaults differ by environment
         assert_eq!(resolve_conditions(&cfg, "ssr"), s(&["node", "import", "module", "default"]));
         assert_eq!(resolve_conditions(&cfg, "client"), s(&["browser", "import", "module", "default"]));
     }
@@ -296,16 +262,13 @@ mod tests {
                },\n\
              };\n",
         );
-        // define_value: string values pass through raw (JS expressions), others JSON
         let defines: std::collections::BTreeMap<_, _> = config_defines(&cfg).into_iter().collect();
         assert_eq!(defines.get("__FLAG__").unwrap(), "true");
         assert_eq!(defines.get("__COUNT__").unwrap(), "3");
 
-        // conditions: env override wins for ssr; top-level used for an env without one
         assert_eq!(resolve_conditions(&cfg, "ssr"), vec!["node-only".to_string()]);
         assert_eq!(resolve_conditions(&cfg, "client"), vec!["custom".to_string()]);
 
-        // alias: env merged over top-level (sorted); "old" overridden only for ssr
         assert_eq!(
             resolve_alias(&cfg, "ssr"),
             vec![("@".to_string(), "/src".to_string()), ("old".to_string(), "/ssr-legacy".to_string())]
@@ -315,7 +278,6 @@ mod tests {
             vec![("@".to_string(), "/src".to_string()), ("old".to_string(), "/legacy".to_string())]
         );
 
-        // per-environment build override and defines
         assert_eq!(environment_build_bool(&cfg, "ssr", "minify"), Some(false));
         assert_eq!(environment_build_bool(&cfg, "ssr", "sourcemap"), None);
         let ssr_defines: std::collections::BTreeMap<_, _> = environment_defines(&cfg, "ssr").into_iter().collect();

@@ -109,7 +109,6 @@ async fn main() -> anyhow::Result<()> {
                 .or_else(|| config.preview.as_ref().and_then(|p| p.port))
                 .unwrap_or(4173);
             let base = config.base.clone().unwrap_or_else(|| "/".into());
-            // preview.headers, else server.headers (COOP/COEP, etc.).
             let headers: Vec<(String, String)> = config
                 .preview
                 .as_ref()

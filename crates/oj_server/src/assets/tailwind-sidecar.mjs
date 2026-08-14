@@ -1,22 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// oj CSS sidecar. If the app has a postcss.config.* it runs CSS through PostCSS
-// with the app's own plugins (Tailwind v3 or v4-via-@tailwindcss/postcss,
-// autoprefixer, ...), like Vite. Otherwise it falls back to the Tailwind v4 JS
-// API (@tailwindcss/node). Everything resolves from the app's node_modules.
-// Protocol: one JSON per line on stdin {id, base, css, from}, stdout {id, css} |
-// {id, error}. `--once <cssfile> <base>` prints compiled css.
 import { createRequire } from "node:module";
 import { existsSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import readline from "node:readline";
 
-// One PostCSS processor per app root (config + plugins loaded once).
 const processors = new Map();
 
-// Build a PostCSS processor from the app's postcss.config.*, or null if the app
-// has none (then the Tailwind v4 fallback below is used).
 async function loadPostcss(base) {
   if (processors.has(base)) return processors.get(base);
   const req = createRequire(base + "/package.json");
@@ -29,7 +20,7 @@ async function loadPostcss(base) {
     try {
       postcss = (await import(req.resolve("postcss"))).default;
     } catch {
-      postcss = null; // postcss not installed: fall back
+      postcss = null;
     }
     if (postcss) {
       const mod = await import(pathToFileURL(cfgPath).href);
@@ -37,10 +28,8 @@ async function loadPostcss(base) {
       const raw = config.plugins ?? {};
       const plugins = [];
       if (Array.isArray(raw)) {
-        // Already-instantiated plugins (array form).
         for (const p of raw) if (p) plugins.push(p);
       } else {
-        // Object map { "plugin-name": options | false }.
         for (const [name, opts] of Object.entries(raw)) {
           if (opts === false) continue;
           const imported = await import(req.resolve(name));
@@ -55,7 +44,6 @@ async function loadPostcss(base) {
   return processor;
 }
 
-// Tailwind v4 JS API fallback (no postcss.config): @tailwindcss/node + oxide.
 async function v4Compile(base, css, from) {
   const req = createRequire(base + "/package.json");
   const tw = await import(req.resolve("@tailwindcss/node"));

@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// End-to-end Fast Refresh verification for oj (milestone 1).
-// 1. Load the playground, click the counter 3 times.
-// 2. Edit App.tsx on disk (change the heading).
-// 3. Expect: heading updates via hot update, counter state survives,
-//    and the page did NOT reload (marker on window still present).
 const { chromium } = require("playwright");
 const fs = require("fs");
 
@@ -31,7 +26,6 @@ const URL = "http://localhost:5199/";
     await page.goto(URL, { waitUntil: "networkidle" });
     await page.waitForSelector("h1:has-text('oj playground')", { timeout: 15000 });
 
-    // Marker to detect a full reload (would wipe window props).
     await page.evaluate(() => { window.__no_reload_marker = 42; });
 
     const button = page.locator("button");
@@ -43,7 +37,6 @@ const URL = "http://localhost:5199/";
     }
     await page.screenshot({ path: "before-edit.png" });
 
-    // Hot edit: change the heading text.
     fs.writeFileSync(APP, original.replace("oj playground", "oj playground — HOT"));
     await page.waitForSelector("h1:has-text('oj playground — HOT')", { timeout: 10000 });
 

@@ -16,21 +16,12 @@ pub struct CachedModule {
     pub is_boundary: bool,
     #[serde(default)]
     pub kind: String,
-    // bundle mode, CJS only: raw require specifier to resolved url.
     #[serde(default)]
     pub require_map: Vec<(String, String)>,
-    // CSS modules only: exported class name to scoped name.
     #[serde(default)]
     pub css_exports: Vec<(String, String)>,
-    /// Absolute out-of-root paths this module's rewritten /@fs/ urls point
-    /// at; re-added to the server allow-set on every serve (cache hits too),
-    /// so a cached module's /@fs/ imports stay servable across restarts.
     #[serde(default)]
     pub fs_allow: Vec<String>,
-    /// Files a plugin registered via `this.addWatchFile` during this module's
-    /// `transform`. Re-applied to the dev watcher's plugin-watch set on every
-    /// serve (cache hits too), so those watches survive a warm-cache restart
-    /// even though the transform hook does not re-run on a cache hit.
     #[serde(default)]
     pub watch_files: Vec<String>,
 }
@@ -41,7 +32,6 @@ pub struct PersistentCache {
 }
 
 impl PersistentCache {
-    /// `dir` is created lazily on first write.
     pub fn new(dir: PathBuf, tool_version: &str) -> Self {
         Self { dir, salt: format!("{tool_version}:{CACHE_FORMAT}") }
     }
@@ -63,8 +53,6 @@ impl PersistentCache {
         match serde_json::from_slice(&bytes) {
             Ok(module) => Some(module),
             Err(_) => {
-                // Corrupt entry (interrupted write, disk trouble): drop it
-                // and recompile rather than serve garbage.
                 let _ = fs::remove_file(self.path_for(key));
                 None
             }
@@ -75,10 +63,8 @@ impl PersistentCache {
         let path = self.path_for(key);
         let Some(parent) = path.parent() else { return };
         if fs::create_dir_all(parent).is_err() {
-            return; // cache is best-effort; never fail the compile over it
+            return;
         }
-        // Write-then-rename so a crash mid-write can't leave a torn entry
-        // under the final name.
         let tmp = path.with_extension("tmp");
         if fs::write(&tmp, serde_json::to_vec(module).unwrap_or_default()).is_ok() {
             let _ = fs::rename(&tmp, &path);
@@ -95,8 +81,6 @@ impl PersistentCache {
 mod tests {
     use super::*;
 
-    // Unique dir per test (by label) so parallel tests never wipe each other's
-    // entries; the process id keeps concurrent test binaries separate too.
     fn temp_cache(label: &str) -> PersistentCache {
         let dir = std::env::temp_dir().join(format!("oj-cache-test-{}-{label}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -113,6 +97,7 @@ mod tests {
             require_map: vec![("react".into(), "/node_modules/react/index.js".into())],
             css_exports: Vec::new(),
             fs_allow: Vec::new(),
+            watch_files: Vec::new(),
         }
     }
 
@@ -153,18 +138,14 @@ mod tests {
         let key = cache.key(b"s", "/u", "dev");
         cache.put(&key, &sample());
         let path = cache.path_for(&key);
-        // the entry lives under a shard directory named by the key's first two chars
         assert_eq!(path.parent().unwrap().file_name().unwrap().to_str().unwrap(), &key[..2]);
         assert!(path.exists());
-        // the write-then-rename leaves no `.tmp` sibling behind
         assert!(!path.with_extension("tmp").exists(), "temp file must be renamed away");
     }
 
     #[test]
     fn field_separators_prevent_key_collisions() {
         let cache = temp_cache("sep");
-        // Without the \0 separators between fields these would hash the same
-        // concatenation ("a" + "bc" == "ab" + "c").
         let a = cache.key(b"bc", "a", "dev");
         let b = cache.key(b"c", "ab", "dev");
         assert_ne!(a, b, "url/source boundary must be unambiguous");

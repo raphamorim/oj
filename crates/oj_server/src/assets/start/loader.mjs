@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Node ESM loader hook: resolves TanStack Start's four framework aliases,
-// compiles TS/JSX (via the app's esbuild), and probes extensions for
-// bundler-style extensionless imports. Registered by runner.mjs.
+
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
 import { resolve as pathResolve, dirname } from "node:path";
@@ -17,17 +15,9 @@ import {
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
 const { transformSync } = await importPkg(APP, "esbuild", ["vite", "@tanstack/react-start"]);
-// The app's vite.config plugin container, for `virtual:*` ids on the SSR side
-// (environment "ssr"). Null when there's no config/Vite; then virtuals just
-// fall through to normal resolution as before.
 const container = await loadPluginContainer(APP, { command: "serve", environment: "ssr" });
 const VIRTUAL_SCHEME = "ojvirtual:///";
 
-// Warm-reload versioning. On a dev rebuild the runner bumps V (over a
-// MessagePort) and re-imports with `?ojv=V`. App files and `@tanstack/*`
-// modules (ESM) get the query, so they re-evaluate fresh (resetting the
-// framework's module-scope caches like `entriesPromise`); React and other
-// node_modules stay unversioned and warm, keeping a single React instance.
 let V = 0;
 export async function initialize(data) {
   if (data && data.port) data.port.on("message", (v) => (V = v));
@@ -36,7 +26,6 @@ const stripQ = (u) => u.split("?")[0];
 const withV = (u) => (V ? `${stripQ(u)}?ojv=${V}` : stripQ(u));
 const isTanstack = (u) => /\/@tanstack\//.test(u) && /\.(js|mjs)$/.test(stripQ(u));
 const ASSET_SUFFIX = /\?(raw|url|inline)$/;
-// `.svg` handled separately (svgr may make it a component); see load() below.
 const ASSET_EXT = /\.(png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|eot|mp4|webm|wasm)$/;
 
 const ALIASES = {
@@ -45,14 +34,9 @@ const ALIASES = {
   "#tanstack-start-plugin-adapters": pathResolve(HERE, "plugin-adapters.ts"),
   "#tanstack-start-server-fn-resolver": pathResolve(HERE, "server-fn-resolver.mjs"),
   "tanstack-start-manifest:v": pathResolve(HERE, "manifest.ts"),
-  // The Cloudflare Vite plugin injects this virtual module; supply a dev shim
-  // exposing getCloudflareContext() with the wrangler `vars` + `.dev.vars`.
   "@cloudflare/vite-plugin/server": pathResolve(HERE, "cf-server.mjs"),
 };
 
-// App package.json "imports" subpath map (e.g. "#shared/*" -> "./shared/*").
-// Node resolves these but never probes extensions, and the app writes
-// extensionless, bundler-style imports -- so mirror the map here with probing.
 const IMPORT_RULES = (() => {
   try {
     return parseImportsField(JSON.parse(readFileSync(pathResolve(APP, "package.json"), "utf8")).imports ?? {});
@@ -70,9 +54,6 @@ function resolveImports(spec) {
   return null;
 }
 
-// tsconfig `paths` aliases (e.g. "@platform/auth" -> "./lib/auth/adapter.ts").
-// esbuild reads these natively for the client bundle; Node's SSR resolver does
-// not, so mirror them here (tolerant JSONC parse, follow `extends`, probe).
 const TS = (() => {
   let file = pathResolve(APP, "tsconfig.json");
   const chain = [];
@@ -100,9 +81,6 @@ function resolveTsPaths(spec) {
 
 export async function resolve(spec, context, next) {
   if (context.parentURL) context = { ...context, parentURL: stripQ(context.parentURL) };
-  // Plugin-owned virtual modules (virtual:* or a \0-prefixed resolved id from
-  // within loaded virtual code): resolve via the vite plugin container and
-  // carry the resolved id in a custom scheme that load() below serves.
   if (container && (spec.startsWith("virtual:") || spec.startsWith("\0"))) {
     const importer = context.parentURL && context.parentURL.startsWith("file:")
       ? fileURLToPath(context.parentURL)
@@ -110,9 +88,6 @@ export async function resolve(spec, context, next) {
     const rid = await container.resolveId(spec, importer);
     if (rid != null) return { url: VIRTUAL_SCHEME + encodeURIComponent(rid), shortCircuit: true };
   }
-  // Asset conventions: resolve the underlying file, then tag the URL so load()
-  // returns a string / URL / data URI (?url mirrors the client's /@oj-start/fs
-  // path) or a no-op for side-effect CSS (styling is a client concern in SSR).
   const suffix = spec.match(ASSET_SUFFIX);
   const isCss = !spec.includes("?") && /\.css$/.test(spec);
   const isAsset = !spec.includes("?") && ASSET_EXT.test(spec);
@@ -131,8 +106,6 @@ export async function resolve(spec, context, next) {
     }
     if (abs) return { url: pathToFileURL(abs).href + `?ojasset=${kind}`, shortCircuit: true };
   }
-  // svgr's explicit-component query: resolve the real .svg, then tag it so
-  // load() runs svgr with the ?react id (svgr keys on the query for a component).
   if (/\.svg\?react$/.test(spec)) {
     const clean = spec.replace(/\?react$/, "");
     let abs = null;
@@ -152,12 +125,10 @@ export async function resolve(spec, context, next) {
     const hit = probe(ALIASES[spec]);
     if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true };
   }
-  // App "#" subpath imports with bundler-style extension probing.
   if (spec.startsWith("#")) {
     const hit = resolveImports(spec);
     if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true };
   }
-  // tsconfig `paths` aliases (bare-looking specifiers like "@platform/auth").
   if (!spec.startsWith(".") && !spec.startsWith("/")) {
     const hit = resolveTsPaths(spec);
     if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true };
@@ -171,10 +142,6 @@ export async function resolve(spec, context, next) {
   try {
     r = await next(spec, context);
   } catch (err) {
-    // A bare subpath into a CJS package with no "exports" map -- e.g.
-    // `lodash/isEqual` -> node_modules/lodash/isEqual.js -- fails Node's strict
-    // ESM resolver, which (unlike a bundler) won't probe extensions. Recover
-    // the path Node tried and probe `.js`/index the way esbuild does.
     if (err && err.code === "ERR_MODULE_NOT_FOUND") {
       const tried = err.url && err.url.startsWith("file:")
         ? fileURLToPath(err.url)
@@ -184,51 +151,38 @@ export async function resolve(spec, context, next) {
     }
     throw err;
   }
-  // Version-bust @tanstack/* (ESM) so their module state re-evaluates on reload.
   if (r && r.url && isTanstack(r.url)) return { ...r, url: withV(r.url), shortCircuit: true };
   return r;
 }
 
-// createServerFn provider transform (server side). The app root turns the file
-// path into the relative id `rewriteServerFns` bakes into each handler; see
-// loader-util for the transform itself.
 function transformServerFns(code, path) {
   const rel = path.startsWith(APP) ? path.slice(APP.length).replace(/^\//, "") : path;
   return rewriteServerFns(code, rel);
 }
 
 export async function load(url, context, next) {
-  // Plugin-owned virtual module: load its code from the container.
   if (url.startsWith(VIRTUAL_SCHEME)) {
     const rid = decodeURIComponent(url.slice(VIRTUAL_SCHEME.length));
     const code = container ? await container.load(rid) : null;
-    // No content (a build-graph virtual oj can't produce in dev): emit a stub
-    // that exports the exact names the app imports, so strict Node ESM named
-    // imports resolve to undefined instead of throwing.
     return { format: "module", source: code ?? emptyVirtualStub(APP, rid), shortCircuit: true };
   }
   const clean = stripQ(url);
-  // Tagged asset (from resolve above).
   const kind = /[?&]ojasset=(\w+)/.exec(url)?.[1];
   if (kind) {
     const path = fileURLToPath(clean);
-    let src = "export default {};"; // css: no-op on the server
+    let src = "export default {};";
     if (kind === "raw") src = `export default ${JSON.stringify(readFileSync(path, "utf8"))};`;
     else if (kind === "url") src = `export default ${JSON.stringify("/@oj-start/fs" + path)};`;
     else if (kind === "inline")
       src = `export default ${JSON.stringify("data:application/octet-stream;base64," + readFileSync(path).toString("base64"))};`;
     return { format: "module", source: src, shortCircuit: true };
   }
-  // JSON without an import attribute: hand back a module (Node would reject it).
   if (clean.endsWith(".json")) {
     return { format: "module", source: `export default ${readFileSync(fileURLToPath(clean), "utf8")};`, shortCircuit: true };
   }
   if (clean.endsWith(".tsx") || clean.endsWith(".ts")) {
     const path = fileURLToPath(clean);
     let raw = readFileSync(path, "utf8");
-    // Run the app's own (non-React, non-TanStack) plugin transforms on its
-    // source before oj's TS/JSX + server-fn/glob rewrites, so plugin-generated
-    // exports (i18n, macros, ...) are present. Skipped for node_modules.
     if (container && !path.includes("/node_modules/")) {
       const t = await container.transformUserCode(raw, path);
       if (t != null) raw = t;
@@ -241,22 +195,16 @@ export async function load(url, context, next) {
     });
     return { format: "module", source: out.code, shortCircuit: true };
   }
-  // Versioned @tanstack/* module: load its ESM source fresh under the new URL.
   if (url.includes("?ojv=") && isTanstack(url)) {
     return { format: "module", source: readFileSync(fileURLToPath(clean), "utf8"), shortCircuit: true };
   }
-  // .svg: svgr (a `load` hook) may turn it into a React component; otherwise
-  // serve it as a URL like any other asset.
   if (clean.endsWith(".svg")) {
     const path = fileURLToPath(clean);
-    // A ?react-tagged svg (see resolve) is handed to svgr with the query.
     const id = /[?&]ojsvg=react/.test(url) ? path + "?react" : path;
     const loaded = container ? await container.load(id) : null;
     const src = loaded != null ? loaded : `export default ${JSON.stringify("/@oj-start/fs" + path)};`;
     return { format: "module", source: src, shortCircuit: true };
   }
-  // A file a vite plugin compiles end-to-end (e.g. .mdx via customerMdx): run
-  // its transform hooks, then esbuild the JSX result to ESM.
   if (container && clean.endsWith(".mdx")) {
     const path = fileURLToPath(clean);
     const compiled = await container.transform(readFileSync(path, "utf8"), path);
@@ -268,7 +216,6 @@ export async function load(url, context, next) {
       return { format: "module", source: out.code, shortCircuit: true };
     }
   }
-  // CJS dependency imported via ESM: facade it so named imports resolve.
   if (clean.startsWith("file:") && clean.includes("/node_modules/")) {
     const path = fileURLToPath(clean);
     if (isCjsFile(path)) {

@@ -1,8 +1,3 @@
-// Measures the per-module gating prescans: str::contains (scalar Two-Way, old)
-// vs memmem::Finder (SIMD, new), over a real TSX source corpus. Most modules
-// contain none of the patterns, so each scan runs to the end of the file — the
-// case that dominates a cold-start crawl.
-//   cargo run --release --example bench_scan -p oj_compiler
 use std::path::Path;
 use std::time::Instant;
 
@@ -34,7 +29,6 @@ fn main() {
     let bytes: usize = sources.iter().map(|s| s.len()).sum();
     let iters = 200;
 
-    // OLD: str::contains (scalar Two-Way for multi-byte needles)
     let mut hits_old = 0usize;
     let t = Instant::now();
     for _ in 0..iters {
@@ -46,7 +40,6 @@ fn main() {
     }
     let old = t.elapsed();
 
-    // NEW: memmem::Finder (SIMD), shift tables built once
     let f_env = Finder::new("import.meta.env");
     let f_glob = Finder::new("import.meta.glob");
     let f_reg = Finder::new("$RefreshReg$(");

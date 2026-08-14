@@ -1,29 +1,12 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// Persistent SSR module runner for `oj dev --ssr`. Spawned once and driven over
-// stdin/stdout instead of bundling and spawning Node per render.
-//
-// Links the SSR module graph on demand: app source is fetched (already
-// TS/JSX-compiled) from the dev server and evaluated via `vm.SourceTextModule`
-// with a custom linker; node_modules are imported natively in this realm (React
-// elements interop across the vm realm via `Symbol.for`).
-//
-// Module identity is the absolute file path, so invalidation is by mtime: any
-// changed source, plus everything that transitively imports it, is dropped and
-// rebuilt; `vm` re-evaluates only those. Push-driven via the dev server's HMR
-// WebSocket, with a render-time mtime scan as fallback.
-//
-// Usage: node --experimental-vm-modules ssr-runner.mjs <baseUrl> <entryAbsPath>
-
 import vm from "node:vm";
 import readline from "node:readline";
 import { statSync } from "node:fs";
 
 const [BASE, ENTRY] = process.argv.slice(2);
 
-// Route module `console` output to stderr so it never corrupts the stdout
-// JSON-lines render protocol.
 const vmConsole = new console.Console(process.stderr, process.stderr);
 
 const context = vm.createContext({
@@ -42,9 +25,7 @@ const context = vm.createContext({
   performance,
 });
 
-// id (abs path): { mod, mtime, importers:Set<id>, evaluated:bool }
 const registry = new Map();
-// bare specifier: SyntheticModule wrapping the native import namespace
 const externals = new Map();
 
 const enc = encodeURIComponent;
@@ -79,7 +60,7 @@ async function externalModule(spec) {
       for (const k of keys) {
         try {
           this.setExport(k, ns[k]);
-        } catch {} // getters that throw off a namespace: skip
+        } catch {}
       }
     },
     { context, identifier: `external:${spec}` },
@@ -100,9 +81,6 @@ async function linker(spec, referencing) {
   return dep;
 }
 
-// Dynamic import() inside a module (e.g. a lazy `import.meta.glob` for
-// route-level code splitting): resolve, build, and evaluate the target, then
-// hand back its namespace/module.
 async function importDynamic(spec, referencing) {
   const r = await resolve(referencing.identifier, spec);
   if (r.external) return import(r.spec);
@@ -112,10 +90,6 @@ async function importDynamic(spec, referencing) {
   return dep;
 }
 
-// Single-flight per id: concurrent importers (e.g. several routes importing the
-// same module via an eager glob) must share one instance. Without this, each
-// caller checks the registry before the first `await` registers the module and
-// they all create duplicates, diverging shared module state.
 const building = new Map();
 async function build(id) {
   const existing = registry.get(id);
@@ -132,7 +106,6 @@ async function build(id) {
       },
       importModuleDynamically: (spec, ref) => importDynamic(spec, ref),
     });
-    // Register before linking so import cycles resolve to this instance.
     registry.set(id, { mod, mtime: mtimeOf(id), importers: new Set(), evaluated: false });
     await mod.link(linker);
     return mod;
@@ -145,8 +118,6 @@ async function build(id) {
   }
 }
 
-// Drop every module whose file changed, plus everything that transitively
-// imports it, so the next render rebuilds and re-evaluates only those.
 function invalidate() {
   const dirty = new Set();
   for (const [id, rec] of registry) if (mtimeOf(id) !== rec.mtime) dirty.add(id);
@@ -172,15 +143,13 @@ async function entryNamespace() {
   let rec = registry.get(ENTRY);
   if (!rec || !rec.evaluated) {
     const mod = await build(ENTRY);
-    await mod.evaluate(); // evaluates only not-yet-evaluated modules in the graph
+    await mod.evaluate();
     rec = registry.get(ENTRY);
     rec.evaluated = true;
   }
   return rec.mod.namespace;
 }
 
-// Build + evaluate an arbitrary module by id and return its namespace (used by
-// server-function calls, where the module is not the SSR entry).
 async function moduleNamespace(id) {
   let rec = registry.get(id);
   if (!rec || !rec.evaluated) {
@@ -192,8 +161,6 @@ async function moduleNamespace(id) {
   return rec.mod.namespace;
 }
 
-// Server function: evaluate the (real, server-side) `*.server.*` module and
-// invoke the named export with the client-supplied args.
 async function handleCall(emit, id, name, args) {
   const ns = await moduleNamespace(id);
   const fn = name === "default" ? ns.default : ns[name];
@@ -204,37 +171,25 @@ async function handleCall(emit, id, name, args) {
   emit({ result: JSON.stringify(result ?? null) });
 }
 
-// JSON-serialize loader data with `<` escaped so it can't close the inline
-// <script> the transport embeds it in.
 const serialize = (data) => JSON.stringify(data ?? null).replace(/</g, "\\u003c");
 
 async function loadData(ns, url) {
   return typeof ns.load === "function" ? await ns.load(url) : null;
 }
 
-// Loader-only: emit `{data}` (server-authoritative route data for a client
-// navigation).
 async function handleLoad(emit, url) {
   emit({ data: serialize(await loadData(await entryNamespace(), url)) });
 }
 
-// Action: run the server-side mutation, then revalidate the loader and emit the
-// fresh `{data}`.
 async function handleAction(emit, url, body) {
   const ns = await entryNamespace();
   if (typeof ns.action === "function") await ns.action(url, body);
   emit({ data: serialize(await loadData(ns, url)) });
 }
 
-// Produce the render for `url`. First runs the route loader (if any) and emits
-// `{data}` for the transport to serialize into the document; then the render
-// output: `{chunk}`… `{end}` for a streaming entry (renderStream), or a single
-// `{html}`.
 async function handleRender(emit, url) {
   const ns = await entryNamespace();
   const data = await loadData(ns, url);
-  // The route's <head> (title/meta) is computed from the chain + data and
-  // injected into the shell alongside the serialized data.
   const head = typeof ns.head === "function" ? String(await ns.head(url, data)) : "";
   emit({ data: serialize(data), head });
   if (typeof ns.renderStream === "function") {
@@ -257,8 +212,6 @@ async function handleRender(emit, url) {
   }
 }
 
-// Serialize renders and push-invalidations so a change event can't delete a
-// module mid-render (Node is single-threaded, but both are async).
 let lock = Promise.resolve();
 function withLock(fn) {
   const run = lock.then(fn, fn);
@@ -269,12 +222,8 @@ function withLock(fn) {
   return run;
 }
 
-// Server-side HMR push: subscribe to the dev server's HMR channel and drop
-// stale SSR modules the moment the server reports a change, rather than waiting
-// to poll mtimes at the next render. The message is just a "re-check now"
-// trigger; invalidate() (mtime-precise) decides exactly what to drop.
 function connectHmr() {
-  if (typeof WebSocket === "undefined") return; // older Node: fall back to poll
+  if (typeof WebSocket === "undefined") return;
   let ws;
   try {
     ws = new WebSocket(`${BASE.replace(/^http/, "ws")}/__ws`);
@@ -295,7 +244,7 @@ function connectHmr() {
     });
   });
   ws.addEventListener("close", () => setTimeout(connectHmr, 1000));
-  ws.addEventListener("error", () => {}); // close handler retries
+  ws.addEventListener("error", () => {});
 }
 connectHmr();
 

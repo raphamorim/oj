@@ -1,19 +1,9 @@
 // SPDX-License-Identifier: MIT
-// A minimal Vite plugin container: loads the app's vite.config plugins and runs
-// their resolveId/load hooks so `virtual:*` (and other plugin-owned) specifiers
-// resolve in the esbuild client bundle and the SSR loader. This is a FALLBACK
-// for ids normal resolution can't handle -- not a full plugin pipeline. It
-// faithfully applies the gating that decides whether a hook runs at all:
-//   * plugin `apply` ("build" | "serve" | fn) vs the current command
-//   * object-form hooks `{ handler, filter, order }` (Vite 6+/Rollup 4), whose
-//     `filter.id` must match the id before the handler runs
-// Getting these wrong lets a build-only, id-filtered stub swallow every id.
+
 import { importPkg } from "./resolve-pkg.mjs";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
-// oj loads the config as tooling; Vite's native-loader "import without a file
-// extension" advisories are noise here. Suppress them as the warning suggests.
 process.env.VITE_CONFIG_NATIVE_IGNORE_WARNING ??= "true";
 
 const CONFIG_FILES = [
@@ -24,26 +14,15 @@ const CONFIG_FILES = [
 const hookHandler = (h) => (typeof h === "function" ? h : typeof h?.handler === "function" ? h.handler : null);
 const hookFilter = (h) => (typeof h === "object" && h ? h.filter : undefined);
 
-// Plugins whose transforms oj reimplements natively (so re-running them here
-// would double-transform and clash): React (vite:react-*), everything under
-// Vite's own `vite:` namespace (esbuild TS/JSX, glob, define), and TanStack
-// Start/Router (server-fns, route code-splitting, manifests). Any other plugin
-// is the app's own and its transforms DO need to run on first-party source.
 const ojReimplemented = (name = "") =>
   name.startsWith("vite:") || /^tanstack[-:]/.test(name) || name.startsWith("@tanstack/");
 
-// Vite 6+ per-environment gate: a plugin may declare `applyToEnvironment` to
-// run only in "client" or "ssr". Ignoring it lets an SSR-only plugin (e.g. one
-// that stubs client-only modules) run against the client bundle and corrupt it.
-// Undefined = runs everywhere; a throwing gate defaults to "applies" (safe).
 function envAllows(plugin, environment) {
   const f = plugin.applyToEnvironment;
   if (typeof f !== "function") return true;
   try { return f({ name: environment }) !== false; } catch { return true; }
 }
 
-// Vite/Rollup hook id filter: RegExp | string | {include,exclude} | array of.
-// A string is treated as a substring match (close enough for id gating here).
 function matchOne(pat, id) {
   if (pat instanceof RegExp) return pat.test(id);
   if (typeof pat === "string") return id.includes(pat);
@@ -70,7 +49,6 @@ function applyMatches(plugin, command, mode) {
   return a === command;
 }
 
-// enforce: 'pre' plugins first, then normal, then 'post' (Vite's order).
 function ordered(plugins) {
   const pre = [], normal = [], post = [];
   for (const p of plugins) {
@@ -89,9 +67,6 @@ function findConfig(app) {
   return null;
 }
 
-// Load the app's plugins and return { resolveId, load } bound to one command +
-// environment. Returns null (no container) if there is no config, no Vite, or
-// the config fails to load -- callers then behave as before.
 export async function loadPluginContainer(app, { command = "serve", mode = "development", environment = "client" } = {}) {
   const configFile = findConfig(app);
   if (!configFile) return null;
@@ -111,9 +86,6 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
     ),
   );
 
-  // Vite re-exports Rollup's parser as `parseAst`; give plugins a real
-  // `this.parse` (some, e.g. code-stubbing plugins, walk the AST and would emit
-  // broken output against a `{}` stub). Fall back to `{}` if unavailable.
   const parse = typeof vite.parseAst === "function"
     ? (code, opts) => vite.parseAst(code, opts)
     : () => ({});
@@ -155,9 +127,6 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
     return null;
   }
 
-  // Run the plugins' transform hooks in order, chaining code through each
-  // (Rollup/Vite semantics). Returns the transformed code, or null if no plugin
-  // touched it. Used for files a plugin owns end-to-end, e.g. `.mdx`.
   async function transform(code, id) {
     let current = code, changed = false;
     for (const p of plugins) {
@@ -172,15 +141,6 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
     return changed ? current : null;
   }
 
-  // Run the app's OWN plugin transforms on first-party source (.ts/.tsx), so
-  // plugin-generated code (i18n message accessors, macros, ...) exists in both
-  // the SSR module and the client bundle. Deliberately SKIPS the plugins oj
-  // reimplements natively -- React (JSX/Fast-Refresh) and TanStack Start/Router
-  // (server-fns, route code-splitting, manifests) -- and Vite's own built-ins
-  // (esbuild TS/JSX, glob, define). Running those here would double-transform
-  // and clash with oj's pipeline (e.g. TanStack's server-fn transform fighting
-  // oj's server-fn resolver). The `{ ssr }` option lets plugins branch per
-  // environment the way Vite passes it. `try/catch` per plugin degrades safely.
   async function transformUserCode(code, id) {
     const ssr = environment === "ssr";
     let current = code, changed = false;
@@ -196,12 +156,6 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
     return changed ? current : null;
   }
 
-  // Run the plugins' generateBundle hooks with a real emitFile, so plugins that
-  // publish files (e.g. content-assets emitting /__content/<collection>/<file>)
-  // produce their output. `emit` receives Rollup's emitFile arg
-  // ({type,fileName,source}) and is expected to write the file. Plugins that
-  // read the output `bundle` get an empty one (we don't reconstruct it), so
-  // bundle-derived emissions are skipped; asset emissions from a manifest work.
   async function generateBundle(emit) {
     const genCtx = { ...ctx, emitFile: (f) => (emit(f), "oj-emit-ref") };
     for (const p of plugins) {
@@ -221,5 +175,4 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
   return { resolveId, load, transform, transformUserCode, generateBundle, publicDir, pluginCount: plugins.length };
 }
 
-// Pure gating helpers exposed for unit tests; not part of the runtime contract.
 export const __test = { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows };

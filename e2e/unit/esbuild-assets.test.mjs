@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Unit tests for esbuild-assets.mjs: the content-hash emitter (incl. CSS url()
-// rewriting + Tailwind compile hook), workspaceRoot, pnpmStorePaths, and the
-// needsCssCompile predicate.
+
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync } from "node:fs";
@@ -43,7 +41,7 @@ test("pnpmStorePaths lists every .pnpm package node_modules dir", () => {
     const store = join(base, "node_modules", ".pnpm");
     mkdirSync(join(store, "react@19", "node_modules"), { recursive: true });
     mkdirSync(join(store, "@babel+runtime@7", "node_modules"), { recursive: true });
-    mkdirSync(join(store, "no-nm-here"), { recursive: true }); // skipped (no node_modules)
+    mkdirSync(join(store, "no-nm-here"), { recursive: true });
     const paths = pnpmStorePaths(base);
     assert.equal(paths.length, 2);
     assert.ok(paths.some((p) => p.endsWith(join("react@19", "node_modules"))));
@@ -63,7 +61,6 @@ test("emit copies a file under a content hash and returns its URL", async () => 
     const url = await emit(join(src, "logo.png"));
     assert.match(url, /^\/assets\/logo-[0-9a-f]{8}\.png$/);
     assert.ok(existsSync(join(base, "client", "assets", url.slice("/assets/".length))));
-    // identical bytes -> identical URL (idempotent, no manifest needed)
     assert.equal(await emit(join(src, "logo.png")), url);
   } finally {
     rmSync(base, { recursive: true, force: true });
@@ -83,11 +80,8 @@ test("emit rewrites CSS url() refs and emits the referenced assets", async () =>
     const emit = contentHashEmitter(join(base, "client"));
     const url = await emit(join(styles, "app.css"));
     const out = readFileSync(join(base, "client", "assets", url.slice("/assets/".length)), "utf8");
-    // the font ref is rewritten to a hashed /assets URL...
     assert.match(out, /url\("\/assets\/font-[0-9a-f]{8}\.woff2"\)/);
-    // ...and the font itself was emitted
     assert.ok(readdirSync(join(base, "client", "assets")).some((f) => /^font-[0-9a-f]{8}\.woff2$/.test(f)));
-    // data: urls are left untouched
     assert.match(out, /url\(data:image\/gif;base64,AA\)/);
   } finally {
     rmSync(base, { recursive: true, force: true });
@@ -103,7 +97,7 @@ test("emit compiles CSS via compileCss before rewriting when it needs it", async
     const compileCss = async (from, src) => {
       called++;
       assert.ok(src.includes("tailwindcss"));
-      return ".compiled{color:red}"; // stand-in for Tailwind output
+      return ".compiled{color:red}";
     };
     const emit = contentHashEmitter(join(base, "client"), compileCss);
     const url = await emit(join(base, "styles", "globals.css"));
@@ -126,9 +120,9 @@ test("emit records emitted stylesheet urls (not other assets)", async () => {
     writeFileSync(join(dir, "logo.png"), "PNG");
     const emit = contentHashEmitter(join(base, "client"));
     const aUrl = await emit(join(dir, "a.css"));
-    await emit(join(dir, "logo.png")); // not a stylesheet
+    await emit(join(dir, "logo.png"));
     const bUrl = await emit(join(dir, "b.css"));
-    await emit(join(dir, "a.css")); // idempotent, no duplicate
+    await emit(join(dir, "a.css"));
     const urls = emit.cssUrls();
     assert.deepEqual(urls, [aUrl, bUrl], "only stylesheets, in order, deduped");
     assert.ok(!urls.some((u) => u.endsWith(".png")), "non-css assets excluded");

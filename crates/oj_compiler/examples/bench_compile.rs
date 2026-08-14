@@ -1,6 +1,3 @@
-// Micro-benchmark for the fused compile pipeline. Compiles a realistic TSX
-// component that uses import.meta.env (so the define pass fires) in a loop.
-//   cargo run --release --example bench_compile -p oj_compiler
 use std::path::Path;
 use std::time::Instant;
 
@@ -46,7 +43,6 @@ fn main() {
     let opts = CompileOptions::dev();
     let path = Path::new("Widget.tsx");
 
-    // sanity: it compiles and replaces the define
     let out = compile(path, SRC, &opts).expect("compile");
     assert!(out.code.contains("\"development\""), "define must be replaced");
     assert!(!out.code.contains("import.meta.env"), "no bare import.meta.env left");

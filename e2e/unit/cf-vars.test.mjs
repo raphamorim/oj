@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Unit tests for the Cloudflare dev shim's var parsers (cf-server.mjs): JSONC
-// comment stripping, wrangler `vars` extraction (jsonc + toml), and the
-// dotenv-style .dev.vars parser.
+
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { __test } from "../../crates/oj_server/src/assets/start/cf-server.mjs";
@@ -17,7 +15,6 @@ test("stripJsonc removes // and /* */ but keeps // inside strings", () => {
   const cleaned = stripJsonc(src);
   assert.ok(!cleaned.includes("line comment"));
   assert.ok(!cleaned.includes("trailing"));
-  // the // in the URL string survives
   assert.ok(cleaned.includes("https://example.com/path"));
 });
 
@@ -59,7 +56,7 @@ test("parseDevVars handles quotes, comments, blank lines, and = in values", () =
     "PLAIN=value",
     'QUOTED="quoted value"',
     "SINGLE='single'",
-    "TOKEN=abc=def==", // '=' inside the value is preserved
+    "TOKEN=abc=def==",
     "IGNORED_NO_EQ",
   ].join("\n");
   assert.deepEqual(parseDevVars(src), {

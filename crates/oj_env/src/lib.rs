@@ -1,18 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-//! Vite-compatible `.env` loading and `import.meta.env` define construction.
-//!
-//! Loads `.env`, `.env.local`, `.env.<mode>`, `.env.<mode>.local` in Vite's
-//! precedence order (later wins), parses dotenv syntax with `${VAR}`
-//! expansion, then exposes only `envPrefix`-prefixed vars (default `VITE_`)
-//! to client code, alongside the built-ins MODE/BASE_URL/DEV/PROD/SSR.
-
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// Parse one `.env` file's contents into ordered key/value pairs, resolving
-/// `${VAR}` / `$VAR` against `base` (earlier vars + process env) as it goes.
 pub fn parse(contents: &str, base: &BTreeMap<String, String>) -> Vec<(String, String)> {
     let mut acc = base.clone();
     let mut out = Vec::new();
@@ -37,23 +28,19 @@ pub fn parse(contents: &str, base: &BTreeMap<String, String>) -> Vec<(String, St
 fn parse_value(raw: &str, vars: &BTreeMap<String, String>) -> String {
     let bytes = raw.as_bytes();
     if bytes.first() == Some(&b'\'') {
-        // Single-quoted: literal, no expansion. Take up to the closing quote.
         let inner = &raw[1..];
         return inner.split_once('\'').map(|(v, _)| v).unwrap_or(inner).to_string();
     }
     if bytes.first() == Some(&b'"') {
-        // Double-quoted: interpret escapes, expand vars.
         let inner = &raw[1..];
         let inner = inner.split_once('"').map(|(v, _)| v).unwrap_or(inner);
         let unescaped = inner.replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", "\"");
         return expand(&unescaped, vars);
     }
-    // Unquoted: strip an inline `#` comment, trim, expand.
     let end = raw.find(" #").unwrap_or(raw.len());
     expand(raw[..end].trim(), vars)
 }
 
-/// Expand `${VAR}` and `$VAR`; `\$` is a literal `$`.
 fn expand(input: &str, vars: &BTreeMap<String, String>) -> String {
     let mut out = String::with_capacity(input.len());
     let bytes = input.as_bytes();
@@ -93,12 +80,9 @@ fn expand(input: &str, vars: &BTreeMap<String, String>) -> String {
     out
 }
 
-/// Load and merge the four env files for `mode` from `dir`. Process env is
-/// the expansion base but is not emitted (only file-declared vars are).
 pub fn load(dir: &Path, mode: &str) -> Vec<(String, String)> {
     let mut base: BTreeMap<String, String> = std::env::vars().collect();
     let mut merged: BTreeMap<String, String> = BTreeMap::new();
-    // Lowest to highest precedence; later overrides earlier.
     for name in [".env", ".env.local", &format!(".env.{mode}"), &format!(".env.{mode}.local")] {
         let Ok(contents) = std::fs::read_to_string(dir.join(name)) else { continue };
         for (k, v) in parse(&contents, &base) {
@@ -109,9 +93,6 @@ pub fn load(dir: &Path, mode: &str) -> Vec<(String, String)> {
     merged.into_iter().collect()
 }
 
-/// Build the `import.meta.env.*` define pairs for the compiler: the built-ins
-/// plus every `prefix`-prefixed loaded var, plus a whole-object replacement
-/// for bare `import.meta.env`. Values are JS expressions (JSON-encoded).
 pub fn import_meta_env_defines(
     loaded: &[(String, String)],
     mode: &str,
@@ -135,7 +116,6 @@ pub fn import_meta_env_defines(
     for (k, v) in &obj {
         defines.push((format!("import.meta.env.{k}"), v.to_string()));
     }
-    // Bare `import.meta.env`: the whole object.
     defines.push(("import.meta.env".into(), serde_json::Value::Object(obj).to_string()));
     defines
 }
@@ -186,7 +166,6 @@ mod tests {
         assert_eq!(map["import.meta.env.PROD"], "false");
         assert_eq!(map["import.meta.env.VITE_API"], "\"https://api.test\"");
         assert!(!map.contains_key("import.meta.env.SECRET"), "unprefixed var must not leak");
-        // The whole-object replacement carries the prefixed var, not the secret.
         assert!(map["import.meta.env"].contains("VITE_API"));
         assert!(!map["import.meta.env"].contains("SECRET"));
     }
@@ -194,20 +173,16 @@ mod tests {
     #[test]
     fn expansion_boundary_undefined_base_and_unclosed_brace() {
         let mut b = base();
-        b.insert("FROM_ENV".into(), "envval".into()); // stands in for a process-env var
+        b.insert("FROM_ENV".into(), "envval".into());
         let src = "A=first\n\
                    UNBRACED=$A/x\n\
                    MISSING=[$NOPE]\n\
                    FROMBASE=${FROM_ENV}\n\
                    UNCLOSED=${OOPS\n";
         let map: std::collections::HashMap<_, _> = parse(src, &b).into_iter().collect();
-        // unbraced $A expands and stops at the non-identifier '/'
         assert_eq!(map["UNBRACED"], "first/x");
-        // an undefined variable expands to the empty string
         assert_eq!(map["MISSING"], "[]");
-        // a base (process env) variable is available to expansion
         assert_eq!(map["FROMBASE"], "envval");
-        // an unterminated ${ is emitted literally rather than swallowing the rest
         assert_eq!(map["UNCLOSED"], "${OOPS");
     }
 

@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// Built-in file-based route manifest (virtual:oj-routes): oj globs src/routes/
-// and derives route paths (index -> "/", $id -> :id, layouts excluded). The
-// derivation runs in the browser, so a headless page imports the demo module
-// and reads the computed paths. Unbundled only (the bundle-registry dev mode
-// doesn't serve virtual ids — a documented limitation, like plugin virtuals).
 const { chromium } = require("playwright");
 
 (async () => {

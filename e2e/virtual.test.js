@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// Virtual modules (plugin foundation): import "virtual:oj-info" resolves to
-// author-provided source at /@virtual/. Unbundled only (bundle registry
-// doesn't register virtual ids yet).
 const { chromium } = require("playwright");
 (async () => {
   if (process.env.OJ_E2E_MODE === "bundle") {

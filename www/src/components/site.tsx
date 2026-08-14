@@ -18,7 +18,6 @@ export function Nav() {
     onScroll();
     window.addEventListener("scroll", onScroll, { passive: true });
 
-    // Scroll-spy: highlight the section nearest the middle of the viewport.
     const obs = new IntersectionObserver(
       (entries) => {
         for (const e of entries) if (e.isIntersecting) setActive(e.target.id);
@@ -84,8 +83,6 @@ export function Footer() {
   );
 }
 
-// A cobalt line that chases the cursor; the signature flourish from rapha.land,
-// ported to a React effect. Skipped for touch and reduced-motion (via CSS).
 export function Trail() {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const pathRef = useRef<SVGPathElement | null>(null);

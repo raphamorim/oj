@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;

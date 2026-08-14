@@ -1,14 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-//! The fused per-file compile pipeline.
-//!
-//! One arena, one parse, one fused transform pass-set, one codegen.
-//! For TSX/TS/JSX: strip types, apply JSX (automatic runtime), then React
-//! Fast Refresh instrumentation (dev), emitting JS plus sourcemap.
-//!
-//! Never re-parses between stages; keep it allocation-conscious.
-
 pub mod bundle;
 pub mod cjs;
 pub mod glob;
@@ -27,22 +19,11 @@ use oxc_span::SourceType;
 use oxc_transformer::{JsxRuntime, ReactRefreshOptions, TransformOptions, Transformer};
 use oxc_transformer_plugins::{ReplaceGlobalDefines, ReplaceGlobalDefinesConfig};
 
-/// Maps an import specifier to a replacement (e.g. `./App` becomes
-/// `/src/App.tsx`). Returning `None` leaves the specifier untouched.
 pub type ImportRewriter<'r> = dyn FnMut(&str) -> Option<String> + 'r;
 
-// SIMD substring finders for the per-module gating prescans. `str::contains`
-// with a multi-byte needle is the scalar Two-Way algorithm; `memmem::Finder`
-// is SIMD-accelerated and its shift table is built once here, not per call.
-// Every compiled module runs these three scans over its full source/output.
 static F_IMPORT_META_ENV: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new("import.meta.env"));
 static F_IMPORT_META_GLOB: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new("import.meta.glob"));
 
-/// Whether a transformed program contains a `$RefreshReg$(...)` registration
-/// call — the semantic signal that Fast Refresh instrumented a component in this
-/// module, so it can be an HMR boundary. Detected by walking the AST rather than
-/// scanning the generated text, so a literal `$RefreshReg$(` inside a string or
-/// comment can never produce a false boundary (and over-invalidate on edit).
 pub(crate) fn detect_refresh_registrations(program: &Program) -> bool {
     use oxc_ast::ast::{CallExpression, Expression};
     use oxc_ast_visit::{Visit, walk};
@@ -69,11 +50,8 @@ pub(crate) fn detect_refresh_registrations(program: &Program) -> bool {
     detector.found
 }
 
-/// `import.meta.env.*` define pairs, set once at dev/build startup from the
-/// app's `.env` files. Unset (e.g. in unit tests) falls back to built-ins.
 static ENV_DEFINES: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
 
-/// Install the env defines for this process (call once, before compiling).
 pub fn set_import_meta_env(defines: Vec<(String, String)>) {
     let _ = ENV_DEFINES.set(defines);
 }
@@ -82,7 +60,6 @@ pub(crate) fn import_meta_env_defines(dev: bool) -> Vec<(String, String)> {
     if let Some(defines) = ENV_DEFINES.get() {
         return defines.clone();
     }
-    // Built-in fallback: no .env loaded (unit tests, minimal usage).
     let mode = if dev { "development" } else { "production" };
     vec![
         ("import.meta.env.BASE_URL".into(), "\"/\"".into()),
@@ -102,12 +79,8 @@ pub(crate) fn import_meta_env_defines(dev: bool) -> Vec<(String, String)> {
 
 #[derive(Debug, Clone)]
 pub struct CompileOptions {
-    /// Dev mode: jsxDEV runtime, no pure annotations needed for shaking yet.
     pub dev: bool,
-    /// Instrument components for React Fast Refresh ($RefreshReg$/$RefreshSig$).
-    /// Only meaningful in dev.
     pub refresh: bool,
-    /// Emit a sourcemap alongside the code.
     pub sourcemap: bool,
 }
 
@@ -124,23 +97,13 @@ impl CompileOptions {
 #[derive(Debug)]
 pub struct CompileOutput {
     pub code: String,
-    /// Sourcemap as a `data:` URL, ready to append as `//# sourceMappingURL=`.
     pub map_data_url: Option<String>,
-    /// Final specifiers of static imports and re-exports, post-rewrite.
-    /// Type-only imports are already erased and never appear here.
     pub imports: Vec<String>,
-    /// Final specifiers of dynamic `import("literal")` targets, post-rewrite.
-    /// Kept separate from `imports` so the crawl and bundler can treat these as
-    /// lazy boundaries (compiled on demand) rather than eager dependencies.
     pub dynamic_imports: Vec<String>,
-    /// Whether the Fast Refresh transform emitted a `$RefreshReg$` registration.
-    /// Detected on the transformed AST (see `detect_refresh_registrations`), not
-    /// by scanning the generated text.
     pub is_refresh_boundary: bool,
 }
 
 impl CompileOutput {
-    /// Code with the sourcemap inlined, for dev serving.
     pub fn code_with_inline_map(&self) -> String {
         match &self.map_data_url {
             Some(url) => format!("{}\n//# sourceMappingURL={}\n", self.code, url),
@@ -148,8 +111,6 @@ impl CompileOutput {
         }
     }
 
-    /// Whether the Fast Refresh transform registered any components here.
-    /// Modules where this is true are HMR boundary candidates.
     pub fn has_refresh_registrations(&self) -> bool {
         self.is_refresh_boundary
     }
@@ -173,12 +134,6 @@ pub fn compile(
     compile_module(path, source_text, opts, None)
 }
 
-/// The module's exported binding names: named exports, re-export specifiers
-/// (`export { a } from "..."`), the namespace of an `export * as ns from "..."`,
-/// and `default` when a default export is present. Used to generate client
-/// stubs for server-only (`*.server.*`) modules. A bare `export * from "..."`
-/// re-exports names that cannot be known without resolving the target module,
-/// so it contributes none. Returns empty on a parse failure.
 pub fn exports(source_text: &str, path: &Path) -> Vec<String> {
     let Ok(source_type) = SourceType::from_path(path) else { return Vec::new() };
     let allocator = Allocator::default();
@@ -189,24 +144,19 @@ pub fn exports(source_text: &str, path: &Path) -> Vec<String> {
     let mut names = Vec::new();
     for stmt in &parsed.program.body {
         match stmt {
-            // `export const/function/class ...`
             Statement::ExportDeclaration(decl) => {
                 names.extend(bundle::binding_names(&decl.declaration));
             }
-            // `export { a, b as c }`
             Statement::ExportNamedDeclaration(decl) => {
                 for spec in &decl.specifiers {
                     names.push(bundle::export_name(&spec.exported));
                 }
             }
-            // `export { a, b as c } from "./mod"`
             Statement::ExportFromDeclaration(decl) => {
                 for spec in &decl.specifiers {
                     names.push(bundle::export_name(&spec.exported));
                 }
             }
-            // `export * as ns from "./mod"` binds `ns`; bare `export *` cannot
-            // be enumerated statically, so it adds nothing.
             Statement::ExportAllDeclaration(decl) => {
                 if let Some(exported) = &decl.exported {
                     names.push(bundle::export_name(exported));
@@ -242,7 +192,6 @@ pub fn compile_module(
     }
     let mut program = parsed.program;
 
-    // Transformer needs scoping info; the transformer roughly triples scope counts.
     let semantic_ret = SemanticBuilder::new().with_excess_capacity(2.0).build(&program);
     let scoping = semantic_ret.semantic.into_scoping();
 
@@ -268,23 +217,17 @@ pub fn compile_module(
         return Err(CompileError::Transform { path: path.to_path_buf(), message });
     }
 
-    // Static define replacement (import.meta.env plus config/env `define`),
-    // gated on a substring test so modules without defines pay nothing.
     let defines = import_meta_env_defines(opts.dev);
     let needs_defines = F_IMPORT_META_ENV.find(source_text.as_bytes()).is_some()
         || defines
             .iter()
             .any(|(k, _)| !k.starts_with("import.meta") && source_text.contains(k.as_str()));
     if needs_defines {
-        // Reuse the scoping the transformer already produced for the transformed
-        // program, instead of running a second full SemanticBuilder pass over it.
         if let Ok(config) = ReplaceGlobalDefinesConfig::new(&defines) {
             let _ = ReplaceGlobalDefines::new(&allocator, config).build(transform_ret.scoping, &mut program);
         }
     }
 
-    // Expand import.meta.glob before specifier rewriting, so the generated
-    // import()/import statements get canonicalized to URLs by the rewriter.
     if F_IMPORT_META_GLOB.find(source_text.as_bytes()).is_some() {
         let dir = path.parent().unwrap_or(path);
         glob::expand(&allocator, dir, &mut program);
@@ -292,9 +235,6 @@ pub fn compile_module(
 
     let (imports, dynamic_imports) = rewrite_module_specifiers(&allocator, &mut program, &mut rewriter);
 
-    // Fast Refresh boundary, decided semantically on the transformed AST (only
-    // when the refresh transform ran). Cheaper than it looks: no separate text
-    // scan, and precise where a string scan would over-invalidate.
     let is_refresh_boundary = opts.refresh && detect_refresh_registrations(&program);
 
     let codegen_options = CodegenOptions {
@@ -313,14 +253,6 @@ pub fn compile_module(
     })
 }
 
-/// Collect (and optionally rewrite) the source specifiers of all static
-/// imports and re-exports. Runs after the transforms, so JSX-runtime imports
-/// injected by the automatic runtime are included and type-only imports are
-/// already gone.
-///
-/// TODO(M2): dynamic `import("...")` with literal arguments needs an AST
-/// visitor pass; top-level statements are enough for milestone 1.
-/// Exposed for bundle mode, which shares specifier canonicalization.
 pub(crate) fn rewrite_module_specifiers_pub<'a>(
     allocator: &'a Allocator,
     program: &mut Program<'a>,
@@ -354,9 +286,6 @@ fn rewrite_module_specifiers<'a>(
         }
         imports.push(lit.value.to_string());
     }
-    // Dynamic import("literal") gets the same canonicalization (needed for
-    // bare specifiers, which the browser cannot resolve), but is collected
-    // separately: these are lazy boundaries, not eager dependencies.
     if let Some(rewriter) = rewriter.as_deref_mut() {
         let mut dyn_rewriter = DynamicImportRewriter { allocator, rewriter, dynamic: &mut dynamic_imports };
         use oxc_ast_visit::VisitMut;
@@ -474,7 +403,6 @@ export function Root() {
         assert!(out.code.contains("\"react\""), "bare imports stay untouched");
         assert!(out.imports.contains(&"/resolved/App".to_string()));
         assert!(out.imports.contains(&"react".to_string()));
-        // the automatic runtime import injected by the JSX transform is visible
         assert!(out.imports.iter().any(|i| i.contains("jsx-runtime")), "{:?}", out.imports);
     }
 
@@ -491,7 +419,6 @@ export function Root() {
                    export const dev = import.meta.env.DEV;\n\
                    export const prod = import.meta.env.PROD;";
         let prod = compile(Path::new("env.ts"), src, &CompileOptions::prod()).unwrap();
-        // every define is substituted, nothing left referencing import.meta.env
         assert!(!prod.code.contains("import.meta.env"), "defines must be replaced:\n{}", prod.code);
         assert!(prod.code.contains("\"production\""), "MODE is production:\n{}", prod.code);
         assert!(prod.code.contains("prod = true"), "PROD is true in prod:\n{}", prod.code);
@@ -512,10 +439,8 @@ import { d } from "./real";
 export const used: A extends B ? number : number = c + d;
 "#;
         let out = compile(Path::new("m.ts"), src, &CompileOptions::prod()).unwrap();
-        // a fully type-only import is elided, so its specifier never surfaces
         assert!(!out.imports.iter().any(|i| i.contains("types")), "type-only import erased: {:?}", out.imports);
         assert!(!out.code.contains("./types"), "type-only source gone:\n{}", out.code);
-        // an import with a value binding survives; the inline `type` specifier is dropped
         assert!(out.imports.iter().any(|i| i.contains("mixed")), "mixed import kept: {:?}", out.imports);
         assert!(!out.code.contains("type B"), "inline type specifier erased:\n{}", out.code);
         assert!(out.imports.iter().any(|i| i.contains("real")));
@@ -530,7 +455,6 @@ export const used: A extends B ? number : number = c + d;
         let out =
             compile_module(Path::new("d.ts"), src, &CompileOptions::prod(), Some(&mut rewrite)).unwrap();
         assert!(out.code.contains("import(\"/res/chunk\")"), "dynamic import rewritten:\n{}", out.code);
-        // Dynamic targets are collected separately from static imports (lazy).
         assert!(
             out.dynamic_imports.contains(&"/res/chunk".to_string()),
             "dynamic spec collected: {:?}",
@@ -541,10 +465,8 @@ export const used: A extends B ? number : number = c + d;
 
     #[test]
     fn fast_refresh_only_in_dev_with_refresh_enabled() {
-        // prod: never instrumented
         let prod = compile(Path::new("C.tsx"), APP_TSX, &CompileOptions::prod()).unwrap();
         assert!(!prod.has_refresh_registrations());
-        // dev with refresh disabled: still the dev jsx runtime, but no instrumentation
         let dev_no_refresh = compile_module(
             Path::new("C.tsx"),
             APP_TSX,
@@ -572,7 +494,6 @@ export const used: A extends B ? number : number = c + d;
         )
         .unwrap();
         assert!(no_map.map_data_url.is_none());
-        // with no map, the inline-map helper returns the code untouched
         assert_eq!(no_map.code_with_inline_map(), no_map.code);
 
         let with_map = compile(Path::new("a.ts"), "export const x = 1;", &CompileOptions::prod()).unwrap();
@@ -582,27 +503,20 @@ export const used: A extends B ? number : number = c + d;
 
     #[test]
     fn exports_handles_reexports_and_never_panics() {
-        // local named exports (no `from`)
         let mut local = exports(r#"export const a = 1; export { a as b };"#, Path::new("m.ts"));
         local.sort();
         assert_eq!(local, ["a", "b"]);
-        // a parse failure yields an empty list rather than a panic
         assert!(exports("export { = ;", Path::new("bad.ts")).is_empty());
-        // an unsupported extension also yields empty, never an error
         assert!(exports("body{}", Path::new("x.css")).is_empty());
     }
 
     #[test]
     fn exports_captures_reexport_from_and_namespace_star() {
-        // `export { a, b as c } from "./mod"` contributes the exported names
         let mut names = exports(r#"export { a, b as c } from "./mod";"#, Path::new("m.ts"));
         names.sort();
         assert_eq!(names, ["a", "c"]);
-        // `export * as ns from "./mod"` binds the namespace name
         assert_eq!(exports(r#"export * as ns from "./mod";"#, Path::new("m.ts")), ["ns"]);
-        // bare `export * from "./mod"` cannot be enumerated statically -> none
         assert!(exports(r#"export * from "./mod";"#, Path::new("m.ts")).is_empty());
-        // a mix: local default + re-export-from are all present
         let mut mixed = exports(
             r#"export default function () {}
 export { x } from "./a";

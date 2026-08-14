@@ -1,22 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// Integration test for the TanStack Start adapter. Runs oj against a real,
-// self-contained Start app (e2e/fixtures/start-app) in both modes and asserts
-// that a server-rendered "/" wires together every seam the adapter supports:
-//   - file/code-based routing (/ and /about), server functions
-//   - import.meta.glob, ?raw / ?url asset conventions, svgr, MDX
-//   - Tailwind v4 CSS compilation, a plugin-owned virtual module
-//   - tsconfig paths + package.json "imports" aliases, a CommonJS dep
-//   - the Cloudflare context shim (wrangler vars), a non-default publicDir
-//
-//   node e2e/start.mjs        # dev + prod
-//   node e2e/start.mjs --dev  # dev only
-//   node e2e/start.mjs --prod # prod only
-//
-// The fixture's dependencies are not vendored. If they are not installed the
-// test SKIPS (exit 0) with an install hint, so a clean checkout stays green:
-//   (cd e2e/fixtures/start-app && npm install)
 import { spawn, execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -31,7 +15,6 @@ const onlyProd = process.argv.includes("--prod");
 const runDev = !onlyProd;
 const runProd = !onlyDev;
 
-// Skip cleanly when the fixture has no installed deps (nothing to test against).
 const installed =
   fs.existsSync(path.join(app, "node_modules", "@tanstack", "react-start")) &&
   fs.existsSync(path.join(app, "node_modules", "esbuild"));
@@ -56,7 +39,6 @@ const waitUp = async (port) => {
   throw new Error(`server on :${port} did not start`);
 };
 
-// The full-stack assertions run identically against dev and prod output.
 async function assertApp(port, label) {
   const home = await get(port, "/");
   if (home.status !== 200) throw new Error(`${label}: / returned ${home.status}`);
@@ -78,8 +60,6 @@ async function assertApp(port, label) {
   for (const [what, marker] of want) {
     if (!h.includes(marker)) throw new Error(`${label}: missing ${what} ("${marker}")`);
   }
-  // ?url resolves to /@oj-start/fs/...hero.png in dev, /assets/hero-<hash>.png
-  // in prod; both reference the hero png from the img src.
   if (!/src="[^"]*hero[^"]*\.png"/.test(h)) {
     throw new Error(`${label}: missing ?url import (hero png src)`);
   }
@@ -94,8 +74,6 @@ async function assertApp(port, label) {
     throw new Error(`${label}: publicDir asset not served`);
   }
 
-  // No flash of unstyled content: the app's stylesheet is linked in the SSR
-  // <head> (via the manifest) in both dev and prod, not injected client-side.
   const head = h.slice(0, h.indexOf("</head>"));
   if (!/<link[^>]*rel="stylesheet"[^>]*\.css/.test(head)) {
     throw new Error(`${label}: stylesheet not linked in the SSR head (FOUC)`);
@@ -124,8 +102,6 @@ async function prodPhase() {
   for (const f of ["server.mjs", "server-bundle.mjs", "client"]) {
     if (!fs.existsSync(path.join(dist, f))) throw new Error(`prod: dist/${f} missing`);
   }
-  // process.env is defined as an object, so no bare `process.env.X` runtime
-  // access survives to crash hydration (e.g. process.env.TSS_ROUTER_BASEPATH).
   const clientDir = path.join(dist, "client", "assets");
   const clientJs = fs
     .readdirSync(clientDir)
@@ -136,7 +112,6 @@ async function prodPhase() {
     throw new Error("prod: client bundle has a bare process.env access (would crash hydration)");
   }
   const port = 3098;
-  // cwd is the app root so the Cloudflare shim finds wrangler.jsonc.
   const srv = spawn("node", [path.join(dist, "server.mjs")], {
     cwd: app, stdio: "ignore", env: { ...process.env, PORT: String(port) },
   });

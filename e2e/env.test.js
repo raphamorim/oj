@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// .env loading: VITE_-prefixed vars reach import.meta.env in compiled code;
-// unprefixed secrets must NOT leak. Playground App renders the values into
-// a data-env attribute ("<VITE_GREETING>|<MODE>|<SECRET or 'none'>").
 const { chromium } = require("playwright");
 (async () => {
   const browser = await chromium.launch();

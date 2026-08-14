@@ -1,12 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-//! CSS compilation on Lightning CSS. Handles plain CSS (syntax lowering,
-//! autoprefixing, optional minify), CSS Modules scoping for `*.module.css`,
-//! and Sass/SCSS via the pure-Rust `grass` compiler (no Node sidecar).
-//!
-//! Targets drive both autoprefixing and modern-CSS lowering (nesting, etc.).
-
 use std::path::Path;
 
 use lightningcss::css_modules;
@@ -17,7 +11,6 @@ use lightningcss::targets::{Browsers, Targets};
 #[derive(Debug)]
 pub struct CssOutput {
     pub css: String,
-    /// CSS Modules only: exported class name to scoped name.
     pub exports: Option<Vec<(String, String)>>,
 }
 
@@ -25,14 +18,11 @@ pub fn is_css_module(url: &str) -> bool {
     url.rsplit('/').next().is_some_and(|f| f.contains(".module."))
 }
 
-/// Sass/SCSS files, by url extension.
 pub fn is_sass(url: &str) -> bool {
     let f = url.split('?').next().unwrap_or(url);
     f.ends_with(".scss") || f.ends_with(".sass")
 }
 
-/// Compile Sass/SCSS to plain CSS. `load_dir` is where `@use`/`@import` of
-/// sibling stylesheets resolve from.
 pub fn compile_sass(source: &str, load_dir: Option<&Path>) -> Result<String, String> {
     let mut options = grass::Options::default();
     if let Some(dir) = load_dir {
@@ -42,9 +32,6 @@ pub fn compile_sass(source: &str, load_dir: Option<&Path>) -> Result<String, Str
 }
 
 fn default_targets() -> Targets {
-    // A broadly-supported modern baseline (version = major<<16). Enables
-    // autoprefixing + nesting/custom-media lowering without transpiling away
-    // everything. Roughly "last 2 years" of the major engines.
     Targets::from(Browsers {
         chrome: Some(100 << 16),
         edge: Some(100 << 16),
@@ -71,8 +58,6 @@ pub fn compile_css(url: &str, source: &str, minify: bool) -> Result<CssOutput, S
         .map_err(|err| format!("css parse error in {url}: {err}"))?;
 
     let targets = default_targets();
-    // The minify pass applies target-driven transforms (autoprefixing,
-    // nesting lowering) regardless of the `minify` whitespace setting.
     stylesheet
         .minify(MinifyOptions { targets: targets.clone(), ..MinifyOptions::default() })
         .map_err(|err| format!("css transform error in {url}: {err}"))?;
@@ -106,9 +91,8 @@ mod tests {
     fn is_css_module_matches_only_the_filename() {
         assert!(is_css_module("/src/app.module.css"));
         assert!(is_css_module("app.module.scss"));
-        assert!(is_css_module("/a/b.module.css?used")); // query kept, still matches
-        assert!(!is_css_module("/src/styles.css")); // plain css
-        // ".module." in a directory name must not count -- only the filename does
+        assert!(is_css_module("/a/b.module.css?used"));
+        assert!(!is_css_module("/src/styles.css"));
         assert!(!is_css_module("/module.styles/app.css"));
     }
 
@@ -116,9 +100,9 @@ mod tests {
     fn is_sass_strips_query_and_checks_extension() {
         assert!(is_sass("/src/theme.scss"));
         assert!(is_sass("vars.sass"));
-        assert!(is_sass("/a/theme.scss?inline")); // query stripped before the check
+        assert!(is_sass("/a/theme.scss?inline"));
         assert!(!is_sass("/a/theme.css"));
-        assert!(!is_sass("/a/scss.ts")); // extension, not a substring, decides
+        assert!(!is_sass("/a/scss.ts"));
     }
 
     #[test]
@@ -154,7 +138,6 @@ mod tests {
 
     #[test]
     fn autoprefixing_applies_for_targets() {
-        // user-select needs -webkit- for older Safari in the "defaults" set.
         let out = compile_css("/p.css", ".x { user-select: none; }", true).unwrap();
         assert!(out.css.contains("-webkit-user-select"), "autoprefixed: {}", out.css);
     }

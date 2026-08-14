@@ -1,14 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-//! Resolution policy for oj, on top of `oxc_resolver` (a Rust port of
-//! webpack's enhanced-resolve, shared with Rspack).
-//!
-//! The library solves the Node algorithm (exports maps, conditions, browser
-//! field, symlinks). This module sets the policy: extension order for a
-//! TS-first React project, browser-flavored condition names, and later the
-//! dedup rules that keep a single copy of react in the graph.
-
 use std::path::{Path, PathBuf};
 
 use oxc_resolver::{
@@ -28,27 +20,14 @@ pub struct ResolveFailure {
 }
 
 impl OjResolver {
-    /// Build a resolver for an app rooted at `root`. If the app has a
-    /// `tsconfig.json`, its `paths` (the `@/*` alias convention) are wired in
-    /// via oxc_resolver's tsconfig support, covering resolve.alias for
-    /// TS+Vite apps.
     pub fn new(root: &Path) -> Self {
         Self::with_conditions(root, &["browser", "import", "module", "default"].map(String::from))
     }
 
-    /// Build a resolver with explicit `exports`/`imports` condition names. The
-    /// client environment uses browser conditions; the SSR environment uses
-    /// node conditions, so packages with conditional `exports` resolve their
-    /// correct per-environment variant (Vite Environment API `resolve.conditions`).
     pub fn with_conditions(root: &Path, conditions: &[String]) -> Self {
         Self::with_options(root, conditions, &[])
     }
 
-    /// As [`Self::with_conditions`], plus `resolve.alias` entries (`find`,
-    /// `replacement`) from the app's config. These sit alongside tsconfig
-    /// `paths`; a bare `find` matches the exact specifier or a `find/...`
-    /// prefix (webpack/Vite semantics). A relative `replacement` (`./src`) is
-    /// resolved against `root` to an absolute path, as Vite does.
     pub fn with_options(root: &Path, conditions: &[String], alias: &[(String, String)]) -> Self {
         let tsconfig = root.join("tsconfig.json");
         let alias = alias
@@ -79,7 +58,6 @@ impl OjResolver {
         Self { inner: Resolver::new(options) }
     }
 
-    /// Resolve `specifier` as imported from the directory `importer_dir`.
     pub fn resolve(
         &self,
         importer_dir: &Path,
@@ -95,7 +73,6 @@ impl OjResolver {
             })
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -117,7 +94,6 @@ mod tests {
 
     #[test]
     fn resolves_tsconfig_paths_alias() {
-        // `@/*` maps to `src/*` from the playground tsconfig.json.
         let resolver = OjResolver::new(&playground_root());
         let resolved = resolver.resolve(&playground_src(), "@/App").unwrap();
         assert!(resolved.ends_with("App.tsx"), "alias @/App -> {resolved:?}");
@@ -125,8 +101,6 @@ mod tests {
 
     #[test]
     fn resolves_config_alias() {
-        // A `resolve.alias` entry (`~` maps to `./src`) rewrites the specifier prefix
-        // and then resolves through the normal extension probing.
         let resolver = OjResolver::with_options(
             &playground_root(),
             &["browser", "import", "default"].map(String::from),
@@ -145,8 +119,6 @@ mod tests {
 
     #[test]
     fn resolves_exports_per_condition() {
-        // A package with conditional `exports`: the browser and node condition
-        // sets resolve to different files (Vite Environment API resolve.conditions).
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/dual");
         let browser = OjResolver::with_conditions(
             &dir,
@@ -161,7 +133,6 @@ mod tests {
     #[test]
     fn default_condition_resolves_the_fallback_export() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/dual");
-        // with only `default`, neither the browser nor node condition matches
         let resolver = OjResolver::with_conditions(&dir, &["default".to_string()]);
         assert!(resolver.resolve(&dir, "dual-pkg").unwrap().ends_with("default.js"));
     }
@@ -170,10 +141,8 @@ mod tests {
     fn resolves_package_subpath_exports_and_enforces_encapsulation() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/subpath");
         let resolver = OjResolver::new(&dir);
-        // the `.` and a named subpath both resolve through the exports map
         assert!(resolver.resolve(&dir, "sub-pkg").unwrap().ends_with("index.js"));
         assert!(resolver.resolve(&dir, "sub-pkg/feature").unwrap().ends_with("feature.js"));
-        // a real file not listed in `exports` is blocked (encapsulation)
         assert!(resolver.resolve(&dir, "sub-pkg/internal").is_err(), "unlisted subpath must not resolve");
     }
 
@@ -181,11 +150,8 @@ mod tests {
     fn resolves_json_css_and_explicit_extensions() {
         let resolver = OjResolver::new(&playground_root());
         let src = playground_src();
-        // .json is in the probe list
         assert!(resolver.resolve(&src, "./data.json").unwrap().ends_with("data.json"));
-        // an explicit extension resolves the exact file
         assert!(resolver.resolve(&src, "./App.tsx").unwrap().ends_with("App.tsx"));
-        // a non-probed extension (.css) still resolves when the exact file exists
         assert!(
             resolver.resolve(&src, "./Counter.module.css").unwrap().ends_with("Counter.module.css"),
             "exact-path .css should resolve",

@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// server.proxy: a browser fetch to /api is forwarded (with ^/api rewrite) to
-// the configured backend. Starts its own backend on :8899 (the target in
-// playground/oj.config.ts), fetches same-origin through the oj dev server.
 const { chromium } = require("playwright");
 const http = require("node:http");
 

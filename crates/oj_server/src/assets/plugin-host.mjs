@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// Persistent plugin host: loads Vite/Rollup-style plugins from the app's
-// plugins module and runs their hooks (transform / resolveId / load) against
-// oj's pipeline. JSON-lines over stdio with correlation ids, so many calls can
-// be in flight at once.
 import http from "node:http";
 import { writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -15,22 +11,12 @@ import { AsyncLocalStorage } from "node:async_hooks";
 const pluginsPath = process.argv[2];
 const initial = JSON.parse(process.argv[3] ?? "{}");
 
-// Suppress Vite's native config-loader "import without a file extension"
-// advisories: oj loads the config as tooling, so they are noise here.
 process.env.VITE_CONFIG_NATIVE_IGNORE_WARNING ??= "true";
 const env = initial.env ?? { command: "serve", mode: "development" };
 
-// The `oj` brand token as a badge: navy foreground on white-background cells,
-// so it stays legible on any terminal theme (plain `oj` when piped / NO_COLOR).
 const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
 const OJ = _ojTTY ? "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m" : "oj";
 
-// Vite's `configResolved` and later hooks receive a fully-resolved
-// `ResolvedConfig`, so real plugins read fields Vite always fills in — e.g.
-// @vitejs/plugin-react reads `config.experimental.bundledDev`. oj only has the
-// app's user config plus plugin `config()` merges, so fill the standard shape
-// UNDER the actual config (user/plugin values win); a missing key must never
-// crash a hook (a plugin crash stalls buildStart until the host times out).
 function withResolvedDefaults(config) {
   const c = config ?? {};
   return deepMerge(
@@ -53,10 +39,6 @@ function withResolvedDefaults(config) {
   );
 }
 
-// Vite Environment API: the environment this host serves (oj exposes "client"
-// for the dev server and the app build). `environment.config` is the base
-// config deep-merged with the per-environment overrides from
-// `config.environments[name]`, so plugins read the resolved per-env config.
 const envName = initial.environment?.name ?? "client";
 const environment = {
   name: envName,
@@ -66,10 +48,6 @@ const environment = {
   ),
 };
 
-// Resolve an app's vite.config to its config object. Preferred path: Vite's
-// own `loadConfigFromFile` (a direct dep of any Vite app; handles TS, local
-// imports, and `defineConfig`). Fallback: bundle the config graph with the
-// app's esbuild (local imports inlined, node_modules external).
 async function loadViteConfig(configPath) {
   const appRoot = initial.config?.root ?? process.cwd();
   const req = createRequire(appRoot + "/package.json");
@@ -86,7 +64,6 @@ async function loadViteConfig(configPath) {
   } catch (e) {
     process.stderr.write(`${OJ}${_ojTTY ? "" : ":"} vite.loadConfigFromFile unavailable (${e}); bundling config directly\n`);
   }
-  // Fallback for apps without a usable vite install.
   let mod;
   if (/\.(ts|tsx|mts|cts)$/.test(configPath)) {
     const esbuild = await import(req.resolve("esbuild"));
@@ -114,8 +91,6 @@ let plugins = [];
 try {
   let list;
   if (initial.pluginsFormat === "vite") {
-    // vite.config.*: run its `plugins` array. Config plugins can be nested
-    // arrays and promises (async plugins); flatten and await.
     const cfg = await loadViteConfig(pluginsPath);
     list = await Promise.all((cfg?.plugins ?? []).flat(Infinity));
   } else {
@@ -123,20 +98,15 @@ try {
     list = mod.default ?? mod.plugins ?? [];
   }
   plugins = (Array.isArray(list) ? list : [list]).filter(Boolean);
-  // `apply`: keep plugins active for this command ("serve"/"build" or a fn).
   plugins = plugins.filter((p) => {
     if (p.apply == null) return true;
     if (typeof p.apply === "function") return !!p.apply(initial.config ?? {}, env);
     return p.apply === env.command;
   });
-  // `applyToEnvironment`: gate a plugin to specific environments (Vite Env API).
-  // A plugin absent from this environment is dropped from the pipeline.
   plugins = plugins.filter((p) => {
     if (typeof p.applyToEnvironment !== "function") return true;
     return !!p.applyToEnvironment(environment);
   });
-  // `enforce`: pre plugins run first, post last, others keep array order
-  // (Array.prototype.sort is stable).
   const rank = (p) => (p.enforce === "pre" ? -1 : p.enforce === "post" ? 1 : 0);
   plugins.sort((a, b) => rank(a) - rank(b));
   process.stderr.write(
@@ -146,9 +116,6 @@ try {
   process.stderr.write(`${OJ} plugin host: failed to load ${pluginsPath}: ${(e && e.stack) || e}\n`);
 }
 
-// Reverse RPC (Node to Rust): a plugin's this.resolve asks oj's own resolver
-// so plugin resolution matches oj (tsconfig aliases etc.). Correlated by id;
-// the reply comes back as an {rpcReply} line on stdin (see the readline loop).
 let rpcCounter = 1;
 const rpcPending = new Map();
 function ctxRpc(method, args) {
@@ -159,47 +126,25 @@ function ctxRpc(method, args) {
   });
 }
 
-// Assets a plugin emits via this.emitFile; the Rust build collects them after
-// buildEnd (getEmittedFiles) and writes them to the output dir.
 let emitCounter = 0;
 const emitted = [];
 
-// ModuleInfo cache: this.load populates it (async, via Rust); getModuleInfo
-// reads it synchronously, matching Rollup, where getModuleInfo returns info
-// for modules already loaded into the graph and null otherwise.
 const moduleInfoCache = new Map();
 
-// Files a plugin registered via this.addWatchFile (dev watcher pulls these).
 const watchedFiles = new Set();
-// Per-transform attribution of addWatchFile calls: each transform() runs its
-// hook chain inside a fresh bucket so oj can cache exactly the files THIS
-// module watched (concurrent transforms interleave at awaits, so a plain
-// module-scoped var would cross-contaminate -- AsyncLocalStorage scopes it to
-// the call chain). Enables re-applying the watch on a warm-cache serve, where
-// transform does not re-run.
 const transformWatchStore = new AsyncLocalStorage();
-// Module ids the host has observed (every transform id + this.load-ed id).
-// getModuleIds returns this: a subset of Rollup's whole-graph view, only the
-// modules the plugin host has actually seen.
 const seenIds = new Set();
 
-// Rollup plugin context. Covers warn/error, this.resolve (async, via oj's
-// resolver), and this.emitFile/getFileName (asset form) used by real plugins.
 const ctx = {
-  // Vite Environment API: hooks read this.environment.name / .config.
   environment,
   warn: (m) => process.stderr.write(`oj plugin warn: ${m}\n`),
   error: (m) => {
     throw typeof m === "string" ? new Error(m) : m;
   },
-  // this.resolve(source, importer) returns { id } | null (Rollup shape).
   async resolve(source, importer) {
     const id = await ctxRpc("resolve", [source, importer ?? ""]);
     return id == null ? null : { id };
   },
-  // this.emitFile({ type:"asset", name?, fileName?, source }) returns a reference id.
-  // Assets only; chunk emission isn't supported. fileName defaults to
-  // assets/<name> so plugins can predict the output path via getFileName.
   emitFile(file) {
     if (file == null || (file.type && file.type !== "asset")) {
       throw new Error("oj: this.emitFile supports { type: 'asset' } only");
@@ -214,8 +159,6 @@ const ctx = {
     if (!f) throw new Error(`oj: unknown emit reference ${referenceId}`);
     return f.fileName;
   },
-  // this.load({ id }) returns ModuleInfo { id, code, importedIds } (or null). Reads
-  // + compiles the module through Rust, then caches it for getModuleInfo.
   async load(options) {
     const id = typeof options === "string" ? options : options.id;
     const info = await ctxRpc("moduleInfo", [id]);
@@ -225,30 +168,20 @@ const ctx = {
     }
     return info;
   },
-  // this.getModuleInfo(id) returns cached ModuleInfo | null. Synchronous (Rollup
-  // shape): only modules previously this.load-ed are present.
   getModuleInfo(id) {
     return moduleInfoCache.get(typeof id === "string" ? id : id.id) ?? null;
   },
-  // this.addWatchFile(id): watch an extra file; a change forces a dev reload.
-  // Also record it in the current transform's bucket (if any) for per-module
-  // caching, so the watch survives a warm-cache restart.
   addWatchFile(id) {
     if (!id) return;
     watchedFiles.add(String(id));
     const bucket = transformWatchStore.getStore();
     if (bucket) bucket.add(String(id));
   },
-  // this.getModuleIds() returns an iterator over observed module ids (Rollup shape).
   getModuleIds() {
     return seenIds.values();
   },
 };
 
-// config() / configResolved() handshake, once at startup. Each plugin's
-// config(config, env) may return a partial that is deep-merged into the
-// resolved config; then every plugin's configResolved(finalConfig) runs so it
-// can capture what it needs for later hooks.
 function deepMerge(a, b) {
   if (Array.isArray(a) && Array.isArray(b)) return [...a, ...b];
   if (a && b && typeof a === "object" && typeof b === "object") {
@@ -273,22 +206,15 @@ async function runConfigHooks() {
 }
 await runConfigHooks();
 
-// configureServer: plugins add dev-server middleware (Connect-style
-// `(req, res, next)`). oj forwards requests it can't serve to this middleware
-// HTTP server (see getMiddlewarePort); a middleware that calls next() past the
-// end falls through (x-oj-fallthrough header) so oj resumes its own handling.
 let middlewarePort = null;
 async function setupConfigureServer() {
-  const stack = []; // { path, fn }
+  const stack = [];
   const middlewares = {
     use(a, b) {
       if (typeof a === "function") stack.push({ path: null, fn: a });
       else stack.push({ path: a, fn: b });
     },
   };
-  // A minimal Vite ViteDevServer shim: enough for middleware-registering
-  // plugins. Deep APIs (moduleGraph/ssrLoadModule/ws.send/watcher) are stubbed
-  // so plugins that merely reference them in configureServer don't crash.
   const noop = () => {};
   const server = {
     config: initial.config ?? {},
@@ -308,7 +234,7 @@ async function setupConfigureServer() {
     const r = await p.configureServer(server);
     if (typeof r === "function") post.push(r);
   }
-  for (const fn of post) await fn(); // post hooks run after "internal" middleware
+  for (const fn of post) await fn();
   if (stack.length === 0) return;
 
   const srv = http.createServer((req, res) => {
@@ -328,7 +254,6 @@ async function setupConfigureServer() {
           return next(e);
         }
       }
-      // Nothing handled it: tell oj to resume its own routing.
       res.setHeader("x-oj-fallthrough", "1");
       res.statusCode = 404;
       res.end();
@@ -339,14 +264,8 @@ async function setupConfigureServer() {
   middlewarePort = srv.address().port;
   process.stderr.write(`${OJ} plugin host: configureServer middleware on :${middlewarePort}\n`);
 }
-// configureServer is a dev-server hook (Vite runs it only in dev). Skipping it
-// in `build` also avoids leaving an http.Server that keeps this process alive.
 if (env.command !== "build") await setupConfigureServer();
 
-// transform chains through all plugins (Rollup semantics). Returns a JSON
-// envelope { code, watchFiles }: the final code plus the files this module's
-// hooks registered via this.addWatchFile, so oj can cache + re-apply the watch
-// on a warm-cache serve (where transform does not re-run).
 async function transform(code, id) {
   const bucket = new Set();
   return transformWatchStore.run(bucket, async () => {
@@ -358,8 +277,6 @@ async function transform(code, id) {
       if (r == null) continue;
       current = typeof r === "string" ? r : (r.code ?? current);
     }
-    // moduleParsed: the module has been transformed. Fire with a minimal
-    // ModuleInfo (id + final code); getModuleInfo caches it for later lookup.
     const info = { id, code: current, importedIds: [] };
     moduleInfoCache.set(id, info);
     seenIds.add(id);
@@ -370,9 +287,6 @@ async function transform(code, id) {
   });
 }
 
-// Replay `moduleParsed` for a module served from oj's warm cache (transform did
-// not re-run). Fires with a minimal ModuleInfo so graph-tracking plugins see
-// the module. Only invoked by oj when a plugin actually defines the hook.
 async function replayModuleParsed(id) {
   if (id) seenIds.add(id);
   const info = moduleInfoCache.get(id) ?? { id, code: "", importedIds: [] };
@@ -385,7 +299,6 @@ async function replayModuleParsed(id) {
 
 const anyModuleParsed = () => plugins.some((p) => typeof p.moduleParsed === "function");
 
-// watchChange: a watched file changed (dev). Fire each plugin's hook.
 async function watchChange(id, event) {
   for (const p of plugins) {
     if (typeof p.watchChange === "function") await p.watchChange.call(ctx, id, { event });
@@ -393,7 +306,6 @@ async function watchChange(id, event) {
   return null;
 }
 
-// resolveId / load are first-non-null-wins.
 async function resolveId(source, importer) {
   for (const p of plugins) {
     if (typeof p.resolveId !== "function") continue;
@@ -414,9 +326,6 @@ async function load(id) {
   return null;
 }
 
-// handleHotUpdate: plugins customize HMR for a changed file. oj's simplified
-// contract: return "full-reload" to force a reload, [] to suppress HMR, or
-// undefined to let default HMR proceed. First decisive result wins.
 async function handleHotUpdate(file, timestamp) {
   let suppress = false;
   for (const p of plugins) {
@@ -428,7 +337,6 @@ async function handleHotUpdate(file, timestamp) {
   return suppress ? "skip" : null;
 }
 
-// Render a Vite tag descriptor { tag, attrs, children } to HTML.
 function renderTag(t) {
   const attrs = Object.entries(t.attrs ?? {})
     .map(([k, v]) => (v === true ? ` ${k}` : v === false || v == null ? "" : ` ${k}="${String(v)}"`))
@@ -454,8 +362,6 @@ function injectTags(html, tags) {
   return html;
 }
 
-// transformIndexHtml: each plugin may return a new HTML string, an array of tag
-// descriptors to inject, or { html, tags }. Chained across plugins.
 async function transformIndexHtml(html) {
   let current = html;
   for (const p of plugins) {
@@ -474,8 +380,6 @@ async function transformIndexHtml(html) {
   return current;
 }
 
-// buildStart / buildEnd: side-effect lifecycle hooks run once per build in
-// declaration order. No return value (like Rollup); errors propagate.
 async function runLifecycle(hook) {
   for (const p of plugins) {
     if (typeof p[hook] === "function") await p[hook].call(ctx);
@@ -483,10 +387,6 @@ async function runLifecycle(hook) {
   return null;
 }
 
-// generateBundle: hand the output bundle (fileName to chunk|asset) to each
-// plugin's generateBundle(outputOptions, bundle, isWrite). Plugins may read it,
-// mutate chunk.code / asset.source, or this.emitFile new assets. Returns the
-// possibly-mutated bundle as JSON.
 async function generateBundle(bundleJson, isWrite) {
   const bundle = JSON.parse(bundleJson || "{}");
   const outputOptions = environment.config?.build ?? {};
@@ -498,8 +398,6 @@ async function generateBundle(bundleJson, isWrite) {
   return JSON.stringify(bundle);
 }
 
-// renderChunk: chain the plugins' renderChunk(code, chunk) over one chunk's
-// code (Rollup semantics). Each may return a string, { code }, or null.
 async function renderChunk(code, chunkJson) {
   const chunk = JSON.parse(chunkJson || "{}");
   let current = code;
@@ -513,8 +411,6 @@ async function renderChunk(code, chunkJson) {
   return current;
 }
 
-// writeBundle: post-write side-effect hook. Files are already on disk, so this
-// is read-only (mutations are not written back).
 async function writeBundle(bundleJson, isWrite) {
   const bundle = JSON.parse(bundleJson || "{}");
   const outputOptions = environment.config?.build ?? {};
@@ -536,14 +432,10 @@ async function run(hook, args) {
     return runLifecycle(hook);
   }
   if (hook === "watchChange") return watchChange(args[0], args[1]);
-  // Assets emitted via this.emitFile, as a JSON string for the Rust build.
   if (hook === "getEmittedFiles") {
     return JSON.stringify(emitted.map(({ fileName, source }) => ({ fileName, source })));
   }
-  // Files registered via this.addWatchFile, for the dev watcher.
   if (hook === "getWatchFiles") return JSON.stringify([...watchedFiles]);
-  // Whether any plugin defines moduleParsed: oj only pays the per-module replay
-  // cost on a warm cache when a plugin actually observes the graph.
   if (hook === "hasModuleParsed") return String(anyModuleParsed());
   if (hook === "replayModuleParsed") return replayModuleParsed(args[0]);
   if (hook === "hasGenerateBundle") {
@@ -558,7 +450,6 @@ async function run(hook, args) {
     return String(plugins.some((p) => typeof (p.writeBundle?.handler ?? p.writeBundle) === "function"));
   }
   if (hook === "writeBundle") return writeBundle(args[0], args[1] === "true");
-  // The configureServer middleware port (null if no plugin added middleware).
   if (hook === "getMiddlewarePort") return middlewarePort == null ? null : String(middlewarePort);
   return null;
 }
@@ -571,7 +462,6 @@ rl.on("line", async (line) => {
   } catch {
     return;
   }
-  // A reply to a this.resolve (or other ctx) reverse-RPC sent earlier.
   if (msg.rpcReply != null) {
     const p = rpcPending.get(msg.rpcReply);
     if (p) {

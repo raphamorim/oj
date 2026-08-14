@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Unit tests for resolve-pkg.mjs: viteEnvDefine (import.meta.env) and the
-// pnpm-strict-aware makeResolver (resolve a transitive dep through a direct-dep
-// anchor).
+
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
@@ -55,13 +53,10 @@ test("makeResolver reaches a transitive dep through a direct-dep anchor", () => 
   const root = mkdtempSync(join(tmpdir(), "oj-resolve-anchor-"));
   try {
     writeFileSync(join(root, "package.json"), '{"name":"app"}');
-    // `anchor` is at the app root; `dep` is only under anchor (pnpm-strict style)
     pkg(join(root, "node_modules", "anchor"), "anchor");
     pkg(join(root, "node_modules", "anchor", "node_modules", "dep"), "dep");
     const resolve = makeResolver(root);
-    // not reachable directly...
     assert.throws(() => resolve("dep"));
-    // ...but reachable via the anchor
     assert.match(resolve("dep", ["anchor"]), /anchor[/\\]node_modules[/\\]dep[/\\]index\.js$/);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -93,7 +88,6 @@ test("importPkg imports a CJS package and unwraps module.exports", async () => {
       "package.json": '{"name":"cjspkg","main":"index.js"}',
       "index.js": 'module.exports = { version: "1.0", build: () => "built" };',
     });
-    // the `default` (CJS module.exports) is unwrapped so callers get the object
     const mod = await importPkg(root, "cjspkg");
     assert.equal(mod.version, "1.0");
     assert.equal(typeof mod.build, "function");
@@ -109,7 +103,6 @@ test("importPkg imports an ESM package and returns its namespace", async () => {
     writeFileSync(join(root, "package.json"), '{"name":"app"}');
     writePkg(root, "esmpkg", {
       "package.json": '{"name":"esmpkg","main":"index.mjs"}',
-      // no default export, so importPkg returns the module namespace
       "index.mjs": 'export const value = 42; export function greet() { return "hi"; }',
     });
     const mod = await importPkg(root, "esmpkg");
@@ -129,7 +122,6 @@ test("importPkg reaches a transitive dep through a preferred anchor", async () =
       "package.json": '{"name":"dep","main":"index.js"}',
       "index.js": 'module.exports = { ok: true };',
     });
-    // not a direct dep of the app; only reachable via the anchor
     const mod = await importPkg(root, "dep", ["anchor"]);
     assert.equal(mod.ok, true);
   } finally {

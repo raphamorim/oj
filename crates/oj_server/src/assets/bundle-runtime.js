@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// oj bundle-mode runtime: module registry, require, Fast Refresh wiring,
-// HMR patches, CSS swap, error overlay. Loaded as the first module script;
-// the chunk (plain registrations) executes after it.
 import * as RefreshRuntime from "/@oj/refresh-runtime.js";
 
 RefreshRuntime.injectIntoGlobalHook(window);
@@ -14,10 +11,9 @@ window.global ??= window;
 window.setImmediate ??= (fn, ...args) => setTimeout(fn, 0, ...args);
 window.clearImmediate ??= (id) => clearTimeout(id);
 
-
-const registry = new Map(); // url -> { kind, deps, factory }
-const instances = new Map(); // url -> { module, exports, ns }
-let socket = null; // set by connect(); used to escalate hot.invalidate
+const registry = new Map();
+const instances = new Map();
+let socket = null;
 
 window.__oj_register = (url, kind, deps, factory) => {
   registry.set(url, { kind, deps: deps || {}, factory });
@@ -28,7 +24,7 @@ function instantiate(url) {
   if (!reg) throw new Error(`[oj] module not registered: ${url}`);
   const module = { exports: {}, hot: makeHot(url) };
   const record = { module, exports: module.exports, ns: null };
-  instances.set(url, record); // set before exec: cycles see partial exports
+  instances.set(url, record);
 
   const localRequire = (spec) => {
     const target = reg.deps[spec] ?? spec;
@@ -45,7 +41,7 @@ function instantiate(url) {
   try {
     if (reg.kind === "cjs") {
       reg.factory.call(module.exports, module, module.exports, localRequire);
-      record.exports = module.exports; // may have been reassigned
+      record.exports = module.exports;
     } else {
       reg.factory.call(undefined, module, module.exports, localRequire);
     }
@@ -64,7 +60,6 @@ function instantiate(url) {
 function requireRaw(url, importerKind) {
   const record = instances.get(url) ?? instantiate(url);
   const target = registry.get(url);
-  // ESM importer of a CJS module sees a namespace with a fixed default.
   if (importerKind === "esm" && target && target.kind === "cjs") {
     if (!record.ns) record.ns = cjsNamespace(record);
     return record.ns;
@@ -88,7 +83,6 @@ function cjsNamespace(record) {
   return ns;
 }
 
-// Factory-side helpers (referenced by compiled ESM factories).
 window.__oj_esm = (exports, getters) => {
   Object.defineProperty(exports, "__esModule", { value: true });
   for (const name of Object.keys(getters)) {
@@ -103,11 +97,6 @@ window.__oj_export_star = (from, exports) => {
   }
 };
 
-// Lazy compilation: a dynamic `import()` compiled in bundle mode calls this
-// instead of a native import. If the target isn't registered yet, fetch its
-// subtree chunk — passing the ids this client already holds so shared deps
-// (React, etc.) are not re-shipped — which registers the factories into this
-// same registry, then instantiate and return the module namespace.
 window.__oj_import_lazy = async (url) => {
   const clean = url.split("?")[0];
   if (!registry.has(clean)) {
@@ -138,24 +127,17 @@ window.__oj_start = (entry) => {
   }
 };
 
-// --- HMR ------------------------------------------------------------------
-
 function makeHot(url) {
   return {
     data: {},
-    accept() {}, // registry-mode acceptance is driven by the server plan
+    accept() {},
     dispose() {},
-    // A rejected boundary escalates to its importers on the server (a patch
-    // that re-executes them with the already-registered factory), instead of a
-    // full reload; only fall back to reload if the socket is gone.
     invalidate() {
       escalateInvalidate(url);
     },
   };
 }
 
-// Ask the server to re-plan from `url`'s importers. Falls back to a reload only
-// when the socket is unavailable.
 function escalateInvalidate(url) {
   if (socket && socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify({ type: "invalidate", path: url }));
@@ -167,8 +149,6 @@ function escalateInvalidate(url) {
 let lastPatchSeq = 0;
 
 async function applyPatch(msg) {
-  // Sequence-gap detection: a dropped patch (backgrounded tab, WS reconnect)
-  // would leave the module graph diverged, so reload instead of applying.
   if (typeof msg.seq === "number") {
     if (lastPatchSeq !== 0 && msg.seq !== lastPatchSeq + 1) {
       console.warn(`[oj] patch gap (${lastPatchSeq} -> ${msg.seq}), reloading`);
@@ -183,13 +163,10 @@ async function applyPatch(msg) {
     if (record) prevExports.set(boundary, record.exports);
   }
   try {
-    // The patch module re-registers changed factories.
     await import(`/@oj/patch.js?m=${encodeURIComponent(msg.changed.join(","))}&t=${msg.timestamp}`);
     for (const url of msg.dirty) instances.delete(url);
     for (const boundary of msg.boundaries) {
       const next = requireRaw(boundary, "esm");
-      // CSS boundaries: re-execution already swapped the style tag; their
-      // exports are class maps, not components — never refresh-validate.
       if (boundary.split("?")[0].endsWith(".css")) continue;
       const prev = prevExports.get(boundary);
       if (prev) {
@@ -204,10 +181,6 @@ async function applyPatch(msg) {
           return;
         }
       } else {
-        // The boundary's instance was already discarded by a prior patch (an
-        // escalated `invalidate`): there is no previous export shape to validate
-        // against, but it just re-instantiated fresh, so schedule a refresh to
-        // let React swap in the new component families.
         RefreshRuntime.enqueueUpdate();
       }
     }
@@ -217,9 +190,6 @@ async function applyPatch(msg) {
     showOverlay(`patch failed\n\n${err && err.stack ? err.stack : err}`);
   }
 }
-
-// --- css + overlay + ws (mirrors client.js; kept separate on purpose — the
-// unbundled client carries import.meta.hot machinery this mode replaces) ---
 
 function swapCss(update) {
   const links = [...document.querySelectorAll("link[rel=stylesheet]")];

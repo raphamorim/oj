@@ -144,7 +144,7 @@ fn classify(req: &Request, proxy_prefixes: &[String]) -> Route {
         return Route::Pass;
     }
     if path.rsplit('/').next().is_some_and(|seg| seg.contains('.')) {
-        return Route::Pass; // file extension: asset
+        return Route::Pass;
     }
     if proxy_prefixes.iter().any(|p| path.starts_with(p.as_str())) {
         return Route::Pass;
@@ -223,8 +223,6 @@ async fn render_route(state: &SsrState, path: &str) -> Response {
         let head = page_head(&data_json, &head_html);
         let tail = page_tail(state);
         tokio::spawn(async move {
-            // hold the runner lock for the whole stream
-            // i need to revisit this
             let mut guard = guard;
             let _ = tx.send(Ok(Bytes::from(head))).await;
             let _ = tx.send(Ok(Bytes::from(first_chunk))).await;
@@ -238,7 +236,6 @@ async fn render_route(state: &SsrState, path: &str) -> Response {
                         let _ = tx.send(Ok(Bytes::from(format!("<pre>[oj ssr] {msg}</pre>")))).await;
                         break;
                     }
-                    // {end} or anything else closes the stream
                     _ => break,
                 }
             }

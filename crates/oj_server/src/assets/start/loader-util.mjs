@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Pure resolution/interop helpers for the SSR loader (loader.mjs). Split out so
-// they can be unit-tested without triggering loader.mjs's import-time bootstrap
-// (which loads the app's esbuild and plugin container). Nothing here depends on
-// the app root or any module-level state beyond a per-process pkg-type cache.
+
 import { readFileSync, statSync } from "node:fs";
 import { resolve as pathResolve, dirname } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -17,8 +14,6 @@ export const isFile = (p) => {
   try { return statSync(p).isFile(); } catch { return false; }
 };
 
-// TS/bundler convention: source imports carry a `.js`/`.jsx`/`.mjs` extension
-// but the file on disk is the TS equivalent.
 export const JS_TO_TS = { ".js": [".ts", ".tsx"], ".jsx": [".tsx"], ".mjs": [".mts"], ".cjs": [".cts"] };
 
 export function probe(base) {
@@ -33,12 +28,6 @@ export function probe(base) {
   return null;
 }
 
-// CJS -> ESM interop. Node builds named exports for a required CJS module with
-// cjs-module-lexer, which misses exports it can't statically see (e.g.
-// `module.exports = {...}`), so `import { x } from "cjs-pkg"` throws. Facade the
-// module instead: require() it at load time and re-export its ACTUAL runtime
-// keys -- strictly more complete than any static analysis, and it fixes every
-// import shape (default, named, namespace) at once.
 export const RESERVED = new Set(
   ("break case catch class const continue debugger default delete do else enum export extends false finally " +
     "for function if import in instanceof new null return super switch this throw true try typeof var void " +
@@ -63,10 +52,6 @@ export function nearestPkgType(startDir) {
   return type;
 }
 
-// A `.js` file is CJS only if its package isn't type:module AND it has no ESM
-// syntax -- Node 22 detects ESM syntax in a type-less .js and loads it as ESM
-// (dual packages ship `export`-using `.js` behind the `import` condition), so
-// faceting those with require() would throw ERR_REQUIRE_CYCLE_MODULE.
 export function hasEsmSyntax(path) {
   try {
     const s = readFileSync(path, "utf8");
@@ -98,8 +83,6 @@ export function cjsFacade(path) {
   ].join("\n");
 }
 
-// Strip // and /* */ comments only outside strings, so comment syntax inside
-// glob patterns (e.g. "./shared/*") survives, then drop trailing commas.
 export function stripJsonc(s) {
   let out = "", i = 0, inStr = false, q = "";
   while (i < s.length) {
@@ -126,9 +109,6 @@ export function readJsonc(file) {
   }
 }
 
-// Flatten a package.json "imports" map into [pattern, target] string pairs.
-// A target may be a string or a conditional object; take the import/default/node
-// condition, in that order, and drop entries with no string target.
 export function parseImportsField(imports = {}) {
   return Object.entries(imports)
     .map(([pattern, target]) => [
@@ -138,11 +118,6 @@ export function parseImportsField(imports = {}) {
     .filter(([, t]) => typeof t === "string");
 }
 
-// Merge a resolved tsconfig `extends` chain (base first) into the `paths` rules
-// and the effective `baseDir`. Each entry is { cfg, dir }. Later configs
-// override earlier `paths`; `baseUrl` resolves against its own config's dir,
-// and with no baseUrl the base dir is that config's own dir. Path targets are
-// normalized to arrays.
 export function mergeTsConfig(chain, fallbackBaseDir) {
   let paths = {}, baseDir = fallbackBaseDir;
   for (const { cfg, dir } of chain) {
@@ -153,11 +128,6 @@ export function mergeTsConfig(chain, fallbackBaseDir) {
   return { rules: Object.entries(paths).map(([k, v]) => [k, Array.isArray(v) ? v : [v]]), baseDir };
 }
 
-// Match a single-`*` alias pattern (a tsconfig `paths` key or a package.json
-// `imports` subpath) against a specifier and return the target with `*` filled
-// in, or null when it does not match. A pattern without `*` matches only an
-// exact specifier. Mirrors how esbuild and Node substitute these aliases so the
-// SSR loader resolves the same ids the bundler does.
 export function substituteAlias(pattern, target, spec) {
   if (pattern.includes("*")) {
     const [pre, post = ""] = pattern.split("*");
@@ -167,16 +137,6 @@ export function substituteAlias(pattern, target, spec) {
   return spec === pattern ? target : null;
 }
 
-// createServerFn provider transform (server side). A bare `.handler(fn)` leaves
-// the runtime's `extractedFn` returning the raw value, but it expects
-// `{ result }`. Rewrite each top-level `const NAME = createServerFn(...).handler(FN)`
-// to the provider shape so `NAME()` runs the handler in-process during SSR:
-//   export const NAME_createServerFn_handler = createServerRpc({id,name,filename},
-//     (opts) => NAME.__executeServer(opts));
-//   const NAME = createServerFn(...).handler(NAME_createServerFn_handler, FN);
-// `rel` is the app-relative module path; it seeds the base64url handler id the
-// server-fn resolver dispatches on. Returns the code unchanged when there is no
-// createServerFn to rewrite.
 export function rewriteServerFns(code, rel) {
   if (!code.includes("createServerFn")) return code;
   const re =
@@ -186,7 +146,6 @@ export function rewriteServerFns(code, rel) {
     changed = true;
     const id = JSON.stringify(Buffer.from(`${rel}#${name}`).toString("base64url"));
     const meta = `{ id: ${id}, name: ${JSON.stringify(name)}, filename: ${JSON.stringify(rel)} }`;
-    // Exported so the server-fn resolver can import it for HTTP dispatch.
     const rpc =
       `${indent}export const ${name}_createServerFn_handler = createServerRpc(${meta}, ` +
       `(opts) => ${name}.__executeServer(opts));\n`;

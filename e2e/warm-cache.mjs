@@ -1,17 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// Warm-cache regression for plugin transform-time side effects.
-//
-// oj's content-addressed cache serves a module without re-running the plugin
-// `transform` hook on a cache hit. Side effects that hook performs therefore
-// have to be replayed from cache metadata on a warm-cache serve, exactly like
-// graph edges and /@fs allowances already are -- otherwise they silently
-// vanish after the first `oj dev` run. This restarts the dev server against a
-// WARM playground/.oj-cache with a fresh plugin host and asserts:
-//   - moduleParsed still records App.tsx (replayed for graph-observing plugins)
-//   - this.addWatchFile still forces a full reload on the watched .txt file
-// Both broke on the second run onward before the replay/re-apply fix.
 import { spawn, execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -30,7 +19,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function killPort() {
   try {
     execSync(`lsof -ti:${PORT} -sTCP:LISTEN | xargs kill`, { shell: "/bin/bash", stdio: "ignore" });
-  } catch {} // nothing listening
+  } catch {}
 }
 function start() {
   killPort();
@@ -52,8 +41,6 @@ function fail(msg) {
   process.exit(1);
 }
 
-// 1) COLD: clear the cache, boot, load "/", confirm the transform ran and
-// moduleParsed recorded App.tsx (baseline the warm run must match).
 fs.rmSync(path.join(playground, ".oj-cache"), { recursive: true, force: true });
 let srv = start();
 try {
@@ -66,23 +53,17 @@ try {
 }
 await sleep(500);
 
-// 2) WARM: reboot against the populated cache with a fresh (empty) plugin host.
 srv = start();
 try {
   await up();
   await fetch(`http://localhost:${PORT}/`);
   await sleep(800);
 
-  // moduleParsed replay: App.tsx is a cache hit (transform did not re-run), yet
-  // the graph-observing plugin must still see it.
   if (!(await parsedModules()).includes("App.tsx")) {
     fail("warm: moduleParsed did not replay App.tsx (transform side effect lost on cache hit)");
   }
   console.log("warm-cache: moduleParsed replayed for cache-hit App.tsx");
 
-  // addWatchFile re-apply: editing the plugin-watched .txt must force a full
-  // reload even though App.tsx's transform (which registered the watch) was a
-  // cache hit. Observe the reload over the HMR WebSocket.
   const original = fs.readFileSync(WATCHED, "utf8");
   const ws = new WebSocket(`ws://localhost:${PORT}/__ws`);
   const gotReload = new Promise((resolve) => {

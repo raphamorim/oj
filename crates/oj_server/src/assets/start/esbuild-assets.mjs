@@ -1,32 +1,13 @@
 // SPDX-License-Identifier: MIT
-// Shared esbuild building blocks for the TanStack Start adapter, used by both
-// the dev client bundle and the prod build so the two stay in lockstep:
-//   - assetsPlugin: Vite-style ?url / ?raw / ?inline / bare-asset / css imports
-//   - makeVitePlugins: routes virtual: ids, .mdx, and .svg through the app's
-//     vite plugin container (svgr, mdx, virtual modules)
-//   - nodeBuiltinShims: browser shims for node: (and bare) builtins
-//   - pnpmStorePaths / contentHashEmitter: pnpm phantom-dep resolution + a
-//     content-addressed asset emitter (client and server emit matching URLs
-//     with no shared manifest, since the URL is a hash of the bytes)
-// In dev, asset URLs point at the server's /@oj-start/fs route; in prod they are
-// emitted into dist/client/assets and referenced by hash.
+
 import { readFileSync, readdirSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, dirname, extname, basename, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { emptyVirtualStub } from "./resolve-pkg.mjs";
 
 const SUFFIX = /\?(raw|url|inline)$/;
-// Bare asset imports (Vite treats these as a URL by default, e.g. `import logo
-// from "./logo.png"`). `.svg` is excluded: svgr (a vite plugin) may turn it
-// into a React component, so it is routed through the plugin container with a
-// URL fallback for svgs svgr doesn't claim.
 const ASSET_EXT = /\.(png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|eot|mp4|webm|wasm)$/;
 
-// dev: the file is streamed by the server's /@oj-start/fs route (relative url()
-// refs resolve against the same dir). prod: the file is emitted into
-// dist/client/assets under a content hash and referenced absolutely.
-// Async because the prod emitter may compile the asset (Tailwind css). In dev
-// it resolves immediately to the /@oj-start/fs URL.
 const makeUrlFor = ({ mode, fsBase, emit }) => async (abs) => (mode === "dev" ? fsBase + abs : emit(abs));
 
 export function assetsPlugin({ mode = "dev", server = false, fsBase = "/@oj-start/fs", emit, cssUrls } = {}) {
@@ -35,9 +16,6 @@ export function assetsPlugin({ mode = "dev", server = false, fsBase = "/@oj-star
   return {
     name: "oj-assets",
     setup(build) {
-      // Route a specifier through esbuild's own resolver (so aliases, package
-      // `imports`, and node_modules all work), then park it in our namespace.
-      // pluginData guards the re-entrant resolve against infinite recursion.
       const route = (namespace) => async (args) => {
         if (args.pluginData?.ojAsset) return undefined;
         const clean = args.path.replace(SUFFIX, "");
@@ -73,12 +51,7 @@ export function assetsPlugin({ mode = "dev", server = false, fsBase = "/@oj-star
       }));
 
       build.onLoad({ filter: /.*/, namespace: "oj-css" }, async (a) => {
-        // Styling is a client concern; on the server a css import is a no-op.
         if (server) return { contents: "export default {};", loader: "js" };
-        // Emit / resolve the stylesheet and record its url (prod also records it
-        // on the emitter). The SSR head links it via the manifest, so the client
-        // import stays a no-op in both dev and prod: no runtime <link> injection,
-        // no flash, and no dependency on hydration succeeding.
         const href = await urlFor(a.path);
         if (cssUrls && !cssUrls.includes(href)) cssUrls.push(href);
         return { contents: "export default {};", loader: "js" };
@@ -87,12 +60,6 @@ export function assetsPlugin({ mode = "dev", server = false, fsBase = "/@oj-star
   };
 }
 
-// Route virtual: ids, .mdx, and .svg through the app's vite plugin container.
-// `.svg` is svgr (a component) when the container claims it, else an asset URL.
-// `fallback` is a second container consulted when the primary can't `load` a
-// virtual: the ssr build's plugins sometimes error expecting cross-environment
-// state (Vite builds client first and shares it), so the client container's
-// output is used instead.
 export function makeVitePlugins({ container, fallback, appRoot, mode = "dev", fsBase = "/@oj-start/fs", emit } = {}) {
   const urlFor = makeUrlFor({ mode, fsBase, emit });
   return {
@@ -105,13 +72,7 @@ export function makeVitePlugins({ container, fallback, appRoot, mode = "dev", fs
         }
         return { contents: `export default ${JSON.stringify(await urlFor(path))};`, loader: "js" };
       };
-      // Bare `.svg` in the default (file) namespace. Registered unconditionally
-      // so .svg always has a loader. The explicit namespace keeps it from also
-      // claiming the ?react-tagged files parked in the oj-svg-react namespace.
       build.onLoad({ filter: /\.svg$/, namespace: "file" }, (args) => svgModule(args.path, args.path));
-      // svgr's explicit-component query `foo.svg?react`: esbuild's resolver
-      // can't find the queried path, so strip the query, resolve the real .svg,
-      // and hand the ?react id to the container so svgr emits a component.
       build.onResolve({ filter: /\.svg\?react$/ }, async (args) => {
         if (args.pluginData?.ojSvg) return undefined;
         const r = await build.resolve(args.path.slice(0, -"?react".length), {
@@ -124,7 +85,7 @@ export function makeVitePlugins({ container, fallback, appRoot, mode = "dev", fs
         svgModule(args.path, args.path + "?react"),
       );
       if (!container) return;
-      const warnedVirtual = new Set(); // dedupe empty-virtual warnings per build
+      const warnedVirtual = new Set();
       const resolveVirtual = async (args) => {
         const rid = await container.resolveId(args.path, args.importer);
         return rid ? { path: rid, namespace: "oj-vite-virtual" } : undefined;
@@ -135,11 +96,6 @@ export function makeVitePlugins({ container, fallback, appRoot, mode = "dev", fs
         let code = await container.load(args.path);
         if (code == null && fallback) code = await fallback.load(args.path);
         if (code == null) {
-          // A plugin claimed this virtual id (its resolveId matched) but its
-          // load produced nothing in oj's minimal bridge — typically a virtual
-          // built from the full bundler module graph (chunk preloads, asset
-          // manifests) that oj does not run in dev. Emit an empty module so the
-          // dev bundle still builds instead of hard-failing, and warn once.
           if (!warnedVirtual.has(args.path)) {
             warnedVirtual.add(args.path);
             process.stderr.write(
@@ -147,9 +103,6 @@ export function makeVitePlugins({ container, fallback, appRoot, mode = "dev", fs
                 `emitting an empty module. This virtual likely needs the full build graph oj does not run in dev.\n`,
             );
           }
-          // Stub that exports the exact names the app imports from this virtual
-          // (as undefined), so both esbuild here and Node's strict ESM loader on
-          // the SSR side satisfy `import { x } from "<virtual>"` without error.
           return { contents: emptyVirtualStub(appRoot, args.path), loader: "js", resolveDir: appRoot };
         }
         return { contents: code, loader: "js", resolveDir: appRoot };
@@ -162,11 +115,6 @@ export function makeVitePlugins({ container, fallback, appRoot, mode = "dev", fs
   };
 }
 
-// Node builtins reach the browser bundle `node:`-prefixed and bare (`import
-// "url"` in older deps). SSR-only framework code (stream rendering) can land in
-// the client graph and named-import from them, so a few need real named exports
-// (browser globals where they exist; inert stubs otherwise -- that code is not
-// reached client-side). async_hooks gets a working synchronous AsyncLocalStorage.
 const ALS =
   "export class AsyncLocalStorage{getStore(){return this._s}" +
   "run(s,cb,...a){const p=this._s;this._s=s;try{return cb(...a)}finally{this._s=p}}" +
@@ -205,10 +153,6 @@ export const nodeBuiltinShims = {
   },
 };
 
-// Resolve phantom dependencies (a package importing something it doesn't
-// declare, e.g. @babel/runtime helpers) by giving esbuild pnpm's virtual store
-// as NODE_PATH-style fallback dirs. esbuild consults `nodePaths` only when
-// normal resolution fails, natively, with no per-import JS cost.
 export function pnpmStorePaths(workspaceRoot) {
   const paths = [];
   const pnpmDir = join(workspaceRoot, "node_modules/.pnpm");
@@ -221,7 +165,6 @@ export function pnpmStorePaths(workspaceRoot) {
   return paths;
 }
 
-// Farthest ancestor with a node_modules (the pnpm/workspace root).
 export function workspaceRoot(app) {
   let best = app;
   for (let cur = app; ; ) {
@@ -233,20 +176,10 @@ export function workspaceRoot(app) {
   return best;
 }
 
-// A content-addressed asset emitter: copies a file into `${clientDir}/assets`
-// under a name that includes an 8-char hash of its bytes and returns the
-// absolute URL. Client and server builds independently produce identical URLs
-// for identical bytes, so no shared manifest is needed. CSS is special-cased:
-// Tailwind/PostCSS stylesheets are compiled first (via `compileCss`), then their
-// relative url() references (fonts, images) are emitted too and rewritten to the
-// hashed URLs, otherwise they'd 404 (the flat /assets layout doesn't preserve
-// the source's relative directory structure). Async because compilation is.
 export function contentHashEmitter(clientDir, compileCss) {
   const assetsDir = join(clientDir, "assets");
   const seen = new Set();
   const emitting = new Set();
-  // Top-level stylesheet urls, in emit order. The prod build feeds these into
-  // the manifest so the SSR head links them (no flash of unstyled content).
   const cssUrls = [];
 
   const write = (absPath, buf) => {
@@ -277,8 +210,6 @@ export function contentHashEmitter(clientDir, compileCss) {
     return write(absPath, readFileSync(absPath));
   }
 
-  // Rewrite url(...) references relative to the CSS file: emit each referenced
-  // asset and substitute its hashed URL. Skips data:, absolute, and rooted refs.
   async function rewriteCss(css, dir) {
     const re = /url\(\s*(['"]?)([^'")]+)\1\s*\)/g;
     let out = "", last = 0, m;
@@ -296,13 +227,10 @@ export function contentHashEmitter(clientDir, compileCss) {
     return out + css.slice(last);
   }
 
-  // The stylesheets emitted so far (top-level `.css` imports, not url() refs).
   emit.cssUrls = () => cssUrls.slice();
   return emit;
 }
 
-// A stylesheet needs Tailwind/PostCSS compilation (v4 `@import "tailwindcss"` or
-// the `@tailwind` / `@plugin` / `@apply` at-rules).
 export function needsCssCompile(src) {
   return src.includes("tailwindcss") || src.includes("@tailwind") || src.includes("@plugin") || src.includes("@apply");
 }

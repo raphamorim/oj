@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Unit tests for the import.meta.glob transform (crates/oj_server/src/assets/
-// start/glob-transform.mjs). Run with: node --test e2e/unit/
+
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
@@ -32,9 +31,7 @@ test("expands a lazy glob to a map of dynamic imports", () => {
     const out = transformGlob('const m = import.meta.glob("./content/*.md");', join(dir, "index.ts"));
     assert.match(out, /"\.\/content\/a\.md":\s*\(\)\s*=>\s*import\("\.\/content\/a\.md"\)/);
     assert.match(out, /"\.\/content\/b\.md":/);
-    // index.json is not matched by *.md
     assert.doesNotMatch(out, /index\.json/);
-    // the call is replaced, no literal import.meta.glob remains
     assert.doesNotMatch(out, /import\.meta\.glob/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -60,10 +57,8 @@ test("eager + query + import:default produces static imports of the ?query", () 
       'const s = import.meta.glob("./content/*.md", { eager: true, query: "?raw", import: "default" });',
       join(dir, "index.ts"),
     );
-    // eager -> static default imports carrying the ?raw query
     assert.match(out, /^import\s+\w+\s+from\s+"\.\/content\/a\.md\?raw";/m);
     assert.match(out, /^import\s+\w+\s+from\s+"\.\/content\/b\.md\?raw";/m);
-    // the map references the imported bindings, not import functions
     assert.doesNotMatch(out, /\(\)\s*=>\s*import/);
   } finally {
     rmSync(dir, { recursive: true, force: true });

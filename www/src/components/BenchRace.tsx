@@ -26,8 +26,8 @@ export function BenchRace() {
     const ink = col("--color-ink", "rgba(0,0,0,0.85)");
     const bg = col("--color-bg", "#ffffff");
     const line = col("--color-line", "#e5e5e5");
-    const accent = col("--color-accent", "#2a33d4"); // oj lane: cobalt
-    const vite = "#b6b4ae"; // vite lane: muted grey, so oj visibly wins on colour too
+    const accent = col("--color-accent", "#2a33d4");
+    const vite = "#b6b4ae";
     const faint = col("--color-faint", "rgba(0,0,0,0.35)");
     const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
@@ -44,14 +44,12 @@ export function BenchRace() {
       canvas.height = Math.floor(h * dpr);
     }
 
-    // draw one lane's pixelated wavefront filling to `p` (0..1)
     function lane(x: number, y: number, width: number, rows: number, p: number, color: string, done: boolean) {
       const cols = Math.floor(width / cell);
       const front = p * cols;
       for (let r = 0; r < rows; r++) {
         for (let c = 0; c < cols; c++) {
           const lit = c <= front;
-          // dithered leading edge for texture
           const edge = front - c;
           if (lit && edge < 2.2 && ((c * 7 + r * 13 + (front | 0) * 5) % 5 === 0)) continue;
           const px = Math.floor((x + c * cell) * dpr);
@@ -88,7 +86,6 @@ export function BenchRace() {
       const gap = 34;
       const topY = (h - (laneH * 2 + gap)) / 2;
 
-      // lane labels
       ctx.fillStyle = ink;
       ctx.font = `600 ${13 * dpr}px ${styles.getPropertyValue("--font-mono") || "monospace"}`;
       ctx.textBaseline = "middle";
@@ -99,11 +96,9 @@ export function BenchRace() {
       lane(trackX, topY, trackW, rows, ojP, accent, ojP >= 1);
       lane(trackX, topY + laneH + gap, trackW, rows, viteP, vite, viteP >= 1);
 
-      // finish line
       ctx.fillStyle = line;
       ctx.fillRect(Math.floor((trackX + trackW + 2) * dpr), Math.floor(topY * dpr), dpr, Math.ceil((laneH * 2 + gap) * dpr));
 
-      // advance to next metric after the slower lane finishes + hold
       if (!reduce && t > viteMs + HOLD) {
         metric = (metric + 1) % METRICS.length;
         runStart = now;

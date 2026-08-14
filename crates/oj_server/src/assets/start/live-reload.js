@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: MIT
-// Dev live-reload client. A reconnecting WebSocket reloads the page when the
-// server signals a rebuild. Before reloading it snapshots ephemeral client
-// state (form values, focus + caret, scroll) to sessionStorage and restores it
-// after the reload, so a warm rebuild doesn't lose the user's place. This adds
-// nothing to the server or the reload path: state lives in the browser only.
+
 (() => {
   const KEY = "oj:start:preserve:" + location.pathname;
   const FIELDS = "input, textarea, select";
 
-  // A key stable across a reload of the same render: prefer id, else a
-  // tag+nth-of-type DOM path (unique per control, distinguishes radio groups).
   function domPath(el) {
     const parts = [];
     while (el && el.nodeType === 1 && el !== document.body) {
@@ -42,9 +36,6 @@
     try { sessionStorage.setItem(KEY, JSON.stringify(data)); } catch {}
   }
 
-  // React drives controlled inputs, so set through the native value setter and
-  // dispatch input/change: that routes the value into React's onChange and it
-  // survives the component's next render.
   function setValue(el, v) {
     const proto =
       el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype
@@ -87,8 +78,6 @@
     try { data = JSON.parse(sessionStorage.getItem(KEY)); } catch {}
     if (!data) return;
     sessionStorage.removeItem(KEY);
-    // Re-apply across a few frames to win over React's hydration, which
-    // overwrites inputs shortly after load.
     let n = 0;
     const tick = () => { apply(data); if (++n < 4) setTimeout(tick, 60); };
     requestAnimationFrame(tick);

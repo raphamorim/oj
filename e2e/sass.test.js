@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// Sass import: ./theme.scss uses a variable + nesting to color the h1. Verify
-// the compiled rule applies (proves scss -> css -> injected stylesheet).
 const { chromium } = require("playwright");
 (async () => {
   const browser = await chromium.launch();

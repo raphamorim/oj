@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// Two consecutive hot edits: exercises sequential patch application (seq
-// N then N+1, no gap) and confirms React state survives BOTH, with the
-// heading reflecting each edit in turn.
 const { chromium } = require("playwright");
 const fs = require("fs");
 const path = require("path");
@@ -18,8 +15,6 @@ const APP = path.join(__dirname, "..", "playground", "src", "App.tsx");
   try {
     await page.goto("http://localhost:5199/", { waitUntil: "networkidle" });
     await page.waitForSelector("h1");
-    // Let any patch from a prior test's file-restore drain before we start,
-    // so our first edit's sequence number isn't preceded by a stale frame.
     await page.waitForTimeout(500);
     const btn = page.locator("button");
     await btn.click(); await btn.click();

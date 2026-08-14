@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-//! JSON module imports (Vite-compatible). `import data from './x.json'`:
-//! default export is the parsed value; top-level object keys that are valid
-//! JS identifiers also become named exports (`import { foo } from './x.json'`).
-//! Raw JSON text is itself a valid JS expression, so it is emitted directly.
-
 use crate::CompileError;
 
-/// Top-level object keys usable as `export const <name>` (valid identifiers,
-/// not reserved). Returns empty for non-objects.
 fn named_keys(value: &serde_json::Value) -> Vec<String> {
     let Some(obj) = value.as_object() else { return Vec::new() };
     obj.keys().filter(|k| is_safe_export_name(k)).cloned().collect()
@@ -37,7 +30,6 @@ fn parse(source: &str, url: &str) -> Result<serde_json::Value, CompileError> {
     })
 }
 
-/// Unbundled dev: a standalone ESM module.
 pub fn to_esm(source: &str, url: &str) -> Result<String, CompileError> {
     let value = parse(source, url)?;
     let raw = source.trim();
@@ -48,7 +40,6 @@ pub fn to_esm(source: &str, url: &str) -> Result<String, CompileError> {
     Ok(out)
 }
 
-/// Bundle mode: a registry-factory body (getters installed before the body).
 pub fn to_factory_body(source: &str, url: &str) -> Result<String, CompileError> {
     let value = parse(source, url)?;
     let raw = source.trim();
@@ -72,7 +63,6 @@ mod tests {
         assert!(out.contains("export default __oj_json"));
         assert!(out.contains(r#"export const name = __oj_json["name"]"#), "{out}");
         assert!(out.contains("export const version ="), "{out}");
-        // Non-identifier and reserved keys are not named exports.
         assert!(!out.contains("is-kebab ="), "kebab key must be skipped: {out}");
     }
 
@@ -110,7 +100,6 @@ mod tests {
             "/k.json",
         )
         .unwrap();
-        // default plus exactly the three valid identifiers
         assert_eq!(out.matches("export ").count(), 4, "only default + 3 valid keys: {out}");
         for ok in ["$ok", "_ok", "ok"] {
             assert!(out.contains(&format!("export const {ok} = __oj_json[")), "{ok} should export: {out}");
@@ -119,13 +108,11 @@ mod tests {
 
     #[test]
     fn nested_objects_and_scalars_export_only_default() {
-        // only the top-level key is a named export; inner keys never leak
         let nested = to_esm(r#"{"outer":{"inner":1}}"#, "/n.json").unwrap();
         assert!(nested.contains("export const outer ="), "{nested}");
         assert!(!nested.contains("export const inner ="), "nested keys must not leak: {nested}");
         assert_eq!(nested.matches("export ").count(), 2, "default + outer only: {nested}");
 
-        // scalar and null JSON have a default export and nothing else
         for (src, label) in [("\"hello\"", "string"), ("42", "number"), ("true", "bool"), ("null", "null")] {
             let out = to_esm(src, "/s.json").unwrap();
             assert_eq!(out.matches("export ").count(), 1, "{label} has only default: {out}");
@@ -138,7 +125,6 @@ mod tests {
         let out = to_factory_body(r#"{"ok":1,"bad-key":2,"default":3}"#, "/f.json").unwrap();
         assert!(out.contains(r#""ok": () => __oj_json["ok"]"#), "valid key getter: {out}");
         assert!(!out.contains(r#""bad-key": () =>"#), "invalid key gets no getter: {out}");
-        // the only `default` getter is the module default, not the JSON key
         assert_eq!(out.matches(r#""default": () =>"#).count(), 1, "one default getter: {out}");
     }
 
@@ -146,7 +132,6 @@ mod tests {
     fn raw_json_formatting_is_preserved() {
         let src = "{\n  \"a\": 1,\n  \"b\": 2\n}";
         let out = to_esm(src, "/fmt.json").unwrap();
-        // the parsed source is emitted verbatim (trimmed), not re-serialized
         assert!(out.contains(src), "raw formatting must be preserved: {out}");
     }
 }

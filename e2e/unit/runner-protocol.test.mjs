@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Integration test for the SSR runner protocol (runner.mjs). Spawns the real
-// runner as a child process, pointing its entry/loader at stubs (so no esbuild
-// bootstrap is needed), and drives the JSON-lines stdio protocol: render
-// round-trips, the Host-derived origin, warm reload, error framing, and the
-// stdout-diversion guard that keeps app logs from corrupting protocol frames.
+
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -18,8 +14,6 @@ const RUNNER = join(here, "..", "..", "crates", "oj_server", "src", "assets", "s
 
 const STUB_LOADER = "export async function initialize() {}\n";
 
-// A stub server entry: a fetch handler that echoes the request and exercises
-// custom status, headers, a thrown error, and app-stdout noise.
 const STUB_ENTRY = `
 export default {
   async fetch(request) {
@@ -49,7 +43,6 @@ function startRunner(dir) {
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
-  // stdout carries only protocol frames; stderr carries "ready" + app logs.
   const frames = [];
   let waiter = null;
   readline.createInterface({ input: child.stdout }).on("line", (line) => {
@@ -80,7 +73,6 @@ test("runner speaks the json-lines stdio protocol", async () => {
   try {
     await r.ready();
 
-    // a GET render round-trips id/status/headers/body; url origin comes from Host
     const g = await r.req({ id: 1, method: "GET", url: "/hello", headers: { host: "example.test" } });
     assert.equal(g.id, 1);
     assert.equal(g.status, 200);
@@ -90,27 +82,21 @@ test("runner speaks the json-lines stdio protocol", async () => {
     assert.equal(gbody.host, "example.test");
     assert.equal(gbody.method, "GET");
 
-    // a non-GET request forwards its body
     const p = await r.req({ id: 2, method: "POST", url: "/submit", headers: { host: "h" }, body: "payload" });
     assert.equal(JSON.parse(p.body).echo, "payload");
 
-    // warm reload acks and keeps serving
     const reloaded = await r.req({ cmd: "reload" });
     assert.equal(reloaded.reloaded, true);
     const after = await r.req({ id: 3, url: "/hello", headers: { host: "h" } });
     assert.equal(after.status, 200);
 
-    // a thrown handler is framed as a 500 carrying the error text
     const boom = await r.req({ id: 4, url: "/boom", headers: { host: "h" } });
     assert.equal(boom.status, 500);
     assert.match(boom.body, /kaboom/);
 
-    // a non-200 status is preserved
     const missing = await r.req({ id: 5, url: "/missing", headers: { host: "h" } });
     assert.equal(missing.status, 404);
 
-    // the guarantee: app stdout was diverted to stderr, so protocol frames on
-    // stdout stayed clean (every one parsed as JSON above) while the log survived
     assert.match(r.getStderr(), /APP_LOG_MUST_NOT_CORRUPT_PROTOCOL/);
   } finally {
     r.child.kill("SIGKILL");

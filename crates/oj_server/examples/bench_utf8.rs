@@ -1,7 +1,3 @@
-// Measures source-file UTF-8 validation: std::str::from_utf8 (scalar-ish, old)
-// vs simdutf8::basic::from_utf8 (SIMD, new), over a real TSX source corpus.
-// Every module read on the cold-start crawl validates its bytes as UTF-8.
-//   cargo run --release --example bench_utf8 -p oj_server
 use std::path::Path;
 use std::time::Instant;
 
@@ -31,7 +27,6 @@ fn main() {
     let total: usize = files.iter().map(|b| b.len()).sum();
     let iters = 300;
 
-    // OLD: standard-library validation
     let mut ok_old = 0usize;
     let t = Instant::now();
     for _ in 0..iters {
@@ -41,7 +36,6 @@ fn main() {
     }
     let old = t.elapsed();
 
-    // NEW: SIMD validation
     let mut ok_new = 0usize;
     let t = Instant::now();
     for _ in 0..iters {

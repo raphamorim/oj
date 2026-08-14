@@ -1,17 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// oj dev client: import.meta.hot contexts, HMR over WebSocket, error overlay.
-//
-// Served at /@oj/client.js. Every compiled module gets
-// `import.meta.hot = createHotContext("/src/X.tsx")` appended by the server,
-// and the Fast Refresh glue registers an accept callback through it.
+const hotModules = new Map();
 
-const hotModules = new Map(); // id -> { acceptCallbacks, disposeCallbacks, pruneCallbacks, data, listeners }
-
-// Custom event bus shared across all modules' hot.on() plus built-in
-// `vite:*` lifecycle events, so tooling written against Vite's API works.
-const customListeners = new Map(); // event -> Set<cb>
+const customListeners = new Map();
 function emit(event, data) {
   const set = customListeners.get(event);
   if (set) for (const cb of [...set]) cb(data);
@@ -19,17 +11,11 @@ function emit(event, data) {
 
 export function createHotContext(ownerId) {
   const id = ownerId.split("?")[0];
-  // Reuse the existing entry and clear its callbacks IN PLACE (stable object
-  // reference), rather than replacing it with a fresh object. A replaced
-  // object detaches any in-flight snapshot and, combined with deferred
-  // registration, drops a fast second edit. Mirrors Vite's HMRContext.
   let mod = hotModules.get(id);
   if (mod) {
     mod.acceptCallbacks = [];
     mod.disposeCallbacks = [];
     mod.pruneCallbacks = [];
-    // Drop this module's previous hot.on listeners so a re-exec doesn't
-    // accumulate duplicates.
     if (mod.listeners) for (const [ev, cb] of mod.listeners) customListeners.get(ev)?.delete(cb);
     mod.listeners = [];
   } else {
@@ -45,9 +31,6 @@ export function createHotContext(ownerId) {
   const data = mod.data;
   return {
     data,
-    // accept() | accept(cb) | accept(dep, cb) | accept([deps], cb). We
-    // re-execute the whole boundary regardless, so all forms register a
-    // callback invoked with the new module namespace.
     accept(first, second) {
       const cb = typeof first === "function" ? first : second || (() => {});
       mod.acceptCallbacks.push(cb);
@@ -61,7 +44,7 @@ export function createHotContext(ownerId) {
     prune(cb) {
       mod.pruneCallbacks.push(cb);
     },
-    decline() {}, // back-compat no-op (matches Vite)
+    decline() {},
     invalidate(message) {
       console.warn(`[oj] ${id} invalidated${message ? ": " + message : ""}`);
       if (socket && socket.readyState === WebSocket.OPEN) {
@@ -86,7 +69,7 @@ export function createHotContext(ownerId) {
   };
 }
 
-const styleTags = new Map(); // id -> <style>
+const styleTags = new Map();
 
 export function updateStyle(id, css) {
   let tag = styleTags.get(id);
@@ -99,9 +82,6 @@ export function updateStyle(id, css) {
   tag.textContent = css;
 }
 
-// Serialize updates: each applyUpdate fully completes (re-import + accept
-// callbacks) before the next starts, so a second update can never read a
-// module's hot context while the first update is mid-re-import.
 let updateChain = Promise.resolve();
 function queueUpdate(update) {
   updateChain = updateChain.then(() => applyUpdate(update)).catch(() => {});
@@ -116,7 +96,6 @@ async function applyUpdate(update) {
     location.reload();
     return;
   }
-  // Snapshot before re-import: the new instance re-registers its own context.
   const accepts = mod.acceptCallbacks.slice();
   const disposes = mod.disposeCallbacks.slice();
   emit("vite:beforeUpdate", { type: "js-update", path: cleanPath });
@@ -133,8 +112,6 @@ async function applyUpdate(update) {
     showOverlay(`hot update failed for ${update.path}\n\n${err && err.stack ? err.stack : err}`);
   }
 }
-
-// --- overlay -------------------------------------------------------------
 
 let overlayEl = null;
 
@@ -159,8 +136,6 @@ function clearOverlay() {
   }
 }
 
-// --- css hot swap ----------------------------------------------------------
-
 function swapCss(update) {
   const links = [...document.querySelectorAll("link[rel=stylesheet]")];
   const link = links.find((l) => new URL(l.href).pathname === update.path);
@@ -175,8 +150,6 @@ function swapCss(update) {
   link.after(next);
   console.log(`[oj] css updated ${update.path}`);
 }
-
-// --- websocket -----------------------------------------------------------
 
 let socket = null;
 
@@ -202,7 +175,6 @@ let socket = null;
       emit("vite:error", { err: { message: msg.message } });
       showOverlay(msg.message || "unknown error");
     } else if (msg.type === "custom") {
-      // Server-sent custom event -> import.meta.hot.on(event) listeners.
       emit(msg.event, msg.data);
     }
   });

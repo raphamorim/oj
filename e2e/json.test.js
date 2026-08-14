@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// JSON module imports: `import meta, { appName } from "./data.json"` — the
-// playground renders `${appName}|${meta.version}` (named + default) into
-// data-json. Verifies default export and named-key export both resolve.
 const { chromium } = require("playwright");
 (async () => {
   const browser = await chromium.launch();

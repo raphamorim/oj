@@ -1,26 +1,18 @@
-// Isolates the relative-import resolution phase: resolving N extensionless
-// sibling imports (`./Comp<i>`) from one directory, the exact stat pattern
-// rewrite_specifier uses, with vs without the per-directory listing cache.
-//   cargo run --release --example bench_resolve -p oj_server
 use std::ffi::OsString;
 use std::path::Path;
 use std::time::Instant;
 
 const COMPILABLE: &[&str] = &["tsx", "ts", "jsx", "js", "mjs"];
 
-// The old path: rewrite_specifier stats `joined` twice (its 1547 + 1560 checks),
-// then probes each candidate extension until one hits.
 fn resolve_stats(dir: &Path, name: &str) -> bool {
-    let joined = dir.join(name); // extensionless
-    let _ = joined.is_file(); // stat #1 (line 1547)
+    let joined = dir.join(name);
+    let _ = joined.is_file();
     if joined.is_file() {
-        // stat #2 (line 1560)
         return true;
     }
-    COMPILABLE.iter().any(|ext| joined.with_extension(ext).is_file()) // probe
+    COMPILABLE.iter().any(|ext| joined.with_extension(ext).is_file())
 }
 
-// The new path: one read_dir per directory, then in-memory membership.
 fn resolve_cached(entries: &std::collections::HashSet<OsString>, name: &str) -> bool {
     if entries.contains(OsString::from(name).as_os_str()) {
         return true;
@@ -37,9 +29,8 @@ fn main() {
         std::process::exit(1);
     }
     let names: Vec<String> = (0..1000).map(|i| format!("Comp{i}")).collect();
-    let crawls = 30; // each iteration ~ one cold-start crawl's resolution of this dir
+    let crawls = 30;
 
-    // OLD: per-import stat probe (no cache)
     let mut hits_old = 0usize;
     let t = Instant::now();
     for _ in 0..crawls {
@@ -51,7 +42,6 @@ fn main() {
     }
     let old = t.elapsed();
 
-    // NEW: one read_dir per crawl, then in-memory lookups
     let mut hits_new = 0usize;
     let t = Instant::now();
     for _ in 0..crawls {

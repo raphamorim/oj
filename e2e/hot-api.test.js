@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// Full import.meta.hot API: send()->server broadcast->on() round-trip, and
-// the vite:afterUpdate lifecycle event firing on a hot update. Uses the
-// client's createHotContext directly from the served /@oj/client.js.
-// Unbundled only (bundle mode uses a different runtime with no import.meta.hot).
 const { chromium } = require("playwright");
 const fs = require("fs");
 const path = require("path");
@@ -22,7 +18,6 @@ const APP = path.join(__dirname, "..", "playground", "src", "App.tsx");
     await page.goto("http://localhost:5199/", { waitUntil: "networkidle" });
     await page.waitForSelector("h1");
 
-    // send -> server broadcast -> on round-trip.
     const echoed = await page.evaluate(async () => {
       const { createHotContext } = await import("/@oj/client.js");
       const hot = createHotContext("/__hot_api_test");
@@ -34,7 +29,6 @@ const APP = path.join(__dirname, "..", "playground", "src", "App.tsx");
     console.log("custom round-trip:", JSON.stringify(echoed));
     if (!echoed || echoed.n !== 7) throw new Error("send/on round-trip failed");
 
-    // vite:afterUpdate fires on a hot edit.
     const afterUpdate = page.evaluate(
       () =>
         new Promise((resolve) =>

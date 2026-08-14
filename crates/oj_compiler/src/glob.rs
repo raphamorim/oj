@@ -1,18 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-//! Compile-time `import.meta.glob` expansion (Vite-compatible).
-//!
-//! `import.meta.glob('./dir/*.js')` becomes an object literal mapping each
-//! matched file (relative to the importing module) to a lazy importer
-//! `() => import('./dir/a.js')`; with `{ eager: true }` it becomes references
-//! to hoisted `import * as` bindings. Options: `eager`, `import` (pick a
-//! named export), `query` (`?raw`/`?url`/custom). Patterns may be a string or
-//! an array; `!`-prefixed patterns are negative filters.
-//!
-//! Runs before specifier rewriting, so the generated `import(...)` / `import`
-//! statements are canonicalized to served URLs by the normal pipeline.
-
 use std::path::Path;
 
 use oxc_allocator::Allocator;
@@ -24,15 +12,11 @@ use oxc_ast_visit::{VisitMut, walk_mut};
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 
-/// Expand `import.meta.glob(...)` in a source string (used by the production
-/// build's Rolldown transform hook, which sees raw TSX/TS before type
-/// stripping). Returns the source unchanged if there is nothing to expand.
 pub fn expand_source(source: &str, path: &Path) -> String {
     if !source.contains("import.meta.glob") {
         return source.to_string();
     }
     let allocator = Allocator::default();
-    // Parse with the file's real dialect (TSX/TS/JSX), not plain ESM.
     let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::mjs());
     let parsed = Parser::new(&allocator, source, source_type).parse();
     if parsed.panicked {
@@ -44,8 +28,6 @@ pub fn expand_source(source: &str, path: &Path) -> String {
     oxc_codegen::Codegen::new().build(&program).code
 }
 
-/// Expand every `import.meta.glob(...)` in `program`. `dir` is the importing
-/// module's directory (patterns and match keys are relative to it).
 pub fn expand<'a>(allocator: &'a Allocator, dir: &Path, program: &mut Program<'a>) {
     let mut expander = GlobExpander { allocator, dir, hoisted: Vec::new(), uid: 0 };
     expander.visit_program(program);
@@ -53,7 +35,6 @@ pub fn expand<'a>(allocator: &'a Allocator, dir: &Path, program: &mut Program<'a
     if hoisted.is_empty() {
         return;
     }
-    // Prepend hoisted `import * as ...` statements (eager mode).
     let src: &str = allocator.alloc_str(&hoisted.join("\n"));
     let parsed = Parser::new(allocator, src, SourceType::mjs()).parse();
     let mut stmts: Vec<Statement> = parsed.program.body.into_iter().collect();
@@ -86,8 +67,6 @@ impl<'a> GlobExpander<'a, '_> {
         }
     }
 
-    /// Build the replacement object-literal source, collecting hoisted eager
-    /// imports as a side effect. Returns None if args aren't static literals.
     fn build_replacement(&mut self, args: &[Argument<'a>]) -> Option<String> {
         let patterns = collect_patterns(args.first()?)?;
         let opts = args.get(1).map(collect_options).unwrap_or(Some(GlobOptions {
@@ -156,7 +135,7 @@ fn collect_patterns(arg: &Argument) -> Option<Vec<String>> {
                 if let ArrayExpressionElement::StringLiteral(s) = el {
                     out.push(s.value.to_string());
                 } else {
-                    return None; // non-literal: bail, leave call untouched
+                    return None;
                 }
             }
             Some(out)
@@ -203,13 +182,9 @@ fn collect_options(arg: &Argument) -> Option<GlobOptions> {
     Some(opts)
 }
 
-/// Glob the filesystem relative to `dir`, returning importer-relative keys
-/// (each prefixed `./` or `../`), sorted for deterministic output. Negative
-/// (`!`) patterns filter the positive matches.
 fn glob_matches(dir: &Path, patterns: &[String]) -> Vec<String> {
     let (negatives, positives): (Vec<&String>, Vec<&String>) =
         patterns.iter().partition(|p| p.starts_with('!'));
-    // Match against dir-relative keys (no `./`), so strip both `!` and `./`.
     let neg_patterns: Vec<glob::Pattern> = negatives
         .iter()
         .filter_map(|p| glob::Pattern::new(p.trim_start_matches('!').trim_start_matches("./")).ok())
@@ -314,7 +289,6 @@ mod tests {
         std::fs::write(dir.join("content").join("top.md"), "").unwrap();
         std::fs::write(dir.join("content").join("posts").join("nested.md"), "").unwrap();
         let out = expand_source(&dir, "const m = import.meta.glob('./content/**/*.md');\n");
-        // `**` reaches into subdirectories
         assert!(out.contains("./content/posts/nested.md"), "recursive match missing: {out}");
         assert!(out.contains("./content/top.md"), "top-level match missing: {out}");
         let _ = std::fs::remove_dir_all(&dir);

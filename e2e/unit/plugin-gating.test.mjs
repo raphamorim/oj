@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Unit tests for the plugin-container gating helpers (vite-plugin-bridge.mjs):
-// the id filter, `apply` matching, enforce ordering, and hook shape parsing.
-// Getting these wrong lets a build-only, id-filtered stub swallow every id.
+
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
@@ -29,8 +27,8 @@ test("idAllowed: filter.id include (single + array)", () => {
 test("idAllowed: include/exclude object, exclude wins", () => {
   const f = { id: { include: /\/src\//, exclude: /\.test\./ } };
   assert.ok(idAllowed(f, "/src/app.ts"));
-  assert.ok(!idAllowed(f, "/src/app.test.ts")); // excluded
-  assert.ok(!idAllowed(f, "/lib/app.ts")); // not included
+  assert.ok(!idAllowed(f, "/src/app.test.ts"));
+  assert.ok(!idAllowed(f, "/lib/app.ts"));
 });
 
 test("idAllowed: a bare filter (not wrapped in .id) still applies", () => {
@@ -44,7 +42,6 @@ test("applyMatches: no apply -> always; string vs command; function form", () =>
   assert.ok(!applyMatches({ apply: "build" }, "serve"));
   assert.ok(applyMatches({ apply: (_c, { command }) => command === "serve" }, "serve"));
   assert.ok(!applyMatches({ apply: (_c, { command }) => command === "build" }, "serve"));
-  // a throwing apply fn is treated as "applies" (safe default)
   assert.ok(applyMatches({ apply: () => { throw new Error("x"); } }, "serve"));
 });
 
@@ -60,9 +57,6 @@ test("ordered: pre first, normal next, post last (stable within a band)", () => 
 });
 
 test("ojReimplemented: skips React / Vite built-ins / TanStack; keeps app plugins", () => {
-  // Framework/built-in plugins oj reimplements -- their transforms must NOT
-  // re-run on app source (double JSX, or TanStack's server-fn transform
-  // fighting oj's own server-fn resolver -> a /_serverFn/ URL parse crash).
   for (const n of [
     "vite:react-babel", "vite:react-refresh", "vite:esbuild", "vite:import-glob",
     "tanstack-start-core::server-fn:client", "tanstack:router-generator",
@@ -70,27 +64,20 @@ test("ojReimplemented: skips React / Vite built-ins / TanStack; keeps app plugin
   ]) {
     assert.ok(ojReimplemented(n), `expected ${n} to be oj-reimplemented`);
   }
-  // The app's own plugins -- their transforms DO need to run.
   for (const n of ["fixture-i18n", "ssr-stub-scopes", "transitive-preloads", "customer-mdx", "i18n-dev", ""]) {
     assert.ok(!ojReimplemented(n), `expected ${n} to be treated as an app plugin`);
   }
 });
 
 test("envAllows: applyToEnvironment gates per environment (the ssr-stub-scopes regression)", () => {
-  // No gate -> runs everywhere.
   assert.ok(envAllows({}, "client"));
   assert.ok(envAllows({}, "ssr"));
-  // The exact ssr-stub-scopes shape: SSR-only. Must be SKIPPED on the client
-  // (running it there stubbed every module and blew up the client bundle with
-  // hundreds of "no matching export" errors).
   const ssrOnly = { name: "ssr-stub-scopes", applyToEnvironment: (env) => env.name === "ssr" };
   assert.ok(!envAllows(ssrOnly, "client"), "ssr-only plugin must be skipped on client");
   assert.ok(envAllows(ssrOnly, "ssr"), "ssr-only plugin must run on ssr");
-  // A client-only gate is the mirror image.
   const clientOnly = { applyToEnvironment: (env) => env.name === "client" };
   assert.ok(envAllows(clientOnly, "client"));
   assert.ok(!envAllows(clientOnly, "ssr"));
-  // A throwing gate defaults to "applies" (safe -- degrade like no gate).
   assert.ok(envAllows({ applyToEnvironment: () => { throw new Error("x"); } }, "client"));
 });
 

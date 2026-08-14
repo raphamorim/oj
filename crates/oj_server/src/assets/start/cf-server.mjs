@@ -1,22 +1,12 @@
 // SPDX-License-Identifier: MIT
-// Dev shim for `@cloudflare/vite-plugin/server`, which is a virtual module the
-// Cloudflare Vite plugin injects (its package exports only "." and
-// "./experimental-config"). The real getCloudflareContext() is backed by a
-// workerd/miniflare instance; here we provide the `env` bindings apps read most
-// -- the wrangler `vars` plus `.dev.vars` -- merged over process.env. Live KV /
-// D1 / R2 / service bindings need workerd emulation and are out of scope; ctx
-// is a no-op so `waitUntil`/`passThroughOnException` are safe to call.
+
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
-// The built client assets sit next to this file in prod (dist/client); the
-// ASSETS binding serves them (e.g. /__content/<collection>/<file>).
 const CLIENT_DIR = fileURLToPath(new URL("./client", import.meta.url));
 
-// Strip // and /* */ comments outside strings, then trailing commas (wrangler
-// config is JSONC and its string values contain `//` in URLs).
 function stripJsonc(s) {
   let out = "", i = 0, inStr = false, q = "";
   while (i < s.length) {
@@ -35,7 +25,6 @@ function stripJsonc(s) {
   return out;
 }
 
-// Parse the `vars` table out of a wrangler.jsonc/.json string.
 function parseWranglerJsonVars(text) {
   try {
     const cfg = JSON.parse(stripJsonc(text).replace(/,(\s*[}\]])/g, "$1"));
@@ -45,7 +34,6 @@ function parseWranglerJsonVars(text) {
   }
 }
 
-// Minimal [vars] scan of a wrangler.toml string (KEY = "value").
 function parseWranglerTomlVars(text) {
   const vars = {};
   let inVars = false;
@@ -58,7 +46,6 @@ function parseWranglerTomlVars(text) {
   return vars;
 }
 
-// .dev.vars is dotenv-style (KEY=VALUE, optional quotes, # comments).
 function parseDevVars(text) {
   const vars = {};
   for (const line of text.split("\n")) {
@@ -89,8 +76,6 @@ function devVars() {
   return parseDevVars(readFileSync(p, "utf8"));
 }
 
-// A Workers static-assets binding backed by dist/client: apps read published
-// content (e.g. /__content/<collection>/<file>) through env.ASSETS.fetch().
 const ASSETS = {
   async fetch(url) {
     const pathname = new URL(url).pathname.replace(/^\/+/, "");
@@ -118,5 +103,4 @@ export async function getCloudflareContext() {
 
 export default { getCloudflareContext };
 
-// Pure parsers exposed for unit tests; not part of the runtime contract.
 export const __test = { stripJsonc, parseWranglerJsonVars, parseWranglerTomlVars, parseDevVars };

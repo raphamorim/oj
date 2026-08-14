@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// Check the streaming production SSR build: `oj build --ssr` emits a server
-// bundle, a hashed client hydration bundle, and a `server.mjs` that streams
-// renderToReadableStream over chunked HTTP and serves the client assets.
-// Verifies, in order:
-//   1. the build emits server bundle + client assets + server.mjs,
-//   2. the running server streams (chunked) the shell + deferred Suspense
-//      content and serves the hashed client bundle,
-//   3. (browser, if Playwright is installed) the page hydrates and is
-//      interactive with no console errors.
 import { spawn, execSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
@@ -30,13 +21,9 @@ execSync(`${path.join(repo, "target", "debug", "oj")} build playground --ssr src
   stdio: "inherit",
 });
 
-// 1. Build artifacts.
 const serverJs = path.join(out, "server.mjs");
 if (!fs.existsSync(path.join(out, "entry-server.mjs"))) throw new Error("no server bundle emitted");
 if (!fs.existsSync(serverJs)) throw new Error("no server.mjs emitted");
-// Prerender (SSG): build.prerender = ["/", "/about"] -> static HTML with the
-// route content, the client hydration script, and (for "/") the resolved
-// Suspense boundary so it hydrates without a mismatch.
 {
   const home = path.join(out, "index.html");
   const about = path.join(out, "about", "index.html");
@@ -48,12 +35,8 @@ if (!fs.existsSync(serverJs)) throw new Error("no server.mjs emitted");
   if (!fs.readFileSync(about, "utf8").includes('data-page="about"')) throw new Error("prerendered /about missing about content");
   console.log("ssr-prod: prerender (SSG) ok (/ and /about static HTML, Suspense resolved, hydration wired)");
 }
-// Server functions: the dispatch bundle carries the real server code; the
-// client bundle carries only stubs (the server-only marker must not leak).
 {
   if (!fs.existsSync(path.join(out, "_oj_server_fns.mjs"))) throw new Error("no server-fn dispatch bundle emitted");
-  // The real server code is code-split into a sibling _oj_server_fns-*.mjs
-  // (the glob produces lazy imports); it must carry the server-only marker.
   const serverHasReal = fs
     .readdirSync(out)
     .filter((f) => f.startsWith("_oj_server_fns") && f.endsWith(".mjs"))
@@ -66,8 +49,6 @@ if (!fs.existsSync(serverJs)) throw new Error("no server.mjs emitted");
   if (clientLeak) throw new Error("server-only code leaked into the client bundle");
   console.log("ssr-prod: server functions ok (dispatch bundle has real code, client has only stubs)");
 }
-// Edge/worker entry: a Web `fetch` handler (Request/Response/ReadableStream, no
-// node:http), runnable in Node too. Renders per route and runs server fns.
 {
   const workerPath = path.join(out, "worker.mjs");
   if (!fs.existsSync(workerPath)) throw new Error("no worker.mjs (edge entry) emitted");
@@ -86,9 +67,6 @@ if (!fs.existsSync(serverJs)) throw new Error("no server.mjs emitted");
   if ((await fn.json()) !== "hello, edge (server=true)") throw new Error("worker server function failed");
   console.log("ssr-prod: edge/worker entry ok (Web fetch handler renders + runs server functions)");
 }
-// User plugins run in BOTH SSR-build environments: entry-server (ssr) and
-// entry-client (client) each import a plugin virtual module, so its source must
-// be bundled into both the server bundle and a client asset.
 if (!fs.readFileSync(path.join(out, "entry-server.mjs"), "utf8").includes("hello from plugin")) {
   throw new Error("ssr build (ssr env) did not run plugin resolveId/load (virtual module absent from server bundle)");
 }
@@ -99,12 +77,9 @@ const clientHasVirtual = fs
 if (!clientHasVirtual) {
   throw new Error("ssr build (client env) did not run plugin resolveId/load (virtual module absent from client bundle)");
 }
-// Per-environment define: the ssr build applies config + ssr-environment define.
 if (!fs.readFileSync(path.join(out, "entry-server.mjs"), "utf8").includes("global-define|ssr-define")) {
   throw new Error("ssr build did not apply the ssr-environment define");
 }
-// Per-environment build output: environments.ssr.build.sourcemap=false means
-// no server-bundle sourcemap, while the client bundle still emits one.
 if (fs.existsSync(path.join(out, "entry-server.mjs.map"))) {
   throw new Error("ssr env sourcemap:false ignored (server bundle emitted a .map)");
 }
@@ -116,8 +91,6 @@ const clientAsset = assetFiles.find((f) => /^entry-client-.*\.js$/.test(f));
 if (!clientAsset) throw new Error("no hashed client hydration bundle emitted");
 console.log("ssr-prod: build emitted server bundle + client assets + server.mjs");
 
-// Route-level code splitting: the entry chunk must NOT inline route bodies;
-// each route is a separate chunk loaded on demand.
 const entryCode = fs.readFileSync(path.join(out, "assets", clientAsset), "utf8");
 if (entryCode.includes("boom: the loader failed")) throw new Error("boom route was bundled into the entry chunk (not split)");
 const boomChunk = assetFiles.find(
@@ -126,10 +99,7 @@ const boomChunk = assetFiles.find(
 if (!boomChunk) throw new Error("boom route was not emitted as its own chunk");
 console.log(`ssr-prod: route code splitting ok (${assetFiles.filter((f) => f.endsWith(".js")).length} js chunks; boom in ${boomChunk}, not entry)`);
 
-// The server bundle's buffered render() (used as the fallback and by non-server
-// consumers) still works — importing it also proves the Node bundle is valid.
 const mod = await import(pathToFileURL(path.join(out, "entry-server.mjs")).href);
-// render() is async (it preloads the route's code-split chunk first).
 if (!String(await mod.render()).includes("ssr")) throw new Error("buffered render() missing ssr content");
 console.log("ssr-prod: server bundle render() ok (buffered fallback)");
 
@@ -160,7 +130,6 @@ const up = async () => {
 try {
   await up();
 
-  // 2. Streaming transport + content.
   const headers = await new Promise((resolve, reject) => {
     http.get(`${base}/`, (res) => (res.resume(), resolve(res.headers))).on("error", reject);
   });
@@ -175,11 +144,8 @@ try {
   if (!html.includes('data-page="home"')) throw new Error("/ did not render the home route");
   const about = await (await fetch(`${base}/about`)).text();
   if (!about.includes('data-page="about"')) throw new Error("/about did not render the about route");
-  // File-based dynamic route (src/routes/users/$id.tsx) with a param.
   const user = await (await fetch(`${base}/users/7`)).text();
   if (!user.includes('data-user-id="7"')) throw new Error("dynamic file-based route /users/7 did not render");
-  // Nested layouts + per-layout loaders: root + users layouts compose, each
-  // with its own loader data alongside the page's.
   if (!user.includes('data-layout="root"') || !user.includes('data-layout="users"')) {
     throw new Error("nested layouts did not compose on /users/7");
   }
@@ -187,7 +153,6 @@ try {
     throw new Error("per-layout loader data missing on /users/7");
   }
   if (about.includes('data-layout="users"')) throw new Error("users layout leaked onto /about");
-  // Per-route head/meta (incl. Open Graph) rendered into <head>.
   if (!user.includes("<title>User 7 - oj</title>")) throw new Error("/users/7 route title missing from head");
   if (!user.includes('property="og:title" content="User 7"') || !user.includes('property="og:site_name"')) {
     throw new Error("/users/7 Open Graph tags missing/unmerged");
@@ -198,20 +163,16 @@ try {
   if (!html.includes("window.__OJ_DATA__=") || !html.includes('"likes":') || !html.includes('data-likes="0"')) {
     throw new Error(`route data not loaded/serialized server-side:\n${html}`);
   }
-  // Action + revalidation over HTTP: POST mutates server state, GET reflects it.
-  // The loader response is the chain's data map keyed by route/layout id.
   const acted = await (await fetch(`${base}/`, { method: "POST", headers: { "oj-loader": "1" } })).json();
   if (acted["index"]?.likes !== 1) throw new Error(`action did not mutate server state: ${JSON.stringify(acted)}`);
   const reloaded = await (await fetch(`${base}/about`, { headers: { "oj-loader": "1" } })).json();
   if (reloaded["about"]?.likes !== 1) throw new Error("mutation not visible via server-authoritative loader");
   if (reloaded["layout"]?.app !== "oj") throw new Error("root layout loader did not run in the chain");
-  // A failing loader returns an error status (surfaced as route-error UI on the client).
   if ((await fetch(`${base}/boom`, { headers: { "oj-loader": "1" } })).status !== 500) {
     throw new Error("failing loader did not return an error status");
   }
   console.log("ssr-prod: streaming + per-route + data loading + action + loader error ok");
 
-  // 3. Hydration.
   let pw = null;
   try {
     pw = await import("playwright");
@@ -222,29 +183,23 @@ try {
     const errors = [];
     page.on("pageerror", (e) => errors.push(String(e)));
     page.on("console", (m) => {
-      // The intentional /boom loader returns 500; the browser logs that failed
-      // response as a console error — expected, not a bug.
       if (m.type() === "error" && !m.text().includes("Failed to load resource")) errors.push(m.text());
     });
     try {
       await page.goto(`${base}/`, { waitUntil: "networkidle" });
       const deferred = await page.locator("[data-deferred]").textContent();
       if (!deferred.includes("deferred-streamed")) throw new Error(`deferred content lost: ${deferred}`);
-      // Server function: entry-client called a `*.server.ts` export on hydrate;
-      // its RPC hit /__oj_fn and ran the real function server-side.
       const sfn = await page.waitForFunction(() => globalThis.__OJ_SFN, { timeout: 8000 }).then((h) => h.jsonValue());
       if (sfn !== "hello, prod (server=true)") throw new Error("server function RPC failed in prod: " + JSON.stringify(sfn));
-      // A failing loader renders the route-error UI (no crash), then recovers.
       await page.locator('a[href="/boom"]').click();
       await page.waitForSelector('[data-error]', { timeout: 5000 });
       await page.locator('[data-error] a[href="/"]').click();
       await page.waitForSelector('[data-page="home"]');
-      await page.locator("button", { hasText: "ssr" }).click(); // counter is interactive
+      await page.locator("button", { hasText: "ssr" }).click();
       await page.waitForFunction(
         () => document.querySelector("button").textContent.includes(": 1"),
         { timeout: 5000 },
       );
-      // Action + SPA routing, no full reload.
       await page.evaluate(() => (window.__spa = 1));
       const before = Number(await page.locator("[data-likes]").getAttribute("data-likes"));
       await page.locator("button", { hasText: "like" }).click();

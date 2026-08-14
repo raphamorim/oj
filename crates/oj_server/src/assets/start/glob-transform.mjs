@@ -1,11 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Implement Vite's `import.meta.glob` as a source transform: expand each call
-// into a literal map of the matched files, keyed by path relative to the
-// importer (Vite's contract). Supports the `<T>` type argument, string or array
-// patterns (with `!` negation), and the { eager, import, query } options.
-//   import.meta.glob("./x/*.ts")                  -> { "./x/a.ts": () => import("./x/a.ts") }
-//   import.meta.glob("./x/*.md",{eager,query:"?raw",import:"default"})
-//                                                  -> { "./x/a.md": <raw string> } (static)
+
 import { readdirSync, statSync } from "node:fs";
 import { resolve, dirname, relative, sep } from "node:path";
 
@@ -72,7 +66,6 @@ export function transformGlob(code, filePath) {
   let g = 0, out = "", last = 0, m;
   GLOB_CALL.lastIndex = 0;
   while ((m = GLOB_CALL.exec(code))) {
-    // Balanced-paren scan for the argument list, respecting string literals.
     let i = GLOB_CALL.lastIndex, depth = 1, str = "";
     for (; i < code.length && depth > 0; i++) {
       const c = code[i];
