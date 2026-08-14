@@ -30,12 +30,12 @@ export function BenchRace() {
 
     const styles = getComputedStyle(document.documentElement);
     const col = (name: string, fb: string) => styles.getPropertyValue(name).trim() || fb;
-    const ink = col("--color-ink", "#0f0e0c");
+    const ink = col("--color-ink", "rgba(0,0,0,0.85)");
     const bg = col("--color-bg", "#ffffff");
-    const line = col("--color-line", "#e4e2db");
-    const accent = col("--color-accent", "#e2571f");
-    const vite = "#4b6bdb";
-    const faint = col("--color-faint", "#8d8a80");
+    const line = col("--color-line", "#e5e5e5");
+    const accent = col("--color-accent", "#2a33d4"); // oj lane: cobalt
+    const vite = "#b6b4ae"; // vite lane: muted grey, so oj visibly wins on colour too
+    const faint = col("--color-faint", "rgba(0,0,0,0.35)");
     const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
     let dpr = 1, w = 0, h = 0, raf = 0;

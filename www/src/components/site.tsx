@@ -1,9 +1,9 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState } from "react";
 
 const GITHUB = "https://github.com/raphamorim/oj";
 
 const SECTIONS = [
-  { id: "process", label: "How it works" },
+  { id: "how", label: "How it works" },
   { id: "benchmark", label: "Benchmark" },
   { id: "features", label: "Features" },
   { id: "architecture", label: "Architecture" },
@@ -39,8 +39,9 @@ export function Nav() {
   return (
     <header className="nav" data-scrolled={scrolled}>
       <div className="wrap nav__inner">
-        <a href="#top" className="mark" aria-label="oj">
-          oj<span className="mark__dot">.</span>
+        <a href="#top" className="mark" aria-label="oj — home">
+          <span className="mark__dot" />
+          <span className="mark__word">oj</span>
         </a>
         <nav className="nav__links">
           {SECTIONS.map((s) => (
@@ -63,27 +64,91 @@ export function Footer() {
       <div className="wrap foot__row">
         <span className="foot__note">
           oj is an open-source project by{" "}
-          <a className="foot__by" href="https://github.com/raphamorim" target="_blank" rel="noreferrer">
+          <a href="https://github.com/raphamorim" target="_blank" rel="noreferrer">
             Raphael Amorim
           </a>
           . This site is built with oj and deployed on Cloudflare.
         </span>
         <div className="foot__links">
-          <a className="foot__link" href="#start">Get started</a>
-          <a className="foot__link" href={GITHUB} target="_blank" rel="noreferrer">GitHub</a>
-          <a className="foot__link" href={`${GITHUB}/issues`} target="_blank" rel="noreferrer">Issues</a>
+          <a className="foot__link" href="#start">
+            Get started
+          </a>
+          <a className="foot__link" href={GITHUB} target="_blank" rel="noreferrer">
+            GitHub
+          </a>
+          <a className="foot__link" href={`${GITHUB}/issues`} target="_blank" rel="noreferrer">
+            Issues
+          </a>
         </div>
       </div>
     </footer>
   );
 }
 
-/** A command line with a copyable feel: `$ oj dev`. */
-export function Cmd({ children }: { children: ReactNode }) {
+// A cobalt line that chases the cursor — the signature flourish from rapha.land,
+// ported to a React effect. Skipped for touch and reduced-motion (via CSS).
+export function Trail() {
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const pathRef = useRef<SVGPathElement | null>(null);
+
+  useEffect(() => {
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+    if (window.matchMedia?.("(pointer: coarse)").matches) return;
+    const svg = svgRef.current;
+    const path = pathRef.current;
+    if (!svg || !path) return;
+
+    const segments = 100;
+    const points: { x: number; y: number }[] = [];
+    const mouse = { x: 0, y: 0 };
+    let raf = 0;
+
+    const move = (event: MouseEvent) => {
+      mouse.x = event.clientX;
+      mouse.y = event.clientY;
+      if (points.length === 0) {
+        for (let i = 0; i < segments; i++) points.push({ x: mouse.x, y: mouse.y });
+      }
+    };
+    const anim = () => {
+      let px = mouse.x;
+      let py = mouse.y;
+      points.forEach((p, index) => {
+        p.x = px;
+        p.y = py;
+        const n = points[index + 1];
+        if (n) {
+          px = px - (p.x - n.x) * 0.6;
+          py = py - (p.y - n.y) * 0.6;
+        }
+      });
+      if (points.length) {
+        path.setAttribute("d", `M ${points.map((p) => `${p.x} ${p.y}`).join(" L ")}`);
+      }
+      raf = requestAnimationFrame(anim);
+    };
+    const resize = () => {
+      const ww = window.innerWidth;
+      const wh = window.innerHeight;
+      svg.style.width = ww + "px";
+      svg.style.height = wh + "px";
+      svg.setAttribute("viewBox", `0 0 ${ww} ${wh}`);
+    };
+
+    document.addEventListener("mousemove", move);
+    window.addEventListener("resize", resize);
+    resize();
+    raf = requestAnimationFrame(anim);
+    return () => {
+      cancelAnimationFrame(raf);
+      document.removeEventListener("mousemove", move);
+      window.removeEventListener("resize", resize);
+    };
+  }, []);
+
   return (
-    <span className="cmd">
-      <span className="cmd__prompt">$</span>
-      <span>{children}</span>
-    </span>
+    <svg ref={svgRef} className="trail" viewBox="0 0 1 1" aria-hidden="true">
+      <path ref={pathRef} d="" />
+    </svg>
   );
 }

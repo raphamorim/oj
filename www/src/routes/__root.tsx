@@ -2,7 +2,7 @@ import { createRootRoute, HeadContent, Outlet, Scripts } from "@tanstack/react-r
 
 // Pulls the design system into the client graph (Tailwind v4 + tokens).
 import "../../styles/app.css";
-import { Nav, Footer } from "../components/site";
+import { Nav, Footer, Trail } from "../components/site";
 
 export const rootRoute = createRootRoute({
   head: () => ({
@@ -15,9 +15,17 @@ export const rootRoute = createRootRoute({
         content:
           "oj is a Rust-native build tool for React apps: a fast dev server, SSR and TanStack Start, Tailwind, and one-command Cloudflare deploys.",
       },
-      { name: "theme-color", content: "#fbfaf7" },
+      { name: "theme-color", content: "#ffffff" },
     ],
-    links: [{ rel: "icon", type: "image/svg+xml", href: "/favicon.svg" }],
+    links: [
+      { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },
+      { rel: "preconnect", href: "https://fonts.googleapis.com" },
+      { rel: "preconnect", href: "https://fonts.gstatic.com", crossOrigin: "anonymous" },
+      {
+        rel: "stylesheet",
+        href: "https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,600;1,400;1,600&display=swap",
+      },
+    ],
   }),
   component: RootComponent,
 });
@@ -29,8 +37,11 @@ function RootComponent() {
         <HeadContent />
       </head>
       <body>
+        <Trail />
         <Nav />
-        <Outlet />
+        <main className="main">
+          <Outlet />
+        </main>
         <Footer />
         <Scripts />
       </body>
