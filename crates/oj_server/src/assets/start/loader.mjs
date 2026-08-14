@@ -5,7 +5,7 @@
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
 import { resolve as pathResolve, dirname } from "node:path";
-import { importPkg, viteEnvDefine } from "./resolve-pkg.mjs";
+import { importPkg, viteEnvDefine, emptyVirtualStub } from "./resolve-pkg.mjs";
 import { loadPluginContainer } from "./vite-plugin-bridge.mjs";
 import { transformGlob } from "./glob-transform.mjs";
 import {
@@ -186,7 +186,10 @@ export async function load(url, context, next) {
   if (url.startsWith(VIRTUAL_SCHEME)) {
     const rid = decodeURIComponent(url.slice(VIRTUAL_SCHEME.length));
     const code = container ? await container.load(rid) : null;
-    return { format: "module", source: code ?? "export default undefined;", shortCircuit: true };
+    // No content (a build-graph virtual oj can't produce in dev): emit a stub
+    // that exports the exact names the app imports, so strict Node ESM named
+    // imports resolve to undefined instead of throwing.
+    return { format: "module", source: code ?? emptyVirtualStub(APP, rid), shortCircuit: true };
   }
   const clean = stripQ(url);
   // Tagged asset (from resolve above).

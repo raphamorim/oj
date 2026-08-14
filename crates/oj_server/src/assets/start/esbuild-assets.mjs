@@ -13,6 +13,7 @@
 import { readFileSync, readdirSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, dirname, extname, basename, resolve } from "node:path";
 import { createHash } from "node:crypto";
+import { emptyVirtualStub } from "./resolve-pkg.mjs";
 
 const SUFFIX = /\?(raw|url|inline)$/;
 // Bare asset imports (Vite treats these as a URL by default, e.g. `import logo
@@ -146,10 +147,10 @@ export function makeVitePlugins({ container, fallback, appRoot, mode = "dev", fs
                 `emitting an empty module. This virtual likely needs the full build graph oj does not run in dev.\n`,
             );
           }
-          // CommonJS, not ESM: esbuild's CJS interop lets any named import
-          // (e.g. `import { dynamicChunkPreloads } from ...`) resolve to
-          // undefined without a "no matching export" bundle error.
-          return { contents: "module.exports = {};\n", loader: "js", resolveDir: appRoot };
+          // Stub that exports the exact names the app imports from this virtual
+          // (as undefined), so both esbuild here and Node's strict ESM loader on
+          // the SSR side satisfy `import { x } from "<virtual>"` without error.
+          return { contents: emptyVirtualStub(appRoot, args.path), loader: "js", resolveDir: appRoot };
         }
         return { contents: code, loader: "js", resolveDir: appRoot };
       });

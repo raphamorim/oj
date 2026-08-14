@@ -6,8 +6,8 @@
 // (a transitive dep is reachable from whichever direct dep pulls it in).
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
-import { dirname } from "node:path";
-import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { readFileSync, readdirSync } from "node:fs";
 
 export function makeResolver(root) {
   const appRequire = createRequire(pathToFileURL(root + "/package.json").href);
@@ -46,4 +46,59 @@ export function viteEnvDefine({ ssr = false, mode = "development" } = {}) {
   const env = { MODE: mode, DEV: mode !== "production", PROD: mode === "production", SSR: !!ssr, BASE_URL: "/" };
   for (const [k, v] of Object.entries(process.env)) if (k.startsWith("VITE_")) env[k] = v;
   return { "import.meta.env": JSON.stringify(env) };
+}
+
+// A plugin `virtual:` that oj can't produce content for in dev still has to
+// satisfy the app's imports of it. esbuild's CJS interop tolerates missing
+// named imports, but Node's native-ESM SSR loader does not — a bare
+// `export default undefined` throws `does not provide an export named X`. So
+// scan the app's source for `import { ... } from "<virtualId>"` and emit an ESM
+// stub that exports exactly those names as undefined, satisfying both.
+const SRC_EXT = /\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$/;
+export function emptyVirtualStub(appRoot, resolvedId) {
+  const original = resolvedId.replace(/^\0/, "");
+  const re = new RegExp(
+    `import\\s+(?:type\\s+)?[^;{]*\\{([^}]*)\\}[^;]*?from\\s*["']${
+      original.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    }["']`,
+    "g",
+  );
+  const names = new Set();
+  const scan = (dir) => {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.name === "node_modules" || e.name.startsWith(".")) continue;
+      const p = join(dir, e.name);
+      if (e.isDirectory()) {
+        scan(p);
+        continue;
+      }
+      if (!SRC_EXT.test(e.name)) continue;
+      let src;
+      try {
+        src = readFileSync(p, "utf8");
+      } catch {
+        continue;
+      }
+      if (!src.includes(original)) continue;
+      let m;
+      while ((m = re.exec(src))) {
+        for (let spec of m[1].split(",")) {
+          spec = spec.trim();
+          if (!spec || spec.startsWith("type ")) continue;
+          const name = spec.split(/\s+as\s+/)[0].trim();
+          if (name && name !== "default" && /^[A-Za-z_$][\w$]*$/.test(name)) names.add(name);
+        }
+      }
+    }
+  };
+  scan(join(appRoot, "src"));
+  let out = "export default undefined;\n";
+  for (const n of names) out += `export const ${n} = undefined;\n`;
+  return out;
 }
