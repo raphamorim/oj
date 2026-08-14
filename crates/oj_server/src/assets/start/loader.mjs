@@ -167,7 +167,23 @@ export async function resolve(spec, context, next) {
     const hit = probe(base);
     if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true };
   }
-  const r = await next(spec, context);
+  let r;
+  try {
+    r = await next(spec, context);
+  } catch (err) {
+    // A bare subpath into a CJS package with no "exports" map -- e.g.
+    // `lodash/isEqual` -> node_modules/lodash/isEqual.js -- fails Node's strict
+    // ESM resolver, which (unlike a bundler) won't probe extensions. Recover
+    // the path Node tried and probe `.js`/index the way esbuild does.
+    if (err && err.code === "ERR_MODULE_NOT_FOUND") {
+      const tried = err.url && err.url.startsWith("file:")
+        ? fileURLToPath(err.url)
+        : (err.message.match(/Cannot find module '([^']+)'/) || [])[1];
+      const hit = tried ? probe(tried) : null;
+      if (hit) return { url: pathToFileURL(hit).href, shortCircuit: true };
+    }
+    throw err;
+  }
   // Version-bust @tanstack/* (ESM) so their module state re-evaluates on reload.
   if (r && r.url && isTanstack(r.url)) return { ...r, url: withV(r.url), shortCircuit: true };
   return r;

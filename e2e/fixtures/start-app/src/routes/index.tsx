@@ -11,6 +11,10 @@ import { shout as shoutViaPaths } from "@app/lib/format";
 // A CommonJS dep with `module.exports = {...}` (the loader's CJS facade).
 import { badge } from "legacy-cjs";
 
+// A CJS subpath imported extensionless (no "exports" map): Node's strict ESM
+// resolver won't probe `.js`, so the SSR loader must recover it like a bundler.
+import deep from "legacy-cjs/deep";
+
 // A plugin-owned virtual module (resolved via oj's plugin-container bridge).
 import { buildTag } from "virtual:build-info";
 
@@ -51,6 +55,7 @@ function Index() {
       <p data-testid="server-fn">{data.message} / edition={data.edition}</p>
       <p data-testid="paths-alias">{shoutViaPaths("alias")}</p>
       <p data-testid="cjs">{badge("interop")}</p>
+      <p data-testid="cjs-subpath">{deep("ok")}</p>
       <p data-testid="virtual">{buildTag}</p>
       <p data-testid="glob">{titles}</p>
       <p data-testid="raw">{notes.trim()}</p>

@@ -67,6 +67,7 @@ async function assertApp(port, label) {
     ["cloudflare wrangler var", "fixture-edition"],
     ["tsconfig paths alias", "ALIAS!"],
     ["commonjs dep facade", "[INTEROP]"],
+    ["commonjs subpath (extensionless)", "[deep:ok]"],
     ["plugin virtual module", "fixture-virtual-ok"],
     ["import.meta.glob", "Alpha Widget, Beta Widget"],
     ["?raw import", "raw-notes-marker"],

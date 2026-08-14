@@ -1,41 +1,16 @@
 # oj
 
-0. If you like the idea and project please consider sponsor, working on it in my free timr.
+0. If you like the idea and project please consider sponsor, working on it in my free time.
 1. This is a research project, use on your own risk.
 2. It was created out of frustration with agents running vite build when I was working on rioterm-js repository. Each build process was carrying 2gb.
-3. If anyone want to move the project upstream, please contact me via email. Currently working mostly to fix my own problems.
+3. Working on it mostly to fix my own problems.
 
 OJ is a Rust-native build tool for React apps.
 
-It optimizes for memory and cold start, where running many builds (CI, agents, multi-tenant) under Vite gets expensive.
+It optimizes for memory and cold start, where running many builds (CI, agents, multi-tenant) under Vite gets expensive. OJ is meant to run real production React apps without changes to their source.
 
 This project is alpha, so expect bugs. For real.
 
-## Goals
-
-oj is meant to run real production React apps without changes to their source.
-The work ahead, roughly in priority order:
-
-- More of the multi-environment build model. Per-environment `define`, resolve
-  conditions (browser for the client, node for SSR), build output (`minify`,
-  `sourcemap`), and plugin gating (`applyToEnvironment`) work today; still
-  missing are per-environment `outDir`/`target`/rollup options and
-  `builder.sharedPlugins`, which modern meta-frameworks build on.
-- More of the router-driven framework layer on top of the streaming SSR that
-  already exists. File-based route discovery ships as `virtual:oj-routes` (a
-  `src/routes/` manifest with the index/`$param`/layout conventions), and
-  `oj build --ssr` prerenders configured routes to static HTML (`build.prerender`,
-  hydrated). Server functions work in dev and in the production build: a
-  `*.server.ts` module is replaced on the client by RPC stubs (its code never
-  ships to the browser), and the real functions run on the module runner in dev
-  and a bundled dispatch behind `server.mjs` in production.
-- Deeper edge support. `oj build --ssr` already emits a `worker.mjs` Web
-  `fetch` handler (Workers/`workerd`-style) beside the Node `server.mjs`; still
-  ahead is bundling for a specific edge runtime's constraints and asset story.
-- More of the module-graph plugin API. The `moduleParsed` and `watchChange`
-  hooks fire today; still ahead is a synchronous whole-graph `getModuleInfo`
-  (oj's plugin host is out of process, so cross-graph lookups are async).
-  
 ## Server rendering
 
 There is an SSR mode: `oj dev --ssr src/entry-server.tsx` in dev, and `oj build --ssr` for production. It streams the HTML out with `renderToReadableStream` instead of buffering, and the client hydrates through
@@ -48,9 +23,7 @@ In dev the server modules run in a small persistent Node process (a module runne
 Vite/Rollup-style plugins run through a persistent Node plugin host. Drop an `oj.plugins.mjs` at the app root that default-exports a plugin array, or let oj read an app's `vite.config.{ts,js,mjs}` and pick up its `plugins` array directly.
 
 A TypeScript config (including one that imports local `.ts` files) is loaded via Vite's own config loader when Vite is installed, or bundled with the app's esbuild otherwise. From a `vite.config` oj also adopts the app's `base`, `server.port`/`host`, `define`, and `resolve.alias` for any field its own config
-leaves unset; alias entries resolve alongside tsconfig `paths`, in both `oj dev` and `oj build`.
-
-The dev server and `oj build` run `transform`, `resolveId`, `load`, `config`, `configResolved`, `transformIndexHtml`, `handleHotUpdate`, `buildStart`, `buildEnd`, `renderStart`, `renderChunk`, `generateBundle`, `writeBundle`, `closeBundle`, and `configureServer`; honor `enforce`, `apply`, and `applyToEnvironment` ordering; and give hooks a plugin context with `this.resolve`, `this.load`, `this.emitFile`, `this.getModuleInfo`, `this.getModuleIds`, and `this.addWatchFile`. Plugins run in both the client and SSR environments, in dev and in the production build. Still missing are whole-graph module info and per-environment build outputs, so a plugin that drives several build environments at once will not work yet.
+leaves unset, alias entries resolve alongside tsconfig `paths`, in both `oj dev` and `oj build`.
 
 ## Quickstart
 
@@ -62,52 +35,9 @@ oj dev                                           # dev server for the current ap
 oj build                                         # production build into ./dist
 ```
 
-Or run it from a checkout of this repo:
-
-```sh
-cargo run -p oj -- dev                          # dev server for ./playground on :5199
-cargo run -p oj -- dev --bundle                 # registry-runtime bundle mode
-cargo run -p oj -- dev --ssr src/entry-server.tsx  # streaming SSR + hydration
-cargo run -p oj -- build playground             # production build into playground/dist
-cargo test --workspace                          # rust unit tests
-node --test e2e/unit/*.test.mjs                 # js unit tests (adapter helpers)
-node e2e/run.mjs                                # browser e2e suite (add --bundle for bundle mode)
-node e2e/ssr-dev.mjs                            # SSR dev e2e; e2e/ssr-prod.mjs for the built server
-node e2e/start.mjs                              # tanstack start integration (see e2e/fixtures/start-app)
-node bench/generate.mjs 1000                    # generate a benchmark app (then npm i inside it)
-node bench/run.mjs 1000                         # p50/p95 benchmark vs vite
-node bench/card.mjs                             # render bench/card.html to oj-benchmarks.png
-```
-
-## Lazy compilation
-
-Dynamic `import()` targets are treated as lazy boundaries, not eager
-dependencies: the eager crawl follows only static imports, so a code-split app
-compiles the shell plus the route you open, not the whole graph. Nested
-`import()`s inside a lazy subtree stay their own boundaries. In `--bundle` mode
-the main chunk excludes lazy subtrees; `import()` compiles to `__oj_import_lazy`,
-which fetches the subtree on demand from `/@oj/lazy.js` and registers it into the
-same runtime registry (shared React — no duplicate instance), sending only the
-modules a client does not already hold.
-
-On a generated 24-route app (~1,000 modules, landing route eager, the rest
-lazy), cold start (spawn to landing painted) versus compiling every route
-eagerly, M-series Mac:
-
-| mode | eager | lazy | crawl (eager modules) |
-|---|---|---|---|
-| unbundled | 296ms | **140ms** | 996 -> **53** |
-| `--bundle` | 217ms | **139ms** | 996 -> **53** |
-
-Reproduce with `node bench/generate-routes.mjs && node bench/measure-lazy.mjs`
-(add `--bundle`).
-
 ## Benchmarks
 
-Generated fanout-10 React component trees, measured save-to-paint with
-Playwright against Vite 8.2.1 (Rolldown-based) on an M-series Mac, in both
-its default dev mode (vite) and its experimental bundled dev mode
-(vite-fbm). p50/p95 over 5 cold+warm restart cycles and 10 HMR edits.
+Generated fanout-10 React component trees, measured save-to-paint with Playwright against Vite 8.2.1 (Rolldown-based) on an M-series Mac, in both its default dev mode (vite) and its experimental bundled dev mode (vite-fbm). p50/p95 over 5 cold+warm restart cycles and 10 HMR edits.
 
 **1,000 components (p50/p95):**
 
@@ -136,18 +66,10 @@ its default dev mode (vite) and its experimental bundled dev mode
 | vite | 5468/5537ms | 4957/4980ms | 1604/1649ms | 114/173ms | 1504MB |
 | vite-fbm | 1415/1442ms | 1417/1438ms | 277/291ms | 64/68ms | 1738MB |
 
-Bundle-mode oj wins cold start, warm start, and reload against Vite's default
-dev at every size (3-7x at 10k), and beats Vite's experimental bundled dev on
-warm start and reload. On HMR oj now matches Vite's bundled dev (within a few
-ms) and is ~2x faster than Vite's default dev at 10k. The two bundled modes are
-close on cold start (vite-fbm edges oj at 10k). oj's decisive, consistent win is
-memory: 47-122MB against Vite's 361MB-1.7GB, an 8-14x gap that widens with app
-size.
+Bundle-mode oj wins cold start, warm start, and reload against Vite's default dev at every size (3-7x at 10k), and beats Vite's experimental bundled dev on warm start and reload. On HMR oj now matches Vite's bundled dev (within a few ms) and is ~2x faster than Vite's default dev at 10k. The two bundled modes are
+close on cold start (vite-fbm edges oj at 10k). oj's decisive, consistent win is memory: 47-122MB against Vite's 361MB-1.7GB, an 8-14x gap that widens with app size.
 
-Production builds (`oj build` vs `vite build`) land at parity: same engine
-(Rolldown), byte-identical output sizes.
-
-Caveats: one machine, one app shape. Reproduce with `bench/`.
+Production builds (`oj build` vs `vite build`) land at parity: same engine (Rolldown), byte-identical output sizes.
 
 ## Reference reading
 
@@ -156,3 +78,20 @@ Caveats: one machine, one app shape. Reproduce with `bench/`.
 - [vitejs/vite-plugin-react](https://github.com/vitejs/vite-plugin-react): the Fast Refresh glue semantics oj replicates
 - [vite/packages/vite/src/node/server](https://github.com/vitejs/vite/tree/main/packages/vite/src/node/server): HMR propagation, `import.meta.hot` protocol
 - [rolldown/rolldown](https://github.com/rolldown/rolldown): plugin hook filters, the prod linker oj embeds
+
+## Self note
+
+```sh
+cargo run -p oj -- dev                            # dev server for ./playground on :5199
+cargo run -p oj -- dev --bundle                   # registry-runtime bundle mode
+cargo run -p oj -- dev --ssr src/entry-server.tsx # streaming SSR + hydration
+cargo run -p oj -- build playground               # production build into playground/dist
+cargo test --workspace                            # rust unit tests
+node --test e2e/unit/*.test.mjs                   # js unit tests (adapter helpers)
+node e2e/run.mjs                                  # browser e2e suite (add --bundle for bundle mode)
+node e2e/ssr-dev.mjs                              # SSR dev e2e, e2e/ssr-prod.mjs for the built server
+node e2e/start.mjs                                # tanstack start integration (see e2e/fixtures/start-app)
+node bench/generate.mjs 1000                      # generate a benchmark app (then npm i inside it)
+node bench/run.mjs 1000                           # p50/p95 benchmark vs vite
+node bench/card.mjs                               # render bench/card.html to oj-benchmarks.png
+```
