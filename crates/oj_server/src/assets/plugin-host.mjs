@@ -15,6 +15,34 @@ const pluginsPath = process.argv[2];
 const initial = JSON.parse(process.argv[3] ?? "{}");
 const env = initial.env ?? { command: "serve", mode: "development" };
 
+// Vite's `configResolved` and later hooks receive a fully-resolved
+// `ResolvedConfig`, so real plugins read fields Vite always fills in — e.g.
+// @vitejs/plugin-react reads `config.experimental.bundledDev`. oj only has the
+// app's user config plus plugin `config()` merges, so fill the standard shape
+// UNDER the actual config (user/plugin values win); a missing key must never
+// crash a hook (a plugin crash stalls buildStart until the host times out).
+function withResolvedDefaults(config) {
+  const c = config ?? {};
+  return deepMerge(
+    {
+      command: env.command,
+      mode: env.mode,
+      root: c.root ?? initial.config?.root ?? process.cwd(),
+      base: "/",
+      isProduction: env.mode === "production",
+      experimental: {},
+      build: {},
+      server: {},
+      define: {},
+      resolve: {},
+      optimizeDeps: {},
+      ssr: {},
+      env: {},
+    },
+    c,
+  );
+}
+
 // Vite Environment API: the environment this host serves (oj exposes "client"
 // for the dev server and the app build). `environment.config` is the base
 // config deep-merged with the per-environment overrides from
@@ -23,7 +51,9 @@ const envName = initial.environment?.name ?? "client";
 const environment = {
   name: envName,
   mode: initial.environment?.mode ?? env.mode,
-  config: deepMerge(initial.config ?? {}, (initial.config?.environments ?? {})[envName] ?? {}),
+  config: withResolvedDefaults(
+    deepMerge(initial.config ?? {}, (initial.config?.environments ?? {})[envName] ?? {}),
+  ),
 };
 
 // Resolve an app's vite.config to its config object. Preferred path: Vite's
@@ -214,8 +244,9 @@ async function runConfigHooks() {
     const partial = await p.config.call(ctx, config, env);
     if (partial) config = deepMerge(config, partial);
   }
+  const resolved = withResolvedDefaults(config);
   for (const p of plugins) {
-    if (typeof p.configResolved === "function") await p.configResolved.call(ctx, config);
+    if (typeof p.configResolved === "function") await p.configResolved.call(ctx, resolved);
   }
 }
 await runConfigHooks();
