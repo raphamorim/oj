@@ -146,7 +146,10 @@ export function makeVitePlugins({ container, fallback, appRoot, mode = "dev", fs
                 `emitting an empty module. This virtual likely needs the full build graph oj does not run in dev.\n`,
             );
           }
-          return { contents: "export default undefined;\nexport {};\n", loader: "js", resolveDir: appRoot };
+          // CommonJS, not ESM: esbuild's CJS interop lets any named import
+          // (e.g. `import { dynamicChunkPreloads } from ...`) resolve to
+          // undefined without a "no matching export" bundle error.
+          return { contents: "module.exports = {};\n", loader: "js", resolveDir: appRoot };
         }
         return { contents: code, loader: "js", resolveDir: appRoot };
       });

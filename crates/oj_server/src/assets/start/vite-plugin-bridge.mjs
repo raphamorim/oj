@@ -12,6 +12,10 @@ import { importPkg } from "./resolve-pkg.mjs";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
+// oj loads the config as tooling; Vite's native-loader "import without a file
+// extension" advisories are noise here. Suppress them as the warning suggests.
+process.env.VITE_CONFIG_NATIVE_IGNORE_WARNING ??= "true";
+
 const CONFIG_FILES = [
   "vite.config.ts", "vite.config.js", "vite.config.mjs", "vite.config.mts",
   "oj.config.ts", "oj.config.js", "oj.config.mjs",
