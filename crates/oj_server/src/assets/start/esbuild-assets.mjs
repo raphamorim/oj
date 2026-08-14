@@ -123,6 +123,7 @@ export function makeVitePlugins({ container, fallback, appRoot, mode = "dev", fs
         svgModule(args.path, args.path + "?react"),
       );
       if (!container) return;
+      const warnedVirtual = new Set(); // dedupe empty-virtual warnings per build
       const resolveVirtual = async (args) => {
         const rid = await container.resolveId(args.path, args.importer);
         return rid ? { path: rid, namespace: "oj-vite-virtual" } : undefined;
@@ -132,7 +133,22 @@ export function makeVitePlugins({ container, fallback, appRoot, mode = "dev", fs
       build.onLoad({ filter: /.*/, namespace: "oj-vite-virtual" }, async (args) => {
         let code = await container.load(args.path);
         if (code == null && fallback) code = await fallback.load(args.path);
-        return code == null ? undefined : { contents: code, loader: "js", resolveDir: appRoot };
+        if (code == null) {
+          // A plugin claimed this virtual id (its resolveId matched) but its
+          // load produced nothing in oj's minimal bridge — typically a virtual
+          // built from the full bundler module graph (chunk preloads, asset
+          // manifests) that oj does not run in dev. Emit an empty module so the
+          // dev bundle still builds instead of hard-failing, and warn once.
+          if (!warnedVirtual.has(args.path)) {
+            warnedVirtual.add(args.path);
+            process.stderr.write(
+              `oj: plugin virtual "${args.path}" produced no content in the dev client bundle; ` +
+                `emitting an empty module. This virtual likely needs the full build graph oj does not run in dev.\n`,
+            );
+          }
+          return { contents: "export default undefined;\nexport {};\n", loader: "js", resolveDir: appRoot };
+        }
+        return { contents: code, loader: "js", resolveDir: appRoot };
       });
       build.onLoad({ filter: /\.mdx?$/ }, async (args) => {
         const out = await container.transform(readFileSync(args.path, "utf8"), args.path);
