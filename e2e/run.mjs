@@ -28,6 +28,12 @@ const up = async () => {
 };
 await up();
 
+// Synchronous sleep between serial tests. A file-editing test triggers a
+// recompile + HMR/reload broadcast; on a slower runner that can land on the
+// next test's freshly-opened page ("execution context destroyed by
+// navigation"). Let the server settle before the next test connects.
+const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
 let failed = 0;
 for (const file of fs.readdirSync(here).filter((f) => f.endsWith(".test.js")).sort()) {
   process.stdout.write(`\n${file} (${bundle ? "bundle" : "unbundled"})\n`);
@@ -40,6 +46,7 @@ for (const file of fs.readdirSync(here).filter((f) => f.endsWith(".test.js")).so
   } catch {
     failed++;
   }
+  sleep(1200);
 }
 server.kill("SIGKILL");
 console.log(failed ? `\n${failed} test(s) FAILED` : "\nALL E2E TESTS PASSED");
