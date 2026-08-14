@@ -2129,9 +2129,35 @@ fn spawn_watcher(state: Arc<ServerState>) {
                 return;
             }
         };
-        if let Err(err) = watcher.watch(&state.root, RecursiveMode::Recursive) {
-            eprintln!("oj: cannot watch {}: {err}", state.root.display());
-            return;
+        // Watch each top-level entry except node_modules/.oj-cache/dist/.git
+        // rather than the whole root: those dirs are huge and, in the case of
+        // .oj-cache, rewritten by oj on every compile -- recursively watching
+        // them floods the watcher (notably Linux inotify) with self-inflicted
+        // events. Skipping them at watch time is more robust than filtering
+        // after the fact.
+        let ignore = |name: &std::ffi::OsStr| {
+            matches!(name.to_str(), Some("node_modules" | ".oj-cache" | "dist" | ".git"))
+        };
+        let mut watched_any = false;
+        if let Ok(entries) = std::fs::read_dir(&state.root) {
+            for entry in entries.flatten() {
+                if ignore(&entry.file_name()) {
+                    continue;
+                }
+                let path = entry.path();
+                let mode = if path.is_dir() { RecursiveMode::Recursive } else { RecursiveMode::NonRecursive };
+                if watcher.watch(&path, mode).is_ok() {
+                    watched_any = true;
+                }
+            }
+        }
+        // Fall back to a recursive root watch only if nothing else could be
+        // watched (e.g. an otherwise-empty root).
+        if !watched_any {
+            if let Err(err) = watcher.watch(&state.root, RecursiveMode::Recursive) {
+                eprintln!("oj: cannot watch {}: {err}", state.root.display());
+                return;
+            }
         }
 
         use std::sync::mpsc::RecvTimeoutError;
