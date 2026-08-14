@@ -26,7 +26,10 @@ const FEATURES = [
 function Home() {
   return (
     <div className="wrap" id="top">
-      <h1 className="display">oj</h1>
+      <div className="masthead-title">
+        <h1 className="display">oj</h1>
+        <span className="badge">alpha</span>
+      </div>
 
       <p className="lede">
         A Rust-native build tool for React apps. Your build tool should be{" "}

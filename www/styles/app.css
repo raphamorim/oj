@@ -146,6 +146,12 @@
 }
 
 /* ---------------------------------------------------------------- headings */
+.masthead-title {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.9rem;
+  margin: clamp(40px, 9vw, 84px) 0 0;
+}
 h1.display {
   font-family: var(--font-display);
   font-style: italic;
@@ -154,7 +160,23 @@ h1.display {
   line-height: 1;
   color: var(--color-accent);
   letter-spacing: -0.01em;
-  margin: clamp(40px, 9vw, 84px) 0 0;
+  margin: 0;
+}
+/* Small upright pill tagging the release stage, tucked by the title's cap. */
+.badge {
+  align-self: flex-start;
+  margin-top: 0.7em;
+  font-family: var(--font-mono);
+  font-size: clamp(0.7rem, 1.3vw, 0.82rem);
+  font-weight: 600;
+  font-style: normal;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-accent);
+  border: 1.5px solid var(--color-accent);
+  border-radius: 999px;
+  padding: 0.22rem 0.62rem;
+  line-height: 1;
 }
 h2.head {
   font-family: var(--font-display);
