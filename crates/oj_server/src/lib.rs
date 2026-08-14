@@ -2171,12 +2171,17 @@ fn spawn_watcher(state: Arc<ServerState>) {
                 Ok(Err(_)) => continue,
                 Err(_) => break,
             };
+            if matches!(first.kind, notify::EventKind::Access(_)) {
+                continue;
+            }
             let mut paths: std::collections::HashSet<PathBuf> =
                 first.paths.into_iter().collect();
             loop {
                 match rx.recv_timeout(Duration::from_millis(debounce_ms)) {
-                    Ok(Ok(ev)) => paths.extend(ev.paths),
-                    Ok(Err(_)) => {}
+                    Ok(Ok(ev)) if !matches!(ev.kind, notify::EventKind::Access(_)) => {
+                        paths.extend(ev.paths);
+                    }
+                    Ok(_) => {}
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => return,
                 }

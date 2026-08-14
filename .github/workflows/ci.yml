@@ -20,7 +20,6 @@ jobs:
   e2e:
     name: e2e (${{ matrix.mode }})
     runs-on: ubuntu-latest
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:

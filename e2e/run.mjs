@@ -9,29 +9,45 @@ import { fileURLToPath } from "node:url";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.join(here, "..");
 const bundle = process.argv.includes("--bundle");
+const oj = path.join(repo, "target", "debug", "oj");
+const playground = path.join(repo, "playground");
 
 execSync("cargo build -p oj", { cwd: repo, stdio: "inherit" });
-fs.rmSync(path.join(repo, "playground", ".oj-cache"), { recursive: true, force: true });
-try {
-  execSync("lsof -ti:5199 -sTCP:LISTEN | xargs kill", { shell: "/bin/bash", stdio: "ignore" });
-} catch {}
-const args = ["dev", path.join(repo, "playground"), "--port", "5199"];
-if (bundle) args.push("--bundle");
-const server = spawn(path.join(repo, "target", "debug", "oj"), args, { stdio: "ignore" });
+fs.rmSync(path.join(playground, ".oj-cache"), { recursive: true, force: true });
 
-const up = async () => {
-  for (let i = 0; i < 60; i++) {
-    try { if ((await fetch("http://localhost:5199/")).ok) return; } catch {}
-    await new Promise((r) => setTimeout(r, 500));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function killPort() {
+  try {
+    execSync("lsof -ti:5199 -sTCP:LISTEN | xargs kill", { shell: "/bin/bash", stdio: "ignore" });
+  } catch {}
+}
+
+async function startServer(logFd) {
+  killPort();
+  await sleep(300);
+  const args = ["dev", playground, "--port", "5199"];
+  if (bundle) args.push("--bundle");
+  const server = spawn(oj, args, { stdio: ["ignore", logFd, logFd] });
+  for (let i = 0; i < 80; i++) {
+    try {
+      if ((await fetch("http://localhost:5199/")).ok) return server;
+    } catch {}
+    await sleep(250);
   }
+  server.kill("SIGKILL");
   throw new Error("dev server did not start");
-};
-await up();
+}
 
 let failed = 0;
 for (const file of fs.readdirSync(here).filter((f) => f.endsWith(".test.js")).sort()) {
   process.stdout.write(`\n${file} (${bundle ? "bundle" : "unbundled"})\n`);
+  const logPath = path.join(here, `.server-${file}.log`);
+  const logFd = fs.openSync(logPath, "w");
+  let server;
+  let ok = true;
   try {
+    server = await startServer(logFd);
     execSync(`node ${path.join(here, file)}`, {
       stdio: "inherit",
       cwd: here,
@@ -39,8 +55,18 @@ for (const file of fs.readdirSync(here).filter((f) => f.endsWith(".test.js")).so
     });
   } catch {
     failed++;
+    ok = false;
+  } finally {
+    if (server) server.kill("SIGKILL");
+    killPort();
+    fs.closeSync(logFd);
+    if (!ok) {
+      const lines = fs.readFileSync(logPath, "utf8").trimEnd().split("\n");
+      console.log(`server log (last 60 lines) for ${file}:`);
+      console.log(lines.slice(-60).join("\n"));
+    }
+    fs.rmSync(logPath, { force: true });
   }
 }
-server.kill("SIGKILL");
 console.log(failed ? `\n${failed} test(s) FAILED` : "\nALL E2E TESTS PASSED");
 process.exit(failed ? 1 : 0);
