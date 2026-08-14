@@ -24,6 +24,24 @@ const CONFIG_FILES = [
 const hookHandler = (h) => (typeof h === "function" ? h : typeof h?.handler === "function" ? h.handler : null);
 const hookFilter = (h) => (typeof h === "object" && h ? h.filter : undefined);
 
+// Plugins whose transforms oj reimplements natively (so re-running them here
+// would double-transform and clash): React (vite:react-*), everything under
+// Vite's own `vite:` namespace (esbuild TS/JSX, glob, define), and TanStack
+// Start/Router (server-fns, route code-splitting, manifests). Any other plugin
+// is the app's own and its transforms DO need to run on first-party source.
+const ojReimplemented = (name = "") =>
+  name.startsWith("vite:") || /^tanstack[-:]/.test(name) || name.startsWith("@tanstack/");
+
+// Vite 6+ per-environment gate: a plugin may declare `applyToEnvironment` to
+// run only in "client" or "ssr". Ignoring it lets an SSR-only plugin (e.g. one
+// that stubs client-only modules) run against the client bundle and corrupt it.
+// Undefined = runs everywhere; a throwing gate defaults to "applies" (safe).
+function envAllows(plugin, environment) {
+  const f = plugin.applyToEnvironment;
+  if (typeof f !== "function") return true;
+  try { return f({ name: environment }) !== false; } catch { return true; }
+}
+
 // Vite/Rollup hook id filter: RegExp | string | {include,exclude} | array of.
 // A string is treated as a substring match (close enough for id gating here).
 function matchOne(pat, id) {
@@ -93,6 +111,13 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
     ),
   );
 
+  // Vite re-exports Rollup's parser as `parseAst`; give plugins a real
+  // `this.parse` (some, e.g. code-stubbing plugins, walk the AST and would emit
+  // broken output against a `{}` stub). Fall back to `{}` if unavailable.
+  const parse = typeof vite.parseAst === "function"
+    ? (code, opts) => vite.parseAst(code, opts)
+    : () => ({});
+
   const ctx = {
     environment: { name: environment, mode: command === "build" ? "build" : "dev" },
     meta: { rollupVersion: "4.0.0", watchMode: command !== "build", framework: "oj" },
@@ -103,11 +128,12 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
     addWatchFile() {}, getWatchFiles() { return []; },
     getModuleInfo() { return null; }, getModuleIds() { return [][Symbol.iterator](); },
     async resolve() { return null; }, async load() { return null; },
-    parse() { return {}; },
+    parse,
   };
 
   async function resolveId(id, importer) {
     for (const p of plugins) {
+      if (!envAllows(p, environment)) continue;
       const h = hookHandler(p.resolveId);
       if (!h || !idAllowed(hookFilter(p.resolveId), id)) continue;
       let r;
@@ -119,6 +145,7 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
 
   async function load(id) {
     for (const p of plugins) {
+      if (!envAllows(p, environment)) continue;
       const h = hookHandler(p.load);
       if (!h || !idAllowed(hookFilter(p.load), id)) continue;
       let r;
@@ -134,10 +161,35 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
   async function transform(code, id) {
     let current = code, changed = false;
     for (const p of plugins) {
+      if (!envAllows(p, environment)) continue;
       const h = hookHandler(p.transform);
       if (!h || !idAllowed(hookFilter(p.transform), id)) continue;
       let r;
       try { r = await h.call(ctx, current, id); } catch { continue; }
+      const next = r == null ? null : typeof r === "string" ? r : r.code;
+      if (next != null) { current = next; changed = true; }
+    }
+    return changed ? current : null;
+  }
+
+  // Run the app's OWN plugin transforms on first-party source (.ts/.tsx), so
+  // plugin-generated code (i18n message accessors, macros, ...) exists in both
+  // the SSR module and the client bundle. Deliberately SKIPS the plugins oj
+  // reimplements natively -- React (JSX/Fast-Refresh) and TanStack Start/Router
+  // (server-fns, route code-splitting, manifests) -- and Vite's own built-ins
+  // (esbuild TS/JSX, glob, define). Running those here would double-transform
+  // and clash with oj's pipeline (e.g. TanStack's server-fn transform fighting
+  // oj's server-fn resolver). The `{ ssr }` option lets plugins branch per
+  // environment the way Vite passes it. `try/catch` per plugin degrades safely.
+  async function transformUserCode(code, id) {
+    const ssr = environment === "ssr";
+    let current = code, changed = false;
+    for (const p of plugins) {
+      if (ojReimplemented(p.name) || !envAllows(p, environment)) continue;
+      const h = hookHandler(p.transform);
+      if (!h || !idAllowed(hookFilter(p.transform), id)) continue;
+      let r;
+      try { r = await h.call(ctx, current, id, { ssr }); } catch { continue; }
       const next = r == null ? null : typeof r === "string" ? r : r.code;
       if (next != null) { current = next; changed = true; }
     }
@@ -166,8 +218,8 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
   }
 
   const publicDir = typeof loaded?.config?.publicDir === "string" ? loaded.config.publicDir : null;
-  return { resolveId, load, transform, generateBundle, publicDir, pluginCount: plugins.length };
+  return { resolveId, load, transform, transformUserCode, generateBundle, publicDir, pluginCount: plugins.length };
 }
 
 // Pure gating helpers exposed for unit tests; not part of the runtime contract.
-export const __test = { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter };
+export const __test = { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows };

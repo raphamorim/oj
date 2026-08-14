@@ -6,7 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
-const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter } = __test;
+const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
 test("matchOne: RegExp tests, string is a substring match", () => {
   assert.ok(matchOne(/\.mdx$/, "/a/b.mdx"));
@@ -57,6 +57,41 @@ test("ordered: pre first, normal next, post last (stable within a band)", () => 
     { name: "pre2", enforce: "pre" },
   ]).map((p) => p.name);
   assert.deepEqual(names, ["pre1", "pre2", "n1", "n2", "post1"]);
+});
+
+test("ojReimplemented: skips React / Vite built-ins / TanStack; keeps app plugins", () => {
+  // Framework/built-in plugins oj reimplements -- their transforms must NOT
+  // re-run on app source (double JSX, or TanStack's server-fn transform
+  // fighting oj's own server-fn resolver -> a /_serverFn/ URL parse crash).
+  for (const n of [
+    "vite:react-babel", "vite:react-refresh", "vite:esbuild", "vite:import-glob",
+    "tanstack-start-core::server-fn:client", "tanstack:router-generator",
+    "tanstack-router:code-splitter:compile-reference-file", "@tanstack/react-start",
+  ]) {
+    assert.ok(ojReimplemented(n), `expected ${n} to be oj-reimplemented`);
+  }
+  // The app's own plugins -- their transforms DO need to run.
+  for (const n of ["fixture-i18n", "ssr-stub-scopes", "transitive-preloads", "customer-mdx", "i18n-dev", ""]) {
+    assert.ok(!ojReimplemented(n), `expected ${n} to be treated as an app plugin`);
+  }
+});
+
+test("envAllows: applyToEnvironment gates per environment (the ssr-stub-scopes regression)", () => {
+  // No gate -> runs everywhere.
+  assert.ok(envAllows({}, "client"));
+  assert.ok(envAllows({}, "ssr"));
+  // The exact ssr-stub-scopes shape: SSR-only. Must be SKIPPED on the client
+  // (running it there stubbed every module and blew up the client bundle with
+  // hundreds of "no matching export" errors).
+  const ssrOnly = { name: "ssr-stub-scopes", applyToEnvironment: (env) => env.name === "ssr" };
+  assert.ok(!envAllows(ssrOnly, "client"), "ssr-only plugin must be skipped on client");
+  assert.ok(envAllows(ssrOnly, "ssr"), "ssr-only plugin must run on ssr");
+  // A client-only gate is the mirror image.
+  const clientOnly = { applyToEnvironment: (env) => env.name === "client" };
+  assert.ok(envAllows(clientOnly, "client"));
+  assert.ok(!envAllows(clientOnly, "ssr"));
+  // A throwing gate defaults to "applies" (safe -- degrade like no gate).
+  assert.ok(envAllows({ applyToEnvironment: () => { throw new Error("x"); } }, "client"));
 });
 
 test("hookHandler / hookFilter: function form and object form", () => {

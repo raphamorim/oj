@@ -26,10 +26,17 @@ const SERVER_FN_BASE = process.env.TSS_SERVER_FN_BASE ?? "/_serverFn/";
 const serverFnClient = {
   name: "server-fn-client",
   setup(build) {
-    build.onLoad({ filter: /\.(ts|tsx)$/ }, (args) => {
+    build.onLoad({ filter: /\.(ts|tsx)$/ }, async (args) => {
       if (args.path.includes("/node_modules/")) return null;
       const loader = args.path.endsWith("tsx") ? "tsx" : "ts";
-      let code = transformGlob(readFileSync(args.path, "utf8"), args.path);
+      let code = readFileSync(args.path, "utf8");
+      // Run the app's own plugin transforms (i18n, macros, ...) -- symmetric
+      // with the SSR loader -- before oj's glob + server-fn client rewrites.
+      if (container) {
+        const t = await container.transformUserCode(code, args.path);
+        if (t != null) code = t;
+      }
+      code = transformGlob(code, args.path);
       if (!code.includes("createServerFn")) return { contents: code, loader };
       const rel = relative(APP, args.path);
       const re = /(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*createServerFn\b[\s\S]*?\.handler\s*\(/g;

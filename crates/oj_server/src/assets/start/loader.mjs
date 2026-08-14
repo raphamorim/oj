@@ -209,7 +209,15 @@ export async function load(url, context, next) {
   }
   if (clean.endsWith(".tsx") || clean.endsWith(".ts")) {
     const path = fileURLToPath(clean);
-    const src = transformServerFns(transformGlob(readFileSync(path, "utf8"), path), path);
+    let raw = readFileSync(path, "utf8");
+    // Run the app's own (non-React, non-TanStack) plugin transforms on its
+    // source before oj's TS/JSX + server-fn/glob rewrites, so plugin-generated
+    // exports (i18n, macros, ...) are present. Skipped for node_modules.
+    if (container && !path.includes("/node_modules/")) {
+      const t = await container.transformUserCode(raw, path);
+      if (t != null) raw = t;
+    }
+    const src = transformServerFns(transformGlob(raw, path), path);
     const out = transformSync(src, {
       loader: clean.endsWith("tsx") ? "tsx" : "ts",
       format: "esm", jsx: "automatic", sourcefile: path,

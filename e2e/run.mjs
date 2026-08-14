@@ -15,6 +15,13 @@ const repo = path.join(here, "..");
 const bundle = process.argv.includes("--bundle");
 
 execSync("cargo build -p oj", { cwd: repo, stdio: "inherit" });
+// Start from a cold cache. The suite edits source files and asserts compile/
+// HMR behavior, so it must exercise the real compile path, not a prior run's
+// content-addressed artifacts. A warm cache also serves modules without
+// re-running the plugin `transform` hook, so transform-time side effects
+// (this.addWatchFile registrations, moduleParsed) wouldn't fire for cache-hit
+// modules -- which silently broke plugin-watch/plugin from the second run on.
+fs.rmSync(path.join(repo, "playground", ".oj-cache"), { recursive: true, force: true });
 try {
   execSync("lsof -ti:5199 -sTCP:LISTEN | xargs kill", { shell: "/bin/bash", stdio: "ignore" });
 } catch {} // nothing was listening
