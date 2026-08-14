@@ -1,10 +1,5 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
-
-//! Persistent Node plugin host: runs Vite/Rollup-style plugin hooks against the
-//! compile pipeline. JSON lines over stdio with correlation ids and a
-//! background reader, so many transforms can be in flight at once.
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -18,16 +13,13 @@ use tokio::sync::oneshot;
 pub const PLUGIN_HOST_JS: &str = include_str!("assets/plugin-host.mjs");
 pub const VITE_EXTRACT_JS: &str = include_str!("assets/vite-extract.mjs");
 
-/// A file a plugin asked to emit via `this.emitFile` (asset form only). The
-/// build collects these after `buildEnd` and writes them to the output dir.
 #[derive(Debug)]
 pub struct EmittedFile {
     pub file_name: String,
     pub source: String,
 }
 
-/// A `oj.plugins.{mjs,js}` at the app root default-exports a plugin array.
-/// Returns its path if one exists.
+#[inline]
 pub fn plugins_file(root: &Path) -> Option<std::path::PathBuf> {
     ["oj.plugins.mjs", "oj.plugins.js"]
         .into_iter()
@@ -35,17 +27,12 @@ pub fn plugins_file(root: &Path) -> Option<std::path::PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Where a build's plugins come from, and in what shape the host should read
-/// them: oj's own `oj.plugins.*` (a plugin array) or an app's `vite.config.*`
-/// (the default export's `.plugins`).
 pub enum PluginSource {
-    /// An `oj.plugins.{mjs,js}`: default-exports a plugin array.
     OjPlugins(std::path::PathBuf),
-    /// A compiled `vite.config.{ts,js,mjs}`; read plugins from `default.plugins`.
     ViteConfig(std::path::PathBuf),
 }
 
-/// The app's `vite.config.{ts,mts,mjs,js}`, if one exists.
+#[inline]
 pub fn vite_config_file(root: &Path) -> Option<std::path::PathBuf> {
     ["vite.config.ts", "vite.config.mts", "vite.config.mjs", "vite.config.js"]
         .into_iter()
@@ -53,9 +40,7 @@ pub fn vite_config_file(root: &Path) -> Option<std::path::PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Resolve the app's plugin source. `oj.plugins.*` wins; otherwise the raw
-/// `vite.config.{ts,js,mjs}` path (the Node host bundles it with the app's own
-/// esbuild, local imports inlined and deps external, before reading `plugins`).
+#[inline]
 pub fn plugin_source(root: &Path) -> Option<PluginSource> {
     if let Some(p) = plugins_file(root) {
         return Some(PluginSource::OjPlugins(p));
@@ -63,7 +48,6 @@ pub fn plugin_source(root: &Path) -> Option<PluginSource> {
     vite_config_file(root).map(PluginSource::ViteConfig)
 }
 
-/// Config values lifted out of an app's `vite.config` (the subset oj honors).
 #[derive(Debug, Default)]
 pub struct ViteValues {
     pub base: Option<String>,
@@ -75,11 +59,6 @@ pub struct ViteValues {
     pub headers: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
-/// Extract `base`, `server.port`/`host`, and `define` from an app's
-/// `vite.config` via a one-shot Node run (same loader the plugin host uses).
-/// Returns `None` when `oj.plugins.*` is present (oj.config supplies values),
-/// when there is no `vite.config`, or when extraction fails (e.g. a config
-/// whose plugins assert during evaluation); callers fall back to defaults.
 pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
     if plugins_file(root).is_some() {
         return None;
@@ -105,8 +84,7 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
     Some(parse_vite_values(&json))
 }
 
-/// Parse the JSON that `vite-extract.mjs` prints into typed values (pure, so it
-/// is unit-testable without spawning node).
+#[inline]
 fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
     ViteValues {
         base: json.get("base").and_then(|v| v.as_str()).map(str::to_string),
@@ -119,11 +97,7 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
     }
 }
 
-/// Merge an app's `vite.config` values into `config` for any field oj.config
-/// left unset (`base`, `server.port`/`host`, `define`, `resolve.alias`).
-/// No-op unless the app is vite.config-configured (see [`extract_vite_values`]).
-/// Precedence stays CLI > oj.config > vite.config > default. Shared by the dev
-/// server and the production build.
+#[inline]
 pub fn adopt_vite_config_values(config: &mut oj_config::OjConfig, root: &Path) {
     let Some(v) = extract_vite_values(root) else {
         return;
@@ -131,8 +105,6 @@ pub fn adopt_vite_config_values(config: &mut oj_config::OjConfig, root: &Path) {
     merge_vite_values(config, v);
 }
 
-/// Merge extracted vite values into `config` for any field oj.config left unset
-/// (config always wins). Pure, so it is unit-testable.
 fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
     if config.base.is_none() {
         config.base = v.base;
@@ -186,9 +158,6 @@ pub struct PluginHost {
     _child: tokio::process::Child,
 }
 
-/// Handle a plugin-context RPC (Node to Rust) and write the reply to `stdin`.
-/// Currently just `resolve`, so plugins' `this.resolve` uses oj's own resolver
-/// (tsconfig aliases and all), keeping plugin resolution consistent with oj.
 async fn handle_ctx_rpc(
     rpc: u64,
     method: &str,
@@ -347,10 +316,6 @@ impl PluginHost {
         }
     }
 
-    /// Run the plugins' `transform` hooks. Returns the (possibly) transformed
-    /// code plus the files those hooks registered via `this.addWatchFile` (so
-    /// the caller can cache + re-apply the watch across warm-cache restarts).
-    /// The host replies with a `{ code, watchFiles }` JSON envelope.
     pub async fn transform(&self, code: &str, id: &str) -> Result<(String, Vec<String>), String> {
         let Some(raw) = self.call("transform", &[code, id]).await? else {
             return Ok((code.to_string(), Vec::new()));
@@ -370,71 +335,62 @@ impl PluginHost {
         }
     }
 
-    /// Whether any loaded plugin defines `moduleParsed`. Queried once so oj only
-    /// replays the hook on warm-cache serves when a plugin actually observes it.
+    #[inline]
     pub async fn has_module_parsed(&self) -> bool {
         matches!(self.call("hasModuleParsed", &[]).await, Ok(Some(s)) if s == "true")
     }
 
-    /// Replay `moduleParsed` for a module served from oj's warm cache, where the
-    /// `transform` hook (which normally fires it) did not re-run.
+    #[inline]
     pub async fn module_parsed(&self, id: &str) -> Result<(), String> {
         self.call("replayModuleParsed", &[id]).await.map(|_| ())
     }
 
-    /// Run `resolveId`; `Ok(None)` = no plugin owns this specifier.
+    #[inline]
     pub async fn resolve_id(&self, source: &str, importer: &str) -> Result<Option<String>, String> {
         self.call("resolveId", &[source, importer]).await
     }
 
-    /// Run `load`; `Ok(None)` = no plugin provides this id.
+    #[inline]
     pub async fn load(&self, id: &str) -> Result<Option<String>, String> {
         self.call("load", &[id]).await
     }
 
-    /// Run `handleHotUpdate`; `Ok(Some("full-reload" | "skip"))` = a plugin
-    /// overrode default HMR for `file`, `Ok(None)` = proceed normally.
+    #[inline]
     pub async fn handle_hot_update(&self, file: &str, timestamp: u64) -> Result<Option<String>, String> {
         self.call("handleHotUpdate", &[file, &timestamp.to_string()]).await
     }
 
-    /// Run `transformIndexHtml` (string / tag-array / {html,tags} forms all
-    /// resolved host-side); returns the transformed HTML unchanged if no plugin
-    /// touched it.
+    #[inline]
     pub async fn transform_index_html(&self, html: &str) -> Result<String, String> {
         Ok(self.call("transformIndexHtml", &[html]).await?.unwrap_or_else(|| html.to_string()))
     }
 
-    /// Run `buildStart`: the build lifecycle is starting. Side-effect hook
-    /// (plugins init state / clean output); the return value is ignored.
+    #[inline]
     pub async fn build_start(&self) -> Result<(), String> {
         self.call("buildStart", &[]).await.map(|_| ())
     }
 
-    /// Run `buildEnd`: the module graph is complete. Side-effect hook; ignored.
+    #[inline]
     pub async fn build_end(&self) -> Result<(), String> {
         self.call("buildEnd", &[]).await.map(|_| ())
     }
 
-    /// Run `renderStart`: the output phase is beginning. Side-effect hook.
+    #[inline]
     pub async fn render_start(&self) -> Result<(), String> {
         self.call("renderStart", &[]).await.map(|_| ())
     }
 
-    /// Run `watchChange`: a watched file changed (Rollup watch hook). `event`
-    /// is `create` / `update` / `delete`. Side-effect; ignored return.
+    #[inline]
     pub async fn watch_change(&self, file: &str, event: &str) -> Result<(), String> {
         self.call("watchChange", &[file, event]).await.map(|_| ())
     }
 
-    /// Run `closeBundle`: the very last hook, after everything is written.
+    #[inline]
     pub async fn close_bundle(&self) -> Result<(), String> {
         self.call("closeBundle", &[]).await.map(|_| ())
     }
 
-    /// Files plugins registered via `this.addWatchFile`. The dev watcher forces
-    /// a full reload when one of these changes (even a non-source file oj would
-    /// otherwise ignore). Absolute paths as the plugin passed them.
+    #[inline]
     pub async fn watch_files(&self) -> Result<Vec<String>, String> {
         let Some(json) = self.call("getWatchFiles", &[]).await? else {
             return Ok(Vec::new());
@@ -442,51 +398,41 @@ impl PluginHost {
         serde_json::from_str(&json).map_err(|e| e.to_string())
     }
 
-    /// Whether any active plugin defines a `generateBundle` hook; lets the
-    /// build skip serializing the whole output bundle when nothing uses it.
+    #[inline]
     pub async fn has_generate_bundle(&self) -> bool {
         matches!(self.call("hasGenerateBundle", &[]).await, Ok(Some(s)) if s == "true")
     }
 
-    /// Run `generateBundle`: hand the output bundle (JSON keyed by fileName) to
-    /// the plugins' generateBundle hooks and return the possibly-mutated bundle
-    /// JSON (chunk `code` / asset `source` edits). Plugins may also `emitFile`
-    /// here; those are collected via [`Self::emitted_files`].
+    #[inline]
     pub async fn generate_bundle(&self, bundle_json: &str, is_write: bool) -> Result<Option<String>, String> {
         self.call("generateBundle", &[bundle_json, if is_write { "true" } else { "false" }]).await
     }
 
-    /// Whether any active plugin defines a `renderChunk` hook.
+    #[inline]
     pub async fn has_render_chunk(&self) -> bool {
         matches!(self.call("hasRenderChunk", &[]).await, Ok(Some(s)) if s == "true")
     }
 
-    /// Run `renderChunk` for one chunk: chain the plugins' hooks over `code`
-    /// (with the chunk's metadata as JSON) and return the final code, or `None`
-    /// if unchanged.
     pub async fn render_chunk(&self, code: &str, chunk_json: &str) -> Result<Option<String>, String> {
         self.call("renderChunk", &[code, chunk_json]).await
     }
 
-    /// Whether any active plugin defines a `writeBundle` hook.
+    #[inline]
     pub async fn has_write_bundle(&self) -> bool {
         matches!(self.call("hasWriteBundle", &[]).await, Ok(Some(s)) if s == "true")
     }
 
-    /// Run `writeBundle` (post-write side effects); the bundle is read-only here
-    /// since files are already on disk, so any return is ignored.
+    #[inline]
     pub async fn write_bundle(&self, bundle_json: &str, is_write: bool) -> Result<(), String> {
         self.call("writeBundle", &[bundle_json, if is_write { "true" } else { "false" }]).await.map(|_| ())
     }
 
-    /// The port of the `configureServer` middleware HTTP server, if any plugin
-    /// registered dev-server middleware. `None` means no middleware to consult.
+    #[inline]
     pub async fn middleware_port(&self) -> Option<u16> {
         self.call("getMiddlewarePort", &[]).await.ok().flatten().and_then(|s| s.parse().ok())
     }
 
-    /// Collect the assets plugins emitted via `this.emitFile` during the build,
-    /// so the build can write them to the output dir.
+    #[inline]
     pub async fn emitted_files(&self) -> Result<Vec<EmittedFile>, String> {
         let Some(json) = self.call("getEmittedFiles", &[]).await? else {
             return Ok(Vec::new());

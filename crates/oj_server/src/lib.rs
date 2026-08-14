@@ -1,11 +1,5 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
-
-//! Dev server with React Fast Refresh. Compiles TS/TSX/JSX on demand via
-//! `oj_compiler`, rewriting relative imports to rooted URLs so each module has
-//! one identity; the `oj_graph` propagates changes to the nearest boundary
-//! (targeted `update`, else `full-reload`). Unbundled in dev by default.
-
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
@@ -31,9 +25,7 @@ use oj_graph::{HmrDecision, ModuleGraph};
 use oj_resolver::OjResolver;
 use tokio::sync::broadcast;
 
-/// oj's brand cobalt (`#2a33d4`, the docs-site accent) as a bold truecolor ANSI
-/// wrap. Applied only to an interactive stdout with `NO_COLOR` unset; otherwise
-/// the string is returned unchanged, so piped and CI output stay plain.
+#[inline]
 pub fn cobalt(s: &str) -> String {
     use std::io::IsTerminal;
     if std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal() {
@@ -43,17 +35,19 @@ pub fn cobalt(s: &str) -> String {
     }
 }
 
-/// The `oj` brand token as a badge: bold navy foreground on white-background
-/// cells (a space of padding each side), so it stays legible on any terminal
-/// theme. Falls back to plain `oj` when piped / `NO_COLOR`.
-pub fn oj_brand() -> String {
+#[inline]
+pub fn cell(s: &str) -> String {
     use std::io::IsTerminal;
     if std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal() {
-        // 48;2;255;255;255 = white bg cells; 1;38;2;42;51;212 = bold navy fg.
-        "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m".to_string()
+        format!("\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m {s} \x1b[0m")
     } else {
-        "oj".to_string()
+        s.to_string()
     }
+}
+
+#[inline]
+pub fn oj_brand() -> String {
+    cell("oj")
 }
 
 /// Wrap `text` in an OSC 8 hyperlink pointing at `url`, so terminals that
@@ -252,10 +246,6 @@ struct ServerState {
     base: Option<String>,
 }
 
-/// A fully-configured dev server that hasn't been bound to a socket yet.
-/// Returned by [`DevServer::build_app`] so other servers (dev-server SSR) can
-/// compose the dev pipeline (Fast Refresh, HMR WebSocket, on-demand module
-/// compilation) beneath their own routes.
 pub struct BuiltApp {
     pub router: Router,
     pub host: std::net::IpAddr,
@@ -275,7 +265,7 @@ impl DevServer {
         println!("  {} dev server", oj_brand());
         println!("  root: {}", built.root.display());
         let url = format!("http://localhost:{}/", built.port);
-        println!("  {}", link(&url, &cobalt(&url)));
+        println!("  {}", link(&url, &cell(&url)));
         if !built.proxy_prefixes.is_empty() {
             println!("  proxy: {}", built.proxy_prefixes.join(", "));
         }
@@ -284,21 +274,13 @@ impl DevServer {
         Ok(())
     }
 
-    /// Configure the dev server (config, .env, state, watcher, crawl, routes,
-    /// proxy) and return it as a [`BuiltApp`] without binding a listener.
     pub async fn build_app(self) -> anyhow::Result<BuiltApp> {
         let root = self
             .root
             .canonicalize()
             .with_context(|| format!("app root not found: {}", self.root.display()))?;
 
-        // Load oj.config.*: the source for proxy/port/host/bundle/envPrefix.
         let mut config = oj_config::load(&root).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        // When the app configures itself through a `vite.config` (no
-        // `oj.plugins.*`), adopt its `base`, `server.port`/`host`, `define`, and
-        // `resolve.alias` for any field oj.config left unset. Shared with the
-        // production build so `oj dev` and `oj build` agree.
         plugins::adopt_vite_config_values(&mut config, &root);
 
         // Load .env files (dev mode) and install the import.meta.env defines
@@ -528,12 +510,6 @@ fn js(body: impl IntoResponse) -> Response {
     ([(header::CONTENT_TYPE, "text/javascript")], body).into_response()
 }
 
-/// Module-runner endpoint: resolve `spec` as imported from `importer`. Returns
-/// `{"external":true,"spec":...}` for anything under node_modules (the runner
-/// imports those natively in Node) or `{"id":"<abs>"}` for app source (which
-/// the runner fetches from [`ssr_module`]). This plus [`ssr_module`] is the
-/// server-side half of dev SSR: a persistent Node runner links the SSR module
-/// graph on demand, so edits re-evaluate incrementally with no bundle step.
 async fn ssr_resolve(
     State(state): State<Arc<ServerState>>,
     Query(q): Query<HashMap<String, String>>,
@@ -706,7 +682,7 @@ pub async fn preview(
     println!("  {} preview", oj_brand());
     println!("  serving: {}", dir.display());
     let url = format!("http://localhost:{port}/");
-    println!("  {}", link(&url, &cobalt(&url)));
+    println!("  {}", link(&url, &cell(&url)));
     axum::serve(listener, app).await?;
     Ok(())
 }

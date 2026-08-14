@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
-
-//! Persistent Node sidecar for Tailwind v4. Lazily spawned; JSON lines over
-//! stdio with correlation ids.
-
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
@@ -15,6 +11,7 @@ use tokio::sync::oneshot;
 
 pub const SIDECAR_JS: &str = include_str!("assets/tailwind-sidecar.mjs");
 
+#[inline]
 pub fn is_tailwind_css(source: &str) -> bool {
     source.contains("@import \"tailwindcss\"")
         || source.contains("@import 'tailwindcss'")

@@ -92,7 +92,7 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("cannot bind {addr}: {e}"))?;
     println!("  {} dev (tanstack start)", oj_server::oj_brand());
     let url = format!("http://localhost:{}/", built.port);
-    println!("  {}", oj_server::link(&url, &oj_server::cobalt(&url)));
+    println!("  {}", oj_server::link(&url, &oj_server::cell(&url)));
     axum::serve(listener, app).await?;
     Ok(())
 }

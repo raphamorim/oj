@@ -61,7 +61,7 @@ pub async fn ssr_dev(root: PathBuf, entry: String, port: Option<u16>) -> anyhow:
         None => println!("  client: none (SSR only; add a *-client entry to hydrate)"),
     }
     let url = format!("http://localhost:{}/", built.port);
-    println!("  {}", oj_server::link(&url, &oj_server::cobalt(&url)));
+    println!("  {}", oj_server::link(&url, &oj_server::cell(&url)));
     axum::serve(listener, app).await?;
     Ok(())
 }
