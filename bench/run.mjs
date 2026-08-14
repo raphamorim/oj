@@ -1,19 +1,3 @@
-// SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Raphael Amorim
-
-// Benchmark oj vs Vite on a generated app (see generate.mjs).
-//
-//   node bench/run.mjs 1000
-//
-// Measures, per tool:
-//   cold start   — process spawn -> page fully rendered (cleared caches)
-//   warm start   — same, with the tool's persistent caches primed
-//   reload       — page reload on the running warm server
-//   hmr          — leaf component edit -> new text painted
-//   rss          — server RSS after render, in MB
-//
-// oj must be built first: cargo build --release -p oj
-
 import { spawn, execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -181,6 +165,7 @@ for (const tool of Object.keys(TOOLS)) {
   await sleep(300);
 }
 
+// again, table??
 console.log(`\n${N} components (fanout-10 tree), ${ITERS} restarts, ${HMR_EDITS} hmr edits — p50/p95, macOS ${process.arch}, ${new Date().toISOString().slice(0, 10)}`);
 console.log("tool      | cold start   | warm start   | reload       | HMR         | RSS");
 console.log("----------|--------------|--------------|--------------|-------------|-----");

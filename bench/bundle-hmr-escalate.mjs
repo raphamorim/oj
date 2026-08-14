@@ -1,7 +1,3 @@
-// Bundle-mode HMR boundary escalation: editing a NON-component export in a
-// mixed module (component + constant) must NOT full-reload. The boundary
-// rejects its own update at runtime; oj should escalate to the importer and
-// re-execute it in place (state/sentinel survive), not reload the page.
 import { chromium } from "playwright";
 import { spawn, execSync } from "node:child_process";
 import { mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync } from "node:fs";

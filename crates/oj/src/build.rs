@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-//! `oj build`: production build via embedded Rolldown 1.x (MIT).
-//!
-//! oj owns the app-shaped parts: HTML entry discovery, NODE_ENV, hashed-asset
-//! HTML rewriting, and the build summary.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -26,23 +21,11 @@ use rolldown_plugin::{
 use rolldown_plugin::__inner::SharedPluginable;
 use oj_server::plugins::PluginHost;
 
-/// The oj build plugin: loads `.css`/`.scss` imports as JS stubs (CSS Modules
-/// export their scoped class map), collecting compiled CSS into one emitted
-/// stylesheet. Its `transform` expands `import.meta.glob` (Rolldown has no
-/// native glob), keeping prod builds in sync with dev.
 #[derive(Debug)]
 struct OjCssPlugin {
     collected: Arc<Mutex<Vec<(String, String)>>>,
-    /// App root, so CSS-module class names hash from the same root-relative id
-    /// (`/src/x.module.css`) the dev server uses. Keeps `oj dev`, `oj build`,
-    /// and the SSR/client bundles consistent, which hydration relies on.
     root: PathBuf,
-    /// App has a postcss.config: run all .css through the sidecar (PostCSS),
-    /// not just Tailwind-flagged css, as the dev server does.
     has_postcss: bool,
-    /// This is a client (browser) build: replace `*.server.*` modules with RPC
-    /// stubs so server-only code never ships to the browser. The server build
-    /// (`false`) keeps the real implementations.
     client: bool,
 }
 
@@ -57,11 +40,6 @@ impl Plugin for OjCssPlugin {
             | rolldown_plugin::HookUsage::Transform
     }
 
-    // Built-in `virtual:oj-routes` resolves to a synthetic module at the app
-    // root (so its `./src/routes/**` glob resolves there); `load` returns the
-    // manifest source and `transform` (below) expands the glob. Also handles
-    // Vite's `?url` asset imports: resolve the real file, keep the `?url` marker
-    // so `load` emits it.
     fn resolve_id(
         &self,
         ctx: &PluginContext,
@@ -320,15 +298,9 @@ fn copy_public_dir(src: &Path, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Bridges the Node plugin host into the Rolldown build, so the same
-/// Vite/Rollup-style `resolveId`/`load`/`transform` hooks that run in the dev
-/// server also run in `oj build`. Runs before `OjCssPlugin` so user transforms
-/// see raw source and user resolveId/load win for virtual ids.
 #[derive(Debug)]
 struct OjUserPlugin {
     host: Arc<PluginHost>,
-    /// Cached `has_render_chunk()`: renderChunk fires per chunk, so resolve it
-    /// once instead of round-tripping to Node for every chunk.
     render_chunk_enabled: Arc<tokio::sync::OnceCell<bool>>,
 }
 
@@ -397,8 +369,6 @@ impl Plugin for OjUserPlugin {
         let code = args.code.to_string();
         let id = args.id.to_string();
         async move {
-            // The prod build uses the transformed code only; addWatchFile
-            // metadata is a dev-watcher concern.
             match host.transform(&code, &id).await {
                 Ok((out, _)) if out != code => Ok(Some(HookTransformOutput {
                     code: Some(out),
@@ -409,10 +379,6 @@ impl Plugin for OjUserPlugin {
         }
     }
 
-    // Output-phase hook: the plugins see the finished bundle (keyed by
-    // fileName), may read it, mutate chunk `code` / asset `source`, or emitFile
-    // new assets (collected separately). Skipped when no plugin defines
-    // generateBundle.
     async fn generate_bundle(
         &self,
         _ctx: &PluginContext,
@@ -428,9 +394,6 @@ impl Plugin for OjUserPlugin {
         Ok(())
     }
 
-    // Per-chunk output hook: chain the plugins' renderChunk over each chunk's
-    // rendered code. Cached `has_render_chunk` avoids a Node round-trip per
-    // chunk when nothing uses it. Sourcemap is dropped (Null) on a change.
     fn render_chunk(
         &self,
         _ctx: &PluginContext,
@@ -454,8 +417,6 @@ impl Plugin for OjUserPlugin {
         }
     }
 
-    // Post-write hook: files are already on disk, so this is a read-only
-    // notification (plugins do side effects like extra fs writes / logging).
     async fn write_bundle(
         &self,
         _ctx: &PluginContext,
@@ -469,7 +430,6 @@ impl Plugin for OjUserPlugin {
         Ok(())
     }
 
-    // Output phase begins (after buildEnd, before renderChunk). Side effect.
     async fn render_start(
         &self,
         _ctx: &PluginContext,
@@ -479,7 +439,6 @@ impl Plugin for OjUserPlugin {
         Ok(())
     }
 
-    // The very last hook, after everything is written. Side effect.
     async fn close_bundle(
         &self,
         _ctx: &PluginContext,
@@ -490,8 +449,6 @@ impl Plugin for OjUserPlugin {
     }
 }
 
-/// A Rollup RenderedChunk as the plugin host expects it (metadata only; the
-/// code is passed separately as the hook's first argument).
 fn serialize_rendered_chunk(chunk: &rolldown_common::RollupRenderedChunk) -> String {
     serde_json::json!({
         "type": "chunk",
@@ -504,9 +461,6 @@ fn serialize_rendered_chunk(chunk: &rolldown_common::RollupRenderedChunk) -> Str
     .to_string()
 }
 
-/// Serialize the Rolldown output bundle to a Rollup-shaped `bundle` object
-/// (JSON keyed by fileName) for the plugin host. Binary asset sources are sent
-/// as null (readable metadata only; not mutable through this bridge).
 fn serialize_bundle(bundle: &[rolldown_common::Output]) -> String {
     use rolldown_common::{Output, StrOrBytes};
     let mut map = serde_json::Map::new();
@@ -543,9 +497,6 @@ fn serialize_bundle(bundle: &[rolldown_common::Output]) -> String {
     serde_json::Value::Object(map).to_string()
 }
 
-/// Apply a plugin's `generateBundle` edits back onto the Rolldown output: only
-/// `code`/`source` changes to existing entries (COW via `Arc::make_mut`). New
-/// entries (use `this.emitFile`) and deletions are not applied.
 fn apply_bundle_mutations(bundle: &mut [rolldown_common::Output], json: &str) {
     use rolldown_common::{Output, StrOrBytes};
     let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(json) else {
@@ -575,9 +526,6 @@ fn apply_bundle_mutations(bundle: &mut [rolldown_common::Output], json: &str) {
     }
 }
 
-/// Spawn the plugin host for a build (`command: "build"`) if the app declares
-/// plugins. Returned so the build can both add it as a Rolldown plugin and run
-/// transformIndexHtml on the emitted HTML.
 async fn user_plugin_host(
     root: &Path,
     base: &str,
@@ -585,9 +533,6 @@ async fn user_plugin_host(
     environments: &serde_json::Value,
     env_name: &str,
 ) -> Option<Arc<PluginHost>> {
-    // Plugins come from oj.plugins.* or the app's vite.config (same source and
-    // format as the dev server), so a vite.config-only app runs its plugins in
-    // the build too.
     let (file, plugins_format, label) = match oj_server::plugins::plugin_source(root)? {
         oj_server::plugins::PluginSource::OjPlugins(p) => {
             let label = p.file_name().unwrap().to_string_lossy().into_owned();
@@ -598,7 +543,6 @@ async fn user_plugin_host(
     let config = serde_json::json!({
         "config": { "root": root.display().to_string(), "base": base, "mode": "production", "command": "build", "define": define, "environments": environments },
         "env": { "command": "build", "mode": "production" },
-        // Which Vite environment this build represents ("client" or "ssr").
         "environment": { "name": env_name, "mode": "production" },
         "pluginsFormat": plugins_format,
     })
@@ -621,11 +565,8 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         .with_context(|| format!("app root not found: {}", root.display()))?;
 
     let mut config = oj_config::load(&root).map_err(|e| anyhow::anyhow!("{e}"))?;
-    // Adopt vite.config base/define/resolve.alias for vite-configured apps, so
-    // `oj build` resolves the same way `oj dev` does.
     oj_server::plugins::adopt_vite_config_values(&mut config, &root);
     let build_cfg = config.build.clone().unwrap_or_default();
-    // Precedence: CLI --out > config build.outDir > "dist".
     let out = out
         .or_else(|| build_cfg.out_dir.as_ref().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("dist"));
@@ -636,14 +577,11 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         eprintln!("oj build: note: build.target is accepted but not yet applied");
     }
 
-    // SSR mode: build the server bundle, a client hydration bundle, and a
-    // streaming production server that ties them together.
     if let Some(entry) = ssr.or_else(|| build_cfg.ssr.clone()) {
         return build_ssr_app(&root, &out_dir, &entry, minify, sourcemap, build_cfg.prerender.clone())
             .await;
     }
 
-    // Library mode: build a distributable, not an app (no index.html).
     if let Some(lib) = build_cfg.lib.clone() {
         return build_library(&root, &out_dir, lib, minify, sourcemap).await;
     }
@@ -733,15 +671,12 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         .write()
         .await
         .map_err(|errs| anyhow::anyhow!("build failed:\n{errs:?}"))?;
-    // Fire the closeBundle hook (the last output hook; write() alone doesn't).
     bundler.close().await.map_err(|errs| anyhow::anyhow!("close failed:\n{errs:?}"))?;
 
-    // The module graph is complete: buildEnd fires before emitting HTML/manifest.
     if let Some(host) = &plugin_host {
         if let Err(e) = host.build_end().await {
             eprintln!("oj build: plugin buildEnd failed: {e}");
         }
-        // Write any assets plugins emitted via this.emitFile into the output.
         match host.emitted_files().await {
             Ok(files) => {
                 for file in files {
@@ -757,14 +692,13 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
     }
 
     for warning in &output.warnings {
-        // oj's transform plugins don't emit sourcemaps yet.
+        // oj's transform plugins don't emit sourcemaps yet!!
         if format!("{warning:?}").contains("SOURCEMAP_BROKEN") {
             continue;
         }
         eprintln!("oj build warning: {warning:?}");
     }
 
-    // Map each entry url to its hashed chunk filename for HTML rewriting.
     let mut rewritten_html = html.clone();
     let mut emitted: Vec<(String, usize)> = Vec::new();
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
@@ -923,10 +857,6 @@ fn scan_attrs(html: &str, tag_prefix: &str, attr_prefix: &str) -> Vec<String> {
     values
 }
 
-/// Build an SSR server bundle (`build.ssr` / `--ssr`): target Node, keep bare
-/// dependencies external (Node resolves them at runtime), emit one ESM
-/// `<stem>.mjs`. This is the server-build half of SSR; a dev-server SSR module
-/// runner (Environment API) is separate, larger work.
 pub(crate) async fn build_ssr(
     root: &Path,
     out_dir: &Path,
@@ -939,15 +869,10 @@ pub(crate) async fn build_ssr(
     let stem =
         Path::new(entry).file_stem().and_then(|s| s.to_str()).unwrap_or("server").to_string();
 
-    // The caller (`build_ssr_app`) owns wiping the shared out dir; just ensure
-    // it exists so the server bundle can sit next to the client assets.
     fs::create_dir_all(out_dir)?;
     let started = Instant::now();
     let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
 
-    // User plugins run in the SSR build as the "ssr" environment, so
-    // resolveId/load/transform (and applyToEnvironment("ssr")) apply to server
-    // modules, matching the dev SSR runner.
     let mut config = oj_config::load(root).map_err(|e| anyhow::anyhow!("{e}"))?;
     oj_server::plugins::adopt_vite_config_values(&mut config, root);
     let ssr_base = config.base.clone().unwrap_or_else(|| "/".into());
@@ -960,9 +885,6 @@ pub(crate) async fn build_ssr(
     )
     .await;
 
-    // Externalize a module once it resolves into node_modules (Node requires
-    // those at runtime); aliases (`@/…`) and relative imports resolve to
-    // source and stay bundled.
     let external = IsExternal::Fn(Some(Arc::new(|spec: &str, _importer, is_resolved: bool| {
         let ext = is_resolved && spec.contains("node_modules");
         Box::pin(async move { Ok(ext) })
@@ -992,8 +914,6 @@ pub(crate) async fn build_ssr(
             format: Some(OutputFormat::Esm),
             entry_filenames: Some(format!("{stem}.mjs").into()),
             chunk_filenames: Some(format!("{stem}-[hash].mjs").into()),
-            // Per-environment build output: "ssr" defaults to unminified but may
-            // override minify/sourcemap (environments.ssr.build).
             minify: Some(RawMinifyOptions::Bool(
                 oj_config::environment_build_bool(&config, "ssr", "minify").unwrap_or(false),
             )),
@@ -1045,9 +965,6 @@ pub(crate) async fn build_ssr(
     Ok(())
 }
 
-/// Server-function dispatch module: globs the app's `*.server.*` modules (real
-/// implementations) and calls the requested export. Bundled to
-/// `<out>/_oj_server_fns.mjs` and imported by the production server.
 const OJ_SERVER_FNS_JS: &str = r#"const mods = import.meta.glob("./src/**/*.server.*");
 const norm = (s) => String(s).replace(/^\.?\/+/, "");
 export async function dispatch(url, name, args) {
@@ -1083,8 +1000,6 @@ fn has_server_modules(root: &Path) -> bool {
     walk(&root.join("src"))
 }
 
-/// Build the server-function dispatch bundle to `<out>/_oj_server_fns.mjs`
-/// (node platform, node_modules external, real server code, not stubbed).
 async fn build_server_fns(root: &Path, out_dir: &Path) -> anyhow::Result<()> {
     use rolldown::{IsExternal, Platform};
     let entry_path = root.join("_oj_server_fns_entry.tsx");
@@ -1137,10 +1052,6 @@ async fn build_server_fns(root: &Path, out_dir: &Path) -> anyhow::Result<()> {
     result
 }
 
-/// One-shot prerender (SSG) script: render each configured path to static HTML
-/// with the same shell the SSR server emits, so it hydrates. `__CLIENT_JS__` /
-/// `__CLIENT_CSS__` are filled at build time; paths arrive as argv JSON. Run
-/// with cwd = the output dir (so `./entry-server.mjs` resolves and files land).
 const PRERENDER_JS: &str = r#"import * as entry from "./entry-server.mjs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";

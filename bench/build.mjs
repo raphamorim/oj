@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// Production build benchmark: oj build (embedded Rolldown) vs vite build.
-//   node bench/build.mjs 5000
+// node bench/build.mjs 5000
 import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -34,6 +33,7 @@ const run = (label, cmd, outDir) => {
   console.log(`${label.padEnd(5)} | ${String(ms + "ms").padEnd(8)} | ${(jsBytes(outDir) / 1024).toFixed(0)}kB js`);
 };
 
+// console.table?
 console.log(`production build, ${N} components`);
 console.log("tool  | time     | output");
 run("oj", `${OJ} build . --out dist-oj`, path.join(app, "dist-oj"));

@@ -1,9 +1,3 @@
-// Generate a route-split React app in two variants for lazy-compilation A/B:
-//   routes-lazy  — App lazily import()s each route (React.lazy + Suspense)
-//   routes-eager — App statically imports every route
-// Same module count; only route 0 is rendered on load. With lazy compilation
-// the cold path is shell + route 0; eager compiles all routes.
-//   node bench/generate-routes.mjs [routes] [componentsPerRoute]
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -99,7 +93,6 @@ createRoot(document.getElementById("root")!).render(<App />);
 `,
   );
   fs.writeFileSync(path.join(dir, "package.json"), `{ "name": "routes-${variant}", "private": true, "type": "module" }\n`);
-  // Reuse the donor app's installed deps (react/react-dom).
   const nm = path.join(dir, "node_modules");
   fs.rmSync(nm, { recursive: true, force: true });
   fs.symlinkSync(path.join(donor, "node_modules"), nm, "dir");

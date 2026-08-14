@@ -1,9 +1,4 @@
-// Localize oj's HMR latency: split save-to-paint into server+transport vs
-// browser apply. Node Date.now() and browser Date.now() share the OS wall clock
-// on one machine, so (ws_arrival.wall - t_edit) is the server+transport phase;
-// browser performance.now() is monotonic, so (dom_hit.perf - ws_arrival.perf)
-// is the pure browser-apply phase, skew-free.
-//   node bench/hmr-instrument.mjs <app-dir> [--bundle] [edits]
+//node bench/hmr-instrument.mjs <app-dir> [--bundle] [edits]
 import { chromium } from "playwright";
 import { spawn, execSync } from "node:child_process";
 import { writeFileSync, readFileSync } from "node:fs";
@@ -21,7 +16,7 @@ const N = path.basename(app).replace("app-", "");
 const leaf = path.join(app, "src", "components", `Comp${N - 1}.tsx`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Injected before any page script: wrap WebSocket + fetch, stamp DOM arrival.
+// injected before any page script: wrap WebSocket + fetch, stamp DOM arrival.
 const PROBE = `
 (() => {
   const OWS = window.WebSocket;
@@ -80,10 +75,10 @@ async function main() {
       const fetches = (window.__fetch||[]).filter(f => ws && f.start >= ws.perf - 1);
       return { ws, dom, fetches, nHmr: hmr.length };
     }, tEdit);
-    if (e === 0) continue; // warmup
+    if (e === 0) continue;
     if (!d.ws || !d.dom) { rows.push(null); continue; }
-    const serverTransport = d.ws.wall - tEdit;            // edit -> HMR msg arrives (debounce+compile+serialize+ws)
-    const clientApply = d.dom.perf - d.ws.perf;           // HMR msg -> DOM painted (fetch+apply+refresh+paint)
+    const serverTransport = d.ws.wall - tEdit;
+    const clientApply = d.dom.perf - d.ws.perf;
     const total = d.dom.wall - tEdit;
     const fetchMs = d.fetches.reduce((s,f)=>s+(f.end-f.start),0);
     rows.push({ serverTransport, clientApply, total, fetchMs, nFetch: d.fetches.length, msg: d.ws.data });

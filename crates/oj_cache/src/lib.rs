@@ -1,24 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-//! Content-addressed persistent cache for compiled module outputs.
-//!
-//! Every input is part of the key: source bytes, the serving URL, and a
-//! salt folding in tool version, cache format, and compile mode. No
-//! invalidation protocol to get wrong; changed content means a different
-//! key, and stale entries are simply never read again (GC is a TODO).
-//!
-//! Layout: `<dir>/<first two hex chars>/<hash>.json`. JSON for now:
-//! debuggable with `cat`; a binary format is a profiling decision, not an
-//! architectural one.
-
 use std::fs;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// Bump whenever the wrapper/glue/output shape changes so old caches
-/// can never poison a new binary.
 pub const CACHE_FORMAT: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -27,13 +14,12 @@ pub struct CachedModule {
     pub map_data_url: Option<String>,
     pub imports: Vec<String>,
     pub is_boundary: bool,
-    /// Bundle mode: "esm" or "cjs" factory kind ("" for unbundled entries).
     #[serde(default)]
     pub kind: String,
-    /// Bundle mode, CJS only: raw require specifier to resolved url.
+    // bundle mode, CJS only: raw require specifier to resolved url.
     #[serde(default)]
     pub require_map: Vec<(String, String)>,
-    /// CSS modules only: exported class name to scoped name.
+    // CSS modules only: exported class name to scoped name.
     #[serde(default)]
     pub css_exports: Vec<(String, String)>,
     /// Absolute out-of-root paths this module's rewritten /@fs/ urls point

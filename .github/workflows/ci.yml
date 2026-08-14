@@ -49,6 +49,7 @@ jobs:
         if: matrix.mode == 'unbundled'
         run: node e2e/ssr-prod.mjs
 
+  # i need to fix this or automate
   build:
     name: prod build smoke
     runs-on: ubuntu-latest

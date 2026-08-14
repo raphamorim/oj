@@ -1,24 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-//! Dev-server SSR with a module runner (`oj dev --ssr <entry>`).
-//!
-//! Initial paint is server-rendered by a persistent Node module runner
-//! (`oj_server::SSR_RUNNER_JS`), spawned once under the app root and driven over
-//! stdin/stdout. It links the SSR graph on demand: app source comes
-//! already-compiled from the dev server's `/@ssr-*` endpoints, evaluated via
-//! `vm.SourceTextModule`; node_modules import natively. No Rolldown bundle, no
-//! per-render spawn; an edit re-evaluates only changed modules and their
-//! importers (invalidated by file mtime).
-//!
-//! Hydration and client HMR ride the normal unbundled dev pipeline: the SSR `/`
-//! route is merged onto [`oj_server::DevServer`], so client entry, Fast Refresh,
-//! and the HMR WebSocket all come from it. Server-rendered markup follows on the
-//! next full navigation.
-//!
-//! CSS-module class names hash identically in runner and dev pipeline (both key
-//! off the root-relative id), so hydrated markup matches the SSR HTML.
-
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -35,7 +17,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_stream::wrappers::ReceiverStream;
 
-/// A live handle to the spawned Node module runner.
 struct Runner {
     stdin: ChildStdin,
     lines: Lines<BufReader<ChildStdout>>,
@@ -43,20 +24,13 @@ struct Runner {
 }
 
 struct SsrState {
-    /// URL of the client hydration entry (`/src/entry-client.tsx`), served by
-    /// the dev pipeline. `None` means SSR-only, inert page.
     client_url: Option<String>,
-    /// `server.proxy` prefixes, which must reach the proxy layer, not SSR.
     proxy_prefixes: Vec<String>,
-    /// App root, to resolve a server-function module URL to its module id.
     root: PathBuf,
     runner: Arc<tokio::sync::Mutex<Runner>>,
 }
 
 pub async fn ssr_dev(root: PathBuf, entry: String, port: Option<u16>) -> anyhow::Result<()> {
-    // Reuse the full dev server for the client side (Fast Refresh, HMR, module
-    // compilation, /@ssr-* runner endpoints); the server-rendered `/` route sits
-    // on top.
     let built = oj_server::DevServer { root, port, bundle: false }.build_app().await?;
 
     let client_url =
@@ -72,8 +46,6 @@ pub async fn ssr_dev(root: PathBuf, entry: String, port: Option<u16>) -> anyhow:
         runner: Arc::new(tokio::sync::Mutex::new(runner)),
     });
 
-    // Layer in front of the dev router: document navigations are rendered per
-    // route; module/asset/proxy requests fall through unchanged.
     let app = built
         .router
         .layer(axum::middleware::from_fn_with_state(Arc::clone(&ssr_state), ssr_route));
@@ -94,8 +66,6 @@ pub async fn ssr_dev(root: PathBuf, entry: String, port: Option<u16>) -> anyhow:
     Ok(())
 }
 
-/// Write the runner script under the app root (so Node resolves the app's
-/// `node_modules`) and spawn it, piping stdin/stdout for the render protocol.
 async fn spawn_runner(root: &Path, base: &str, entry_abs: &Path) -> anyhow::Result<Runner> {
     let dir = root.join(".oj-cache").join("ssr");
     std::fs::create_dir_all(&dir)?;
@@ -121,24 +91,14 @@ async fn spawn_runner(root: &Path, base: &str, entry_abs: &Path) -> anyhow::Resu
     Ok(Runner { stdin, lines: BufReader::new(stdout).lines(), _child: child })
 }
 
-/// How an app-route request should be served.
 enum Route {
-    /// Browser navigation: full HTML document.
     Document,
-    /// Client data fetch (`oj-loader` header): JSON loader data.
     Loader,
-    /// Form submit / mutation (POST): run the action, then revalidate.
-    /// `json` means a fetch call wants JSON back; otherwise redirect (no-JS form).
     Action { json: bool },
-    /// Not an app route (module, asset, `/@…`, `/__…`, proxy): dev pipeline.
     Pass,
 }
 
-/// Route app navigations/data/actions to the SSR runner; everything else
-/// (modules, `/@oj/*`, `/@ssr-*`, assets, proxy, `/__ws`) to the dev pipeline.
 async fn ssr_route(State(state): State<Arc<SsrState>>, req: Request, next: Next) -> Response {
-    // Server function RPC: client stub POSTs {module (url), name, args}; resolve
-    // the module to its id and run it on the module runner.
     if req.method() == axum::http::Method::POST && req.uri().path() == "/__oj_fn" {
         let bytes = axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024).await.unwrap_or_default();
         let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
@@ -169,8 +129,6 @@ async fn ssr_route(State(state): State<Arc<SsrState>>, req: Request, next: Next)
             if json {
                 data_response(data)
             } else if data.is_ok() {
-                // Progressive enhancement: mutation ran; redirect so the browser
-                // re-GETs the updated document (POST/redirect/GET).
                 (StatusCode::SEE_OTHER, [(header::LOCATION, path)]).into_response()
             } else {
                 error_page(&data.unwrap_err())
@@ -180,10 +138,6 @@ async fn ssr_route(State(state): State<Arc<SsrState>>, req: Request, next: Next)
     }
 }
 
-/// Classify a request. App routes are extensionless paths that aren't a reserved
-/// dev prefix (`/@…`, `/__…`) or a configured proxy prefix (`/api`). Modules and
-/// assets carry extensions or the `/@` prefix; proxied paths reach the proxy
-/// layer; everything else (`/`, `/about`, …) is an app route.
 fn classify(req: &Request, proxy_prefixes: &[String]) -> Route {
     let path = req.uri().path();
     if path.starts_with("/@") || path.starts_with("/__") {
@@ -204,12 +158,6 @@ fn classify(req: &Request, proxy_prefixes: &[String]) -> Route {
     }
 }
 
-/// Send a command to the runner and return the string under `reply_key`
-/// (`"data"` for loaders/actions, `"result"` for server-function calls).
-///
-/// Runs in a detached task so a cancelled request (e.g. an aborted prefetch)
-/// still drains the runner's one-line reply; reading inline would drop the lock
-/// mid-protocol and leave a stale line the next render desyncs on.
 async fn run_command(
     state: &SsrState,
     cmd: serde_json::Value,
@@ -252,9 +200,6 @@ async fn render_route(state: &SsrState, path: &str) -> Response {
     if guard.stdin.write_all(cmd.as_bytes()).await.is_err() || guard.stdin.flush().await.is_err() {
         return error_page("SSR runner is not accepting input (did it crash?)");
     }
-    // Runner sends loader data and the route's <head> (title/meta) first, then
-    // the render output. Both go into the shell so the client hydrates without
-    // refetching and the head is SEO-visible.
     let (data_json, head_html) = match read_message(&mut guard.lines).await {
         Some(v) if v.get("data").and_then(|d| d.as_str()).is_some() => (
             v["data"].as_str().unwrap().to_owned(),
@@ -270,18 +215,17 @@ async fn render_route(state: &SsrState, path: &str) -> Response {
         None => return error_page("SSR runner did not respond"),
     };
 
-    // Buffered entry (render): one `{html}` message.
     if let Some(html) = v.get("html").and_then(|h| h.as_str()) {
         return Html(page(state, html, &data_json, &head_html)).into_response();
     }
-    // Streaming entry (renderStream): `{chunk}`… then `{end}`. Flush the shell,
-    // forward each chunk as React produces it, close with the tail.
     if let Some(first_chunk) = v.get("chunk").and_then(|c| c.as_str()).map(str::to_owned) {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
         let head = page_head(&data_json, &head_html);
         let tail = page_tail(state);
         tokio::spawn(async move {
-            let mut guard = guard; // hold the runner lock for the whole stream
+            // hold the runner lock for the whole stream
+            // i need to revisit this
+            let mut guard = guard;
             let _ = tx.send(Ok(Bytes::from(head))).await;
             let _ = tx.send(Ok(Bytes::from(first_chunk))).await;
             while let Ok(Some(line)) = guard.lines.next_line().await {
@@ -294,7 +238,8 @@ async fn render_route(state: &SsrState, path: &str) -> Response {
                         let _ = tx.send(Ok(Bytes::from(format!("<pre>[oj ssr] {msg}</pre>")))).await;
                         break;
                     }
-                    _ => break, // {end} or anything else closes the stream
+                    // {end} or anything else closes the stream
+                    _ => break,
                 }
             }
             let _ = tx.send(Ok(Bytes::from(tail))).await;
@@ -308,8 +253,6 @@ async fn render_route(state: &SsrState, path: &str) -> Response {
     error_page(v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown SSR error"))
 }
 
-/// Read and parse one JSON-lines message from the runner (None if it closed or
-/// sent malformed output).
 async fn read_message(
     lines: &mut Lines<BufReader<ChildStdout>>,
 ) -> Option<serde_json::Value> {
@@ -317,10 +260,6 @@ async fn read_message(
     serde_json::from_str(&line).ok()
 }
 
-/// Document head + open of `#app`: charset, loader data (for hydration without
-/// refetch), then the Fast Refresh preamble and dev HMR client. The preamble
-/// must be the first module script, so the refresh hook installs before any
-/// module pulls in React.
 fn page_head(data_json: &str, head_html: &str) -> String {
     format!(
         "<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n{head_html}\n\
@@ -331,8 +270,6 @@ fn page_head(data_json: &str, head_html: &str) -> String {
     )
 }
 
-/// Close `#app`, then the hydration entry (served by the dev router), then the
-/// document.
 fn page_tail(state: &SsrState) -> String {
     let entry = match &state.client_url {
         Some(u) => format!("<script type=\"module\" src=\"{u}\"></script>"),
@@ -341,7 +278,6 @@ fn page_tail(state: &SsrState) -> String {
     format!("</div>\n{entry}\n</body>\n</html>\n")
 }
 
-/// The full document for a buffered render.
 fn page(state: &SsrState, body: &str, data_json: &str, head_html: &str) -> String {
     format!("{}{}{}", page_head(data_json, head_html), body, page_tail(state))
 }

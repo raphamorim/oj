@@ -1,8 +1,3 @@
-// Correctness check for bundle-mode lazy compilation: generate a tiny app with
-// an eager landing route and lazy (import()) routes behind nav, drive it in
-// --bundle mode, and assert a lazy route loads on demand, renders with working
-// React hooks (proving the shared registry — no duplicate React), and logs no
-// console errors.
 import { chromium } from "playwright";
 import { spawn, execSync } from "node:child_process";
 import { mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
@@ -17,7 +12,6 @@ const donor = path.join(here, "apps", "app-1000");
 const PORT = 5199;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// --- generate the app ---
 rmSync(app, { recursive: true, force: true });
 mkdirSync(path.join(app, "src", "routes"), { recursive: true });
 for (let r = 0; r < 3; r++) {
@@ -66,7 +60,6 @@ rmSync(path.join(app, "node_modules"), { recursive: true, force: true });
 symlinkSync(path.join(donor, "node_modules"), path.join(app, "node_modules"), "dir");
 rmSync(path.join(app, ".oj-cache"), { recursive: true, force: true });
 
-// --- drive it ---
 try { execSync(`lsof -ti:${PORT} -sTCP:LISTEN | xargs kill -9`, { stdio: "ignore" }); } catch {}
 const proc = spawn(OJ, ["dev", app, "--port", String(PORT), "--bundle"], { stdio: "ignore" });
 const errors = [];

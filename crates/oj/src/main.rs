@@ -19,48 +19,31 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start the dev server
     Dev {
-        /// App root containing index.html (defaults to ./playground when present)
         root: Option<PathBuf>,
-        /// Dev server port (overrides oj.config server.port; default 5199)
         #[arg(long)]
         port: Option<u16>,
-        /// Full bundle mode: serve one registry-runtime chunk instead of
-        /// native ESM modules (experimental)
         #[arg(long)]
         bundle: bool,
-        /// SSR dev mode: render this entry (exporting `render(): string`)
-        /// server-side, rebuilding on change with full page reload
         #[arg(long)]
         ssr: Option<String>,
     },
-    /// Compile one file and print the output (debugging aid)
     Compile {
         file: PathBuf,
-        /// Production transform (no jsxDEV, no Fast Refresh instrumentation)
         #[arg(long)]
         prod: bool,
     },
-    /// Production build (embedded Rolldown: shake, chunk, minify, hash)
     Build {
-        /// App root containing index.html (defaults to ./playground when present)
         root: Option<PathBuf>,
-        /// Output directory (overrides oj.config build.outDir; default dist)
         #[arg(long)]
         out: Option<PathBuf>,
-        /// SSR entry: build a Node server bundle (overrides oj.config build.ssr)
         #[arg(long)]
         ssr: Option<String>,
     },
-    /// Preview a production build (static server over the build dir)
     Preview {
-        /// App root (defaults to ./playground when present)
         root: Option<PathBuf>,
-        /// Build dir to serve (overrides oj.config build.outDir; default dist)
         #[arg(long)]
         out: Option<PathBuf>,
-        /// Preview port (overrides oj.config preview.port; default 4173)
         #[arg(long)]
         port: Option<u16>,
     },

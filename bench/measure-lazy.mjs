@@ -1,7 +1,3 @@
-// A/B for lazy compilation: cold start (spawn -> route 0 painted) and the eager
-// crawl size for routes-lazy vs routes-eager. Same module count; lazy should
-// crawl only the shell (dynamic route subtrees deferred) and paint faster.
-//   node bench/measure-lazy.mjs [iters]
 import { chromium } from "playwright";
 import { spawn, execSync } from "node:child_process";
 import { rmSync, readFileSync } from "node:fs";

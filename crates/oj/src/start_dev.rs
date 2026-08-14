@@ -1,15 +1,5 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
-
-//! Dev-server support for TanStack Start apps (`oj dev`, auto-detected).
-//!
-//! oj generates the route tree with `@tanstack/router-generator`, synthesizes
-//! the server/client/manifest entries the TanStack Vite plugin would, and runs
-//! the server entry in a persistent Node process behind a loader hook that
-//! resolves the framework's four alias specifiers. Document requests are
-//! answered by the entry's `fetch(request)`; modules and assets fall through to
-//! the normal dev pipeline.
-
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -33,20 +23,10 @@ struct Runner {
 struct StartState {
     proxy_prefixes: Vec<String>,
     runner: Arc<tokio::sync::Mutex<Runner>>,
-    /// The browser-bundled client hydration entry, served at
-    /// `/@oj-start/client-entry.js`.
     client_bundle: PathBuf,
-    /// The live-reload client (snapshot/restore + reconnecting WebSocket),
-    /// served at `/@oj-start/live-reload.js`.
     live_reload: PathBuf,
-    /// Trust boundary for `/@oj-start/fs/` asset serving: the farthest ancestor
-    /// of the app root that has a `node_modules` (the pnpm/workspace root), so
-    /// assets under sibling workspace packages and the shared store resolve.
     workspace_root: PathBuf,
-    /// Fires after a rebuild so the injected client reloads the page.
     reload_tx: broadcast::Sender<()>,
-    /// Persistent CSS compiler (PostCSS + Tailwind v4). Absent when the app has
-    /// no `@tailwindcss/postcss`; then css is served raw.
     css_host: Option<Arc<tokio::sync::Mutex<Runner>>>,
 }
 
@@ -57,18 +37,9 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
     let cache = root.join(".oj-cache").join("start");
     oj_server::write_start_assets(&cache)?;
 
-    // Cold start, parallelized. These are otherwise-idle `node` spawns that used
-    // to run strictly back to back. Only two real dependencies constrain them:
-    // the client bundle esbuild's the router, which imports `routeTree.gen.ts`,
-    // and the runner imports the server entry (route tree + server-fn resolver)
-    // and the bundle's manifest. Everything else overlaps.
-    //
     //   route-tree gen ─┬─────────────────┐
     //   resolver gen ───┼──(both done)────┴─> client bundle ─┐
     //                   └──> build_app (Rust) ───────────────┴─> runner
-    //
-    // Route-tree and resolver generation are independent node processes: launch
-    // both at once instead of one, then the other.
     let route_tree = {
         let (root, cache) = (root.clone(), cache.clone());
         tokio::task::spawn_blocking(move || generate_route_tree(&root, &cache))
@@ -79,23 +50,17 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
             run_node(&root, &cache.join("gen-resolver.mjs"), "server-fn resolver")
         })
     };
-    // The client bundle needs the route tree; the Rust dev-server build overlaps
-    // it (build_app crawls the same source but writes nothing the bundle reads).
     route_tree.await??;
     let bundle = {
         let (root, cache) = (root.clone(), cache.clone());
         tokio::task::spawn_blocking(move || bundle_client_entry(&root, &cache))
     };
-    // Reuse the dev server for module/asset serving; the document route sits on top.
     let built_fut = oj_server::DevServer { root: root.clone(), port, bundle: false }.build_app();
     let (bundle_res, built_res) = tokio::join!(bundle, built_fut);
     bundle_res??;
     resolver.await??;
     let built = built_res?;
-    // Runner needs the route tree, resolver, and the bundle's manifest — all done.
     let runner = spawn_start_runner(&root, &cache).await?;
-    // Only spawn the CSS compiler when the app actually uses Tailwind's PostCSS
-    // plugin; otherwise css is served as-is.
     let css_host = if app_uses_tailwind(&root) {
         spawn_node_service(&root, &cache.join("css-host.mjs"))
             .await
@@ -115,8 +80,6 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
         css_host,
     });
 
-    // Watch src/: on change, regenerate the route tree, rebuild the client, and
-    // restart the runner (so SSR is fresh), then reload the page.
     spawn_start_watcher(root.clone(), cache.clone(), Arc::clone(&state));
 
     let app = built
@@ -134,8 +97,6 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Tell the warm runner to re-import the server entry in place, and drain its
-/// ack line so the request/response protocol stays aligned.
 async fn reload_runner(state: &StartState) {
     let mut guard = state.runner.lock().await;
     if guard.stdin.write_all(b"{\"cmd\":\"reload\"}\n").await.is_err() {
@@ -145,8 +106,6 @@ async fn reload_runner(state: &StartState) {
     let _ = guard.lines.next_line().await;
 }
 
-/// The set of route source files under `src/routes` (recursive). Used to
-/// decide whether the route tree needs regenerating.
 fn list_route_files(root: &Path) -> std::collections::BTreeSet<PathBuf> {
     let mut out = std::collections::BTreeSet::new();
     fn walk(dir: &Path, out: &mut std::collections::BTreeSet<PathBuf>) {
@@ -164,9 +123,6 @@ fn list_route_files(root: &Path) -> std::collections::BTreeSet<PathBuf> {
     out
 }
 
-/// The farthest ancestor of `app` (including itself) that contains a
-/// `node_modules`. Under pnpm workspaces this is the repo root, so assets in
-/// sibling packages and the shared store are reachable via `/@oj-start/fs/`.
 fn workspace_root(app: &Path) -> PathBuf {
     let mut best = app.to_path_buf();
     let mut cur = app;
@@ -200,12 +156,8 @@ fn asset_mime(ext: &str) -> &'static str {
     }
 }
 
-/// Injected into HTML documents in dev: loads the live-reload client, which
-/// snapshots ephemeral state, reloads on a rebuild signal, then restores it.
 const RELOAD_CLIENT: &str = "<script type=\"module\" src=\"/@oj-start/live-reload.js\"></script>";
 
-/// Watch `src/`: on a real change, regenerate the route tree + resolver,
-/// rebuild the client bundle, restart the runner (fresh SSR), then reload.
 fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
     let rt = tokio::runtime::Handle::current();
     std::thread::spawn(move || {
@@ -225,9 +177,6 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             eprintln!("oj start: cannot watch {}: {e}", src.display());
             return;
         }
-        // Regenerate the route tree only when the route-file SET changes (add/
-        // remove/rename); content edits leave the tree unchanged, so skip the
-        // generator (its cost scales with route count).
         let mut prev_routes = list_route_files(&root);
         loop {
             let mut paths: std::collections::HashSet<PathBuf> = match rx.recv() {
@@ -253,8 +202,6 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
                 let _ = generate_route_tree(&root, &cache);
                 prev_routes = routes_now;
             }
-            // Regenerate the server-fn resolver only when a server-fn file was
-            // added/removed/edited (or routes changed), not on every edit.
             let server_fn_changed = paths.iter().any(|p| {
                 let is_ts = p.extension().is_some_and(|e| e == "ts" || e == "tsx");
                 is_ts && (!p.exists() || std::fs::read_to_string(p).is_ok_and(|s| s.contains("createServerFn")))
@@ -262,9 +209,6 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             if routes_changed || server_fn_changed {
                 let _ = run_node(&root, &cache.join("gen-resolver.mjs"), "server-fn resolver");
             }
-            // Rebuild the client and warm-reload the runner concurrently. The
-            // runner re-imports the entry in place (app + @tanstack re-evaluate,
-            // React stays warm) rather than respawning the process.
             rt.block_on(async {
                 let (r, c) = (root.clone(), cache.clone());
                 let client = tokio::task::spawn_blocking(move || {
@@ -278,8 +222,6 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
     });
 }
 
-/// Production build for a TanStack Start app (`oj build`): generate the route
-/// tree + resolver, then run the esbuild pipeline that writes `dist/`.
 pub async fn start_build(root: PathBuf) -> anyhow::Result<()> {
     let root = root
         .canonicalize()
@@ -311,12 +253,10 @@ pub async fn start_build(root: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run `@tanstack/router-generator` once to write `src/routeTree.gen.ts`.
 fn generate_route_tree(root: &Path, cache: &Path) -> anyhow::Result<()> {
     run_node(root, &cache.join("generate.mjs"), "route tree generation")
 }
 
-/// Bundle the client hydration entry for the browser (esbuild, aliases resolved).
 fn bundle_client_entry(root: &Path, cache: &Path) -> anyhow::Result<()> {
     run_node(root, &cache.join("bundle-client.mjs"), "client entry bundling")
 }
@@ -339,8 +279,6 @@ async fn spawn_start_runner(root: &Path, cache: &Path) -> anyhow::Result<Runner>
     spawn_node_service(root, &cache.join("runner.mjs")).await
 }
 
-/// Spawn a persistent Node service (`runner.mjs`, `css-host.mjs`) that speaks
-/// JSON lines over stdio. stderr is inherited so its logs are visible.
 async fn spawn_node_service(root: &Path, script: &Path) -> anyhow::Result<Runner> {
     let mut child = tokio::process::Command::new("node")
         .arg(script)
@@ -358,22 +296,16 @@ async fn spawn_node_service(root: &Path, script: &Path) -> anyhow::Result<Runner
     Ok(Runner { stdin, lines: BufReader::new(stdout).lines(), _child: child })
 }
 
-/// Whether the app depends on `@tailwindcss/postcss` (Tailwind v4 via PostCSS),
-/// so css served in dev needs compiling rather than passing through raw.
 fn app_uses_tailwind(root: &Path) -> bool {
     std::fs::read_to_string(root.join("package.json"))
         .map(|s| s.contains("@tailwindcss/postcss"))
         .unwrap_or(false)
 }
 
-/// True when a stylesheet needs Tailwind/PostCSS compilation (v4 `@import
-/// "tailwindcss"` or the `@tailwind` / `@plugin` / `@apply` at-rules).
 fn needs_css_compile(src: &str) -> bool {
     src.contains("tailwindcss") || src.contains("@tailwind") || src.contains("@plugin") || src.contains("@apply")
 }
 
-/// Compile a css file through the CSS host. Returns None on any failure so the
-/// caller can fall back to serving the raw file.
 async fn compile_css(host: &Arc<tokio::sync::Mutex<Runner>>, path: &Path) -> Option<String> {
     let mut guard = host.lock().await;
     let req = serde_json::json!({ "path": path.to_string_lossy() });
@@ -392,16 +324,11 @@ enum Route {
     Pass,
 }
 
-/// App document routes are extensionless GETs that aren't a dev prefix (`/@`,
-/// `/__`) or a proxy prefix. Everything else falls through to the dev pipeline.
 fn classify(req: &Request, proxy_prefixes: &[String]) -> Route {
     let path = req.uri().path();
     if path.starts_with("/@") || path.starts_with("/__") {
         return Route::Pass;
     }
-    // A request for `index.html` is the document for its directory, not a static
-    // file (a TanStack Start app has no index.html on disk); everything else
-    // with an extension falls through to the dev pipeline.
     let last = path.rsplit('/').next().unwrap_or("");
     if last != "index.html" && last.contains('.') {
         return Route::Pass;
@@ -415,8 +342,6 @@ fn classify(req: &Request, proxy_prefixes: &[String]) -> Route {
     }
 }
 
-/// Serve `.../index.html` as the document for `.../` so the router matches the
-/// directory route instead of a nonexistent file. Preserves the query string.
 fn document_url(url: &str) -> String {
     let (path, query) = match url.split_once('?') {
         Some((p, q)) => (p, format!("?{q}")),
@@ -430,7 +355,6 @@ fn document_url(url: &str) -> String {
 }
 
 async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: Next) -> Response {
-    // Live-reload channel: the injected client reconnects and reloads on a ping.
     if req.uri().path() == "/@oj-start/hmr" {
         let (mut parts, _) = req.into_parts();
         return match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
@@ -447,22 +371,15 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
             Err(e) => e.into_response(),
         };
     }
-    // The browser-bundled client hydration entry (esbuild, aliases resolved).
     if req.uri().path() == "/@oj-start/client-entry.js" {
         return serve_js(&state.client_bundle, "client entry").await;
     }
-    // The live-reload client (snapshot/restore + reconnecting WebSocket).
     if req.uri().path() == "/@oj-start/live-reload.js" {
         return serve_js(&state.live_reload, "live-reload client").await;
     }
-    // Asset files referenced by the client bundle (?url imports, side-effect
-    // CSS). The path after the prefix is the file's real absolute path, bounded
-    // to the workspace root; relative url() refs inside CSS resolve here too.
     if let Some(abs) = req.uri().path().strip_prefix("/@oj-start/fs") {
         return serve_fs_asset(&state, abs).await;
     }
-    // Server-function RPC: forward the whole request (method/headers/body) to
-    // the runner's fetch handler, which dispatches it via `handleServerAction`.
     if req.uri().path().starts_with("/_serverFn/") {
         let method = req.method().to_string();
         let url = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
@@ -482,7 +399,6 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
     }
 }
 
-/// Serve a cached dev JS asset (no-cache so rebuilds always take effect).
 async fn serve_js(path: &Path, what: &str) -> Response {
     match tokio::fs::read(path).await {
         Ok(bytes) => (
@@ -494,8 +410,6 @@ async fn serve_js(path: &Path, what: &str) -> Response {
     }
 }
 
-/// Serve an asset file by absolute path, bounded to the workspace root. `abs`
-/// is the URL path after `/@oj-start/fs` (starts with `/`), percent-decoded.
 async fn serve_fs_asset(state: &StartState, abs: &str) -> Response {
     let decoded = percent_decode(abs);
     let path = PathBuf::from(&decoded);
@@ -506,8 +420,6 @@ async fn serve_fs_asset(state: &StartState, abs: &str) -> Response {
     if !canon.starts_with(&state.workspace_root) {
         return (StatusCode::FORBIDDEN, "oj start: asset outside workspace").into_response();
     }
-    // Tailwind/PostCSS stylesheets are compiled by the CSS host before serving;
-    // everything else (and any compile failure) is served as-is.
     if canon.extension().and_then(|e| e.to_str()) == Some("css") {
         if let Some(host) = &state.css_host {
             if let Ok(src) = tokio::fs::read_to_string(&canon).await {
@@ -536,7 +448,6 @@ async fn serve_fs_asset(state: &StartState, abs: &str) -> Response {
     }
 }
 
-/// Minimal percent-decode for `%XX` sequences in a URL path.
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -571,8 +482,6 @@ fn collect_headers(headers: &header::HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Forward a request to the runner's fetch handler and return its response.
-/// Detached so a cancelled request still drains the runner's one-line reply.
 async fn forward(
     state: &StartState,
     method: String,
@@ -610,7 +519,7 @@ async fn forward(
                 .and_then(|h| h.get("content-type"))
                 .and_then(|c| c.as_str())
                 .is_some_and(|c| c.contains("text/html"));
-            // Inject the live-reload client into HTML documents.
+            // inject the live-reload client into HTML documents
             if is_html {
                 if let Some(i) = body.rfind("</body>") {
                     body.insert_str(i, RELOAD_CLIENT);

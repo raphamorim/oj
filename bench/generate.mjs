@@ -1,15 +1,4 @@
-// SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Raphael Amorim
-
-// Generate a synthetic React app with N components for benchmarking,
-// shaped like rspack-contrib/build-tools-performance's cases: a component
-// tree with fanout 10, every component using a hook (so Fast Refresh
-// signatures are exercised), one shared app dir that both oj and Vite serve.
-//
-//   node bench/generate.mjs 1000
-//
-// Output: bench/apps/app-<N>/
-
+// node bench/generate.mjs 1000
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -125,7 +114,7 @@ export default {
 `
 );
 
-// tsconfig so editors don't complain; neither tool needs it.
+// tsconfig so editors don't complain. neither tool needs it.
 fs.writeFileSync(
   path.join(dir, "tsconfig.json"),
   JSON.stringify({ compilerOptions: { jsx: "react-jsx", strict: true } }, null, 2)

@@ -1,8 +1,3 @@
-// SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Raphael Amorim
-
-// Render bench/card.html to bench/oj-benchmarks.png (the benchmark card).
-//   node bench/card.mjs
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
