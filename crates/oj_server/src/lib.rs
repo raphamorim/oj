@@ -2299,6 +2299,9 @@ fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
         }
 
         let url = url_of(&state.root, path);
+        if !state.graph.lock().unwrap().contains(Path::new(&url)) {
+            continue;
+        }
         if state.bundle {
             let plan = state.graph.lock().unwrap().update_plan(Path::new(&url));
             match plan {
