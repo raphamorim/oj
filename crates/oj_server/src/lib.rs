@@ -414,6 +414,7 @@ impl DevServer {
             .route("/@oj/bundle-runtime.js", get(|| async { js(BUNDLE_RUNTIME_JS) }))
             .route("/@oj/chunk.js", get(serve_chunk))
             .route("/@oj/patch.js", get(serve_patch))
+            .route("/@oj/lazy.js", get(serve_lazy))
             .route("/@oj/routes.js", get(serve_oj_routes))
             .route("/@oj/server-fn.js", get(|| async { js(SERVER_FN_JS) }))
             .route("/@ssr-resolve", get(ssr_resolve))
@@ -2112,15 +2113,18 @@ async fn serve_patch(State(state): State<Arc<ServerState>>, uri: Uri) -> Respons
         .into_response()
 }
 
-/// One `__oj_register(...)` statement for a module, compiling if needed.
-async fn registration_for(state: &Arc<ServerState>, url: &str) -> Result<String, String> {
-    let file = if let Some(abs) = url.strip_prefix("/@fs") {
-        PathBuf::from(abs)
+/// Resolve a module url to its file path (shared by chunk + lazy assembly).
+fn locate_url(state: &ServerState, url: &str) -> Result<PathBuf, String> {
+    if let Some(abs) = url.strip_prefix("/@fs") {
+        Ok(PathBuf::from(abs))
     } else {
         let rel = url.trim_start_matches('/');
-        locate(&state.root, &state.public_dir, rel).ok_or_else(|| format!("no such module: {url}"))?
-    };
-    let (_, module) = ensure_module(state, &file, url).await?;
+        locate(&state.root, &state.public_dir, rel).ok_or_else(|| format!("no such module: {url}"))
+    }
+}
+
+/// Render a module's `__oj_register(...)` statement from its compiled form.
+fn render_registration(url: &str, module: &CachedModule) -> String {
     let deps: serde_json::Map<String, serde_json::Value> = module
         .require_map
         .iter()
@@ -2137,12 +2141,11 @@ async fn registration_for(state: &Arc<ServerState>, url: &str) -> Result<String,
                 .collect();
             serde_json::Value::Object(map).to_string()
         };
-        return Ok(format!(
+        return format!(
             "__oj_register({url:?}, \"esm\", {{}}, function(module, __oj_exports, __oj_require) {{\n             __oj_esm(__oj_exports, {{ \"default\": () => __oj_css_default }});\n             var __oj_css_default = {exports};\n             __oj_inject_css({url:?}, {css});\n             }});\n",
             css = serde_json::Value::String(module.code.clone()),
-        ));
+        );
     }
-
     // Parameter names are kind-specific: CJS bodies reference
     // `exports`/`require` directly, ESM factories the __oj_* forms.
     let params = if module.kind == "cjs" {
@@ -2150,12 +2153,61 @@ async fn registration_for(state: &Arc<ServerState>, url: &str) -> Result<String,
     } else {
         "module, __oj_exports, __oj_require"
     };
-    Ok(format!(
+    format!(
         "__oj_register({url:?}, {kind:?}, {deps}, function({params}) {{\n{body}\n}});\n",
         kind = module.kind,
         deps = serde_json::Value::Object(deps),
         body = module.code,
-    ))
+    )
+}
+
+/// One `__oj_register(...)` statement for a module, compiling if needed.
+async fn registration_for(state: &Arc<ServerState>, url: &str) -> Result<String, String> {
+    let file = locate_url(state, url)?;
+    let (_, module) = ensure_module(state, &file, url).await?;
+    Ok(render_registration(url, &module))
+}
+
+/// `?id=<url>&have=<csv>`: register the target's static-import closure (minus
+/// the modules this client already holds) so a lazy `import()` compiled to
+/// `__oj_import_lazy` resolves on demand. Nested dynamic imports inside the
+/// subtree stay their own lazy boundaries. Compiles subtrees the eager crawl
+/// deliberately skipped.
+async fn serve_lazy(State(state): State<Arc<ServerState>>, uri: Uri) -> Response {
+    let query = uri.query().unwrap_or("");
+    let field = |k: &str| query.split('&').find_map(|kv| kv.strip_prefix(k)).map(urldecode);
+    let Some(id) = field("id=").filter(|s| !s.is_empty()) else {
+        return (StatusCode::BAD_REQUEST, "oj: lazy: id required").into_response();
+    };
+    // Modules the client already registered: never re-ship (shared React etc.).
+    let mut visited: std::collections::HashSet<String> = field("have=")
+        .map(|v| v.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default();
+
+    let mut chunk = String::new();
+    let mut queue = vec![id.split('?').next().unwrap_or(&id).to_string()];
+    while let Some(url) = queue.pop() {
+        if url.starts_with("/@oj/") || !visited.insert(url.clone()) {
+            continue;
+        }
+        let Ok(file) = locate_url(&state, &url) else { continue };
+        let module = match ensure_module(&state, &file, &url).await {
+            Ok((_, module)) => module,
+            Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: lazy: {err}")).into_response(),
+        };
+        chunk.push_str(&render_registration(&url, &module));
+        for imp in &module.imports {
+            let clean = imp.split('?').next().unwrap_or(imp);
+            if clean.starts_with('/') && !clean.starts_with("/@oj/") && !visited.contains(clean) {
+                queue.push(clean.to_string());
+            }
+        }
+    }
+    (
+        [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
+        chunk,
+    )
+        .into_response()
 }
 
 fn urldecode(input: &str) -> String {

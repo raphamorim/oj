@@ -102,6 +102,20 @@ window.__oj_export_star = (from, exports) => {
   }
 };
 
+// Lazy compilation: a dynamic `import()` compiled in bundle mode calls this
+// instead of a native import. If the target isn't registered yet, fetch its
+// subtree chunk — passing the ids this client already holds so shared deps
+// (React, etc.) are not re-shipped — which registers the factories into this
+// same registry, then instantiate and return the module namespace.
+window.__oj_import_lazy = async (url) => {
+  const clean = url.split("?")[0];
+  if (!registry.has(clean)) {
+    const have = [...registry.keys()].map(encodeURIComponent).join(",");
+    await import(`/@oj/lazy.js?id=${encodeURIComponent(url)}&have=${have}`);
+  }
+  return requireRaw(clean, "esm");
+};
+
 const styleTags = new Map();
 window.__oj_inject_css = (id, css) => {
   let tag = styleTags.get(id);

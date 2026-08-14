@@ -66,7 +66,14 @@ pub fn compile_factory(
     source_text: &str,
     resolve: &mut ImportRewriter,
 ) -> Result<FactoryOutput, CompileError> {
-    let is_dep = url.starts_with("/node_modules/");
+    // A dependency is anything under a node_modules — whether served as a
+    // rooted `/node_modules/...` url or, for symlinked / workspace / monorepo
+    // layouts that resolve outside the app root, an `/@fs/...node_modules/...`
+    // one. Missing the `/@fs/` case compiles a CJS dep (e.g. react's entry,
+    // `module.exports = require(...)`) as an ESM factory, and its bare `require`
+    // is then undefined at runtime.
+    let is_dep = url.starts_with("/node_modules/")
+        || (url.starts_with("/@fs/") && url.contains("/node_modules/"));
     if is_dep && !crate::cjs::has_module_syntax_pub(path, source_text) {
         return compile_cjs_factory(path, source_text, resolve);
     }
@@ -472,6 +479,17 @@ impl<'a> VisitMut<'a> for RefRewriter<'a, '_> {
             {
                 Some("module.hot".to_string())
             }
+            // Dynamic `import("url")` becomes `__oj_import_lazy("url")`: the
+            // runtime fetches + registers the target's subtree into the shared
+            // registry on demand, so it stays out of the eager chunk. The url is
+            // already canonical (specifier rewrite ran first). Non-literal
+            // `import(expr)` is left as-is (rare; no static target to defer).
+            Expression::ImportExpression(imp) => match &imp.source {
+                Expression::StringLiteral(lit) => {
+                    Some(format!("__oj_import_lazy({:?})", lit.value.as_str()))
+                }
+                _ => None,
+            },
             _ => None,
         };
         if let Some(src) = replacement_src {
