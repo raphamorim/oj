@@ -28,8 +28,6 @@ const up = async () => {
 };
 await up();
 
-const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-
 let failed = 0;
 for (const file of fs.readdirSync(here).filter((f) => f.endsWith(".test.js")).sort()) {
   process.stdout.write(`\n${file} (${bundle ? "bundle" : "unbundled"})\n`);
@@ -42,7 +40,6 @@ for (const file of fs.readdirSync(here).filter((f) => f.endsWith(".test.js")).so
   } catch {
     failed++;
   }
-  sleep(1200);
 }
 server.kill("SIGKILL");
 console.log(failed ? `\n${failed} test(s) FAILED` : "\nALL E2E TESTS PASSED");
