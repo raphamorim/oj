@@ -3,11 +3,28 @@
 
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync, readFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import builtinModules from "node:module";
 
 const { root, outDir, entries, include = [], exclude = [] } = JSON.parse(process.argv[2]);
+
+function detectEntries() {
+  const html = path.join(root, "index.html");
+  if (!existsSync(html)) return [];
+  const src = readFileSync(html, "utf8");
+  const found = [];
+  for (const tag of src.match(/<script\b[^>]*>/gi) || []) {
+    if (!/type\s*=\s*["']module["']/i.test(tag)) continue;
+    const m = tag.match(/\bsrc\s*=\s*["']([^"']+)["']/i);
+    if (!m || /^https?:/i.test(m[1])) continue;
+    const abs = path.join(root, m[1].replace(/^\//, ""));
+    if (existsSync(abs)) found.push(abs);
+  }
+  return found;
+}
+
+const entryList = entries && entries.length ? entries : detectEntries();
 
 const req = createRequire(path.join(root, "package.json"));
 const esbuild = await import(pathToFileURL(req.resolve("esbuild")).href).then((m) => m.default ?? m);
@@ -34,7 +51,7 @@ async function scan() {
   };
   try {
     await esbuild.build({
-      entryPoints: entries,
+      entryPoints: entryList,
       bundle: true,
       write: false,
       logLevel: "silent",

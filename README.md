@@ -102,6 +102,7 @@ node --test e2e/unit/*.test.mjs                   # js unit tests (adapter helpe
 node e2e/run.mjs                                  # browser e2e suite (add --bundle for bundle mode)
 node e2e/ssr-dev.mjs                              # SSR dev e2e, e2e/ssr-prod.mjs for the built server
 node e2e/start.mjs                                # tanstack start integration (see e2e/fixtures/start-app)
+node e2e/dep-optimize.mjs                         # dependency pre-bundle + cjs interop integration
 node bench/generate.mjs 1000                      # generate a benchmark app (then npm i inside it)
 node bench/run.mjs 1000                           # p50/p95 benchmark vs vite
 node bench/card.mjs                               # render bench/card.html to oj-benchmarks.png

@@ -20,6 +20,7 @@ use oj_cache::{CachedModule, PersistentCache};
 
 pub mod sidecar;
 pub mod plugins;
+pub mod optimize;
 use sidecar::{Sidecar, is_tailwind_css};
 use plugins::PluginHost;
 use oj_graph::{HmrDecision, ModuleGraph};
@@ -165,6 +166,7 @@ struct ServerState {
     parsed_fired: Mutex<std::collections::HashSet<String>>,
     rt: tokio::runtime::Handle,
     base: Option<String>,
+    optimized: Arc<optimize::OptimizedDeps>,
 }
 
 pub struct BuiltApp {
@@ -343,6 +345,11 @@ impl DevServer {
             parsed_fired: Mutex::new(std::collections::HashSet::new()),
             rt: tokio::runtime::Handle::current(),
             base: config.base.clone().filter(|b| b != "/"),
+            optimized: Arc::new(if bundle {
+                optimize::OptimizedDeps::disabled()
+            } else {
+                optimize::OptimizedDeps::prepare(&root, env!("CARGO_PKG_VERSION"))
+            }),
         });
         {
             let state = Arc::clone(&state);
@@ -786,6 +793,21 @@ async fn serve_path(
     let rel = path.trim_start_matches('/');
     let rel = if rel.is_empty() { "index.html" } else { rel };
 
+    if let Some(name) = uri.path().strip_prefix("/@oj-deps/") {
+        if name.contains('/') || name.contains("..") {
+            return (StatusCode::FORBIDDEN, "oj: bad optimized dep path").into_response();
+        }
+        state.optimized.ready().await;
+        return match tokio::fs::read(state.optimized.dir().join(name)).await {
+            Ok(bytes) => (
+                [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
+                bytes,
+            )
+                .into_response(),
+            Err(_) => (StatusCode::NOT_FOUND, format!("oj: no optimized dep {name}")).into_response(),
+        };
+    }
+
     if let Some(id) = uri.path().strip_prefix("/@virtual/") {
         return match state.virtual_modules.get(id) {
             Some(code) => (
@@ -1071,6 +1093,11 @@ async fn ensure_module(
     let ext = file.extension().and_then(|e| e.to_str());
     let is_css = matches!(ext, Some("css") | Some("scss") | Some("sass"));
     let is_json = ext == Some("json");
+    let dep_map = if !is_dep && !bundle {
+        state.optimized.ready().await
+    } else {
+        Arc::new(optimize::DepMap::new())
+    };
     let compiled = tokio::task::spawn_blocking(move || -> Result<CachedModule, String> {
         if is_json {
             let code = if bundle {
@@ -1117,6 +1144,11 @@ async fn ensure_module(
             if virtual_ids.contains(spec) {
                 return Some(format!("/@virtual/{spec}"));
             }
+            if let Some(meta) = dep_map.get(spec) {
+                if !meta.needs_interop {
+                    return Some(format!("/@oj-deps/{}", meta.file));
+                }
+            }
             if let Some(url) = rewrite_specifier(&root, &dir, &resolver, &fs_allow, &dir_cache, spec, !bundle) {
                 return Some(url);
             }
@@ -1147,9 +1179,15 @@ async fn ensure_module(
             let output = if is_dep {
                 oj_compiler::cjs::compile_dep(&file_owned, &url_owned, &source, &mut rewrite)
             } else {
+                let interopped = oj_compiler::interop::rewrite_cjs_interop(&source, &file_owned, &|spec| {
+                    dep_map
+                        .get(spec)
+                        .filter(|m| m.needs_interop)
+                        .map(|m| format!("/@oj-deps/{}", m.file))
+                });
                 oj_compiler::compile_module(
                     &file_owned,
-                    &source,
+                    interopped.as_deref().unwrap_or(&source),
                     &oj_compiler::CompileOptions::dev(),
                     Some(&mut rewrite),
                 )
