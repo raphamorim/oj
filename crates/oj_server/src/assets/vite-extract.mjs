@@ -101,6 +101,8 @@ try {
       alias: extractAlias(c.resolve?.alias),
       headers: stringMap(c.server?.headers),
       rollupOptions: c.build?.rolldownOptions ?? c.build?.rollupOptions ?? null,
+      assetsInlineLimit:
+        typeof c.build?.assetsInlineLimit === "number" ? c.build.assetsInlineLimit : null,
     }),
   );
 } catch (e) {

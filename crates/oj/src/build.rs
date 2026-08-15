@@ -43,6 +43,96 @@ struct OjCssPlugin {
     root: PathBuf,
     has_postcss: bool,
     client: bool,
+    inline_limit: u64,
+}
+
+fn assets_inline_limit_of(config: &oj_config::OjConfig) -> u64 {
+    config.build.as_ref().and_then(|b| b.assets_inline_limit).unwrap_or(4096)
+}
+
+fn is_build_asset(id: &str) -> bool {
+    matches!(
+        std::path::Path::new(id.split('?').next().unwrap_or(id))
+            .extension()
+            .and_then(|e| e.to_str()),
+        Some(
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "ico" | "bmp" | "svg" | "woff"
+                | "woff2" | "ttf" | "otf" | "eot" | "mp4" | "webm" | "mov" | "mp3" | "wav" | "ogg"
+        )
+    )
+}
+
+fn asset_mime(ext: &str) -> &'static str {
+    match ext {
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        _ => "application/octet-stream",
+    }
+}
+
+fn b64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+fn emit_or_inline(
+    ctx: &rolldown_plugin::SharedLoadPluginContext,
+    file: &str,
+    bytes: Vec<u8>,
+    inline_limit: u64,
+) -> anyhow::Result<String> {
+    let path = std::path::Path::new(file);
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if (bytes.len() as u64) <= inline_limit && ext != "svg" {
+        return Ok(format!("export default \"data:{};base64,{}\";", asset_mime(ext), b64(&bytes)));
+    }
+    if (bytes.len() as u64) <= inline_limit && ext == "svg" {
+        let text = String::from_utf8_lossy(&bytes);
+        let encoded = text
+            .replace('%', "%25")
+            .replace('#', "%23")
+            .replace('<', "%3C")
+            .replace('>', "%3E")
+            .replace('"', "'")
+            .replace('\n', "");
+        return Ok(format!("export default \"data:image/svg+xml,{encoded}\";"));
+    }
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("asset").to_string();
+    let reference = ctx
+        .emit_file(
+            rolldown_common::EmittedAsset {
+                name: Some(name),
+                source: rolldown_common::StrOrBytes::Bytes(bytes),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok(format!("export default import.meta.ROLLUP_FILE_URL_{reference};"))
 }
 
 impl Plugin for OjCssPlugin {
@@ -121,30 +211,24 @@ impl Plugin for OjCssPlugin {
         let root = self.root.clone();
         let routes_id = root.join("oj-routes.tsx").to_string_lossy().into_owned();
         let client = self.client;
+        let inline_limit = self.inline_limit;
         async move {
             if let Some(file) = id.strip_suffix("?url") {
                 let bytes = std::fs::read(file)
                     .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
-                let name = std::path::Path::new(file)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("asset")
-                    .to_string();
-                let reference = ctx
-                    .emit_file(
-                        rolldown_common::EmittedAsset {
-                            name: Some(name),
-                            source: rolldown_common::StrOrBytes::Bytes(bytes),
-                            ..Default::default()
-                        },
-                        None,
-                        None,
-                    )
-                    .map_err(|e| anyhow::anyhow!(e))?;
+                let code = emit_or_inline(&ctx, file, bytes, inline_limit)?;
                 return Ok(Some(rolldown_plugin::HookLoadOutput {
-                    code: arcstr::ArcStr::from(format!(
-                        "export default import.meta.ROLLUP_FILE_URL_{reference};"
-                    )),
+                    code: arcstr::ArcStr::from(code),
+                    module_type: Some(rolldown_common::ModuleType::Js),
+                    ..Default::default()
+                }));
+            }
+            if !id.contains('?') && is_build_asset(&id) {
+                let bytes = std::fs::read(&id)
+                    .map_err(|e| anyhow::anyhow!("cannot read {id}: {e}"))?;
+                let code = emit_or_inline(&ctx, &id, bytes, inline_limit)?;
+                return Ok(Some(rolldown_plugin::HookLoadOutput {
+                    code: arcstr::ArcStr::from(code),
                     module_type: Some(rolldown_common::ModuleType::Js),
                     ..Default::default()
                 }));
@@ -702,7 +786,7 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         }
         oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host))));
     }
-    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(&root), client: true }));
+    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(&root), inline_limit: assets_inline_limit_of(&config), client: true }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
         .with_options(BundlerOptions {
@@ -962,7 +1046,7 @@ pub(crate) async fn build_ssr(
         }
         oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host))));
     }
-    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root), client: false }));
+    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root), inline_limit: assets_inline_limit_of(&config), client: false }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
         .with_options(BundlerOptions {
@@ -1077,6 +1161,7 @@ async fn build_server_fns(root: &Path, out_dir: &Path) -> anyhow::Result<()> {
                 collected: Arc::clone(&collected),
                 root: root.to_path_buf(),
                 has_postcss: oj_server::has_postcss_config(root),
+                inline_limit: 4096,
                 client: false,
             })])
             .with_options(BundlerOptions {
@@ -1405,7 +1490,7 @@ async fn build_client_entry(
         }
         oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host))));
     }
-    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root), client: true }));
+    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root), inline_limit: assets_inline_limit_of(&config), client: true }));
 
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
@@ -1519,7 +1604,7 @@ async fn build_library(
         }
 
         let mut bundler = BundlerBuilder::default()
-            .with_plugins(vec![Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root), client: true })])
+            .with_plugins(vec![Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root), inline_limit: 4096, client: true })])
             .with_options(BundlerOptions {
                 input: Some(vec![InputItem {
                     name: Some(file_name.clone()),

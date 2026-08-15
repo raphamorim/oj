@@ -108,6 +108,7 @@ pub struct BuildConfig {
     pub prerender: Option<Vec<String>>,
     pub rollup_options: Option<serde_json::Value>,
     pub rolldown_options: Option<serde_json::Value>,
+    pub assets_inline_limit: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
