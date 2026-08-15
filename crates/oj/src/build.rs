@@ -21,6 +21,22 @@ use rolldown_plugin::{
 use rolldown_plugin::__inner::SharedPluginable;
 use oj_server::plugins::PluginHost;
 
+fn ro_output_str(ro: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    let output = ro?.get("output")?;
+    let obj = if output.is_array() { output.get(0)? } else { output };
+    obj.get(key)?.as_str().map(String::from)
+}
+
+fn ro_external(ro: Option<&serde_json::Value>) -> Vec<String> {
+    match ro.and_then(|v| v.get("external")) {
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        Some(serde_json::Value::Array(a)) => {
+            a.iter().filter_map(|x| x.as_str().map(String::from)).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
 #[derive(Debug)]
 struct OjCssPlugin {
     collected: Arc<Mutex<Vec<(String, String)>>>,
@@ -578,6 +594,7 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
     let mut config = oj_config::load(&root).map_err(|e| anyhow::anyhow!("{e}"))?;
     oj_server::plugins::adopt_vite_config_values(&mut config, &root);
     let build_cfg = config.build.clone().unwrap_or_default();
+    let ro_opts = oj_config::rolldown_options(&config);
     let out = out
         .or_else(|| build_cfg.out_dir.as_ref().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("dist"));
@@ -651,8 +668,21 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         cwd: Some(root.clone()),
         dir: Some(out_dir.display().to_string()),
         resolve: rolldown_resolve(&root, &config, "client"),
-        entry_filenames: Some("assets/[name]-[hash].js".to_string().into()),
-        chunk_filenames: Some("assets/[name]-[hash].js".to_string().into()),
+        entry_filenames: Some(
+            ro_output_str(ro_opts, "entryFileNames")
+                .unwrap_or_else(|| "assets/[name]-[hash].js".to_string())
+                .into(),
+        ),
+        chunk_filenames: Some(
+            ro_output_str(ro_opts, "chunkFileNames")
+                .unwrap_or_else(|| "assets/[name]-[hash].js".to_string())
+                .into(),
+        ),
+        asset_filenames: ro_output_str(ro_opts, "assetFileNames").map(Into::into),
+        external: {
+            let ext = ro_external(ro_opts);
+            (!ext.is_empty()).then(|| rolldown::IsExternal::from(ext))
+        },
         minify: Some(RawMinifyOptions::Bool(
             oj_config::environment_build_bool(&config, "client", "minify").unwrap_or(minify),
         )),

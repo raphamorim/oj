@@ -100,6 +100,7 @@ try {
       define: c.define && typeof c.define === "object" ? c.define : null,
       alias: extractAlias(c.resolve?.alias),
       headers: stringMap(c.server?.headers),
+      rollupOptions: c.build?.rolldownOptions ?? c.build?.rollupOptions ?? null,
     }),
   );
 } catch (e) {

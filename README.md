@@ -107,6 +107,7 @@ node e2e/assets.mjs                               # asset url imports + new URL(
 node e2e/dynamic-import.mjs                       # dynamic import with variables (glob switch)
 node e2e/wasm.mjs                                 # wasm ?init instantiation (dev + build)
 node e2e/query-assets.mjs                         # ?url/?raw/?inline/?init in bundle mode
+node e2e/rolldown-options.mjs                     # build.rollupOptions filenames + external
 node bench/generate.mjs 1000                      # generate a benchmark app (then npm i inside it)
 node bench/run.mjs 1000                           # p50/p95 benchmark vs vite
 node bench/card.mjs                               # render bench/card.html to oj-benchmarks.png

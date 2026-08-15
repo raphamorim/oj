@@ -106,6 +106,8 @@ pub struct BuildConfig {
     pub lib: Option<LibConfig>,
     pub ssr: Option<String>,
     pub prerender: Option<Vec<String>>,
+    pub rollup_options: Option<serde_json::Value>,
+    pub rolldown_options: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

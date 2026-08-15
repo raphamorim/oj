@@ -25,6 +25,11 @@ fn define_value(v: &serde_json::Value) -> String {
     }
 }
 
+pub fn rolldown_options(config: &OjConfig) -> Option<&serde_json::Value> {
+    let build = config.build.as_ref()?;
+    build.rolldown_options.as_ref().or(build.rollup_options.as_ref())
+}
+
 pub fn config_defines(config: &OjConfig) -> Vec<(String, String)> {
     config
         .define

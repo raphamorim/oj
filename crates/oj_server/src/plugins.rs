@@ -58,6 +58,7 @@ pub struct ViteValues {
     pub define: Option<serde_json::Map<String, serde_json::Value>>,
     pub alias: Option<serde_json::Map<String, serde_json::Value>>,
     pub headers: Option<serde_json::Map<String, serde_json::Value>>,
+    pub rollup_options: Option<serde_json::Value>,
 }
 
 pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
@@ -95,6 +96,7 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
         define: json.get("define").and_then(|v| v.as_object()).cloned(),
         alias: json.get("alias").and_then(|v| v.as_object()).cloned(),
         headers: json.get("headers").and_then(|v| v.as_object()).cloned(),
+        rollup_options: json.get("rollupOptions").filter(|v| !v.is_null()).cloned(),
     }
 }
 
@@ -148,6 +150,12 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
                     map.entry(find).or_insert_with(|| s.to_string());
                 }
             }
+        }
+    }
+    if let Some(ro) = v.rollup_options {
+        let build = config.build.get_or_insert_with(Default::default);
+        if build.rollup_options.is_none() && build.rolldown_options.is_none() {
+            build.rollup_options = Some(ro);
         }
     }
 }
@@ -480,6 +488,7 @@ mod vite_values_tests {
             define: None,
             alias: None,
             headers: None,
+            rollup_options: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/vite-base/"));
@@ -500,9 +509,22 @@ mod vite_values_tests {
             define: None,
             alias: None,
             headers: None,
+            rollup_options: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/oj-base/"));
         assert_eq!(config.public_dir.as_deref(), Some("my-public"));
+    }
+
+    #[test]
+    fn merge_adopts_rollup_options() {
+        let mut config = oj_config::OjConfig::default();
+        let v = ViteValues {
+            rollup_options: Some(serde_json::json!({ "output": { "entryFileNames": "x/[name].js" } })),
+            ..Default::default()
+        };
+        merge_vite_values(&mut config, v);
+        let ro = oj_config::rolldown_options(&config).unwrap();
+        assert_eq!(ro.pointer("/output/entryFileNames").and_then(|v| v.as_str()), Some("x/[name].js"));
     }
 }
