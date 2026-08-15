@@ -50,6 +50,53 @@ fn assets_inline_limit_of(config: &oj_config::OjConfig) -> u64 {
     config.build.as_ref().and_then(|b| b.assets_inline_limit).unwrap_or(4096)
 }
 
+fn re_escape(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        match c {
+            '/' => out.push_str(r"[\\/]"),
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn manual_chunks(ro: Option<&serde_json::Value>) -> Option<rolldown_common::CodeSplittingMode> {
+    let output = ro?.get("output")?;
+    let output = if output.is_array() { output.get(0)? } else { output };
+    let map = output.get("manualChunks")?.as_object()?;
+    let mut groups = Vec::new();
+    let mut priority = map.len() as u32;
+    for (name, tokens) in map {
+        let Some(arr) = tokens.as_array() else { continue };
+        let escaped: Vec<String> =
+            arr.iter().filter_map(|t| t.as_str()).map(re_escape).collect();
+        if escaped.is_empty() {
+            continue;
+        }
+        let pattern = format!(r"[\\/]node_modules[\\/]({})([\\/]|$)", escaped.join("|"));
+        let Ok(test) = rolldown_utils::js_regex::HybridRegex::new(&pattern) else { continue };
+        groups.push(rolldown_common::MatchGroup {
+            name: rolldown_common::MatchGroupName::Static(name.clone()),
+            test: Some(rolldown_common::MatchGroupTest::Regex(test)),
+            priority: Some(priority),
+            ..Default::default()
+        });
+        priority = priority.saturating_sub(1);
+    }
+    if groups.is_empty() {
+        return None;
+    }
+    Some(rolldown_common::CodeSplittingMode::Advanced(rolldown_common::ManualCodeSplittingOptions {
+        groups: Some(groups),
+        ..Default::default()
+    }))
+}
+
 fn target_transform(config: &oj_config::OjConfig) -> Option<rolldown_common::BundlerTransformOptions> {
     let target = config.build.as_ref().and_then(|b| b.target.clone())?;
     Some(rolldown_common::BundlerTransformOptions {
@@ -831,6 +878,7 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         .with_options(BundlerOptions {
         input: Some(inputs),
         transform: target_transform(&config),
+        code_splitting: manual_chunks(ro_opts),
         cwd: Some(root.clone()),
         dir: Some(out_dir.display().to_string()),
         resolve: rolldown_resolve(&root, &config, "client"),

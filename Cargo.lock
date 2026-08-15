@@ -1779,6 +1779,7 @@ dependencies = [
  "rolldown",
  "rolldown_common",
  "rolldown_plugin",
+ "rolldown_utils",
  "serde_json",
  "tokio",
  "tokio-stream",
