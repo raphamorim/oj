@@ -72,10 +72,19 @@ impl Plugin for OjCssPlugin {
         let id = args.id.to_string();
         let code = args.code.to_string();
         async move {
-            if !code.contains("import.meta.glob") {
+            let has_glob = code.contains("import.meta.glob");
+            let has_dynamic = code.contains("import(");
+            if !has_glob && !has_dynamic {
                 return Ok(None);
             }
-            let expanded = oj_compiler::glob::expand_source(&code, std::path::Path::new(&id));
+            let path = std::path::Path::new(&id);
+            let mut expanded = code;
+            if has_glob {
+                expanded = oj_compiler::glob::expand_source(&expanded, path);
+            }
+            if has_dynamic {
+                expanded = oj_compiler::glob::expand_dynamic_import_vars_source(&expanded, path);
+            }
             Ok(Some(rolldown_plugin::HookTransformOutput {
                 code: Some(expanded),
                 ..Default::default()

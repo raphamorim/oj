@@ -125,6 +125,15 @@ fn compile_esm_factory(
 
     let is_refresh_boundary = refresh && crate::detect_refresh_registrations(&program);
 
+    if source_text.contains("import(") {
+        crate::glob::expand_dynamic_import_vars(
+            &allocator,
+            path.parent().unwrap_or(path),
+            &mut program,
+            source_text,
+        );
+    }
+
     if source_text.contains("import.meta.env") {
         use oxc_transformer_plugins::{ReplaceGlobalDefines, ReplaceGlobalDefinesConfig};
         let scoping = SemanticBuilder::new().build(&program).semantic.into_scoping();

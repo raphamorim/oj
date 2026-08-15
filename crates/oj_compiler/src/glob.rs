@@ -121,6 +121,95 @@ impl<'a> VisitMut<'a> for GlobExpander<'a, '_> {
     }
 }
 
+pub fn expand_dynamic_import_vars<'a>(
+    allocator: &'a Allocator,
+    dir: &Path,
+    program: &mut Program<'a>,
+    source_text: &str,
+) -> bool {
+    let mut v = DynImportVars { allocator, dir, source: source_text, changed: false };
+    v.visit_program(program);
+    v.changed
+}
+
+pub fn expand_dynamic_import_vars_source(source: &str, path: &Path) -> String {
+    if !source.contains("import(") {
+        return source.to_string();
+    }
+    let allocator = Allocator::default();
+    let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::mjs());
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+    if parsed.panicked {
+        return source.to_string();
+    }
+    let mut program = parsed.program;
+    let dir = path.parent().unwrap_or(path);
+    if expand_dynamic_import_vars(&allocator, dir, &mut program, source) {
+        oxc_codegen::Codegen::new().build(&program).code
+    } else {
+        source.to_string()
+    }
+}
+
+struct DynImportVars<'a, 'd, 's> {
+    allocator: &'a Allocator,
+    dir: &'d Path,
+    source: &'s str,
+    changed: bool,
+}
+
+impl<'a> DynImportVars<'a, '_, '_> {
+    fn build(&self, imp: &oxc_ast::ast::ImportExpression<'a>) -> Option<String> {
+        let Expression::TemplateLiteral(tpl) = &imp.source else { return None };
+        if tpl.expressions.is_empty() {
+            return None;
+        }
+        let mut pattern = String::new();
+        for (i, q) in tpl.quasis.iter().enumerate() {
+            let piece = q.value.cooked.as_ref().map(|c| c.as_str()).unwrap_or(q.value.raw.as_str());
+            pattern.push_str(piece);
+            if i < tpl.expressions.len() {
+                pattern.push('*');
+            }
+        }
+        if !(pattern.starts_with("./") || pattern.starts_with("../")) {
+            return None;
+        }
+        let mut matches = glob_matches(self.dir, &[pattern]);
+        matches.sort();
+        if matches.is_empty() {
+            return None;
+        }
+        let arg = self.source.get(tpl.span.start as usize..tpl.span.end as usize)?;
+        let mut cases = String::new();
+        for key in &matches {
+            cases.push_str(&format!("case {key:?}: return import({key:?});"));
+        }
+        Some(format!(
+            "(function (p) {{ switch (p) {{ {cases}default: return Promise.reject(new Error(\"Unknown variable dynamic import: \" + p)); }} }})({arg})"
+        ))
+    }
+}
+
+impl<'a> VisitMut<'a> for DynImportVars<'a, '_, '_> {
+    fn visit_expression(&mut self, expr: &mut Expression<'a>) {
+        if let Expression::ImportExpression(imp) = &*expr {
+            if let Some(rep) = self.build(imp) {
+                let src: &'a str = self.allocator.alloc_str(&rep);
+                let parsed = Parser::new(self.allocator, src, SourceType::mjs()).parse();
+                if let Some(Statement::ExpressionStatement(es)) =
+                    parsed.program.body.into_iter().next()
+                {
+                    *expr = es.unbox().expression;
+                    self.changed = true;
+                    return;
+                }
+            }
+        }
+        walk_mut::walk_expression(self, expr);
+    }
+}
+
 fn is_import_meta_glob(call: &oxc_ast::ast::CallExpression) -> bool {
     let Expression::StaticMemberExpression(member) = &call.callee else { return false };
     member.property.name == "glob" && matches!(member.object, Expression::ImportMeta(_))
@@ -249,6 +338,28 @@ mod tests {
         let out = expand_source(&dir, "const m = import.meta.glob('./locales/*.json', { eager: true });\n");
         assert!(out.contains("import * as __oj_glob_0"), "{out}");
         assert!(out.contains(r#""./locales/en.json": __oj_glob_"#), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dynamic_import_var_expands_to_switch() {
+        let dir = fixture_dir("dynvar");
+        let out = expand_dynamic_import_vars_source(
+            "const load = (l) => import(`./locales/${l}.json`);\n",
+            &dir.join("main.js"),
+        );
+        assert!(out.contains(r#"case "./locales/en.json": return import("./locales/en.json")"#), "{out}");
+        assert!(out.contains("fr.json"), "{out}");
+        assert!(out.contains("${l}"), "original template kept as runtime arg: {out}");
+        assert!(out.contains("Unknown variable dynamic import"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plain_string_dynamic_import_untouched() {
+        let dir = fixture_dir("dynplain");
+        let out = expand_dynamic_import_vars_source("const m = import(\"./locales/en.json\");\n", &dir.join("main.js"));
+        assert!(!out.contains("switch"), "string-literal import left alone: {out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
