@@ -105,6 +105,7 @@ node e2e/start.mjs                                # tanstack start integration (
 node e2e/dep-optimize.mjs                         # dependency pre-bundle + cjs interop integration
 node e2e/assets.mjs                               # asset url imports + new URL(import.meta.url)
 node e2e/dynamic-import.mjs                       # dynamic import with variables (glob switch)
+node e2e/wasm.mjs                                 # wasm ?init instantiation (dev + build)
 node bench/generate.mjs 1000                      # generate a benchmark app (then npm i inside it)
 node bench/run.mjs 1000                           # p50/p95 benchmark vs vite
 node bench/card.mjs                               # render bench/card.html to oj-benchmarks.png

@@ -1532,7 +1532,7 @@ fn rewrite_specifier(
     }
 
     if let Some((base, query)) = spec.split_once('?') {
-        if matches!(query, "url" | "raw" | "inline" | "worker" | "sharedworker") {
+        if matches!(query, "url" | "raw" | "inline" | "worker" | "sharedworker" | "init") {
             let resolved = rewrite_specifier(root, dir, resolver, fs_allow, dir_cache, base, false)
                 .or_else(|| {
                     resolver.resolve(dir, base).ok().map(|p| {
@@ -1641,7 +1641,7 @@ fn locate(root: &Path, public_dir: &Path, rel: &str) -> Option<PathBuf> {
 
 fn query_asset_kind(query: Option<&str>) -> Option<&'static str> {
     let q = query?;
-    for kind in ["url", "raw", "inline", "worker", "sharedworker"] {
+    for kind in ["url", "raw", "inline", "worker", "sharedworker", "init"] {
         if q.split('&').any(|kv| kv == kind) {
             return Some(kind);
         }
@@ -1672,6 +1672,9 @@ async fn asset_module(file: &Path, url: &str, kind: &str) -> Result<String, Stri
                 "export default function () {{ return new {ctor}({clean_url:?}, {{ type: \"module\" }}); }}\n"
             ))
         }
+        "init" => Ok(format!(
+            "export default (imports = {{}}) => {{\n  const url = {clean_url:?};\n  const inst = (r) => r.instance;\n  const fallback = () => fetch(url).then((r) => r.arrayBuffer()).then((b) => WebAssembly.instantiate(b, imports)).then(inst);\n  if (WebAssembly.instantiateStreaming) {{\n    return WebAssembly.instantiateStreaming(fetch(url), imports).then(inst).catch(fallback);\n  }}\n  return fallback();\n}};\n"
+        )),
         _ => Err(format!("unknown asset query: {kind}")),
     }
 }

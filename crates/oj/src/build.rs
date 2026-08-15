@@ -48,16 +48,19 @@ impl Plugin for OjCssPlugin {
         let is_routes = args.specifier == "virtual:oj-routes";
         let routes_id = self.root.join("oj-routes.tsx").to_string_lossy().into_owned();
         let url_base = args.specifier.strip_suffix("?url").map(str::to_string);
+        let init_base = args.specifier.strip_suffix("?init").map(str::to_string);
         let importer = args.importer.map(str::to_string);
         let ctx = ctx.clone();
         async move {
             if is_routes {
                 return Ok(Some(HookResolveIdOutput::from_id(routes_id)));
             }
-            if let Some(base) = url_base {
-                if let Ok(Ok(resolved)) = ctx.resolve(&base, importer.as_deref(), None).await {
-                    let id = format!("{}?url", resolved.id.as_str());
-                    return Ok(Some(HookResolveIdOutput::from_id(id)));
+            for (base, query) in [(url_base, "url"), (init_base, "init")] {
+                if let Some(base) = base {
+                    if let Ok(Ok(resolved)) = ctx.resolve(&base, importer.as_deref(), None).await {
+                        let id = format!("{}?{query}", resolved.id.as_str());
+                        return Ok(Some(HookResolveIdOutput::from_id(id)));
+                    }
                 }
             }
             Ok(None)
@@ -125,6 +128,33 @@ impl Plugin for OjCssPlugin {
                 return Ok(Some(rolldown_plugin::HookLoadOutput {
                     code: arcstr::ArcStr::from(format!(
                         "export default import.meta.ROLLUP_FILE_URL_{reference};"
+                    )),
+                    module_type: Some(rolldown_common::ModuleType::Js),
+                    ..Default::default()
+                }));
+            }
+            if let Some(file) = id.strip_suffix("?init") {
+                let bytes = std::fs::read(file)
+                    .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
+                let name = std::path::Path::new(file)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("asset")
+                    .to_string();
+                let reference = ctx
+                    .emit_file(
+                        rolldown_common::EmittedAsset {
+                            name: Some(name),
+                            source: rolldown_common::StrOrBytes::Bytes(bytes),
+                            ..Default::default()
+                        },
+                        None,
+                        None,
+                    )
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                return Ok(Some(rolldown_plugin::HookLoadOutput {
+                    code: arcstr::ArcStr::from(format!(
+                        "const u = import.meta.ROLLUP_FILE_URL_{reference};\nexport default (imports = {{}}) => {{ const inst = (r) => r.instance; const fb = () => fetch(u).then((r) => r.arrayBuffer()).then((b) => WebAssembly.instantiate(b, imports)).then(inst); return WebAssembly.instantiateStreaming ? WebAssembly.instantiateStreaming(fetch(u), imports).then(inst).catch(fb) : fb(); }};"
                     )),
                     module_type: Some(rolldown_common::ModuleType::Js),
                     ..Default::default()
