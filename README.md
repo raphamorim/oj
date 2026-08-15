@@ -114,6 +114,7 @@ node e2e/config-proxy.mjs                         # adopt vite.config server.pro
 node e2e/config-function.mjs                      # oj.config function form ({ command, mode }) => config
 node e2e/build-target-raw-inline.mjs              # build.target downleveling + ?raw/?inline in build
 node e2e/manual-chunks.mjs                        # rollupOptions output.manualChunks vendor splitting
+node e2e/svgr.mjs                                 # svg as react component (?react), installs react
 node bench/generate.mjs 1000                      # generate a benchmark app (then npm i inside it)
 node bench/run.mjs 1000                           # p50/p95 benchmark vs vite
 node bench/card.mjs                               # render bench/card.html to oj-benchmarks.png

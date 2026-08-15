@@ -213,15 +213,20 @@ impl Plugin for OjCssPlugin {
         let init_base = args.specifier.strip_suffix("?init").map(str::to_string);
         let raw_base = args.specifier.strip_suffix("?raw").map(str::to_string);
         let inline_base = args.specifier.strip_suffix("?inline").map(str::to_string);
+        let react_base = args.specifier.strip_suffix("?react").map(str::to_string);
         let importer = args.importer.map(str::to_string);
         let ctx = ctx.clone();
         async move {
             if is_routes {
                 return Ok(Some(HookResolveIdOutput::from_id(routes_id)));
             }
-            for (base, query) in
-                [(url_base, "url"), (init_base, "init"), (raw_base, "raw"), (inline_base, "inline")]
-            {
+            for (base, query) in [
+                (url_base, "url"),
+                (init_base, "init"),
+                (raw_base, "raw"),
+                (inline_base, "inline"),
+                (react_base, "react"),
+            ] {
                 if let Some(base) = base {
                     if let Ok(Ok(resolved)) = ctx.resolve(&base, importer.as_deref(), None).await {
                         let id = format!("{}?{query}", resolved.id.as_str());
@@ -346,6 +351,15 @@ impl Plugin for OjCssPlugin {
                         b64(&bytes)
                     )),
                     module_type: Some(rolldown_common::ModuleType::Js),
+                    ..Default::default()
+                }));
+            }
+            if let Some(file) = id.strip_suffix("?react") {
+                let svg = std::fs::read_to_string(file)
+                    .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
+                return Ok(Some(rolldown_plugin::HookLoadOutput {
+                    code: arcstr::ArcStr::from(oj_server::svgr::svg_to_component(&svg)),
+                    module_type: Some(rolldown_common::ModuleType::Jsx),
                     ..Default::default()
                 }));
             }

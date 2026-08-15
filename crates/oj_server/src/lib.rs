@@ -21,6 +21,7 @@ use oj_cache::{CachedModule, PersistentCache};
 pub mod sidecar;
 pub mod plugins;
 pub mod optimize;
+pub mod svgr;
 use sidecar::{Sidecar, is_tailwind_css};
 use plugins::PluginHost;
 use oj_graph::{HmrDecision, ModuleGraph};
@@ -887,6 +888,10 @@ async fn serve_path(
         let url = url_of(&state.root, &file);
         return serve_compiled(&state, &file, &url, uri.query(), &headers).await;
     }
+    if ext == "svg" && uri.query().is_some_and(|q| q.split('&').any(|kv| kv == "react")) {
+        let url = format!("{}?react", url_of(&state.root, &file));
+        return serve_compiled(&state, &file, &url, None, &headers).await;
+    }
     if ext == "json" && !file.starts_with(&state.public_dir) {
         let url = url_of(&state.root, &file);
         return serve_compiled(&state, &file, &url, uri.query(), &headers).await;
@@ -994,7 +999,10 @@ async fn ensure_module(
     file: &Path,
     url: &str,
 ) -> Result<(String, Arc<CachedModule>), String> {
-    if state.bundle {
+    let react_svg = file.extension().and_then(|e| e.to_str()) == Some("svg")
+        && url.split_once('?').is_some_and(|(_, q)| q.split('&').any(|kv| kv == "react"));
+
+    if !react_svg && state.bundle {
         if let Some(kind) = query_asset_kind(url.split_once('?').map(|(_, q)| q)) {
             if matches!(kind, "url" | "raw" | "inline" | "init") {
                 let code = asset_module(file, url, kind).await?;
@@ -1021,7 +1029,7 @@ async fn ensure_module(
         }
     }
 
-    if is_asset_path(file) {
+    if !react_svg && is_asset_path(file) {
         let clean = url.split('?').next().unwrap_or(url);
         let default = format!("export default {};\n", serde_json::Value::String(clean.to_string()));
         let module = if state.bundle {
@@ -1162,6 +1170,8 @@ async fn ensure_module(
         source
     };
 
+    let source = if react_svg { svgr::svg_to_component(&source) } else { source };
+
     let root = state.root.clone();
     let resolver = Arc::clone(&state.resolver);
     let fs_allow = Arc::clone(&state.fs_allow);
@@ -1169,7 +1179,7 @@ async fn ensure_module(
     let virtual_ids: std::collections::BTreeSet<String> =
         state.virtual_modules.keys().cloned().collect();
     let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
-    let file_owned = file.to_path_buf();
+    let file_owned = if react_svg { file.with_extension("svg.tsx") } else { file.to_path_buf() };
     let url_owned = url.to_string();
     let bundle = state.bundle;
     let plugin_fallback = state.plugins.is_some() && !bundle;
@@ -1604,7 +1614,7 @@ fn rewrite_specifier(
     }
 
     if let Some((base, query)) = spec.split_once('?') {
-        if matches!(query, "url" | "raw" | "inline" | "worker" | "sharedworker" | "init") {
+        if matches!(query, "url" | "raw" | "inline" | "worker" | "sharedworker" | "init" | "react") {
             let resolved = rewrite_specifier(root, dir, resolver, fs_allow, dir_cache, base, false)
                 .or_else(|| {
                     resolver.resolve(dir, base).ok().map(|p| {
@@ -1711,7 +1721,10 @@ fn locate(root: &Path, public_dir: &Path, rel: &str) -> Option<PathBuf> {
 
 fn is_bundle_asset_query(url: &str) -> bool {
     match url.split_once('?') {
-        Some((_, q)) => matches!(query_asset_kind(Some(q)), Some("url" | "raw" | "inline" | "init")),
+        Some((_, q)) => {
+            matches!(query_asset_kind(Some(q)), Some("url" | "raw" | "inline" | "init"))
+                || q.split('&').any(|kv| kv == "react")
+        }
         None => false,
     }
 }
