@@ -198,7 +198,9 @@ impl Plugin for OjCssPlugin {
                     ..Default::default()
                 }));
             }
-            if !(path.ends_with(".css") || oj_css::is_sass(path)) {
+            let is_less = oj_server::sidecar::is_less(path);
+            let is_stylus = oj_server::sidecar::is_stylus(path);
+            if !(path.ends_with(".css") || oj_css::is_sass(path) || is_less || is_stylus) {
                 return Ok(None);
             }
             let mut source = std::fs::read_to_string(path)
@@ -206,6 +208,8 @@ impl Plugin for OjCssPlugin {
             if oj_css::is_sass(path) {
                 let dir = std::path::Path::new(path).parent();
                 source = oj_css::compile_sass(&source, dir).map_err(|e| anyhow::anyhow!(e))?;
+            } else if is_less || is_stylus {
+                source = preprocess_via_sidecar(&root, std::path::Path::new(path))?;
             }
             if oj_server::sidecar::is_tailwind_css(&source)
                 || (self.has_postcss && path.ends_with(".css"))
@@ -258,6 +262,44 @@ fn expand_css_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String
         bail!("css build failed for {}: {}", css_file.display(), String::from_utf8_lossy(&out.stderr));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn preprocess_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String> {
+    use std::io::Write;
+    let script = root.join(".oj-cache").join("css-preprocess.mjs");
+    if let Some(parent) = script.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&script, oj_server::sidecar::PREPROCESS_JS)?;
+    let css = fs::read_to_string(css_file)?;
+    let req = serde_json::json!({
+        "id": 1,
+        "base": root.to_string_lossy(),
+        "css": css,
+        "from": css_file.to_string_lossy(),
+    })
+    .to_string();
+    let mut child = std::process::Command::new("node")
+        .arg(&script)
+        .current_dir(root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .context("node not found for css preprocess build")?;
+    child.stdin.take().unwrap().write_all(format!("{req}\n").as_bytes())?;
+    let out = child.wait_with_output()?;
+    let line = String::from_utf8_lossy(&out.stdout);
+    let line = line.trim().lines().next().unwrap_or("{}");
+    let v: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+    match v.get("css").and_then(|c| c.as_str()) {
+        Some(css) => Ok(css.to_string()),
+        None => bail!(
+            "css preprocess failed for {}: {}",
+            css_file.display(),
+            v.get("error").and_then(|e| e.as_str()).unwrap_or("is `less`/`stylus` installed?")
+        ),
+    }
 }
 
 fn rolldown_resolve(

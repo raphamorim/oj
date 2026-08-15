@@ -151,6 +151,7 @@ struct ServerState {
     chunk_cache: Mutex<Option<(String, Arc<String>)>>,
     cache_writes: tokio::sync::mpsc::Sender<(String, Arc<CachedModule>)>,
     tailwind: tokio::sync::OnceCell<std::sync::Arc<Sidecar>>,
+    preprocess: tokio::sync::OnceCell<std::sync::Arc<Sidecar>>,
     tailwind_urls: Mutex<std::collections::HashSet<String>>,
     has_postcss: bool,
     preload_snapshot: Vec<String>,
@@ -325,6 +326,7 @@ impl DevServer {
             compile_locks: Mutex::new(HashMap::new()),
             crawl_done: crawl_rx,
             tailwind: tokio::sync::OnceCell::new(),
+            preprocess: tokio::sync::OnceCell::new(),
             tailwind_urls: Mutex::new(std::collections::HashSet::new()),
             has_postcss: has_postcss_config(&root),
             fs_allow: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -465,7 +467,15 @@ async fn ssr_module(
         },
     };
     let ext = path.extension().and_then(|e| e.to_str());
-    if !from_plugin && matches!(ext, Some("css") | Some("scss") | Some("sass")) {
+    if !from_plugin && ext.is_some_and(is_style_ext) {
+        let source = if is_preprocessor(id) {
+            match run_preprocess_sidecar(&state, id, &source).await {
+                Ok(css) => css,
+                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+            }
+        } else {
+            source
+        };
         return match ssr_css_module(&state.root, &path, &source) {
             Ok(code) => js(code),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -867,7 +877,7 @@ async fn serve_path(
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {e}")).into_response(),
         };
     }
-    if matches!(ext, "css" | "scss" | "sass")
+    if is_style_ext(ext)
         && uri.query().is_some_and(|q| q.contains("import"))
     {
         let url = url_of(&state.root, &file);
@@ -1137,7 +1147,16 @@ async fn ensure_module(
         _ => source,
     };
 
-    let source = if state.has_postcss && file.extension().and_then(|e| e.to_str()) == Some("css") {
+    let source = if is_preprocessor(url) {
+        run_preprocess_sidecar(state, url, &source)
+            .await
+            .map_err(|e| format!("css preprocess error for {url}: {e}"))?
+    } else {
+        source
+    };
+
+    let css_like = is_preprocessor(url) || file.extension().and_then(|e| e.to_str()) == Some("css");
+    let source = if state.has_postcss && css_like {
         run_css_sidecar(state, url, &source).await.unwrap_or(source)
     } else {
         source
@@ -1156,7 +1175,7 @@ async fn ensure_module(
     let plugin_fallback = state.plugins.is_some() && !bundle;
     let importer_abs = file.to_string_lossy().into_owned();
     let ext = file.extension().and_then(|e| e.to_str());
-    let is_css = matches!(ext, Some("css") | Some("scss") | Some("sass"));
+    let is_css = ext.is_some_and(is_style_ext);
     let is_json = ext == Some("json");
     let dep_map = if !is_dep && !bundle {
         state.optimized.ready().await
@@ -1414,6 +1433,32 @@ async fn run_css_sidecar(state: &Arc<ServerState>, url: &str, source: &str) -> R
     sidecar.compile(source, url).await
 }
 
+fn is_preprocessor(url: &str) -> bool {
+    sidecar::is_less(url) || sidecar::is_stylus(url)
+}
+
+fn is_style_ext(ext: &str) -> bool {
+    matches!(ext, "css" | "scss" | "sass" | "less" | "styl" | "stylus")
+}
+
+fn is_style_url(url: &str) -> bool {
+    let f = url.split('?').next().unwrap_or(url);
+    std::path::Path::new(f).extension().and_then(|e| e.to_str()).is_some_and(is_style_ext)
+}
+
+async fn run_preprocess_sidecar(
+    state: &Arc<ServerState>,
+    url: &str,
+    source: &str,
+) -> Result<String, String> {
+    let sidecar = state
+        .preprocess
+        .get_or_try_init(|| Sidecar::spawn_preprocess(&state.root))
+        .await
+        .map_err(|e| e.to_string())?;
+    sidecar.compile(source, url).await
+}
+
 async fn compile_tailwind(
     state: &Arc<ServerState>,
     url: &str,
@@ -1595,9 +1640,7 @@ fn rewrite_specifier(
         };
         if let Some(p) = quick {
             let url = url_of(root, &p);
-            if css_import_marker
-                && (url.ends_with(".css") || url.ends_with(".scss") || url.ends_with(".sass"))
-            {
+            if css_import_marker && is_style_url(&url) {
                 return Some(format!("{url}?import"));
             }
             if css_import_marker && is_asset_path(&p) {
@@ -1914,7 +1957,7 @@ fn inject_module_preloads(html: String, state: &ServerState) -> String {
     let links: String = paths
         .iter()
         .map(|p| {
-            if p.ends_with(".css") || p.ends_with(".scss") || p.ends_with(".sass") {
+            if is_style_url(p) {
                 format!("<link rel=\"modulepreload\" href=\"{p}?import\" />\n")
             } else {
                 format!("<link rel=\"modulepreload\" href=\"{p}\" />\n")
@@ -2215,7 +2258,7 @@ fn spawn_crawl(state: Arc<ServerState>, done_tx: tokio::sync::watch::Sender<bool
                     match locate(&state.root, &state.public_dir, &rel) { Some(f) => f, None => continue }
                 };
                 let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if !COMPILABLE.contains(&ext) && !matches!(ext, "css" | "scss" | "sass" | "json") {
+                if !COMPILABLE.contains(&ext) && !(is_style_ext(ext) || ext == "json") {
                     continue;
                 }
                 let state = Arc::clone(&state);
@@ -2455,7 +2498,7 @@ fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
             );
             return messages;
         }
-        if !COMPILABLE.contains(&ext) && !matches!(ext, "css" | "scss" | "sass" | "json") {
+        if !COMPILABLE.contains(&ext) && !(is_style_ext(ext) || ext == "json") {
             continue;
         }
 
@@ -2504,7 +2547,7 @@ fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
                 let timestamp = now_millis() as u64;
                 updates.extend(boundaries.iter().map(|b| {
                     let mut path = format!("{}", b.display());
-                    if path.ends_with(".css") {
+                    if is_style_url(&path) {
                         path.push_str("?import");
                     }
                     serde_json::json!({ "path": path, "timestamp": timestamp })

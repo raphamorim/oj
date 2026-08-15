@@ -11,6 +11,18 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
 
 pub const SIDECAR_JS: &str = include_str!("assets/tailwind-sidecar.mjs");
+pub const PREPROCESS_JS: &str = include_str!("assets/css-preprocess.mjs");
+
+#[inline]
+pub fn is_less(url: &str) -> bool {
+    url.split('?').next().unwrap_or(url).ends_with(".less")
+}
+
+#[inline]
+pub fn is_stylus(url: &str) -> bool {
+    let f = url.split('?').next().unwrap_or(url);
+    f.ends_with(".styl") || f.ends_with(".stylus")
+}
 
 #[inline]
 pub fn is_tailwind_css(source: &str) -> bool {
@@ -30,11 +42,23 @@ pub struct Sidecar {
 
 impl Sidecar {
     pub async fn spawn(root: &Path) -> anyhow::Result<std::sync::Arc<Sidecar>> {
-        let script = root.join(".oj-cache").join("tailwind-sidecar.mjs");
+        Self::spawn_named(root, "tailwind-sidecar.mjs", SIDECAR_JS).await
+    }
+
+    pub async fn spawn_preprocess(root: &Path) -> anyhow::Result<std::sync::Arc<Sidecar>> {
+        Self::spawn_named(root, "css-preprocess.mjs", PREPROCESS_JS).await
+    }
+
+    async fn spawn_named(
+        root: &Path,
+        name: &str,
+        js: &str,
+    ) -> anyhow::Result<std::sync::Arc<Sidecar>> {
+        let script = root.join(".oj-cache").join(name);
         if let Some(parent) = script.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&script, SIDECAR_JS)?;
+        std::fs::write(&script, js)?;
 
         let mut child = tokio::process::Command::new("node")
             .arg(&script)
@@ -43,7 +67,7 @@ impl Sidecar {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .map_err(|e| anyhow::anyhow!("cannot spawn node for tailwind sidecar: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("cannot spawn node for css sidecar: {e}"))?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
 
