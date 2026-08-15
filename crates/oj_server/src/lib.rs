@@ -984,6 +984,33 @@ async fn ensure_module(
     file: &Path,
     url: &str,
 ) -> Result<(String, Arc<CachedModule>), String> {
+    if state.bundle {
+        if let Some(kind) = query_asset_kind(url.split_once('?').map(|(_, q)| q)) {
+            if matches!(kind, "url" | "raw" | "inline" | "init") {
+                let code = asset_module(file, url, kind).await?;
+                let mut noop = |_: &str| None;
+                let factory = oj_compiler::bundle::compile_factory(file, url, &code, &mut noop)
+                    .map_err(|err| format!("asset module error for {url}: {err}"))?;
+                let module = Arc::new(CachedModule {
+                    is_boundary: false,
+                    kind: match factory.kind {
+                        oj_compiler::bundle::FactoryKind::Esm => "esm".into(),
+                        oj_compiler::bundle::FactoryKind::Cjs => "cjs".into(),
+                    },
+                    code: factory.code,
+                    map_data_url: None,
+                    imports: factory.imports,
+                    require_map: factory.require_map,
+                    css_exports: Vec::new(),
+                    fs_allow: Vec::new(),
+                    watch_files: Vec::new(),
+                });
+                register_in_graph(state, url, &module);
+                return Ok((String::new(), module));
+            }
+        }
+    }
+
     if is_asset_path(file) {
         let clean = url.split('?').next().unwrap_or(url);
         let default = format!("export default {};\n", serde_json::Value::String(clean.to_string()));
@@ -1639,6 +1666,13 @@ fn locate(root: &Path, public_dir: &Path, rel: &str) -> Option<PathBuf> {
     None
 }
 
+fn is_bundle_asset_query(url: &str) -> bool {
+    match url.split_once('?') {
+        Some((_, q)) => matches!(query_asset_kind(Some(q)), Some("url" | "raw" | "inline" | "init")),
+        None => false,
+    }
+}
+
 fn query_asset_kind(query: Option<&str>) -> Option<&'static str> {
     let q = query?;
     for kind in ["url", "raw", "inline", "worker", "sharedworker", "init"] {
@@ -1952,12 +1986,30 @@ async fn serve_chunk(State(state): State<Arc<ServerState>>, headers: HeaderMap) 
     }
 
     let mut chunk = String::new();
-    for url in &urls {
-        match registration_for(&state, url).await {
-            Ok(registration) => chunk.push_str(&registration),
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut queue: std::collections::VecDeque<String> = urls.into_iter().collect();
+    while let Some(url) = queue.pop_front() {
+        if !seen.insert(url.clone()) {
+            continue;
+        }
+        let file = match locate_url(&state, &url) {
+            Ok(file) => file,
             Err(err) => {
                 return (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: chunk: {err}"))
                     .into_response();
+            }
+        };
+        let module = match ensure_module(&state, &file, &url).await {
+            Ok((_, module)) => module,
+            Err(err) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: chunk: {err}"))
+                    .into_response();
+            }
+        };
+        chunk.push_str(&render_registration(&url, &module));
+        for imp in &module.imports {
+            if is_bundle_asset_query(imp) && !seen.contains(imp) {
+                queue.push_back(imp.clone());
             }
         }
     }
@@ -2017,10 +2069,11 @@ async fn serve_patch(State(state): State<Arc<ServerState>>, uri: Uri) -> Respons
 }
 
 fn locate_url(state: &ServerState, url: &str) -> Result<PathBuf, String> {
-    if let Some(abs) = url.strip_prefix("/@fs") {
+    let base = url.split('?').next().unwrap_or(url);
+    if let Some(abs) = base.strip_prefix("/@fs") {
         Ok(PathBuf::from(abs))
     } else {
-        let rel = url.trim_start_matches('/');
+        let rel = base.trim_start_matches('/');
         locate(&state.root, &state.public_dir, rel).ok_or_else(|| format!("no such module: {url}"))
     }
 }
@@ -2077,7 +2130,12 @@ async fn serve_lazy(State(state): State<Arc<ServerState>>, uri: Uri) -> Response
         .unwrap_or_default();
 
     let mut chunk = String::new();
-    let mut queue = vec![id.split('?').next().unwrap_or(&id).to_string()];
+    let start = if is_bundle_asset_query(&id) {
+        id.clone()
+    } else {
+        id.split('?').next().unwrap_or(&id).to_string()
+    };
+    let mut queue = vec![start];
     while let Some(url) = queue.pop() {
         if url.starts_with("/@oj/") || !visited.insert(url.clone()) {
             continue;
@@ -2089,9 +2147,13 @@ async fn serve_lazy(State(state): State<Arc<ServerState>>, uri: Uri) -> Response
         };
         chunk.push_str(&render_registration(&url, &module));
         for imp in &module.imports {
-            let clean = imp.split('?').next().unwrap_or(imp);
-            if clean.starts_with('/') && !clean.starts_with("/@oj/") && !visited.contains(clean) {
-                queue.push(clean.to_string());
+            let next = if is_bundle_asset_query(imp) {
+                imp.clone()
+            } else {
+                imp.split('?').next().unwrap_or(imp).to_string()
+            };
+            if next.starts_with('/') && !next.starts_with("/@oj/") && !visited.contains(&next) {
+                queue.push(next);
             }
         }
     }
