@@ -110,6 +110,7 @@ node e2e/query-assets.mjs                         # ?url/?raw/?inline/?init in b
 node e2e/rolldown-options.mjs                     # build.rollupOptions filenames + external
 node e2e/preprocessors.mjs                        # less + stylus css (installs both, then dev+build)
 node e2e/assets-inline.mjs                        # assetsInlineLimit: small assets become data uris
+node e2e/config-proxy.mjs                         # adopt vite.config server.proxy + ignored-config warnings
 node bench/generate.mjs 1000                      # generate a benchmark app (then npm i inside it)
 node bench/run.mjs 1000                           # p50/p95 benchmark vs vite
 node bench/card.mjs                               # render bench/card.html to oj-benchmarks.png

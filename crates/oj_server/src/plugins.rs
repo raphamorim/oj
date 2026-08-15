@@ -60,6 +60,7 @@ pub struct ViteValues {
     pub headers: Option<serde_json::Map<String, serde_json::Value>>,
     pub rollup_options: Option<serde_json::Value>,
     pub assets_inline_limit: Option<u64>,
+    pub proxy: Option<serde_json::Value>,
 }
 
 pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
@@ -99,6 +100,7 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
         headers: json.get("headers").and_then(|v| v.as_object()).cloned(),
         rollup_options: json.get("rollupOptions").filter(|v| !v.is_null()).cloned(),
         assets_inline_limit: json.get("assetsInlineLimit").and_then(|v| v.as_u64()),
+        proxy: json.get("proxy").filter(|v| !v.is_null()).cloned(),
     }
 }
 
@@ -163,6 +165,19 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
     if let Some(limit) = v.assets_inline_limit {
         let build = config.build.get_or_insert_with(Default::default);
         build.assets_inline_limit.get_or_insert(limit);
+    }
+    if let Some(proxy) = v.proxy {
+        let sc = config.server.get_or_insert_with(Default::default);
+        if sc.proxy.is_none() {
+            if let Ok(map) = serde_json::from_value::<
+                std::collections::BTreeMap<String, oj_config::ProxyEntry>,
+            >(proxy)
+            {
+                if !map.is_empty() {
+                    sc.proxy = Some(map);
+                }
+            }
+        }
     }
 }
 
@@ -496,6 +511,7 @@ mod vite_values_tests {
             headers: None,
             rollup_options: None,
             assets_inline_limit: None,
+            proxy: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/vite-base/"));
@@ -518,10 +534,28 @@ mod vite_values_tests {
             headers: None,
             rollup_options: None,
             assets_inline_limit: None,
+            proxy: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/oj-base/"));
         assert_eq!(config.public_dir.as_deref(), Some("my-public"));
+    }
+
+    #[test]
+    fn merge_adopts_proxy() {
+        let mut config = oj_config::OjConfig::default();
+        let v = ViteValues {
+            proxy: Some(serde_json::json!({
+                "/api": "http://localhost:3000",
+                "/ws": { "target": "http://localhost:4000", "changeOrigin": true }
+            })),
+            ..Default::default()
+        };
+        merge_vite_values(&mut config, v);
+        let proxy = config.server.unwrap().proxy.unwrap();
+        assert_eq!(proxy.get("/api").unwrap().target(), "http://localhost:3000");
+        assert_eq!(proxy.get("/ws").unwrap().target(), "http://localhost:4000");
+        assert!(proxy.get("/ws").unwrap().change_origin());
     }
 
     #[test]

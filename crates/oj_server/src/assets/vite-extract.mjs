@@ -89,8 +89,41 @@ function stringMap(obj) {
   return Object.keys(out).length ? out : null;
 }
 
+const warn = (msg) => process.stderr.write(`oj: vite.config: ${msg}\n`);
+
+function extractProxy(proxy) {
+  if (!proxy || typeof proxy !== "object") return null;
+  const out = {};
+  for (const [ctx, v] of Object.entries(proxy)) {
+    if (typeof v === "string") {
+      out[ctx] = v;
+    } else if (v && typeof v === "object" && typeof v.target === "string") {
+      const entry = { target: v.target };
+      if (typeof v.changeOrigin === "boolean") entry.changeOrigin = v.changeOrigin;
+      if (typeof v.ws === "boolean") entry.ws = v.ws;
+      if (typeof v.rewrite === "function") {
+        warn(`server.proxy["${ctx}"].rewrite is a function; oj applies only {from,to} string rewrites`);
+      }
+      out[ctx] = entry;
+    }
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+function warnUnsupported(c) {
+  if (c.css?.preprocessorOptions) warn("css.preprocessorOptions is not applied yet");
+  if (c.esbuild && typeof c.esbuild === "object") warn("esbuild options are not applied");
+  if (c.optimizeDeps) warn("optimizeDeps is ignored; oj has its own dependency optimizer");
+  if (c.worker) warn("worker config is not applied");
+  if (c.ssr) warn("ssr config is not applied");
+  for (const k of ["strictPort", "open", "cors", "allowedHosts"]) {
+    if (c.server?.[k] !== undefined) warn(`server.${k} is accepted but not applied`);
+  }
+}
+
 try {
   const c = (await loadConfig()) ?? {};
+  warnUnsupported(c);
   process.stdout.write(
     JSON.stringify({
       base: typeof c.base === "string" ? c.base : null,
@@ -100,6 +133,7 @@ try {
       define: c.define && typeof c.define === "object" ? c.define : null,
       alias: extractAlias(c.resolve?.alias),
       headers: stringMap(c.server?.headers),
+      proxy: extractProxy(c.server?.proxy),
       rollupOptions: c.build?.rolldownOptions ?? c.build?.rollupOptions ?? null,
       assetsInlineLimit:
         typeof c.build?.assetsInlineLimit === "number" ? c.build.assetsInlineLimit : null,
