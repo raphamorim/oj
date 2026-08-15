@@ -25,6 +25,17 @@ Vite/Rollup-style plugins run through a persistent Node plugin host. Drop an `oj
 A TypeScript config (including one that imports local `.ts` files) is loaded via Vite's own config loader when Vite is installed, or bundled with the app's esbuild otherwise. From a `vite.config` oj also adopts the app's `base`, `server.port`/`host`, `define`, and `resolve.alias` for any field its own config
 leaves unset, alias entries resolve alongside tsconfig `paths`, in both `oj dev` and `oj build`.
 
+## TanStack Start
+
+Point oj at a TanStack Start app and it runs the framework directly, no source changes. It detects Start from the app itself:
+
+```sh
+oj dev web                                       # dev server for the ./web Start app
+oj build web                                     # production build
+```
+
+Dev serves file-based routes with streaming SSR and client hydration, keeps Fast Refresh working, runs server functions in the module runner, and applies the app's `vite.config` plugins (React and the app's own). `oj build` emits a Node `server.mjs`, a Cloudflare `worker.mjs` (`nodejs_compat`), content-hashed client assets, and prerendered routes. oj's own docs site (`www/`) is a TanStack Start app built by oj and served from a Cloudflare Worker.
+
 ## Quickstart
 
 Install the CLI from crates.io, then run `oj` in any app:
