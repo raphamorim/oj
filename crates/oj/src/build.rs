@@ -50,6 +50,14 @@ fn assets_inline_limit_of(config: &oj_config::OjConfig) -> u64 {
     config.build.as_ref().and_then(|b| b.assets_inline_limit).unwrap_or(4096)
 }
 
+fn target_transform(config: &oj_config::OjConfig) -> Option<rolldown_common::BundlerTransformOptions> {
+    let target = config.build.as_ref().and_then(|b| b.target.clone())?;
+    Some(rolldown_common::BundlerTransformOptions {
+        target: Some(rolldown_common::Either::Left(target)),
+        ..Default::default()
+    })
+}
+
 fn is_build_asset(id: &str) -> bool {
     matches!(
         std::path::Path::new(id.split('?').next().unwrap_or(id))
@@ -75,6 +83,7 @@ fn asset_mime(ext: &str) -> &'static str {
         "woff2" => "font/woff2",
         "ttf" => "font/ttf",
         "otf" => "font/otf",
+        "eot" => "application/vnd.ms-fontobject",
         "mp4" => "video/mp4",
         "webm" => "video/webm",
         "mp3" => "audio/mpeg",
@@ -155,13 +164,17 @@ impl Plugin for OjCssPlugin {
         let routes_id = self.root.join("oj-routes.tsx").to_string_lossy().into_owned();
         let url_base = args.specifier.strip_suffix("?url").map(str::to_string);
         let init_base = args.specifier.strip_suffix("?init").map(str::to_string);
+        let raw_base = args.specifier.strip_suffix("?raw").map(str::to_string);
+        let inline_base = args.specifier.strip_suffix("?inline").map(str::to_string);
         let importer = args.importer.map(str::to_string);
         let ctx = ctx.clone();
         async move {
             if is_routes {
                 return Ok(Some(HookResolveIdOutput::from_id(routes_id)));
             }
-            for (base, query) in [(url_base, "url"), (init_base, "init")] {
+            for (base, query) in
+                [(url_base, "url"), (init_base, "init"), (raw_base, "raw"), (inline_base, "inline")]
+            {
                 if let Some(base) = base {
                     if let Ok(Ok(resolved)) = ctx.resolve(&base, importer.as_deref(), None).await {
                         let id = format!("{}?{query}", resolved.id.as_str());
@@ -255,6 +268,35 @@ impl Plugin for OjCssPlugin {
                 return Ok(Some(rolldown_plugin::HookLoadOutput {
                     code: arcstr::ArcStr::from(format!(
                         "const u = import.meta.ROLLUP_FILE_URL_{reference};\nexport default (imports = {{}}) => {{ const inst = (r) => r.instance; const fb = () => fetch(u).then((r) => r.arrayBuffer()).then((b) => WebAssembly.instantiate(b, imports)).then(inst); return WebAssembly.instantiateStreaming ? WebAssembly.instantiateStreaming(fetch(u), imports).then(inst).catch(fb) : fb(); }};"
+                    )),
+                    module_type: Some(rolldown_common::ModuleType::Js),
+                    ..Default::default()
+                }));
+            }
+            if let Some(file) = id.strip_suffix("?raw") {
+                let text = std::fs::read_to_string(file)
+                    .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
+                return Ok(Some(rolldown_plugin::HookLoadOutput {
+                    code: arcstr::ArcStr::from(format!(
+                        "export default {};",
+                        serde_json::Value::String(text)
+                    )),
+                    module_type: Some(rolldown_common::ModuleType::Js),
+                    ..Default::default()
+                }));
+            }
+            if let Some(file) = id.strip_suffix("?inline") {
+                let bytes = std::fs::read(file)
+                    .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
+                let ext = std::path::Path::new(file)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                return Ok(Some(rolldown_plugin::HookLoadOutput {
+                    code: arcstr::ArcStr::from(format!(
+                        "export default \"data:{};base64,{}\";",
+                        asset_mime(ext),
+                        b64(&bytes)
                     )),
                     module_type: Some(rolldown_common::ModuleType::Js),
                     ..Default::default()
@@ -727,9 +769,6 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
     let out_dir = if out.is_absolute() { out } else { root.join(&out) };
     let minify = build_cfg.minify.unwrap_or(true);
     let sourcemap = build_cfg.sourcemap.unwrap_or(true);
-    if build_cfg.target.is_some() {
-        eprintln!("oj build: note: build.target is accepted but not yet applied");
-    }
 
     if let Some(entry) = ssr.or_else(|| build_cfg.ssr.clone()) {
         return build_ssr_app(&root, &out_dir, &entry, minify, sourcemap, build_cfg.prerender.clone())
@@ -791,6 +830,7 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         .with_plugins(oj_plugins)
         .with_options(BundlerOptions {
         input: Some(inputs),
+        transform: target_transform(&config),
         cwd: Some(root.clone()),
         dir: Some(out_dir.display().to_string()),
         resolve: rolldown_resolve(&root, &config, "client"),
@@ -1058,6 +1098,7 @@ pub(crate) async fn build_ssr(
             cwd: Some(root.to_path_buf()),
             dir: Some(out_dir.display().to_string()),
             resolve: rolldown_resolve(root, &config, "ssr"),
+            transform: target_transform(&config),
             platform: Some(Platform::Node),
             external: Some(external),
             format: Some(OutputFormat::Esm),
@@ -1499,6 +1540,7 @@ async fn build_client_entry(
             cwd: Some(root.to_path_buf()),
             dir: Some(out_dir.display().to_string()),
             resolve: rolldown_resolve(root, &config, "client"),
+            transform: target_transform(&config),
             entry_filenames: Some("assets/[name]-[hash].js".to_string().into()),
             chunk_filenames: Some("assets/[name]-[hash].js".to_string().into()),
             minify: Some(RawMinifyOptions::Bool(
