@@ -984,6 +984,44 @@ async fn ensure_module(
     file: &Path,
     url: &str,
 ) -> Result<(String, Arc<CachedModule>), String> {
+    if is_asset_path(file) {
+        let clean = url.split('?').next().unwrap_or(url);
+        let default = format!("export default {};\n", serde_json::Value::String(clean.to_string()));
+        let module = if state.bundle {
+            let mut noop = |_: &str| None;
+            let factory = oj_compiler::bundle::compile_factory(file, url, &default, &mut noop)
+                .map_err(|err| format!("asset module error for {url}: {err}"))?;
+            Arc::new(CachedModule {
+                is_boundary: false,
+                kind: match factory.kind {
+                    oj_compiler::bundle::FactoryKind::Esm => "esm".into(),
+                    oj_compiler::bundle::FactoryKind::Cjs => "cjs".into(),
+                },
+                code: factory.code,
+                map_data_url: None,
+                imports: factory.imports,
+                require_map: factory.require_map,
+                css_exports: Vec::new(),
+                fs_allow: Vec::new(),
+                watch_files: Vec::new(),
+            })
+        } else {
+            Arc::new(CachedModule {
+                is_boundary: false,
+                kind: String::new(),
+                code: default,
+                map_data_url: None,
+                imports: Vec::new(),
+                require_map: Vec::new(),
+                css_exports: Vec::new(),
+                fs_allow: Vec::new(),
+                watch_files: Vec::new(),
+            })
+        };
+        register_in_graph(state, url, &module);
+        return Ok((String::new(), module));
+    }
+
     let source = bytes_to_string(
         tokio::fs::read(file).await.map_err(|err| format!("read error for {url}: {err}"))?,
     )
@@ -1535,6 +1573,9 @@ fn rewrite_specifier(
             {
                 return Some(format!("{url}?import"));
             }
+            if css_import_marker && is_asset_path(&p) {
+                return Some(format!("{url}?url"));
+            }
             return Some(url);
         }
     }
@@ -1776,6 +1817,18 @@ fn hex_decode(s: &str) -> Option<String> {
         out.push((hi * 16 + lo) as u8);
     }
     String::from_utf8(out).ok()
+}
+
+fn is_asset_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "ico" | "bmp" | "svg" | "woff" | "woff2"
+            | "ttf" | "otf" | "eot" | "mp4" | "webm" | "mov" | "mp3" | "wav" | "ogg" | "wasm"
+    )
+}
+
+fn is_asset_path(file: &Path) -> bool {
+    file.extension().and_then(|e| e.to_str()).map(is_asset_ext).unwrap_or(false)
 }
 
 fn content_type(ext: &str) -> &'static str {

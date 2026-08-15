@@ -417,7 +417,10 @@ impl<'a> VisitMut<'a> for RefRewriter<'a, '_> {
                 if matches!(member.object, Expression::ImportMeta(_))
                     && member.property.name == "url" =>
             {
-                Some(format!("({:?})", self.url))
+                Some(format!(
+                    "(typeof location !== \"undefined\" ? location.origin + {0:?} : {0:?})",
+                    self.url
+                ))
             }
             Expression::StaticMemberExpression(member)
                 if matches!(member.object, Expression::ImportMeta(_))
@@ -562,7 +565,7 @@ export { c } from "./third";
 export function Thing() { return import.meta.url; }
 "#,
         );
-        assert!(out.code.contains(r#"return "/src/Mod.tsx""#), "{}", out.code);
+        assert!(out.code.contains(r#"location.origin + "/src/Mod.tsx""#), "{}", out.code);
         assert!(out.is_boundary(), "component module registers refresh");
     }
 
