@@ -717,7 +717,7 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         .canonicalize()
         .with_context(|| format!("app root not found: {}", root.display()))?;
 
-    let mut config = oj_config::load(&root).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut config = oj_config::load_with(&root, "build", "production").map_err(|e| anyhow::anyhow!("{e}"))?;
     oj_server::plugins::adopt_vite_config_values(&mut config, &root);
     let build_cfg = config.build.clone().unwrap_or_default();
     let ro_opts = oj_config::rolldown_options(&config);
@@ -1022,7 +1022,7 @@ pub(crate) async fn build_ssr(
     let started = Instant::now();
     let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let mut config = oj_config::load(root).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut config = oj_config::load_with(root, "build", "production").map_err(|e| anyhow::anyhow!("{e}"))?;
     oj_server::plugins::adopt_vite_config_values(&mut config, root);
     let ssr_base = config.base.clone().unwrap_or_else(|| "/".into());
     let plugin_host = user_plugin_host(
@@ -1472,7 +1472,7 @@ async fn build_client_entry(
     let stem = Path::new(entry).file_stem().and_then(|s| s.to_str()).unwrap_or("client").to_string();
     let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let mut config = oj_config::load(root).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut config = oj_config::load_with(root, "build", "production").map_err(|e| anyhow::anyhow!("{e}"))?;
     oj_server::plugins::adopt_vite_config_values(&mut config, root);
     let client_base = config.base.clone().unwrap_or_else(|| "/".into());
     let plugin_host = user_plugin_host(

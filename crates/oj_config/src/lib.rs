@@ -102,6 +102,10 @@ pub fn environment_defines(config: &OjConfig, env_name: &str) -> Vec<(String, St
 }
 
 pub fn load(root: &Path) -> Result<OjConfig, ConfigError> {
+    load_with(root, "serve", "development")
+}
+
+pub fn load_with(root: &Path, command: &str, mode: &str) -> Result<OjConfig, ConfigError> {
     let Some(path) = CANDIDATES.iter().map(|c| root.join(c)).find(|p| p.is_file()) else {
         return Ok(OjConfig::default());
     };
@@ -111,12 +115,12 @@ pub fn load(root: &Path) -> Result<OjConfig, ConfigError> {
     let json = if path.extension().and_then(|e| e.to_str()) == Some("json") {
         source
     } else {
-        evaluate(&path, &source)?
+        evaluate(&path, &source, command, mode)?
     };
     serde_json::from_str(&json).map_err(|e| ConfigError::Schema(path, e.to_string()))
 }
 
-fn evaluate(path: &Path, source: &str) -> Result<String, ConfigError> {
+fn evaluate(path: &Path, source: &str, command: &str, mode: &str) -> Result<String, ConfigError> {
     let js = strip_types(path, source)?;
     let script = to_script(&js);
 
@@ -135,7 +139,17 @@ fn evaluate(path: &Path, source: &str) -> Result<String, ConfigError> {
              var process = {{ env: {{ {env_obj} }} }};\n\
              var globalThis = globalThis || this;\n"
         );
-        let full = format!("{prelude}{script}\nJSON.stringify(globalThis.__ojConfig ?? null)");
+        let env_arg = format!(
+            "{{ command: {}, mode: {}, isSsrBuild: false, isPreview: false }}",
+            serde_json::to_string(command).unwrap(),
+            serde_json::to_string(mode).unwrap()
+        );
+        let full = format!(
+            "{prelude}{script}\n\
+             var __ojC = globalThis.__ojConfig;\n\
+             if (typeof __ojC === 'function') __ojC = __ojC({env_arg});\n\
+             JSON.stringify(__ojC ?? null)"
+        );
         let result: rquickjs::Value = ctx
             .eval(full)
             .map_err(|e| ConfigError::Eval(path.to_path_buf(), format!("{e}")))?;
@@ -226,6 +240,31 @@ mod tests {
             "http://localhost:8080"
         );
         assert_eq!(cfg.resolve.unwrap().alias.unwrap().get("@").unwrap(), "./src");
+    }
+
+    #[test]
+    fn function_config_receives_command_and_mode() {
+        let src = "export default ({ command, mode }) => ({ base: command === \"build\" ? \"/prod/\" : \"/dev/\", define: { __M__: mode } });\n";
+        let cfg = eval_config_in("fnform", src);
+        assert_eq!(cfg.base.as_deref(), Some("/dev/"));
+        let defines: std::collections::BTreeMap<_, _> = config_defines(&cfg).into_iter().collect();
+        assert_eq!(defines.get("__M__").unwrap(), "development");
+
+        let dir = std::env::temp_dir().join(format!("oj-cfg-fnbuild-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("oj.config.js"), src).unwrap();
+        let cfg = load_with(&dir, "build", "production").unwrap();
+        assert_eq!(cfg.base.as_deref(), Some("/prod/"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn defineconfig_function_form_works() {
+        let cfg = eval_config_in(
+            "definefn",
+            "import { defineConfig } from \"oj\";\nexport default defineConfig(({ mode }) => ({ bundle: mode === \"development\" }));\n",
+        );
+        assert_eq!(cfg.bundle, Some(true));
     }
 
     #[test]
