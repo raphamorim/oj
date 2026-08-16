@@ -120,6 +120,7 @@ node e2e/html-entry.mjs                           # relative index.html script e
 node e2e/svelte.mjs                               # svelte 5 components in dev, bundle, and build
 node e2e/build-mode.mjs                           # build --mode (import.meta.env.MODE + .env.<mode>)
 node e2e/hmr-protocol.mjs                         # hmr client derives wss (behind https proxy)
+node e2e/host-binding.mjs                         # dev/preview --host + server.host bind all interfaces
 node bench/generate.mjs 1000                      # generate a benchmark app (then npm i inside it)
 node bench/run.mjs 1000                           # p50/p95 benchmark vs vite
 node bench/card.mjs                               # render bench/card.html to oj-benchmarks.png

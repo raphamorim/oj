@@ -133,6 +133,7 @@ pub struct DevServer {
     pub root: PathBuf,
     pub port: Option<u16>,
     pub bundle: bool,
+    pub host: Option<String>,
 }
 
 struct ServerState {
@@ -228,11 +229,7 @@ impl DevServer {
         let server_cfg = config.server.clone().unwrap_or_default();
         let port = self.port.or(server_cfg.port).unwrap_or(5199);
         let bundle = self.bundle || config.bundle.unwrap_or(false);
-        let host: std::net::IpAddr = match server_cfg.host.as_deref() {
-            Some("0.0.0.0") | Some("true") => [0, 0, 0, 0].into(),
-            Some(h) => h.parse().unwrap_or([127, 0, 0, 1].into()),
-            None => [127, 0, 0, 1].into(),
-        };
+        let host = resolve_host(self.host.as_deref().or(server_cfg.host.as_deref()));
         let proxy: Vec<(String, oj_config::ProxyEntry)> =
             server_cfg.proxy.clone().unwrap_or_default().into_iter().collect();
 
@@ -547,11 +544,20 @@ fn ssr_css_module(root: &Path, path: &Path, source: &str) -> Result<String, Stri
     })
 }
 
+pub fn resolve_host(host: Option<&str>) -> std::net::IpAddr {
+    match host {
+        Some("true") | Some("0.0.0.0") | Some("::") | Some("[::]") => [0, 0, 0, 0].into(),
+        Some("localhost") | None => [127, 0, 0, 1].into(),
+        Some(h) => h.parse().unwrap_or([127, 0, 0, 1].into()),
+    }
+}
+
 pub async fn preview(
     dir: PathBuf,
     port: u16,
     base: String,
     headers: Vec<(String, String)>,
+    host: Option<String>,
 ) -> anyhow::Result<()> {
     let dir = dir
         .canonicalize()
@@ -562,7 +568,7 @@ pub async fn preview(
         .collect();
     let state = Arc::new((dir.clone(), base, headers));
     let app = Router::new().fallback(get(preview_serve)).with_state(state);
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::from((resolve_host(host.as_deref()), port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("cannot bind {addr}"))?;
@@ -2771,6 +2777,21 @@ mod tests {
         assert!(glue.contains(r#"from "/src/App.tsx?t=123""#), "{glue}");
         assert!(glue.contains("validateRefreshBoundaryAndEnqueueUpdate"));
         assert!(glue.contains("function $RefreshReg$"));
+    }
+
+    #[test]
+    fn resolve_host_maps_wildcards_to_all_interfaces() {
+        let any: std::net::IpAddr = [0, 0, 0, 0].into();
+        let local: std::net::IpAddr = [127, 0, 0, 1].into();
+        assert_eq!(resolve_host(Some("true")), any);
+        assert_eq!(resolve_host(Some("0.0.0.0")), any);
+        assert_eq!(resolve_host(Some("::")), any);
+        assert_eq!(resolve_host(Some("[::]")), any);
+        assert_eq!(resolve_host(Some("localhost")), local);
+        assert_eq!(resolve_host(None), local);
+        let lan: std::net::IpAddr = [192, 168, 1, 5].into();
+        assert_eq!(resolve_host(Some("192.168.1.5")), lan);
+        assert_eq!(resolve_host(Some("bogus")), local);
     }
 
     #[test]

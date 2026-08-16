@@ -27,6 +27,7 @@ pub struct OjConfig {
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct PreviewConfig {
     pub port: Option<u16>,
+    pub host: Option<String>,
     pub headers: Option<BTreeMap<String, String>>,
 }
 

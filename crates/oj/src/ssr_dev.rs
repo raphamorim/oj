@@ -30,8 +30,13 @@ struct SsrState {
     runner: Arc<tokio::sync::Mutex<Runner>>,
 }
 
-pub async fn ssr_dev(root: PathBuf, entry: String, port: Option<u16>) -> anyhow::Result<()> {
-    let built = oj_server::DevServer { root, port, bundle: false }.build_app().await?;
+pub async fn ssr_dev(
+    root: PathBuf,
+    entry: String,
+    port: Option<u16>,
+    host: Option<String>,
+) -> anyhow::Result<()> {
+    let built = oj_server::DevServer { root, port, bundle: false, host }.build_app().await?;
 
     let client_url =
         crate::build::derive_client_entry(&built.root, &entry).map(|rel| format!("/{rel}"));

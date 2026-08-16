@@ -27,6 +27,8 @@ enum Command {
         bundle: bool,
         #[arg(long)]
         ssr: Option<String>,
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+        host: Option<String>,
     },
     Compile {
         file: PathBuf,
@@ -48,23 +50,25 @@ enum Command {
         out: Option<PathBuf>,
         #[arg(long)]
         port: Option<u16>,
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+        host: Option<String>,
     },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
-        Command::Dev { root, port, bundle, ssr } => {
+        Command::Dev { root, port, bundle, ssr, host } => {
             let root = root.unwrap_or_else(|| {
                 let playground = PathBuf::from("playground");
                 if playground.join("index.html").is_file() { playground } else { PathBuf::from(".") }
             });
             if let Some(entry) = ssr {
-                ssr_dev::ssr_dev(root, entry, port).await
+                ssr_dev::ssr_dev(root, entry, port, host).await
             } else if oj_server::is_tanstack_start_app(&root) {
-                start_dev::start_dev(root, port).await
+                start_dev::start_dev(root, port, host).await
             } else {
-                oj_server::DevServer { root, port, bundle }.run().await
+                oj_server::DevServer { root, port, bundle, host }.run().await
             }
         }
         Command::Compile { file, prod } => {
@@ -91,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
                 build::build(root, out, ssr, &mode).await
             }
         }
-        Command::Preview { root, out, port } => {
+        Command::Preview { root, out, port, host } => {
             let root = root
                 .unwrap_or_else(|| {
                     let playground = PathBuf::from("playground");
@@ -119,7 +123,10 @@ async fn main() -> anyhow::Result<()> {
                 .or_else(|| config.server.as_ref().and_then(|s| s.headers.clone()))
                 .map(|m| m.into_iter().collect())
                 .unwrap_or_default();
-            oj_server::preview(out_dir, port, base, headers).await
+            let host = host
+                .or_else(|| config.preview.as_ref().and_then(|p| p.host.clone()))
+                .or_else(|| config.server.as_ref().and_then(|s| s.host.clone()));
+            oj_server::preview(out_dir, port, base, headers, host).await
         }
     }
 }

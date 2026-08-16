@@ -31,7 +31,7 @@ struct StartState {
     css_host: Option<Arc<tokio::sync::Mutex<Runner>>>,
 }
 
-pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
+pub async fn start_dev(root: PathBuf, port: Option<u16>, host: Option<String>) -> anyhow::Result<()> {
     let root = root
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("app root not found: {}: {e}", root.display()))?;
@@ -53,7 +53,8 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>) -> anyhow::Result<()> {
         let (root, cache) = (root.clone(), cache.clone());
         tokio::task::spawn_blocking(move || bundle_client_entry(&root, &cache))
     };
-    let built_fut = oj_server::DevServer { root: root.clone(), port, bundle: false }.build_app();
+    let built_fut =
+        oj_server::DevServer { root: root.clone(), port, bundle: false, host }.build_app();
     let (bundle_res, built_res) = tokio::join!(bundle, built_fut);
     bundle_res??;
     resolver.await??;
