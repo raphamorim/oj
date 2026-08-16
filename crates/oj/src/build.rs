@@ -214,6 +214,8 @@ impl Plugin for OjCssPlugin {
         let raw_base = args.specifier.strip_suffix("?raw").map(str::to_string);
         let inline_base = args.specifier.strip_suffix("?inline").map(str::to_string);
         let react_base = args.specifier.strip_suffix("?react").map(str::to_string);
+        let worker_base = args.specifier.strip_suffix("?worker").map(str::to_string);
+        let shared_base = args.specifier.strip_suffix("?sharedworker").map(str::to_string);
         let importer = args.importer.map(str::to_string);
         let ctx = ctx.clone();
         async move {
@@ -226,6 +228,8 @@ impl Plugin for OjCssPlugin {
                 (raw_base, "raw"),
                 (inline_base, "inline"),
                 (react_base, "react"),
+                (worker_base, "worker"),
+                (shared_base, "sharedworker"),
             ] {
                 if let Some(base) = base {
                     if let Ok(Ok(resolved)) = ctx.resolve(&base, importer.as_deref(), None).await {
@@ -360,6 +364,34 @@ impl Plugin for OjCssPlugin {
                 return Ok(Some(rolldown_plugin::HookLoadOutput {
                     code: arcstr::ArcStr::from(oj_server::svgr::svg_to_component(&svg)),
                     module_type: Some(rolldown_common::ModuleType::Jsx),
+                    ..Default::default()
+                }));
+            }
+            let worker = id
+                .strip_suffix("?worker")
+                .map(|f| (f, "Worker"))
+                .or_else(|| id.strip_suffix("?sharedworker").map(|f| (f, "SharedWorker")));
+            if let Some((file, ctor)) = worker {
+                let stem = std::path::Path::new(file)
+                    .file_stem()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("worker")
+                    .to_string();
+                let reference = ctx
+                    .emit_chunk(rolldown_common::EmittedChunk {
+                        id: file.to_string(),
+                        name: Some(stem.into()),
+                        preserve_entry_signatures: Some(
+                            rolldown_common::PreserveEntrySignatures::False,
+                        ),
+                        ..Default::default()
+                    })
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                return Ok(Some(rolldown_plugin::HookLoadOutput {
+                    code: arcstr::ArcStr::from(format!(
+                        "export default function () {{ return new {ctor}(import.meta.ROLLUP_FILE_URL_{reference}, {{ type: \"module\" }}); }};"
+                    )),
+                    module_type: Some(rolldown_common::ModuleType::Js),
                     ..Default::default()
                 }));
             }

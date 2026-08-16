@@ -87,6 +87,7 @@ const SERVER_FN_JS: &str = include_str!("assets/server-fn.js");
 const REFRESH_RUNTIME_JS: &str = include_str!("assets/refresh-runtime.js");
 const REFRESH_PREAMBLE_JS: &str = include_str!("assets/refresh-preamble.js");
 const BUNDLE_RUNTIME_JS: &str = include_str!("assets/bundle-runtime.js");
+const WORKER_RUNTIME_JS: &str = include_str!("assets/worker-runtime.js");
 pub const SSR_RUNNER_JS: &str = include_str!("assets/ssr-runner.mjs");
 const COMPILABLE: &[&str] = &["tsx", "ts", "jsx", "js", "mjs"];
 
@@ -373,6 +374,7 @@ impl DevServer {
             .route("/@oj/chunk.js", get(serve_chunk))
             .route("/@oj/patch.js", get(serve_patch))
             .route("/@oj/lazy.js", get(serve_lazy))
+            .route("/@oj/worker.js", get(serve_worker_chunk))
             .route("/@oj/routes.js", get(serve_oj_routes))
             .route("/@oj/server-fn.js", get(|| async { js(SERVER_FN_JS) }))
             .route("/@ssr-resolve", get(ssr_resolve))
@@ -1026,6 +1028,33 @@ async fn ensure_module(
                 register_in_graph(state, url, &module);
                 return Ok((String::new(), module));
             }
+            if matches!(kind, "worker" | "sharedworker") {
+                let clean = url.split('?').next().unwrap_or(url);
+                let ctor = if kind == "sharedworker" { "SharedWorker" } else { "Worker" };
+                let code = format!(
+                    "export default function () {{ return new {ctor}(\"/@oj/worker.js?entry={}\", {{ type: \"module\" }}); }}\n",
+                    hex_encode(clean)
+                );
+                let mut noop = |_: &str| None;
+                let factory = oj_compiler::bundle::compile_factory(file, url, &code, &mut noop)
+                    .map_err(|err| format!("worker module error for {url}: {err}"))?;
+                let module = Arc::new(CachedModule {
+                    is_boundary: false,
+                    kind: match factory.kind {
+                        oj_compiler::bundle::FactoryKind::Esm => "esm".into(),
+                        oj_compiler::bundle::FactoryKind::Cjs => "cjs".into(),
+                    },
+                    code: factory.code,
+                    map_data_url: None,
+                    imports: factory.imports,
+                    require_map: factory.require_map,
+                    css_exports: Vec::new(),
+                    fs_allow: Vec::new(),
+                    watch_files: Vec::new(),
+                });
+                register_in_graph(state, url, &module);
+                return Ok((String::new(), module));
+            }
         }
     }
 
@@ -1386,7 +1415,7 @@ fn register_in_graph(state: &ServerState, url: &str, module: &CachedModule) {
     let local_imports: Vec<PathBuf> = module
         .imports
         .iter()
-        .filter(|s| s.starts_with('/') && !s.starts_with("/@oj/"))
+        .filter(|s| s.starts_with('/') && !s.starts_with("/@oj/") && !is_worker_query(s))
         .map(|s| PathBuf::from(s.split('?').next().unwrap_or(s)))
         .collect();
     graph.set_imports(Path::new(url), &local_imports);
@@ -1719,11 +1748,20 @@ fn locate(root: &Path, public_dir: &Path, rel: &str) -> Option<PathBuf> {
     None
 }
 
+fn is_worker_query(url: &str) -> bool {
+    match url.split_once('?') {
+        Some((_, q)) => q.split('&').any(|kv| kv == "worker" || kv == "sharedworker"),
+        None => false,
+    }
+}
+
 fn is_bundle_asset_query(url: &str) -> bool {
     match url.split_once('?') {
         Some((_, q)) => {
-            matches!(query_asset_kind(Some(q)), Some("url" | "raw" | "inline" | "init"))
-                || q.split('&').any(|kv| kv == "react")
+            matches!(
+                query_asset_kind(Some(q)),
+                Some("url" | "raw" | "inline" | "init" | "worker" | "sharedworker")
+            ) || q.split('&').any(|kv| kv == "react")
         }
         None => false,
     }
@@ -2124,6 +2162,51 @@ async fn serve_patch(State(state): State<Arc<ServerState>>, uri: Uri) -> Respons
         .into_response()
 }
 
+async fn serve_worker_chunk(State(state): State<Arc<ServerState>>, uri: Uri) -> Response {
+    let entry = uri
+        .query()
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("entry=")))
+        .and_then(hex_decode)
+        .unwrap_or_default();
+    if entry.is_empty() {
+        return (StatusCode::BAD_REQUEST, "oj: worker: entry required").into_response();
+    }
+
+    let mut chunk = String::from(WORKER_RUNTIME_JS);
+    chunk.push('\n');
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut queue = vec![entry.clone()];
+    while let Some(url) = queue.pop() {
+        if url.starts_with("/@oj/") || !seen.insert(url.clone()) {
+            continue;
+        }
+        let Ok(file) = locate_url(&state, &url) else { continue };
+        let module = match ensure_module(&state, &file, &url).await {
+            Ok((_, module)) => module,
+            Err(err) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: worker: {err}")).into_response();
+            }
+        };
+        chunk.push_str(&render_registration(&url, &module));
+        for imp in &module.imports {
+            let next = if is_bundle_asset_query(imp) {
+                imp.clone()
+            } else {
+                imp.split('?').next().unwrap_or(imp).to_string()
+            };
+            if next.starts_with('/') && !next.starts_with("/@oj/") && !seen.contains(&next) {
+                queue.push(next);
+            }
+        }
+    }
+    chunk.push_str(&format!("__oj_start({});\n", serde_json::Value::String(entry)));
+    (
+        [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
+        chunk,
+    )
+        .into_response()
+}
+
 fn locate_url(state: &ServerState, url: &str) -> Result<PathBuf, String> {
     let base = url.split('?').next().unwrap_or(url);
     if let Some(abs) = base.strip_prefix("/@fs") {
@@ -2221,7 +2304,30 @@ async fn serve_lazy(State(state): State<Arc<ServerState>>, uri: Uri) -> Response
 }
 
 fn urldecode(input: &str) -> String {
-    input.replace("%2F", "/").replace("%2f", "/").replace("%2C", ",").replace("%2c", ",")
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn html_entries(root: &Path) -> Vec<String> {

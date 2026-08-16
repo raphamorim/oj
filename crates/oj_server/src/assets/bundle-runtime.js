@@ -99,11 +99,11 @@ window.__oj_export_star = (from, exports) => {
 
 window.__oj_import_lazy = async (url) => {
   const clean = url.split("?")[0];
-  if (!registry.has(clean)) {
+  if (!registry.has(url) && !registry.has(clean)) {
     const have = [...registry.keys()].map(encodeURIComponent).join(",");
     await import(`/@oj/lazy.js?id=${encodeURIComponent(url)}&have=${have}`);
   }
-  return requireRaw(clean, "esm");
+  return requireRaw(registry.has(url) ? url : clean, "esm");
 };
 
 const styleTags = new Map();
