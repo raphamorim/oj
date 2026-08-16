@@ -867,6 +867,7 @@ async fn user_plugin_host(
     define: &serde_json::Value,
     environments: &serde_json::Value,
     env_name: &str,
+    mode: &str,
 ) -> Option<Arc<PluginHost>> {
     let (file, plugins_format, label) = match oj_server::plugins::plugin_source(root)? {
         oj_server::plugins::PluginSource::OjPlugins(p) => {
@@ -876,9 +877,9 @@ async fn user_plugin_host(
         oj_server::plugins::PluginSource::ViteConfig(p) => (p, "vite", "vite.config".to_string()),
     };
     let config = serde_json::json!({
-        "config": { "root": root.display().to_string(), "base": base, "mode": "production", "command": "build", "define": define, "environments": environments },
-        "env": { "command": "build", "mode": "production" },
-        "environment": { "name": env_name, "mode": "production" },
+        "config": { "root": root.display().to_string(), "base": base, "mode": mode, "command": "build", "define": define, "environments": environments },
+        "env": { "command": "build", "mode": mode },
+        "environment": { "name": env_name, "mode": mode },
         "pluginsFormat": plugins_format,
     })
     .to_string();
@@ -894,12 +895,12 @@ async fn user_plugin_host(
     }
 }
 
-pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> anyhow::Result<()> {
+pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>, mode: &str) -> anyhow::Result<()> {
     let root = root
         .canonicalize()
         .with_context(|| format!("app root not found: {}", root.display()))?;
 
-    let mut config = oj_config::load_with(&root, "build", "production").map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut config = oj_config::load_with(&root, "build", mode).map_err(|e| anyhow::anyhow!("{e}"))?;
     oj_server::plugins::adopt_vite_config_values(&mut config, &root);
     let build_cfg = config.build.clone().unwrap_or_default();
     let ro_opts = oj_config::rolldown_options(&config);
@@ -959,6 +960,7 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
         &serde_json::json!(config.define),
         &serde_json::json!(config.environments),
         "client",
+        mode,
     )
     .await;
     let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
@@ -1000,10 +1002,10 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
             .unwrap_or(sourcemap)
             .then_some(SourceMapType::File),
         define: Some({
-            let env = oj_env::load(&root, "production");
+            let env = oj_env::load(&root, mode);
             let mut pairs: Vec<(String, String)> =
                 vec![("process.env.NODE_ENV".into(), "'production'".into())];
-            pairs.extend(oj_env::import_meta_env_defines(&env, "production", false, &base, "VITE_"));
+            pairs.extend(oj_env::import_meta_env_defines(&env, mode, false, &base, "VITE_"));
             pairs.extend(oj_config::config_defines(&config));
             pairs.extend(oj_config::environment_defines(&config, "client"));
             pairs.into_iter().collect()
@@ -1216,6 +1218,7 @@ pub(crate) async fn build_ssr(
         &serde_json::json!(config.define),
         &serde_json::json!(config.environments),
         "ssr",
+        "production",
     )
     .await;
 
@@ -1667,6 +1670,7 @@ async fn build_client_entry(
         &serde_json::json!(config.define),
         &serde_json::json!(config.environments),
         "client",
+        "production",
     )
     .await;
     let mut oj_plugins: Vec<SharedPluginable> = Vec::new();

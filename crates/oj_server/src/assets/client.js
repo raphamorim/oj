@@ -154,7 +154,8 @@ function swapCss(update) {
 let socket = null;
 
 (function connect() {
-  const ws = new WebSocket("ws://" + location.host + "/__ws");
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(proto + "://" + location.host + "/__ws");
   socket = ws;
   ws.addEventListener("message", (event) => {
     let msg;

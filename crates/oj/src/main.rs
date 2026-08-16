@@ -39,6 +39,8 @@ enum Command {
         out: Option<PathBuf>,
         #[arg(long)]
         ssr: Option<String>,
+        #[arg(long)]
+        mode: Option<String>,
     },
     Preview {
         root: Option<PathBuf>,
@@ -77,15 +79,16 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", output.code);
             Ok(())
         }
-        Command::Build { root, out, ssr } => {
+        Command::Build { root, out, ssr, mode } => {
             let root = root.unwrap_or_else(|| {
                 let playground = PathBuf::from("playground");
                 if playground.join("index.html").is_file() { playground } else { PathBuf::from(".") }
             });
+            let mode = mode.unwrap_or_else(|| "production".to_string());
             if oj_server::is_tanstack_start_app(&root) {
                 start_dev::start_build(root).await
             } else {
-                build::build(root, out, ssr).await
+                build::build(root, out, ssr, &mode).await
             }
         }
         Command::Preview { root, out, port } => {
