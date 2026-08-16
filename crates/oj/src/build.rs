@@ -1926,6 +1926,14 @@ mod tests {
     }
 
     #[test]
+    fn module_script_srcs_accepts_relative_entries() {
+        let html = r#"<script type="module" src="src/index.tsx"></script>"#;
+        assert_eq!(module_script_srcs(html), vec!["src/index.tsx"]);
+        let html2 = r#"<script type="module" src="./app/main.ts"></script>"#;
+        assert_eq!(module_script_srcs(html2), vec!["./app/main.ts"]);
+    }
+
+    #[test]
     fn is_server_module_path_matches_server_suffixes() {
         for yes in ["api.server.ts", "a/b/auth.server.tsx", "x.server.js", "y.server.jsx"] {
             assert!(is_server_module_path(yes), "{yes} should be a server module");

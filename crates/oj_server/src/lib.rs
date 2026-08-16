@@ -2747,6 +2747,16 @@ mod tests {
     }
 
     #[test]
+    fn html_entry_src_normalizes_relative_and_excludes_external() {
+        assert_eq!(html_entry_src("src/index.tsx").as_deref(), Some("/src/index.tsx"));
+        assert_eq!(html_entry_src("./src/index.tsx").as_deref(), Some("/src/index.tsx"));
+        assert_eq!(html_entry_src("/src/index.tsx").as_deref(), Some("/src/index.tsx"));
+        assert_eq!(html_entry_src("https://cdn/x.js"), None);
+        assert_eq!(html_entry_src("//cdn/x.js"), None);
+        assert_eq!(html_entry_src("data:text/js,1"), None);
+    }
+
+    #[test]
     fn spa_navigation_falls_back_only_for_routes() {
         let html = {
             let mut h = HeaderMap::new();

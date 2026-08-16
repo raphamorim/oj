@@ -268,6 +268,20 @@ mod tests {
     }
 
     #[test]
+    fn undefined_reference_config_gives_plugins_hint() {
+        let err = evaluate(
+            std::path::Path::new("oj.config.mjs"),
+            "export default [tailwindcss()];\n",
+            "serve",
+            "development",
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("tailwindcss"), "{msg}");
+        assert!(msg.contains("oj.plugins.mjs"), "{msg}");
+    }
+
+    #[test]
     fn defineconfig_function_form_works() {
         let cfg = eval_config_in(
             "definefn",

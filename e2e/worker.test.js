@@ -4,8 +4,6 @@
 const { chromium } = require("playwright");
 (async () => {
   if (process.env.OJ_E2E_MODE === "bundle") {
-    // bundle workers are covered by e2e/worker-modes.mjs (all modes); this
-    // shared-server playground test flakes on a mid-test full-reload navigation.
     console.log("SKIP worker (bundle covered by worker-modes.mjs)");
     return;
   }
