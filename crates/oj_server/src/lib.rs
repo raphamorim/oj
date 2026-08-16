@@ -89,7 +89,7 @@ const REFRESH_PREAMBLE_JS: &str = include_str!("assets/refresh-preamble.js");
 const BUNDLE_RUNTIME_JS: &str = include_str!("assets/bundle-runtime.js");
 const WORKER_RUNTIME_JS: &str = include_str!("assets/worker-runtime.js");
 pub const SSR_RUNNER_JS: &str = include_str!("assets/ssr-runner.mjs");
-const COMPILABLE: &[&str] = &["tsx", "ts", "jsx", "js", "mjs"];
+const COMPILABLE: &[&str] = &["tsx", "ts", "jsx", "js", "mjs", "svelte"];
 
 const START_ASSETS: &[(&str, &str)] = &[
     ("resolve-pkg.mjs", include_str!("assets/start/resolve-pkg.mjs")),
@@ -154,6 +154,7 @@ struct ServerState {
     cache_writes: tokio::sync::mpsc::Sender<(String, Arc<CachedModule>)>,
     tailwind: tokio::sync::OnceCell<std::sync::Arc<Sidecar>>,
     preprocess: tokio::sync::OnceCell<std::sync::Arc<Sidecar>>,
+    svelte: tokio::sync::OnceCell<std::sync::Arc<Sidecar>>,
     tailwind_urls: Mutex<std::collections::HashSet<String>>,
     has_postcss: bool,
     preload_snapshot: Vec<String>,
@@ -329,6 +330,7 @@ impl DevServer {
             crawl_done: crawl_rx,
             tailwind: tokio::sync::OnceCell::new(),
             preprocess: tokio::sync::OnceCell::new(),
+            svelte: tokio::sync::OnceCell::new(),
             tailwind_urls: Mutex::new(std::collections::HashSet::new()),
             has_postcss: has_postcss_config(&root),
             fs_allow: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -977,8 +979,12 @@ async fn serve_compiled(
         }
     }
 
-    let mut body = module.code.clone();
-    if !state.bundle {
+    let mut body = if !state.bundle && module.kind == "svelte" {
+        format!("{}{}", svelte_hot_glue(url), module.code)
+    } else {
+        module.code.clone()
+    };
+    if !state.bundle && module.kind != "svelte" {
         body.push_str(&hot_glue(url, query, module.is_boundary));
     }
     if let Some(map_url) = &module.map_data_url {
@@ -1003,6 +1009,7 @@ async fn ensure_module(
 ) -> Result<(String, Arc<CachedModule>), String> {
     let react_svg = file.extension().and_then(|e| e.to_str()) == Some("svg")
         && url.split_once('?').is_some_and(|(_, q)| q.split('&').any(|kv| kv == "react"));
+    let is_svelte = file.extension().and_then(|e| e.to_str()) == Some("svelte");
 
     if !react_svg && state.bundle {
         if let Some(kind) = query_asset_kind(url.split_once('?').map(|(_, q)| q)) {
@@ -1200,6 +1207,13 @@ async fn ensure_module(
     };
 
     let source = if react_svg { svgr::svg_to_component(&source) } else { source };
+    let source = if is_svelte {
+        run_svelte_sidecar(state, url, &source)
+            .await
+            .map_err(|e| format!("svelte compile error for {url}: {e}"))?
+    } else {
+        source
+    };
 
     let root = state.root.clone();
     let resolver = Arc::clone(&state.resolver);
@@ -1208,7 +1222,13 @@ async fn ensure_module(
     let virtual_ids: std::collections::BTreeSet<String> =
         state.virtual_modules.keys().cloned().collect();
     let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
-    let file_owned = if react_svg { file.with_extension("svg.tsx") } else { file.to_path_buf() };
+    let file_owned = if react_svg {
+        file.with_extension("svg.tsx")
+    } else if is_svelte {
+        file.with_extension("svelte.js")
+    } else {
+        file.to_path_buf()
+    };
     let url_owned = url.to_string();
     let bundle = state.bundle;
     let plugin_fallback = state.plugins.is_some() && !bundle;
@@ -1308,22 +1328,27 @@ async fn ensure_module(
                         .filter(|m| m.needs_interop)
                         .map(|m| format!("/@oj-deps/{}", m.file))
                 });
+                let opts = if is_svelte {
+                    oj_compiler::CompileOptions { dev: true, refresh: false, sourcemap: true }
+                } else {
+                    oj_compiler::CompileOptions::dev()
+                };
                 oj_compiler::compile_module(
                     &file_owned,
                     interopped.as_deref().unwrap_or(&source),
-                    &oj_compiler::CompileOptions::dev(),
+                    &opts,
                     Some(&mut rewrite),
                 )
             }
             .map_err(|err| format!("compile error:\n{err}"))?;
             Ok(CachedModule {
-                is_boundary: !is_dep && output.has_refresh_registrations(),
+                is_boundary: is_svelte || (!is_dep && output.has_refresh_registrations()),
                 code: output.code,
                 map_data_url: output.map_data_url,
                 fs_allow: fs_allow_from(&output.imports),
                 watch_files: Vec::new(),
                 imports: output.imports,
-                kind: String::new(),
+                kind: if is_svelte { "svelte".into() } else { String::new() },
                 require_map: Vec::new(),
                 css_exports: Vec::new(),
             })
@@ -1498,6 +1523,19 @@ async fn run_preprocess_sidecar(
     sidecar.compile(source, url).await
 }
 
+async fn run_svelte_sidecar(
+    state: &Arc<ServerState>,
+    url: &str,
+    source: &str,
+) -> Result<String, String> {
+    let sidecar = state
+        .svelte
+        .get_or_try_init(|| Sidecar::spawn_svelte(&state.root))
+        .await
+        .map_err(|e| e.to_string())?;
+    sidecar.compile(source, url).await
+}
+
 async fn compile_tailwind(
     state: &Arc<ServerState>,
     url: &str,
@@ -1600,6 +1638,12 @@ if (import.meta.hot) {{
 function $RefreshReg$(type, id) {{ return RefreshRuntime.register(type, {url:?} + " " + id); }}
 function $RefreshSig$() {{ return RefreshRuntime.createSignatureFunctionForTransform(); }}
 "#
+    )
+}
+
+fn svelte_hot_glue(url: &str) -> String {
+    format!(
+        "\nimport {{ createHotContext as __oj_createHotContext }} from \"/@oj/client.js\";\nimport.meta.hot = __oj_createHotContext({url:?});\n"
     )
 }
 

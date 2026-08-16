@@ -117,6 +117,7 @@ node e2e/manual-chunks.mjs                        # rollupOptions output.manualC
 node e2e/svgr.mjs                                 # svg as react component (?react), installs react
 node e2e/worker-modes.mjs                         # ?worker in dev, bundle, and production build
 node e2e/html-entry.mjs                           # relative index.html script entry (src="src/x")
+node e2e/svelte.mjs                               # svelte 5 components in dev, bundle, and build
 node bench/generate.mjs 1000                      # generate a benchmark app (then npm i inside it)
 node bench/run.mjs 1000                           # p50/p95 benchmark vs vite
 node bench/card.mjs                               # render bench/card.html to oj-benchmarks.png

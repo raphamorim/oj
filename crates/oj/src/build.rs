@@ -367,6 +367,14 @@ impl Plugin for OjCssPlugin {
                     ..Default::default()
                 }));
             }
+            if oj_server::sidecar::is_svelte(&id) {
+                let js = svelte_via_sidecar(&root, std::path::Path::new(&id))?;
+                return Ok(Some(rolldown_plugin::HookLoadOutput {
+                    code: arcstr::ArcStr::from(js),
+                    module_type: Some(rolldown_common::ModuleType::Js),
+                    ..Default::default()
+                }));
+            }
             let worker = id
                 .strip_suffix("?worker")
                 .map(|f| (f, "Worker"))
@@ -481,6 +489,45 @@ fn expand_css_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String
         bail!("css build failed for {}: {}", css_file.display(), String::from_utf8_lossy(&out.stderr));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn svelte_via_sidecar(root: &Path, file: &Path) -> anyhow::Result<String> {
+    use std::io::Write;
+    let script = root.join(".oj-cache").join("svelte-compile.mjs");
+    if let Some(parent) = script.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&script, oj_server::sidecar::SVELTE_COMPILE_JS)?;
+    let source = fs::read_to_string(file)?;
+    let req = serde_json::json!({
+        "id": 1,
+        "base": root.to_string_lossy(),
+        "css": source,
+        "from": file.to_string_lossy(),
+        "dev": false,
+    })
+    .to_string();
+    let mut child = std::process::Command::new("node")
+        .arg(&script)
+        .current_dir(root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .context("node not found for svelte compile")?;
+    child.stdin.take().unwrap().write_all(format!("{req}\n").as_bytes())?;
+    let out = child.wait_with_output()?;
+    let line = String::from_utf8_lossy(&out.stdout);
+    let line = line.trim().lines().next().unwrap_or("{}");
+    let v: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+    match v.get("css").and_then(|c| c.as_str()) {
+        Some(js) => Ok(js.to_string()),
+        None => bail!(
+            "svelte compile failed for {}: {}",
+            file.display(),
+            v.get("error").and_then(|e| e.as_str()).unwrap_or("is `svelte` installed?")
+        ),
+    }
 }
 
 fn preprocess_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String> {

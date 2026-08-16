@@ -12,6 +12,12 @@ use tokio::sync::oneshot;
 
 pub const SIDECAR_JS: &str = include_str!("assets/tailwind-sidecar.mjs");
 pub const PREPROCESS_JS: &str = include_str!("assets/css-preprocess.mjs");
+pub const SVELTE_COMPILE_JS: &str = include_str!("assets/svelte-compile.mjs");
+
+#[inline]
+pub fn is_svelte(url: &str) -> bool {
+    url.split('?').next().unwrap_or(url).ends_with(".svelte")
+}
 
 #[inline]
 pub fn is_less(url: &str) -> bool {
@@ -47,6 +53,10 @@ impl Sidecar {
 
     pub async fn spawn_preprocess(root: &Path) -> anyhow::Result<std::sync::Arc<Sidecar>> {
         Self::spawn_named(root, "css-preprocess.mjs", PREPROCESS_JS).await
+    }
+
+    pub async fn spawn_svelte(root: &Path) -> anyhow::Result<std::sync::Arc<Sidecar>> {
+        Self::spawn_named(root, "svelte-compile.mjs", SVELTE_COMPILE_JS).await
     }
 
     async fn spawn_named(
