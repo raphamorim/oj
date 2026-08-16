@@ -897,7 +897,10 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
                     .unwrap_or("entry")
                     .to_string(),
             ),
-            import: format!(".{entry}"),
+            import: format!(
+                ".{}",
+                oj_server::html_entry_src(entry).unwrap_or_else(|| entry.clone())
+            ),
             ..Default::default()
         })
         .collect();
@@ -1017,7 +1020,8 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>) -> 
                 css: Vec::new(),
             });
             for entry in &entries {
-                let entry_abs = root.join(entry.trim_start_matches('/'));
+                let resolved = oj_server::html_entry_src(entry).unwrap_or_else(|| entry.clone());
+                let entry_abs = root.join(resolved.trim_start_matches('/'));
                 if Path::new(facade.as_ref()) == entry_abs.as_path() {
                     rewritten_html =
                         rewritten_html.replace(entry.as_str(), &with_base(&chunk.filename, &base));
@@ -1111,7 +1115,7 @@ fn human_bytes(bytes: usize) -> String {
 fn module_script_srcs(html: &str) -> Vec<String> {
     scan_attrs(html, "<script", "src=\"")
         .into_iter()
-        .filter(|src| src.starts_with('/'))
+        .filter(|src| oj_server::html_entry_src(src).is_some())
         .collect()
 }
 

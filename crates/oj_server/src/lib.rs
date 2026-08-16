@@ -2027,7 +2027,13 @@ fn inject_bundle_scripts(html: String) -> String {
     while let Some(start) = rest.find("<script") {
         let Some(tag_close) = rest[start..].find('>') else { break };
         let tag = &rest[start..start + tag_close];
-        if tag.contains("type=\"module\"") && tag.contains("src=\"/") {
+        let entry_src = tag.contains("type=\"module\"")
+            && tag
+                .find("src=\"")
+                .and_then(|at| tag[at + 5..].split('"').next())
+                .and_then(html_entry_src)
+                .is_some();
+        if entry_src {
             out.push_str(&rest[..start]);
             let after_tag = &rest[start + tag_close + 1..];
             rest = match after_tag.find("</script>") {
@@ -2330,6 +2336,20 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
+pub fn html_entry_src(src: &str) -> Option<String> {
+    let s = src.trim();
+    if s.is_empty()
+        || s.starts_with("http://")
+        || s.starts_with("https://")
+        || s.starts_with("//")
+        || s.starts_with("data:")
+    {
+        return None;
+    }
+    let s = s.strip_prefix("./").unwrap_or(s);
+    Some(if s.starts_with('/') { s.to_string() } else { format!("/{s}") })
+}
+
 fn html_entries(root: &Path) -> Vec<String> {
     let Ok(html) = std::fs::read_to_string(root.join("index.html")) else {
         return Vec::new();
@@ -2344,9 +2364,8 @@ fn html_entries(root: &Path) -> Vec<String> {
         if let Some(src_at) = tag.find("src=\"") {
             let rest = &tag[src_at + 5..];
             if let Some(end) = rest.find('"') {
-                let src = &rest[..end];
-                if src.starts_with('/') {
-                    entries.push(src.to_string());
+                if let Some(entry) = html_entry_src(&rest[..end]) {
+                    entries.push(entry);
                 }
             }
         }

@@ -150,9 +150,18 @@ fn evaluate(path: &Path, source: &str, command: &str, mode: &str) -> Result<Stri
              if (typeof __ojC === 'function') __ojC = __ojC({env_arg});\n\
              JSON.stringify(__ojC ?? null)"
         );
-        let result: rquickjs::Value = ctx
-            .eval(full)
-            .map_err(|e| ConfigError::Eval(path.to_path_buf(), format!("{e}")))?;
+        let result: rquickjs::Value = ctx.eval(full).map_err(|e| {
+            let caught = ctx.catch();
+            let mut detail =
+                caught.as_exception().map(|ex| ex.to_string()).unwrap_or_else(|| format!("{e}"));
+            if detail.contains("is not defined") {
+                detail.push_str(
+                    "\nnote: oj.config is evaluated in a sandbox without module imports; \
+                     if this file is a plugins array, put it in oj.plugins.mjs instead",
+                );
+            }
+            ConfigError::Eval(path.to_path_buf(), detail)
+        })?;
         result
             .get::<String>()
             .map_err(|e| ConfigError::Eval(path.to_path_buf(), e.to_string()))
