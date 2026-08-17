@@ -54,7 +54,7 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>, host: Option<String>) -
         tokio::task::spawn_blocking(move || bundle_client_entry(&root, &cache))
     };
     let built_fut =
-        oj_server::DevServer { root: root.clone(), port, bundle: false, host }.build_app();
+        oj_server::DevServer { root: root.clone(), port, bundle: false, host, config: None }.build_app();
     let (bundle_res, built_res) = tokio::join!(bundle, built_fut);
     bundle_res??;
     resolver.await??;

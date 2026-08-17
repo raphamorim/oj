@@ -33,8 +33,17 @@ pub enum PluginSource {
     ViteConfig(std::path::PathBuf),
 }
 
+static VITE_CONFIG_OVERRIDE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+pub fn set_vite_config_override(path: std::path::PathBuf) {
+    let _ = VITE_CONFIG_OVERRIDE.set(path);
+}
+
 #[inline]
 pub fn vite_config_file(root: &Path) -> Option<std::path::PathBuf> {
+    if let Some(p) = VITE_CONFIG_OVERRIDE.get() {
+        return p.is_file().then(|| p.clone());
+    }
     ["vite.config.ts", "vite.config.mts", "vite.config.mjs", "vite.config.js"]
         .into_iter()
         .map(|f| root.join(f))
@@ -43,6 +52,9 @@ pub fn vite_config_file(root: &Path) -> Option<std::path::PathBuf> {
 
 #[inline]
 pub fn plugin_source(root: &Path) -> Option<PluginSource> {
+    if VITE_CONFIG_OVERRIDE.get().is_some() {
+        return vite_config_file(root).map(PluginSource::ViteConfig);
+    }
     if let Some(p) = plugins_file(root) {
         return Some(PluginSource::OjPlugins(p));
     }

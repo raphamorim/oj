@@ -124,6 +124,7 @@ node e2e/host-binding.mjs                         # dev/preview --host + server.
 node e2e/plugin-ws.mjs                             # plugin server.ws custom events (send/on) round-trip
 node e2e/plugin-middleware.mjs                     # configureServer post body forwarding + transformIndexHtml
 node e2e/hmr-gate.mjs                              # hmr gate holds updates until POST /__hmr_flush
+node e2e/config-flag.mjs                           # oj dev --config <path> loads an override config
 node bench/generate.mjs 1000                      # generate a benchmark app (then npm i inside it)
 node bench/run.mjs 1000                           # p50/p95 benchmark vs vite
 node bench/card.mjs                               # render bench/card.html to oj-benchmarks.png

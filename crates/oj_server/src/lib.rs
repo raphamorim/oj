@@ -134,6 +134,7 @@ pub struct DevServer {
     pub port: Option<u16>,
     pub bundle: bool,
     pub host: Option<String>,
+    pub config: Option<PathBuf>,
 }
 
 struct ServerState {
@@ -209,6 +210,11 @@ impl DevServer {
             .root
             .canonicalize()
             .with_context(|| format!("app root not found: {}", self.root.display()))?;
+
+        if let Some(cfg) = &self.config {
+            let cfg = if cfg.is_absolute() { cfg.clone() } else { root.join(cfg) };
+            plugins::set_vite_config_override(cfg);
+        }
 
         let mut config = oj_config::load(&root).map_err(|e| anyhow::anyhow!("{e}"))?;
         plugins::adopt_vite_config_values(&mut config, &root);

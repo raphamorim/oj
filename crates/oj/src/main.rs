@@ -29,6 +29,8 @@ enum Command {
         ssr: Option<String>,
         #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
         host: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     Compile {
         file: PathBuf,
@@ -58,7 +60,7 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
-        Command::Dev { root, port, bundle, ssr, host } => {
+        Command::Dev { root, port, bundle, ssr, host, config } => {
             let root = root.unwrap_or_else(|| {
                 let playground = PathBuf::from("playground");
                 if playground.join("index.html").is_file() { playground } else { PathBuf::from(".") }
@@ -68,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
             } else if oj_server::is_tanstack_start_app(&root) {
                 start_dev::start_dev(root, port, host).await
             } else {
-                oj_server::DevServer { root, port, bundle, host }.run().await
+                oj_server::DevServer { root, port, bundle, host, config }.run().await
             }
         }
         Command::Compile { file, prod } => {
