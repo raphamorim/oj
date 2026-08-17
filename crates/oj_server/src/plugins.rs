@@ -185,6 +185,7 @@ pub struct PluginHost {
     stdin: tokio::sync::Mutex<tokio::process::ChildStdin>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Option<String>, String>>>>,
     counter: AtomicU64,
+    ws_out: Mutex<Option<tokio::sync::broadcast::Sender<String>>>,
     _child: tokio::process::Child,
 }
 
@@ -283,6 +284,7 @@ impl PluginHost {
             stdin: tokio::sync::Mutex::new(stdin),
             pending: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(1),
+            ws_out: Mutex::new(None),
             _child: child,
         });
 
@@ -297,6 +299,24 @@ impl PluginHost {
                     let method = msg["method"].as_str().unwrap_or("").to_string();
                     let args = msg["args"].as_array().cloned().unwrap_or_default();
                     handle_ctx_rpc(rpc, &method, &args, &resolver, &root_buf, &reader_ref.stdin).await;
+                    continue;
+                }
+                if let Some(ws) = msg.get("ojWs") {
+                    let tx = reader_ref.ws_out.lock().unwrap().clone();
+                    if let Some(tx) = tx {
+                        let payload = match ws.get("event").and_then(|e| e.as_str()) {
+                            Some(event) => serde_json::json!({
+                                "type": "custom",
+                                "event": event,
+                                "data": ws.get("data").cloned().unwrap_or(serde_json::Value::Null),
+                            })
+                            .to_string(),
+                            None => ws.get("data").filter(|d| d.is_object()).map(|d| d.to_string()).unwrap_or_default(),
+                        };
+                        if !payload.is_empty() {
+                            let _ = tx.send(payload);
+                        }
+                    }
                     continue;
                 }
                 let Some(id) = msg["id"].as_u64() else { continue };
@@ -444,6 +464,15 @@ impl PluginHost {
     #[inline]
     pub async fn middleware_port(&self) -> Option<u16> {
         self.call("getMiddlewarePort", &[]).await.ok().flatten().and_then(|s| s.parse().ok())
+    }
+
+    pub fn set_ws_sender(&self, tx: tokio::sync::broadcast::Sender<String>) {
+        *self.ws_out.lock().unwrap() = Some(tx);
+    }
+
+    #[inline]
+    pub async fn ws_message(&self, event: &str, data: &str) -> Result<(), String> {
+        self.call("wsMessage", &[event, data]).await.map(|_| ())
     }
 
     #[inline]

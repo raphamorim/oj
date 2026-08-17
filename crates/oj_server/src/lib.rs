@@ -361,6 +361,9 @@ impl DevServer {
                 optimize::OptimizedDeps::prepare(&root, env!("CARGO_PKG_VERSION"))
             }),
         });
+        if let Some(host) = &state.plugins {
+            host.set_ws_sender(state.reload_tx.clone());
+        }
         {
             let state = Arc::clone(&state);
             std::thread::spawn(move || {
@@ -1570,6 +1573,16 @@ async fn compile_tailwind(
 
 fn handle_client_message(state: &Arc<ServerState>, text: &str) {
     let Ok(msg) = serde_json::from_str::<serde_json::Value>(text) else { return };
+    if msg["type"] == "custom" {
+        if let Some(host) = state.plugins.clone() {
+            let event = msg["event"].as_str().unwrap_or_default().to_string();
+            let data = msg["data"].to_string();
+            tokio::spawn(async move {
+                let _ = host.ws_message(&event, &data).await;
+            });
+        }
+        return;
+    }
     if msg["type"] == "invalidate" {
         let Some(path) = msg["path"].as_str() else { return };
         let reply = if state.bundle {

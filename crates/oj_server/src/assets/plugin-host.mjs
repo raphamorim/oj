@@ -219,6 +219,26 @@ async function runConfigHooks() {
 }
 await runConfigHooks();
 
+const wsListeners = new Map();
+function ojWsSend(event, data) {
+  process.stdout.write(JSON.stringify({ ojWs: { event, data: data ?? null } }) + "\n");
+}
+const wsApi = {
+  on(event, cb) {
+    let a = wsListeners.get(event);
+    if (!a) wsListeners.set(event, (a = new Set()));
+    a.add(cb);
+  },
+  off(event, cb) {
+    wsListeners.get(event)?.delete(cb);
+  },
+  send(a, b) {
+    if (typeof a === "string") ojWsSend(a, b);
+    else if (a && typeof a === "object" && typeof a.event === "string") ojWsSend(a.event, a.data);
+    else ojWsSend(null, a);
+  },
+};
+
 let middlewarePort = null;
 async function setupConfigureServer() {
   const stack = [];
@@ -233,7 +253,8 @@ async function setupConfigureServer() {
     config: initial.config ?? {},
     middlewares,
     httpServer: null,
-    ws: { on: noop, off: noop, send: noop },
+    ws: wsApi,
+    hot: wsApi,
     watcher: { on: noop, add: noop, close: noop },
     moduleGraph: { getModuleById: () => null, invalidateModule: noop },
     transformRequest: async () => null,
@@ -464,6 +485,22 @@ async function run(hook, args) {
   }
   if (hook === "writeBundle") return writeBundle(args[0], args[1] === "true");
   if (hook === "getMiddlewarePort") return middlewarePort == null ? null : String(middlewarePort);
+  if (hook === "wsMessage") {
+    const event = args[0];
+    const data = args[1] ? JSON.parse(args[1]) : null;
+    const a = wsListeners.get(event);
+    if (a) {
+      const client = { send: (e, d) => wsApi.send(e, d) };
+      for (const cb of [...a]) {
+        try {
+          cb(data, client);
+        } catch (e) {
+          process.stderr.write(`${OJ} ws.on(${event}) handler failed: ${(e && e.stack) || e}\n`);
+        }
+      }
+    }
+    return null;
+  }
   return null;
 }
 
