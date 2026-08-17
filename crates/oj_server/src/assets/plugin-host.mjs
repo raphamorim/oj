@@ -5,6 +5,7 @@ import http from "node:http";
 import { writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
+import { dirname } from "node:path";
 import readline from "node:readline";
 import { AsyncLocalStorage } from "node:async_hooks";
 
@@ -77,6 +78,10 @@ async function loadViteConfig(configPath) {
       sourcemap: false,
       logLevel: "silent",
       absWorkingDir: appRoot,
+      define: {
+        __dirname: JSON.stringify(dirname(configPath)),
+        __filename: JSON.stringify(configPath),
+      },
     });
     const out = `${appRoot}/.oj-cache/oj-vite-config.mjs`;
     writeFileSync(out, result.outputFiles[0].text);
@@ -86,6 +91,13 @@ async function loadViteConfig(configPath) {
   }
   return typeof mod.default === "function" ? await mod.default(env) : mod.default;
 }
+
+const OJ_NATIVE_PLUGIN_NAMES = new Set([
+  "vite:react-babel",
+  "vite:react-refresh",
+  "vite:react-swc",
+  "vite:react-swc:resolve-runtime",
+]);
 
 let plugins = [];
 try {
@@ -98,6 +110,7 @@ try {
     list = mod.default ?? mod.plugins ?? [];
   }
   plugins = (Array.isArray(list) ? list : [list]).filter(Boolean);
+  plugins = plugins.filter((p) => !OJ_NATIVE_PLUGIN_NAMES.has(p && p.name));
   plugins = plugins.filter((p) => {
     if (p.apply == null) return true;
     if (typeof p.apply === "function") return !!p.apply(initial.config ?? {}, env);

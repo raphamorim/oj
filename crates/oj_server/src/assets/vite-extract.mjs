@@ -60,6 +60,10 @@ async function loadConfig() {
     const r = await esbuild.build({
       entryPoints: [configPath], bundle: true, platform: "node", format: "esm",
       packages: "external", write: false, logLevel: "silent", absWorkingDir: appRoot,
+      define: {
+        __dirname: JSON.stringify(dirname(configPath)),
+        __filename: JSON.stringify(configPath),
+      },
     });
     const out = `${appRoot}/.oj-cache/oj-vite-config.mjs`;
     writeFileSync(out, r.outputFiles[0].text);
