@@ -12,9 +12,9 @@ use axum::{
     Router,
     body::Body,
     extract::{Query, State, WebSocketUpgrade, ws::Message},
-    http::{HeaderMap, StatusCode, Uri, header},
+    http::{HeaderMap, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use oj_cache::{CachedModule, PersistentCache};
 
@@ -163,6 +163,7 @@ struct ServerState {
     http: reqwest::Client,
     virtual_modules: std::collections::BTreeMap<String, String>,
     jsx_overrides: std::collections::BTreeMap<String, String>,
+    hmr_gate: Option<Arc<HmrGate>>,
     plugins: Option<std::sync::Arc<PluginHost>>,
     plugin_mw_port: Option<u16>,
     plugins_ssr: tokio::sync::OnceCell<Option<std::sync::Arc<PluginHost>>>,
@@ -298,6 +299,22 @@ impl DevServer {
             None => std::collections::BTreeMap::new(),
         };
 
+        let hmr_gate = {
+            let enabled = server_cfg.hmr_gate == Some(true)
+                || std::env::var("LOVABLE_DEV_SERVER").as_deref() == Ok("true");
+            if enabled {
+                let full_reload = std::env::var("LOVABLE_HMR_FULL_RELOAD").as_deref() != Ok("false");
+                println!("  hmr gate: on ({})", if full_reload { "full-reload" } else { "granular" });
+                Some(Arc::new(HmrGate {
+                    full_reload,
+                    max_hold: Duration::from_millis(240_000),
+                    inner: Mutex::new(GateInner::default()),
+                }))
+            } else {
+                None
+            }
+        };
+
         let started = Instant::now();
         let (reload_tx, _) = broadcast::channel::<String>(64);
         let (crawl_tx, crawl_rx) = tokio::sync::watch::channel(false);
@@ -346,6 +363,7 @@ impl DevServer {
             http: reqwest::Client::new(),
             virtual_modules: config.virtual_modules.clone().unwrap_or_default(),
             jsx_overrides,
+            hmr_gate,
             plugins: plugin_host,
             plugin_mw_port,
             plugins_ssr: tokio::sync::OnceCell::new(),
@@ -389,7 +407,9 @@ impl DevServer {
             .route("/@ssr-resolve", get(ssr_resolve))
             .route("/@ssr-module", get(ssr_module))
             .route("/__ws", get(ws_upgrade))
-            .fallback(get(serve_path));
+            .route("/__hmr_flush", post(hmr_flush))
+            .route("/__hmr_gate", get(hmr_gate_status))
+            .fallback(serve_fallback);
         let extra_headers: Vec<(header::HeaderName, header::HeaderValue)> = config
             .server
             .as_ref()
@@ -637,6 +657,22 @@ async fn ws_upgrade(
 ) -> impl IntoResponse {
     upgrade.on_upgrade(move |mut socket| async move {
         let mut rx = state.reload_tx.subscribe();
+        if state.hmr_gate.is_some() {
+            let mode = serde_json::json!({
+                "type": "custom",
+                "event": "lovable:dev-server-mode",
+                "data": { "mode": "classic" },
+            })
+            .to_string();
+            let _ = socket.send(Message::Text(mode.into())).await;
+            let boot = serde_json::json!({
+                "type": "custom",
+                "event": "lovable:boot-progress",
+                "data": { "ready": true },
+            })
+            .to_string();
+            let _ = socket.send(Message::Text(boot.into())).await;
+        }
         loop {
             tokio::select! {
                 msg = rx.recv() => match msg {
@@ -778,20 +814,41 @@ fn is_spa_navigation(rel: &str, headers: &HeaderMap) -> bool {
     no_extension || accepts_html
 }
 
+async fn serve_fallback(State(state): State<Arc<ServerState>>, req: axum::extract::Request) -> Response {
+    if req.method() == Method::GET {
+        let headers = req.headers().clone();
+        let uri = req.uri().clone();
+        return serve_path(State(state), headers, uri).await;
+    }
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let headers = req.headers().clone();
+    let body = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap_or_default().to_vec();
+    forward_to_plugin_middleware(&state, &method, &uri, &headers, body)
+        .await
+        .unwrap_or_else(|| (StatusCode::NOT_FOUND, "oj: not found").into_response())
+}
+
 async fn forward_to_plugin_middleware(
     state: &ServerState,
+    method: &Method,
     uri: &Uri,
     headers: &HeaderMap,
+    body: Vec<u8>,
 ) -> Option<Response> {
     let port = state.plugin_mw_port?;
     let pq = uri.path_and_query().map(|p| p.as_str()).unwrap_or(uri.path());
     let target = format!("http://127.0.0.1:{port}{pq}");
-    let mut out = state.http.get(&target);
+    let rmethod = reqwest::Method::from_bytes(method.as_str().as_bytes()).ok()?;
+    let mut out = state.http.request(rmethod, &target);
     for (name, value) in headers.iter() {
         if name == header::HOST {
             continue;
         }
         out = out.header(name, value);
+    }
+    if !body.is_empty() {
+        out = out.body(body);
     }
     let resp = out.send().await.ok()?;
     if resp.headers().contains_key("x-oj-fallthrough") {
@@ -879,7 +936,9 @@ async fn serve_path(
         match locate(&state.root, &state.public_dir, rel) {
             Some(file) => file,
             None => {
-                if let Some(resp) = forward_to_plugin_middleware(&state, &uri, &headers).await {
+                if let Some(resp) =
+                    forward_to_plugin_middleware(&state, &Method::GET, &uri, &headers, Vec::new()).await
+                {
                     return resp;
                 }
                 if is_spa_navigation(rel, &headers) {
@@ -1573,16 +1632,6 @@ async fn compile_tailwind(
 
 fn handle_client_message(state: &Arc<ServerState>, text: &str) {
     let Ok(msg) = serde_json::from_str::<serde_json::Value>(text) else { return };
-    if msg["type"] == "custom" {
-        if let Some(host) = state.plugins.clone() {
-            let event = msg["event"].as_str().unwrap_or_default().to_string();
-            let data = msg["data"].to_string();
-            tokio::spawn(async move {
-                let _ = host.ws_message(&event, &data).await;
-            });
-        }
-        return;
-    }
     if msg["type"] == "invalidate" {
         let Some(path) = msg["path"].as_str() else { return };
         let reply = if state.bundle {
@@ -1640,6 +1689,13 @@ fn handle_client_message(state: &Arc<ServerState>, text: &str) {
                 })
                 .to_string(),
             );
+            if let Some(host) = state.plugins.clone() {
+                let event = msg["event"].as_str().unwrap_or_default().to_string();
+                let data = msg["data"].to_string();
+                tokio::spawn(async move {
+                    let _ = host.ws_message(&event, &data).await;
+                });
+            }
         }
     }
 }
@@ -2607,6 +2663,118 @@ fn save_graph_snapshot(root: &Path, paths: &[PathBuf]) {
     let _ = std::fs::write(path, serde_json::to_vec(&urls).unwrap_or_default());
 }
 
+struct HmrGate {
+    full_reload: bool,
+    max_hold: Duration,
+    inner: Mutex<GateInner>,
+}
+
+#[derive(Default)]
+struct GateInner {
+    pending: std::collections::BTreeMap<PathBuf, std::collections::BTreeSet<String>>,
+    generation: u64,
+}
+
+fn gate_relevant(path: &Path) -> bool {
+    !path.components().any(|c| {
+        let c = c.as_os_str();
+        c == "node_modules" || c == ".oj-cache" || c == "dist"
+    })
+}
+
+impl HmrGate {
+    fn hold(&self, state: &Arc<ServerState>, paths: &[PathBuf]) -> bool {
+        let relevant: Vec<&PathBuf> = paths.iter().filter(|p| gate_relevant(p)).collect();
+        if relevant.is_empty() {
+            return false;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let was_empty = inner.pending.is_empty();
+        for p in relevant {
+            inner.pending.entry(p.clone()).or_default().insert("change".to_string());
+        }
+        if was_empty {
+            inner.generation += 1;
+            let generation = inner.generation;
+            let state = Arc::clone(state);
+            let max_hold = self.max_hold;
+            let rt = state.rt.clone();
+            rt.spawn(async move {
+                tokio::time::sleep(max_hold).await;
+                if let Some(gate) = &state.hmr_gate {
+                    let expired = {
+                        let g = gate.inner.lock().unwrap();
+                        g.generation == generation && !g.pending.is_empty()
+                    };
+                    if expired {
+                        gate.flush(&state);
+                    }
+                }
+            });
+        }
+        true
+    }
+
+    fn flush(&self, state: &Arc<ServerState>) -> (Vec<String>, usize) {
+        let entries: Vec<(PathBuf, std::collections::BTreeSet<String>)> = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.generation += 1;
+            std::mem::take(&mut inner.pending).into_iter().collect()
+        };
+        let files: Vec<String> = entries.iter().map(|(p, _)| p.display().to_string()).collect();
+        let count = entries.len();
+        if !entries.is_empty() {
+            *state.chunk_cache.lock().unwrap() = None;
+            state.dir_cache.lock().unwrap().clear();
+            if self.full_reload {
+                let _ = state.reload_tx.send(
+                    serde_json::json!({ "type": "full-reload", "reason": "hmr-flush" }).to_string(),
+                );
+            } else {
+                let paths: Vec<PathBuf> = entries.into_iter().map(|(p, _)| p).collect();
+                let sref: &ServerState = state;
+                for message in decide(sref, &paths) {
+                    let _ = state.reload_tx.send(message);
+                }
+            }
+        }
+        (files, count)
+    }
+
+    fn mode(&self) -> &'static str {
+        if self.full_reload { "full-reload" } else { "granular" }
+    }
+
+    fn status(&self) -> serde_json::Value {
+        let inner = self.inner.lock().unwrap();
+        let mut pending = serde_json::Map::new();
+        for (p, events) in &inner.pending {
+            pending.insert(p.display().to_string(), serde_json::json!(events.iter().collect::<Vec<_>>()));
+        }
+        serde_json::json!({
+            "enabled": true,
+            "pending": pending,
+            "count": inner.pending.len(),
+            "mode": self.mode(),
+        })
+    }
+}
+
+async fn hmr_flush(State(state): State<Arc<ServerState>>) -> Response {
+    let Some(gate) = &state.hmr_gate else {
+        return js_response_json(serde_json::json!({ "flushed": [], "count": 0, "mode": "disabled" }));
+    };
+    let (files, count) = gate.flush(&state);
+    js_response_json(serde_json::json!({ "flushed": files, "count": count, "mode": gate.mode() }))
+}
+
+async fn hmr_gate_status(State(state): State<Arc<ServerState>>) -> Response {
+    match &state.hmr_gate {
+        Some(gate) => js_response_json(gate.status()),
+        None => js_response_json(serde_json::json!({ "enabled": false })),
+    }
+}
+
 fn spawn_watcher(state: Arc<ServerState>) {
     std::thread::spawn(move || {
         use notify::{RecursiveMode, Watcher};
@@ -2677,6 +2845,11 @@ fn spawn_watcher(state: Arc<ServerState>) {
                 }
             }
             let paths: Vec<PathBuf> = paths.into_iter().collect();
+            if let Some(gate) = &state.hmr_gate {
+                if gate.hold(&state, &paths) {
+                    continue;
+                }
+            }
             let messages = decide(&state, &paths);
             if messages.is_empty() {
                 continue;

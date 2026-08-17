@@ -39,6 +39,7 @@ pub struct ServerConfig {
     pub strict_port: Option<bool>,
     pub open: Option<bool>,
     pub cors: Option<bool>,
+    pub hmr_gate: Option<bool>,
     pub allowed_hosts: Option<Vec<String>>,
     pub headers: Option<BTreeMap<String, String>>,
     pub proxy: Option<BTreeMap<String, ProxyEntry>>,
