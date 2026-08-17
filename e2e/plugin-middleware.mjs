@@ -22,6 +22,10 @@ fs.writeFileSync(
   `export default [{
     name: "bridge-like",
     configureServer(server) {
+      const orig = server.watcher.emit.bind(server.watcher);
+      server.watcher.emit = (e, ...a) => orig(e, ...a);
+      server.moduleGraph.onFileChange("/x");
+      server.ws.on("connection", () => {});
       server.middlewares.use((req, res, next) => {
         if (req.method === "POST" && req.url === "/__lovable/echo") {
           let body = "";

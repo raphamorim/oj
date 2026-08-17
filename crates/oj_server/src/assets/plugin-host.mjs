@@ -255,8 +255,9 @@ async function setupConfigureServer() {
     httpServer: null,
     ws: wsApi,
     hot: wsApi,
-    watcher: { on: noop, add: noop, close: noop },
-    moduleGraph: { getModuleById: () => null, invalidateModule: noop },
+    watcher: { on: noop, off: noop, add: noop, unwatch: noop, close: noop, emit: () => true, removeAllListeners: noop },
+    moduleGraph: { getModuleById: () => null, getModulesByFile: () => null, invalidateModule: noop, onFileChange: noop },
+    restart: async () => {},
     transformRequest: async () => null,
     ssrLoadModule: async () => {
       throw new Error("oj: server.ssrLoadModule is not available in configureServer");
