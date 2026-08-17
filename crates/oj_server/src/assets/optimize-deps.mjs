@@ -7,7 +7,7 @@ import { mkdirSync, rmSync, readFileSync, writeFileSync, renameSync, existsSync 
 import path from "node:path";
 import builtinModules from "node:module";
 
-const { root, outDir, entries, include = [], exclude = [], dedupe = [] } = JSON.parse(process.argv[2]);
+const { root, outDir, entries, include = [], exclude = [], dedupe = [], alias = [] } = JSON.parse(process.argv[2]);
 
 const DEDUPE = new Set([
   "react",
@@ -42,13 +42,64 @@ const NODE_BUILTINS = new Set([...builtinModules.builtinModules, ...builtinModul
 const isBare = (id) => id && !id.startsWith(".") && !id.startsWith("/") && !id.startsWith("\0") && !NODE_BUILTINS.has(id);
 const excludeSet = new Set(exclude);
 
+function stripJsonc(s) {
+  return s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+}
+
+function loadTsconfigAliases(dir) {
+  for (const name of ["tsconfig.json", "tsconfig.app.json"]) {
+    const p = path.join(dir, name);
+    if (!existsSync(p)) continue;
+    let json;
+    try {
+      json = JSON.parse(stripJsonc(readFileSync(p, "utf8")));
+    } catch {
+      continue;
+    }
+    const co = json.compilerOptions || {};
+    if (!co.paths) continue;
+    const base = path.resolve(dir, co.baseUrl || ".");
+    const out = [];
+    for (const [key, targets] of Object.entries(co.paths)) {
+      if (!Array.isArray(targets) || !targets.length) continue;
+      const t = targets[0];
+      if (key.endsWith("/*") && t.endsWith("/*")) {
+        out.push({ prefix: key.slice(0, -1), target: path.resolve(base, t.slice(0, -1)) });
+      } else {
+        out.push({ exact: key, target: path.resolve(base, t) });
+      }
+    }
+    if (out.length) return out;
+  }
+  return [];
+}
+
+const aliasEntries = [
+  ...loadTsconfigAliases(root),
+  ...(alias || []).map(([find, replacement]) => ({ exact: find, prefix: find + "/", target: replacement })),
+];
+
+function aliasResolve(id) {
+  for (const a of aliasEntries) {
+    if (a.exact && id === a.exact) return a.target;
+    if (a.prefix && id.startsWith(a.prefix)) return path.join(a.target, id.slice(a.prefix.length));
+  }
+  return null;
+}
+
 async function scan() {
   const found = new Set();
   const collector = {
     name: "oj-scan",
     setup(build) {
-      build.onResolve({ filter: /.*/ }, (args) => {
+      build.onResolve({ filter: /.*/ }, async (args) => {
         if (args.kind === "entry-point") return null;
+        const aliased = aliasResolve(args.path);
+        if (aliased) {
+          const r = await build.resolve(aliased, { kind: args.kind, resolveDir: root });
+          if (r.errors && r.errors.length) return null;
+          return { path: r.path, external: r.external };
+        }
         if (isBare(args.path) && !excludeSet.has(args.path)) {
           found.add(args.path);
           return { path: args.path, external: true };
