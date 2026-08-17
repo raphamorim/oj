@@ -122,6 +122,7 @@ node e2e/build-mode.mjs                           # build --mode (import.meta.en
 node e2e/hmr-protocol.mjs                         # hmr client derives wss (behind https proxy)
 node e2e/host-binding.mjs                         # dev/preview --host + server.host bind all interfaces
 node e2e/plugin-ws.mjs                             # plugin server.ws custom events (send/on) round-trip
+node e2e/plugin-ws-execute.mjs                     # post -> ws broadcast -> client reply -> collect (bridge execute)
 node e2e/plugin-middleware.mjs                     # configureServer post body forwarding + transformIndexHtml
 node e2e/hmr-gate.mjs                              # hmr gate holds updates until POST /__hmr_flush
 node e2e/config-flag.mjs                           # oj dev --config <path> loads an override config

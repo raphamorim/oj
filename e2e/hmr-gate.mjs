@@ -40,14 +40,22 @@ try {
 
   // on-connect custom frame: dev-server-mode
   const ws = new WebSocket(`ws://localhost:${port}/__ws`);
-  const mode = await new Promise((res, rej) => {
-    const t = setTimeout(() => rej(new Error("no dev-server-mode frame")), 6000);
+  const frames = {};
+  const onConnect = new Promise((res, rej) => {
+    const t = setTimeout(() => rej(new Error("missing on-connect frames")), 6000);
     ws.addEventListener("message", (e) => {
       let m; try { m = JSON.parse(e.data); } catch { return; }
-      if (m.type === "custom" && m.event === "lovable:dev-server-mode") { clearTimeout(t); res(m.data); }
+      if (m.type === "custom" && (m.event === "lovable:dev-server-mode" || m.event === "lovable:boot-progress")) {
+        frames[m.event] = m.data;
+        if (frames["lovable:dev-server-mode"] && frames["lovable:boot-progress"]) { clearTimeout(t); res(); }
+      }
     });
   });
-  assert.equal(mode.mode, "classic", "gate announces classic mode on connect");
+  await onConnect;
+  assert.equal(frames["lovable:dev-server-mode"].mode, "classic", "gate announces classic mode on connect");
+  const boot = frames["lovable:boot-progress"];
+  assert.equal(typeof boot.ssrModules, "number", "boot-progress ssrModules is a number");
+  assert.equal(typeof boot.clientModules, "number", "boot-progress clientModules is a number");
   ws.close();
 
   const browser = await chromium.launch();

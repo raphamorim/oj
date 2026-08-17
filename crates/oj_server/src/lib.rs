@@ -674,7 +674,13 @@ async fn ws_upgrade(
             let boot = serde_json::json!({
                 "type": "custom",
                 "event": "lovable:boot-progress",
-                "data": { "ready": true },
+                "data": {
+                    "ssrModules": 0,
+                    "clientModules": state.preload_snapshot.len(),
+                    "ssrIdleMs": serde_json::Value::Null,
+                    "clientIdleMs": 0,
+                    "buildError": serde_json::Value::Null,
+                },
             })
             .to_string();
             let _ = socket.send(Message::Text(boot.into())).await;
