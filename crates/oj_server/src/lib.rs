@@ -162,6 +162,7 @@ struct ServerState {
     proxy: Vec<(String, oj_config::ProxyEntry)>,
     http: reqwest::Client,
     virtual_modules: std::collections::BTreeMap<String, String>,
+    jsx_overrides: std::collections::BTreeMap<String, String>,
     plugins: Option<std::sync::Arc<PluginHost>>,
     plugin_mw_port: Option<u16>,
     plugins_ssr: tokio::sync::OnceCell<Option<std::sync::Arc<PluginHost>>>,
@@ -292,6 +293,11 @@ impl DevServer {
             None => false,
         };
 
+        let jsx_overrides = match &plugin_host {
+            Some(host) => resolve_jsx_overrides(host, &root).await,
+            None => std::collections::BTreeMap::new(),
+        };
+
         let started = Instant::now();
         let (reload_tx, _) = broadcast::channel::<String>(64);
         let (crawl_tx, crawl_rx) = tokio::sync::watch::channel(false);
@@ -339,6 +345,7 @@ impl DevServer {
             proxy,
             http: reqwest::Client::new(),
             virtual_modules: config.virtual_modules.clone().unwrap_or_default(),
+            jsx_overrides,
             plugins: plugin_host,
             plugin_mw_port,
             plugins_ssr: tokio::sync::OnceCell::new(),
@@ -840,6 +847,11 @@ async fn serve_path(
         };
     }
 
+    if let Some(hex) = uri.path().strip_prefix("/@presolve/") {
+        let id = hex_decode(hex).unwrap_or_default();
+        return serve_plugin_resolve(&state, &id).await;
+    }
+
     if let Some(hex) = uri.path().strip_prefix("/@id/") {
         let spec = hex_decode(hex).unwrap_or_default();
         let importer = uri
@@ -1227,6 +1239,7 @@ async fn ensure_module(
     let dir_cache = Arc::clone(&state.dir_cache);
     let virtual_ids: std::collections::BTreeSet<String> =
         state.virtual_modules.keys().cloned().collect();
+    let jsx_overrides = state.jsx_overrides.clone();
     let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
     let file_owned = if react_svg {
         file.with_extension("svg.tsx")
@@ -1292,6 +1305,9 @@ async fn ensure_module(
             }
             if virtual_ids.contains(spec) {
                 return Some(format!("/@virtual/{spec}"));
+            }
+            if let Some(id) = jsx_overrides.get(spec) {
+                return Some(format!("/@presolve/{}", hex_encode(id)));
             }
             if let Some(meta) = dep_map.get(spec) {
                 if !meta.needs_interop {
@@ -1924,6 +1940,80 @@ async fn serve_oj_routes(State(state): State<Arc<ServerState>>) -> Response {
         )
             .into_response(),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: routes manifest: {e}")).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("compile task failed: {e}")).into_response(),
+    }
+}
+
+async fn resolve_jsx_overrides(
+    host: &PluginHost,
+    root: &Path,
+) -> std::collections::BTreeMap<String, String> {
+    let mut overrides = std::collections::BTreeMap::new();
+    let importer = root.join("index.html");
+    let importer = importer.to_string_lossy();
+    for spec in ["react/jsx-dev-runtime", "react/jsx-runtime"] {
+        if let Ok(Some(id)) = host.resolve_id(spec, &importer).await {
+            if id != spec {
+                overrides.insert(spec.to_string(), id);
+            }
+        }
+    }
+    overrides
+}
+
+async fn serve_plugin_resolve(state: &Arc<ServerState>, id: &str) -> Response {
+    let Some(host) = &state.plugins else {
+        return (StatusCode::NOT_FOUND, "oj: no plugin host").into_response();
+    };
+    let source = match host.load(id).await {
+        Ok(Some(src)) => src,
+        Ok(None) => return (StatusCode::NOT_FOUND, format!("oj: no plugin loaded {id}")).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let dep_map = state.optimized.ready().await;
+    let root = state.root.clone();
+    let resolver = Arc::clone(&state.resolver);
+    let fs_allow = Arc::clone(&state.fs_allow);
+    let dir_cache = Arc::clone(&state.dir_cache);
+    let virtual_ids: std::collections::BTreeSet<String> =
+        state.virtual_modules.keys().cloned().collect();
+    let plugin_fallback = state.plugins.is_some();
+    let importer_abs = format!("\0{id}");
+    let compiled = tokio::task::spawn_blocking(move || {
+        let mut rewrite = |spec: &str| {
+            if virtual_ids.contains(spec) {
+                return Some(format!("/@virtual/{spec}"));
+            }
+            if let Some(meta) = dep_map.get(spec) {
+                if !meta.needs_interop {
+                    return Some(format!("/@oj-deps/{}", meta.file));
+                }
+            }
+            if let Some(url) = rewrite_specifier(&root, &root, &resolver, &fs_allow, &dir_cache, spec, true) {
+                return Some(url);
+            }
+            if plugin_fallback && is_bare_specifier(spec) {
+                return Some(format!("/@id/{}?importer={}", hex_encode(spec), hex_encode(&importer_abs)));
+            }
+            None
+        };
+        oj_compiler::compile_module(
+            Path::new("plugin.tsx"),
+            &source,
+            &oj_compiler::CompileOptions::dev(),
+            Some(&mut rewrite),
+        )
+        .map(|o| o.code_with_inline_map())
+        .map_err(|e| format!("{e}"))
+    })
+    .await;
+    match compiled {
+        Ok(Ok(code)) => (
+            [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
+            code,
+        )
+            .into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("compile task failed: {e}")).into_response(),
     }
 }
