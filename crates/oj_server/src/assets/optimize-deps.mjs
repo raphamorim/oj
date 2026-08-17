@@ -3,11 +3,20 @@
 
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
-import { mkdirSync, rmSync, readFileSync, existsSync } from "node:fs";
+import { mkdirSync, rmSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
 import path from "node:path";
 import builtinModules from "node:module";
 
-const { root, outDir, entries, include = [], exclude = [] } = JSON.parse(process.argv[2]);
+const { root, outDir, entries, include = [], exclude = [], dedupe = [] } = JSON.parse(process.argv[2]);
+
+const DEDUPE = new Set([
+  "react",
+  "react-dom",
+  "react-dom/client",
+  "react/jsx-runtime",
+  "react/jsx-dev-runtime",
+  ...dedupe,
+]);
 
 function detectEntries() {
   const html = path.join(root, "index.html");
@@ -108,11 +117,37 @@ if (Object.keys(entryPoints).length) {
   for (const [out, meta] of Object.entries(result.metafile.outputs)) {
     if (meta.entryPoint) exportsOf[path.basename(out)] = meta.exports || [];
   }
+  const IDENT = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+  function namedExportsOf(dep) {
+    try {
+      const m = req(dep);
+      const mod = m && m.__esModule && m.default && typeof m.default === "object" ? m.default : m;
+      if (!mod || (typeof mod !== "object" && typeof mod !== "function")) return [];
+      return [...new Set(Object.keys(mod))].filter((k) => k !== "default" && k !== "__esModule" && IDENT.test(k));
+    } catch {
+      return [];
+    }
+  }
   for (const [dep, name] of Object.entries(nameOf)) {
     const file = `${name}.mjs`;
     const exports = exportsOf[file] || [];
-    const needsInterop = exports.length === 0 || (exports.length === 1 && exports[0] === "default");
-    metadata[dep] = { file, needsInterop, exports };
+    const bundledInterop = exports.length === 0 || (exports.length === 1 && exports[0] === "default");
+    if (bundledInterop && DEDUPE.has(dep)) {
+      const names = namedExportsOf(dep);
+      if (names.length) {
+        const cjsFile = `${name}-cjs.mjs`;
+        renameSync(path.join(outDir, file), path.join(outDir, cjsFile));
+        const proxy =
+          `import __m from "./${cjsFile}";\n` +
+          `export default __m;\n` +
+          `export const __cjs_exports = __m;\n` +
+          `export const { ${names.join(", ")} } = __m;\n`;
+        writeFileSync(path.join(outDir, file), proxy);
+        metadata[dep] = { file, needsInterop: false, exports: ["default", ...names] };
+        continue;
+      }
+    }
+    metadata[dep] = { file, needsInterop: bundledInterop, exports };
   }
 }
 

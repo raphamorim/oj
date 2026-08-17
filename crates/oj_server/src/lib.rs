@@ -1242,7 +1242,7 @@ async fn ensure_module(
     let ext = file.extension().and_then(|e| e.to_str());
     let is_css = ext.is_some_and(is_style_ext);
     let is_json = ext == Some("json");
-    let dep_map = if !is_dep && !bundle {
+    let dep_map = if !bundle {
         state.optimized.ready().await
     } else {
         Arc::new(optimize::DepMap::new())

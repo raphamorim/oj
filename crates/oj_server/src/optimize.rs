@@ -106,7 +106,13 @@ async fn run_optimizer(root: &Path, dir: &Path, hash: &str) -> Option<DepMap> {
     std::fs::create_dir_all(&cache).ok()?;
     let script = cache.join("optimize-deps.mjs");
     std::fs::write(&script, OPTIMIZE_JS).ok()?;
-    let cfg = serde_json::json!({ "root": root, "outDir": dir, "entries": [] }).to_string();
+    let cfg = serde_json::json!({
+        "root": root,
+        "outDir": dir,
+        "entries": [],
+        "include": ["react/jsx-dev-runtime"],
+    })
+    .to_string();
     let out = tokio::process::Command::new("node")
         .arg(&script)
         .arg(&cfg)
