@@ -277,13 +277,24 @@ impl DevServer {
         let plugin_host = match plugins_path {
             Some(file) => match PluginHost::spawn(&root, &file, &plugin_config).await {
                 Ok(host) => {
-                    println!("  plugins: {plugins_label}");
-                    if !is_start {
-                        if let Err(e) = host.build_start().await {
-                            eprintln!("oj: plugin buildStart failed: {e}");
+                    // Every remaining plugin may be one oj reimplements natively
+                    // (e.g. @vitejs/plugin-react -> oj does JSX/refresh in oxc). If
+                    // nothing is left after that filtering, the host is an idle
+                    // Node process sitting on the per-request/HMR path -- drop it
+                    // and serve natively. Dropping the Arc kills the process.
+                    if host.plugin_count().await == 0 {
+                        host.shutdown();
+                        println!("  plugins: {plugins_label} (none active after native filtering; served natively)");
+                        None
+                    } else {
+                        println!("  plugins: {plugins_label}");
+                        if !is_start {
+                            if let Err(e) = host.build_start().await {
+                                eprintln!("oj: plugin buildStart failed: {e}");
+                            }
                         }
+                        Some(host)
                     }
-                    Some(host)
                 }
                 Err(e) => {
                     eprintln!("oj: plugin host failed to start: {e}");

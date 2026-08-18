@@ -217,7 +217,9 @@ pub struct PluginHost {
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Option<String>, String>>>>,
     counter: AtomicU64,
     ws_out: Mutex<Option<tokio::sync::broadcast::Sender<String>>>,
-    _child: tokio::process::Child,
+    // In an Option so it can be taken + killed explicitly (the reader task holds
+    // an Arc clone, so dropping the caller's Arc alone never triggers kill_on_drop).
+    child: Mutex<Option<tokio::process::Child>>,
 }
 
 async fn handle_ctx_rpc(
@@ -316,7 +318,7 @@ impl PluginHost {
             pending: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(1),
             ws_out: Mutex::new(None),
-            _child: child,
+            child: Mutex::new(Some(child)),
         });
 
         let resolver = std::sync::Arc::new(OjResolver::new(root));
@@ -495,6 +497,20 @@ impl PluginHost {
     #[inline]
     pub async fn middleware_port(&self) -> Option<u16> {
         self.call("getMiddlewarePort", &[]).await.ok().flatten().and_then(|s| s.parse().ok())
+    }
+
+    /// Number of plugins still active after oj filters out the ones it
+    /// reimplements natively (the React family). Defaults to 1 on RPC failure so
+    /// an uncertain host is kept, never dropped by mistake.
+    pub async fn plugin_count(&self) -> usize {
+        self.call("getPluginCount", &[]).await.ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(1)
+    }
+
+    /// Kill the Node process now (used when the host has no active plugins).
+    pub fn shutdown(&self) {
+        if let Some(mut child) = self.child.lock().unwrap().take() {
+            let _ = child.start_kill();
+        }
     }
 
     pub fn set_ws_sender(&self, tx: tokio::sync::broadcast::Sender<String>) {

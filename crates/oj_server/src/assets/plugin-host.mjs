@@ -540,6 +540,7 @@ async function run(hook, args) {
     return String(plugins.some((p) => typeof (p.writeBundle?.handler ?? p.writeBundle) === "function"));
   }
   if (hook === "writeBundle") return writeBundle(args[0], args[1] === "true");
+  if (hook === "getPluginCount") return String(plugins.length);
   if (hook === "getMiddlewarePort") return middlewarePort == null ? null : String(middlewarePort);
   if (hook === "wsMessage") {
     const event = args[0];
