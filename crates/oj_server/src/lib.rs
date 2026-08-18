@@ -171,6 +171,7 @@ struct ServerState {
     ssr_plugin_config: String,
     plugin_watched: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
     plugins_use_module_parsed: bool,
+    plugins_have_transform: bool,
     parsed_fired: Mutex<std::collections::HashSet<String>>,
     rt: tokio::runtime::Handle,
     base: Option<String>,
@@ -314,6 +315,13 @@ impl DevServer {
             Some(host) => host.has_module_parsed().await,
             None => false,
         };
+        // The tagger (and other jsx-override/configureServer plugins) have no
+        // transform hook, so the per-module transform RPC is a wasted full-source
+        // stdio round-trip; skip it when nothing consumes it.
+        let plugins_have_transform = match &plugin_host {
+            Some(host) => host.has_transform().await,
+            None => false,
+        };
 
         let jsx_overrides = match &plugin_host {
             Some(host) => resolve_jsx_overrides(host, &root).await,
@@ -393,6 +401,7 @@ impl DevServer {
             ssr_plugin_config,
             plugin_watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             plugins_use_module_parsed,
+            plugins_have_transform,
             parsed_fired: Mutex::new(std::collections::HashSet::new()),
             rt: tokio::runtime::Handle::current(),
             base: config.base.clone().filter(|b| b != "/"),
@@ -1338,7 +1347,7 @@ async fn ensure_module(
     let is_dep = url.contains("/node_modules/") || url.starts_with("/@fs/");
     let mut plugin_watch_files: Vec<String> = Vec::new();
     let source = match &state.plugins {
-        Some(host) if !is_dep => match host.transform(&source, &file.to_string_lossy()).await {
+        Some(host) if !is_dep && state.plugins_have_transform => match host.transform(&source, &file.to_string_lossy()).await {
             Ok((code, watches)) => {
                 plugin_watch_files = watches;
                 code

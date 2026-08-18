@@ -541,6 +541,14 @@ async function run(hook, args) {
   }
   if (hook === "writeBundle") return writeBundle(args[0], args[1] === "true");
   if (hook === "getPluginCount") return String(plugins.length);
+  if (hook === "getHasTransform") {
+    const has = plugins.some((p) => {
+      const t = p && p.transform;
+      const fn = typeof t === "function" ? t : t && t.handler;
+      return typeof fn === "function";
+    });
+    return String(has);
+  }
   if (hook === "getMiddlewarePort") return middlewarePort == null ? null : String(middlewarePort);
   if (hook === "wsMessage") {
     const event = args[0];

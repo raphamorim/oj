@@ -506,6 +506,12 @@ impl PluginHost {
         self.call("getPluginCount", &[]).await.ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(1)
     }
 
+    /// Whether any active plugin has a `transform` hook. Defaults to true on RPC
+    /// failure so the per-module transform pass is never skipped by mistake.
+    pub async fn has_transform(&self) -> bool {
+        self.call("getHasTransform", &[]).await.ok().flatten().map(|s| s == "true").unwrap_or(true)
+    }
+
     /// Kill the Node process now (used when the host has no active plugins).
     pub fn shutdown(&self) {
         if let Some(mut child) = self.child.lock().unwrap().take() {
