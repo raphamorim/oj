@@ -295,7 +295,11 @@ async fn spawn_node_service(root: &Path, script: &Path) -> anyhow::Result<Runner
 
 fn app_uses_tailwind(root: &Path) -> bool {
     std::fs::read_to_string(root.join("package.json"))
-        .map(|s| s.contains("@tailwindcss/postcss"))
+        .map(|s| {
+            s.contains("@tailwindcss/postcss")
+                || s.contains("@tailwindcss/vite")
+                || s.contains("\"tailwindcss\"")
+        })
         .unwrap_or(false)
 }
 
@@ -561,6 +565,24 @@ mod tests {
             .uri(path)
             .body(axum::body::Body::empty())
             .unwrap()
+    }
+
+    #[test]
+    fn app_uses_tailwind_detects_postcss_vite_and_bare() {
+        let base = tmp("tw");
+        let cases = [
+            (r#"{"devDependencies":{"@tailwindcss/postcss":"4"}}"#, true),
+            (r#"{"devDependencies":{"@tailwindcss/vite":"4"}}"#, true),
+            (r#"{"dependencies":{"tailwindcss":"3"}}"#, true),
+            (r#"{"dependencies":{"react":"19"}}"#, false),
+        ];
+        for (i, (pkg, expected)) in cases.iter().enumerate() {
+            let app = base.join(format!("app{i}"));
+            std::fs::create_dir_all(&app).unwrap();
+            std::fs::write(app.join("package.json"), pkg).unwrap();
+            assert_eq!(app_uses_tailwind(&app), *expected, "case {i}: {pkg}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -126,6 +126,7 @@ node e2e/plugin-ws-execute.mjs                     # post -> ws broadcast -> cli
 node e2e/plugin-middleware.mjs                     # configureServer post body forwarding + transformIndexHtml
 node e2e/hmr-gate.mjs                              # hmr gate holds updates until POST /__hmr_flush
 node e2e/config-flag.mjs                           # oj dev --config <path> loads an override config
+node e2e/config-wrapper.mjs                        # vite.config that calls an external defineConfig wrapper
 node bench/generate.mjs 1000                      # generate a benchmark app (then npm i inside it)
 node bench/run.mjs 1000                           # p50/p95 benchmark vs vite
 node bench/card.mjs                               # render bench/card.html to oj-benchmarks.png
