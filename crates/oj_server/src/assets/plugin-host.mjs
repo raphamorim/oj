@@ -15,6 +15,12 @@ const initial = JSON.parse(process.argv[3] ?? "{}");
 process.env.VITE_CONFIG_NATIVE_IGNORE_WARNING ??= "true";
 const env = initial.env ?? { command: "serve", mode: "development" };
 
+// Start mode hosts only configureServer middleware for a framework config oj
+// owns (TanStack Start): the framework plugins drive the module graph and SSR
+// themselves, so their config lifecycle hooks are tolerated per-plugin instead
+// of aborting the load, keeping the editor middleware (dev-server bridge) alive.
+const ojStartMode = initial.ojStartMode === true;
+
 const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
 const OJ = _ojTTY ? "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m" : "oj";
 
@@ -113,12 +119,22 @@ try {
   plugins = plugins.filter((p) => !OJ_NATIVE_PLUGIN_NAMES.has(p && p.name));
   plugins = plugins.filter((p) => {
     if (p.apply == null) return true;
-    if (typeof p.apply === "function") return !!p.apply(initial.config ?? {}, env);
-    return p.apply === env.command;
+    try {
+      if (typeof p.apply === "function") return !!p.apply(initial.config ?? {}, env);
+      return p.apply === env.command;
+    } catch (e) {
+      if (ojStartMode) return true;
+      throw e;
+    }
   });
   plugins = plugins.filter((p) => {
     if (typeof p.applyToEnvironment !== "function") return true;
-    return !!p.applyToEnvironment(environment);
+    try {
+      return !!p.applyToEnvironment(environment);
+    } catch (e) {
+      if (ojStartMode) return true;
+      throw e;
+    }
   });
   const rank = (p) => (p.enforce === "pre" ? -1 : p.enforce === "post" ? 1 : 0);
   plugins.sort((a, b) => rank(a) - rank(b));
@@ -209,12 +225,23 @@ async function runConfigHooks() {
   let config = initial.config ?? {};
   for (const p of plugins) {
     if (typeof p.config !== "function") continue;
-    const partial = await p.config.call(ctx, config, env);
-    if (partial) config = deepMerge(config, partial);
+    try {
+      const partial = await p.config.call(ctx, config, env);
+      if (partial) config = deepMerge(config, partial);
+    } catch (e) {
+      if (!ojStartMode) throw e;
+      process.stderr.write(`${OJ} plugin host: config(${p.name ?? "?"}) skipped: ${(e && e.message) || e}\n`);
+    }
   }
   const resolved = withResolvedDefaults(config);
   for (const p of plugins) {
-    if (typeof p.configResolved === "function") await p.configResolved.call(ctx, resolved);
+    if (typeof p.configResolved !== "function") continue;
+    try {
+      await p.configResolved.call(ctx, resolved);
+    } catch (e) {
+      if (!ojStartMode) throw e;
+      process.stderr.write(`${OJ} plugin host: configResolved(${p.name ?? "?"}) skipped: ${(e && e.message) || e}\n`);
+    }
   }
 }
 await runConfigHooks();
@@ -266,10 +293,24 @@ async function setupConfigureServer() {
   const post = [];
   for (const p of plugins) {
     if (typeof p.configureServer !== "function") continue;
-    const r = await p.configureServer(server);
+    let r;
+    try {
+      r = await p.configureServer(server);
+    } catch (e) {
+      if (!ojStartMode) throw e;
+      process.stderr.write(`${OJ} plugin host: configureServer(${p.name ?? "?"}) skipped: ${(e && e.message) || e}\n`);
+      continue;
+    }
     if (typeof r === "function") post.push(r);
   }
-  for (const fn of post) await fn();
+  for (const fn of post) {
+    try {
+      await fn();
+    } catch (e) {
+      if (!ojStartMode) throw e;
+      process.stderr.write(`${OJ} plugin host: post configureServer skipped: ${(e && e.message) || e}\n`);
+    }
+  }
   if (stack.length === 0) return;
 
   const srv = http.createServer((req, res) => {

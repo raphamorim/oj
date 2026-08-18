@@ -241,11 +241,11 @@ impl DevServer {
         let proxy: Vec<(String, oj_config::ProxyEntry)> =
             server_cfg.proxy.clone().unwrap_or_default().into_iter().collect();
 
-        let plugin_src = if is_tanstack_start_app(&root) {
-            None
-        } else {
-            plugins::plugin_source(&root)
-        };
+        // TanStack Start owns its module graph and SSR; oj runs the plugin host
+        // only to host configureServer middleware (the editor dev-server bridge),
+        // in start mode so the framework plugins' lifecycle hooks are tolerated.
+        let is_start = is_tanstack_start_app(&root);
+        let plugin_src = plugins::plugin_source(&root);
         let (plugins_path, plugins_format, plugins_label) = match plugin_src {
             Some(plugins::PluginSource::OjPlugins(p)) => {
                 let label = p.file_name().unwrap().to_string_lossy().into_owned();
@@ -268,6 +268,7 @@ impl DevServer {
             "env": { "command": "serve", "mode": "development" },
             "environment": { "name": "client", "mode": "development" },
             "pluginsFormat": plugins_format,
+            "ojStartMode": is_start,
         });
         let plugin_config = plugin_cfg.to_string();
         plugin_cfg["environment"]["name"] = serde_json::json!("ssr");
@@ -276,8 +277,10 @@ impl DevServer {
             Some(file) => match PluginHost::spawn(&root, &file, &plugin_config).await {
                 Ok(host) => {
                     println!("  plugins: {plugins_label}");
-                    if let Err(e) = host.build_start().await {
-                        eprintln!("oj: plugin buildStart failed: {e}");
+                    if !is_start {
+                        if let Err(e) = host.build_start().await {
+                            eprintln!("oj: plugin buildStart failed: {e}");
+                        }
                     }
                     Some(host)
                 }
