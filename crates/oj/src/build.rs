@@ -1102,8 +1102,16 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>, mod
     let mut css_entries = collected_css.lock().unwrap().clone();
     if !css_entries.is_empty() {
         css_entries.sort();
-        let combined: String =
-            css_entries.into_iter().map(|(_, css)| css).collect::<Vec<_>>().join("\n");
+        fs::create_dir_all(out_dir.join("assets"))?;
+        let mut seen_assets: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
+        let combined: String = css_entries
+            .into_iter()
+            .map(|(src, css)| {
+                let dir = Path::new(&src).parent().map(Path::to_path_buf).unwrap_or_else(|| root.to_path_buf());
+                rebase_css_urls(&css, &dir, &out_dir, &base, &mut emitted, &mut seen_assets)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         let hash = format!("{:016x}", {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1874,6 +1882,102 @@ fn normalize_base(base: &str) -> String {
 
 fn with_base(filename: &str, base: &str) -> String {
     format!("{base}{}", filename.trim_start_matches('/'))
+}
+
+fn sanitize_asset_name(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .collect()
+}
+
+fn content_hash(bytes: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// Emit a CSS-referenced asset (font/image) under a content hash and return its
+/// base-prefixed URL, or None to leave the `url()` untouched (data:/absolute/external).
+fn emit_css_url(
+    inner: &str,
+    css_dir: &Path,
+    out_dir: &Path,
+    base: &str,
+    emitted: &mut Vec<(String, usize)>,
+    seen: &mut std::collections::HashMap<PathBuf, String>,
+) -> Option<String> {
+    if inner.is_empty()
+        || inner.starts_with("data:")
+        || inner.starts_with("http://")
+        || inner.starts_with("https://")
+        || inner.starts_with("//")
+        || inner.starts_with('#')
+        || inner.starts_with('/')
+    {
+        return None;
+    }
+    let cut = inner.find(['?', '#']).unwrap_or(inner.len());
+    let (clean, suffix) = inner.split_at(cut);
+    let abs = css_dir.join(clean).canonicalize().ok()?;
+    if let Some(url) = seen.get(&abs) {
+        return Some(format!("{url}{suffix}"));
+    }
+    let data = std::fs::read(&abs).ok()?;
+    let hash = content_hash(&data);
+    let stem = abs.file_stem().and_then(|s| s.to_str()).unwrap_or("asset");
+    let ext = abs.extension().and_then(|s| s.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
+    let name = format!("assets/{}-{}{}", sanitize_asset_name(stem), &hash[..8], ext);
+    let dest = out_dir.join(&name);
+    if let Some(p) = dest.parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    std::fs::write(&dest, &data).ok()?;
+    emitted.push((name.clone(), data.len()));
+    let url = with_base(&name, base);
+    seen.insert(abs, url.clone());
+    Some(format!("{url}{suffix}"))
+}
+
+/// Rewrite relative `url()` refs in one stylesheet to point at emitted,
+/// content-hashed assets, since the stylesheet is concatenated into
+/// `/assets/style-*.css` where the original relative paths would 404.
+fn rebase_css_urls(
+    css: &str,
+    css_dir: &Path,
+    out_dir: &Path,
+    base: &str,
+    emitted: &mut Vec<(String, usize)>,
+    seen: &mut std::collections::HashMap<PathBuf, String>,
+) -> String {
+    let mut out = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some(pos) = rest.find("url(") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 4..];
+        let Some(close) = after.find(')') else {
+            out.push_str("url(");
+            rest = after;
+            continue;
+        };
+        let inner_raw = &after[..close];
+        let inner = inner_raw.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+        match emit_css_url(inner, css_dir, out_dir, base, emitted, seen) {
+            Some(url) => {
+                out.push_str("url(\"");
+                out.push_str(&url);
+                out.push_str("\")");
+            }
+            None => {
+                out.push_str("url(");
+                out.push_str(inner_raw);
+                out.push(')');
+            }
+        }
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 struct ManifestEntry {
