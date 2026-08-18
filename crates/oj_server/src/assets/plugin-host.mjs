@@ -413,9 +413,12 @@ async function handleHotUpdate(file, timestamp) {
   return suppress ? "skip" : null;
 }
 
+function escapeAttr(v) {
+  return String(v).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+}
 function renderTag(t) {
   const attrs = Object.entries(t.attrs ?? {})
-    .map(([k, v]) => (v === true ? ` ${k}` : v === false || v == null ? "" : ` ${k}="${String(v)}"`))
+    .map(([k, v]) => (v === true ? ` ${k}` : v === false || v == null ? "" : ` ${k}="${escapeAttr(v)}"`))
     .join("");
   const inner = t.children ?? "";
   const voidTag = ["meta", "link", "base"].includes(t.tag);
@@ -424,7 +427,8 @@ function renderTag(t) {
 
 function injectTags(html, tags) {
   const at = { "head-prepend": [], head: [], "body-prepend": [], body: [] };
-  for (const t of tags) (at[t.injectTo ?? "head"] ?? at.head).push(renderTag(t));
+  // Vite's default injection point is head-prepend, not head-append.
+  for (const t of tags) (at[t.injectTo ?? "head-prepend"] ?? at["head-prepend"]).push(renderTag(t));
   const put = (h, marker, html2, after) => {
     const i = h.indexOf(marker);
     if (i === -1) return h + html2;
@@ -438,12 +442,22 @@ function injectTags(html, tags) {
   return html;
 }
 
+function htmlHookRank(hook) {
+  const order = hook && typeof hook === "object" ? hook.order ?? hook.enforce : undefined;
+  return order === "pre" ? -1 : order === "post" ? 1 : 0;
+}
 async function transformIndexHtml(html) {
   let current = html;
+  // Honor per-hook order: 'pre' hooks run first, 'post' last (stable within a rank).
+  const entries = [];
   for (const p of plugins) {
     const hook = p.transformIndexHtml;
     const fn = typeof hook === "function" ? hook : hook?.handler ?? hook?.transform;
     if (typeof fn !== "function") continue;
+    entries.push({ fn, rank: htmlHookRank(hook) });
+  }
+  entries.sort((a, b) => a.rank - b.rank);
+  for (const { fn } of entries) {
     const r = await fn.call(ctx, current, { path: "/index.html", filename: "index.html" });
     if (r == null) continue;
     if (typeof r === "string") current = r;

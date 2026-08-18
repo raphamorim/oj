@@ -879,7 +879,7 @@ async fn user_plugin_host(
     let config = serde_json::json!({
         "config": { "root": root.display().to_string(), "base": base, "mode": mode, "command": "build", "define": define, "environments": environments },
         "env": { "command": "build", "mode": mode },
-        "environment": { "name": env_name, "mode": mode },
+        "environment": { "name": env_name, "mode": "build" },
         "pluginsFormat": plugins_format,
     })
     .to_string();

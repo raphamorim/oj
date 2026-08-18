@@ -267,7 +267,7 @@ impl DevServer {
                 "environments": config.environments,
             },
             "env": { "command": "serve", "mode": "development" },
-            "environment": { "name": "client", "mode": "development" },
+            "environment": { "name": "client", "mode": "dev" },
             "pluginsFormat": plugins_format,
             "ojStartMode": is_start,
         });

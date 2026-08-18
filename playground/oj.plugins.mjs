@@ -211,8 +211,47 @@ function htmlPlugin() {
     transformIndexHtml(html) {
       return {
         html: html.replace("<title>oj playground</title>", '<title>oj playground (plugin)</title>'),
-        tags: [{ tag: "meta", attrs: { name: "oj-plugin-injected", content: "yes" }, injectTo: "head" }],
+        tags: [
+          { tag: "meta", attrs: { name: "oj-plugin-injected", content: "yes" }, injectTo: "head" },
+          // No injectTo -> Vite default is head-prepend (lands right after <head>).
+          { tag: "meta", attrs: { name: "oj-html-default", content: "yes" } },
+        ],
       };
+    },
+  };
+}
+
+// Two object-form transformIndexHtml hooks with order pre/post. Registered
+// post-before-pre in the array, so the sequence is only correct if oj honors
+// `order`: pre injects the seq meta, post rewrites it to "pre-post".
+function htmlSeqPost() {
+  return {
+    name: "oj-html-seq-post",
+    transformIndexHtml: {
+      order: "post",
+      handler: (html) =>
+        html.includes('name="oj-html-seq" content="pre"')
+          ? html.replace('content="pre"', 'content="pre-post"')
+          : html,
+    },
+  };
+}
+function htmlSeqPre() {
+  return {
+    name: "oj-html-seq-pre",
+    transformIndexHtml: {
+      order: "pre",
+      handler: () => ({ tags: [{ tag: "meta", attrs: { name: "oj-html-seq", content: "pre" } }] }),
+    },
+  };
+}
+
+function envModePlugin() {
+  return {
+    name: "oj-env-mode",
+    transform(code, id) {
+      if (!id.endsWith("App.tsx") || !code.includes("__ENV_MODE__")) return null;
+      return code.replace("__ENV_MODE__", this.environment.mode);
     },
   };
 }
@@ -254,6 +293,9 @@ export default [
   configPlugin(),
   hmrPlugin(),
   htmlPlugin(),
+  htmlSeqPost(),
+  htmlSeqPre(),
+  envModePlugin(),
   orderPlugin("post", "post"),
   orderPlugin("pre", "pre"),
   applyPlugin("serve-only", "serve"),

@@ -36,6 +36,20 @@ const path = require("node:path");
     if (buildStart !== "serve") throw new Error("buildStart marker wrong (expected serve): " + buildStart);
     const envName = await page.getAttribute("[data-env-name]", "data-env-name");
     if (envName !== "client") throw new Error("this.environment.name wrong (expected client): " + envName);
+    const envMode = await page.getAttribute("[data-env-mode]", "data-env-mode");
+    if (envMode !== "dev") throw new Error("this.environment.mode wrong (expected dev, not development): " + envMode);
+    // transformIndexHtml: default injectTo is head-prepend (before head-append tags),
+    // and object-form hooks honor order:'pre'/'post'.
+    const rawHtml = await (await page.request.get("http://localhost:5199/")).text();
+    const headOpen = rawHtml.indexOf("<head>");
+    const defaultAt = rawHtml.indexOf('name="oj-html-default"');
+    const appendAt = rawHtml.indexOf('name="oj-plugin-injected"');
+    if (defaultAt === -1 || headOpen === -1 || defaultAt < headOpen)
+      throw new Error("head-prepend tag missing or before <head>");
+    if (appendAt === -1 || defaultAt > appendAt)
+      throw new Error("default injectTo should be head-prepend (before the head-append tag)");
+    const seq = await page.locator('meta[name="oj-html-seq"]').getAttribute("content");
+    if (seq !== "pre-post") throw new Error("transformIndexHtml order pre/post not honored: " + seq);
     const envClient = await page.getAttribute("[data-env-client]", "data-env-client");
     if (envClient !== "client-ran") throw new Error("applyToEnvironment client gate wrong: " + envClient);
     const envSsr = await page.getAttribute("[data-env-ssr]", "data-env-ssr");
@@ -48,7 +62,7 @@ const path = require("node:path");
     const parsed = (await (await page.request.get("http://localhost:5199/__oj_parsed")).text()).trim();
     if (!parsed.split(",").includes("App.tsx")) throw new Error("moduleParsed did not record App.tsx: " + parsed);
     if (errors.length) throw new Error("console errors");
-    console.log("PLUGIN transform + config + transformIndexHtml + enforce/apply + buildStart + this.resolve + getModuleInfo + getModuleIds + configureServer + Environment API + per-env define HOOKS VERIFIED");
+    console.log("PLUGIN transform + config + transformIndexHtml (head-prepend default + pre/post order) + enforce/apply + buildStart + this.resolve + getModuleInfo + getModuleIds + configureServer + Environment API (name+mode) + per-env define HOOKS VERIFIED");
   } finally {
     await browser.close();
   }

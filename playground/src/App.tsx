@@ -39,6 +39,8 @@ export function App() {
       <div data-moduleids="__MODULEIDS__" hidden />
       {/* Environment API: this.environment.name -> "client". */}
       <div data-env-name="__ENV_NAME__" hidden />
+      {/* Environment API: this.environment.mode -> "dev" (not "development"). */}
+      <div data-env-mode="__ENV_MODE__" hidden />
       {/* applyToEnvironment gating: client plugin runs, ssr plugin is dropped. */}
       <div data-env-client="__ENV_CLIENT__" hidden />
       <div data-env-ssr="__ENV_SSR__" hidden />
