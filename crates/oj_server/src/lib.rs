@@ -182,6 +182,7 @@ pub struct BuiltApp {
     pub host: std::net::IpAddr,
     pub port: u16,
     pub proxy_prefixes: Vec<String>,
+    pub plugin_mw_port: Option<u16>,
     pub root: PathBuf,
     pub started: Instant,
 }
@@ -445,7 +446,7 @@ impl DevServer {
             state.proxy.iter().map(|(p, _)| p.clone()).collect();
         let app = app.with_state(state);
 
-        Ok(BuiltApp { router: app, host, port, proxy_prefixes, root, started })
+        Ok(BuiltApp { router: app, host, port, proxy_prefixes, plugin_mw_port, root, started })
     }
 }
 
@@ -864,6 +865,43 @@ async fn forward_to_plugin_middleware(
     }
     if !body.is_empty() {
         out = out.body(body);
+    }
+    let resp = out.send().await.ok()?;
+    if resp.headers().contains_key("x-oj-fallthrough") {
+        return None;
+    }
+    let status = resp.status();
+    let resp_headers = resp.headers().clone();
+    let bytes = resp.bytes().await.unwrap_or_default();
+    let mut response = Response::new(Body::from(bytes));
+    *response.status_mut() = status;
+    for (name, value) in resp_headers.iter() {
+        if name == header::TRANSFER_ENCODING || name == header::CONTENT_LENGTH {
+            continue;
+        }
+        response.headers_mut().insert(name, value.clone());
+    }
+    Some(response)
+}
+
+// Forward a GET to a plugin's configureServer middleware; returns None when the
+// middleware falls through (x-oj-fallthrough), so the caller can fall back to
+// SSR. Used by the TanStack start path, where GET requests are otherwise
+// SSR'd and would never reach editor endpoints (the dev-server bridge).
+pub async fn forward_get_to_plugin_mw(
+    port: u16,
+    path_and_query: &str,
+    headers: &HeaderMap,
+) -> Option<Response> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = CLIENT.get_or_init(reqwest::Client::new);
+    let target = format!("http://127.0.0.1:{port}{path_and_query}");
+    let mut out = client.get(&target);
+    for (name, value) in headers.iter() {
+        if name == header::HOST {
+            continue;
+        }
+        out = out.header(name, value);
     }
     let resp = out.send().await.ok()?;
     if resp.headers().contains_key("x-oj-fallthrough") {

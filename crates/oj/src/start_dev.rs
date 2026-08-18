@@ -23,6 +23,7 @@ struct Runner {
 
 struct StartState {
     proxy_prefixes: Vec<String>,
+    plugin_mw_port: Option<u16>,
     runner: Arc<tokio::sync::Mutex<Runner>>,
     client_bundle: PathBuf,
     live_reload: PathBuf,
@@ -71,6 +72,7 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>, host: Option<String>) -
     let (reload_tx, _) = broadcast::channel::<()>(16);
     let state = Arc::new(StartState {
         proxy_prefixes: built.proxy_prefixes.clone(),
+        plugin_mw_port: built.plugin_mw_port,
         runner: Arc::new(tokio::sync::Mutex::new(runner)),
         client_bundle: cache.join("client-entry.js"),
         live_reload: cache.join("live-reload.js"),
@@ -393,8 +395,19 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
     }
     match classify(&req, &state.proxy_prefixes) {
         Route::Document => {
-            let raw = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
-            forward(&state, "GET".into(), document_url(raw), vec![], None).await
+            let raw = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
+            // Editor plugins (dev-server bridge) register configureServer routes
+            // with no path prefix, so a GET like /_sandbox/preview/viewers can only
+            // be told from an app route by asking the middleware first; it returns
+            // x-oj-fallthrough when it does not own the path, and then we SSR.
+            if let Some(port) = state.plugin_mw_port {
+                if let Some(resp) =
+                    oj_server::forward_get_to_plugin_mw(port, &raw, req.headers()).await
+                {
+                    return resp;
+                }
+            }
+            forward(&state, "GET".into(), document_url(&raw), vec![], None).await
         }
         Route::Pass => next.run(req).await,
     }
