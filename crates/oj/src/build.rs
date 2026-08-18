@@ -1049,12 +1049,19 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>, mod
     let mut rewritten_html = html.clone();
     let mut emitted: Vec<(String, usize)> = Vec::new();
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
+    let mut imports_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut entry_files: Vec<String> = Vec::new();
     for asset in &output.assets {
         if let rolldown_common::Output::Chunk(chunk) = asset {
             emitted.push((chunk.filename.to_string(), chunk.code.len()));
+            imports_map.insert(
+                chunk.filename.to_string(),
+                chunk.imports.iter().map(|i| i.to_string()).collect(),
+            );
             if !chunk.is_entry {
                 continue;
             }
+            entry_files.push(chunk.filename.to_string());
             let Some(facade) = &chunk.facade_module_id else { continue };
             let src = Path::new(facade.as_ref())
                 .strip_prefix(&root)
@@ -1079,6 +1086,27 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>, mod
         } else if let rolldown_common::Output::Asset(asset) = asset {
             emitted.push((asset.filename.to_string(), asset.source.as_bytes().len()));
         }
+    }
+
+    // Inject <link rel="modulepreload"> for each entry's transitively-imported
+    // chunks so the browser fetches them in parallel instead of discovering them
+    // one waterfall level at a time.
+    let mut preloads: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for entry in &entry_files {
+        for dep in transitive_imports(entry, &imports_map) {
+            preloads.insert(dep);
+        }
+    }
+    if !preloads.is_empty() {
+        let links = preloads
+            .iter()
+            .map(|f| format!("<link rel=\"modulepreload\" href=\"{}\" />", with_base(f, &base)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        rewritten_html = match rewritten_html.find("</head>") {
+            Some(i) => format!("{}{}\n{}", &rewritten_html[..i], links, &rewritten_html[i..]),
+            None => format!("{links}\n{rewritten_html}"),
+        };
     }
 
     for href in link_hrefs(&html) {
@@ -1882,6 +1910,23 @@ fn normalize_base(base: &str) -> String {
 
 fn with_base(filename: &str, base: &str) -> String {
     format!("{base}{}", filename.trim_start_matches('/'))
+}
+
+/// All chunks reachable from `entry` via static imports (excludes `entry`).
+fn transitive_imports(
+    entry: &str,
+    map: &std::collections::HashMap<String, Vec<String>>,
+) -> std::collections::BTreeSet<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut stack: Vec<String> = map.get(entry).cloned().unwrap_or_default();
+    while let Some(f) = stack.pop() {
+        if seen.insert(f.clone()) {
+            if let Some(deps) = map.get(&f) {
+                stack.extend(deps.iter().cloned());
+            }
+        }
+    }
+    seen
 }
 
 fn sanitize_asset_name(s: &str) -> String {
