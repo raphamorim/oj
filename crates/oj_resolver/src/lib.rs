@@ -9,6 +9,23 @@ use oxc_resolver::{
 
 pub struct OjResolver {
     inner: Resolver,
+    root: PathBuf,
+    dedupe: Vec<String>,
+}
+
+/// The package id of a bare specifier: `react-dom/client` -> `react-dom`,
+/// `@radix-ui/react-slot/x` -> `@radix-ui/react-slot`.
+fn package_name(spec: &str) -> String {
+    let mut it = spec.split('/');
+    let first = it.next().unwrap_or("");
+    if first.starts_with('@') {
+        match it.next() {
+            Some(second) => format!("{first}/{second}"),
+            None => first.to_string(),
+        }
+    } else {
+        first.to_string()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -25,10 +42,15 @@ impl OjResolver {
     }
 
     pub fn with_conditions(root: &Path, conditions: &[String]) -> Self {
-        Self::with_options(root, conditions, &[])
+        Self::with_options(root, conditions, &[], &[])
     }
 
-    pub fn with_options(root: &Path, conditions: &[String], alias: &[(String, String)]) -> Self {
+    pub fn with_options(
+        root: &Path,
+        conditions: &[String],
+        alias: &[(String, String)],
+        dedupe: &[String],
+    ) -> Self {
         let tsconfig = root.join("tsconfig.json");
         let alias = alias
             .iter()
@@ -55,7 +77,17 @@ impl OjResolver {
             }),
             ..ResolveOptions::default()
         };
-        Self { inner: Resolver::new(options) }
+        Self { inner: Resolver::new(options), root: root.to_path_buf(), dedupe: dedupe.to_vec() }
+    }
+
+    /// A bare import of a `resolve.dedupe` package resolves from the project
+    /// root so nested / monorepo copies collapse to one instance (Vite parity).
+    fn should_dedupe(&self, specifier: &str) -> bool {
+        if self.dedupe.is_empty() || specifier.starts_with('.') || specifier.starts_with('/') {
+            return false;
+        }
+        let pkg = package_name(specifier);
+        self.dedupe.iter().any(|d| d == &pkg)
     }
 
     pub fn resolve(
@@ -63,14 +95,25 @@ impl OjResolver {
         importer_dir: &Path,
         specifier: &str,
     ) -> Result<PathBuf, ResolveFailure> {
-        self.inner
-            .resolve(importer_dir, specifier)
-            .map(|resolution| resolution.full_path())
-            .map_err(|err| ResolveFailure {
-                specifier: specifier.to_string(),
-                importer: importer_dir.to_path_buf(),
-                reason: err.to_string(),
-            })
+        let deduped = self.should_dedupe(specifier);
+        let base = if deduped { self.root.as_path() } else { importer_dir };
+        match self.inner.resolve(base, specifier) {
+            Ok(resolution) => Ok(resolution.full_path()),
+            Err(err) => {
+                // Dedupe from root can miss a package only installed nested;
+                // fall back to the importer's dir before failing.
+                if deduped {
+                    if let Ok(resolution) = self.inner.resolve(importer_dir, specifier) {
+                        return Ok(resolution.full_path());
+                    }
+                }
+                Err(ResolveFailure {
+                    specifier: specifier.to_string(),
+                    importer: importer_dir.to_path_buf(),
+                    reason: err.to_string(),
+                })
+            }
+        }
     }
 }
 
@@ -105,9 +148,35 @@ mod tests {
             &playground_root(),
             &["browser", "import", "default"].map(String::from),
             &[("~".to_string(), "./src".to_string())],
+            &[],
         );
         let resolved = resolver.resolve(&playground_root(), "~/App").unwrap();
         assert!(resolved.ends_with("App.tsx"), "alias ~/App -> {resolved:?}");
+    }
+
+    #[test]
+    fn dedupe_collapses_nested_copy_to_root() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/dedupe");
+        let nested_dir = root.join("pkg");
+        let conds = ["import", "default"].map(String::from);
+        // Without dedupe: the importer's nested copy wins.
+        let plain = OjResolver::with_options(&root, &conds, &[], &[]);
+        let n = plain.resolve(&nested_dir, "dep").unwrap();
+        assert!(
+            n.to_string_lossy().contains("pkg/node_modules/dep"),
+            "without dedupe expected nested copy, got {n:?}",
+        );
+        // With dedupe: collapses to the root copy.
+        let deduped = OjResolver::with_options(&root, &conds, &[], &["dep".to_string()]);
+        let r = deduped.resolve(&nested_dir, "dep").unwrap();
+        assert!(
+            !r.to_string_lossy().contains("pkg/node_modules/dep")
+                && r.to_string_lossy().contains("dedupe/node_modules/dep"),
+            "with dedupe expected the root copy, got {r:?}",
+        );
+        // Subpaths of a deduped package dedupe too.
+        let deduped2 = OjResolver::with_options(&root, &conds, &[], &["dep".to_string()]);
+        assert!(deduped2.resolve(&nested_dir, "dep").is_ok());
     }
 
     #[test]

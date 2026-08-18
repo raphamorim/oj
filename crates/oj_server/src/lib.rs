@@ -345,11 +345,13 @@ impl DevServer {
                 &root,
                 &oj_config::resolve_conditions(&config, "client"),
                 &oj_config::resolve_alias(&config, "client"),
+                &oj_config::resolve_dedupe(&config),
             )),
             ssr_resolver: Arc::new(OjResolver::with_options(
                 &root,
                 &oj_config::resolve_conditions(&config, "ssr"),
                 &oj_config::resolve_alias(&config, "ssr"),
+                &oj_config::resolve_dedupe(&config),
             )),
             cache: PersistentCache::new(
                 root.join(".oj-cache"),
