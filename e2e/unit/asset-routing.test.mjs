@@ -11,19 +11,19 @@ import {
   assetsPlugin,
   makeVitePlugins,
   nodeBuiltinShims,
-} from "../../crates/oj_server/src/assets/start/esbuild-assets.mjs";
+} from "../../crates/oj_server/src/assets/start/rolldown-assets.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixture = resolve(here, "..", "fixtures", "start-app");
 
-let esbuild = null;
+let build = null;
 try {
   const req = createRequire(pathToFileURL(join(fixture, "package.json")).href);
-  const m = await import(pathToFileURL(req.resolve("esbuild")).href);
-  esbuild = m.default ?? m;
+  const m = await import(pathToFileURL(req.resolve("rolldown")).href);
+  build = m.build;
 } catch {}
 
-const it = esbuild ? test : (name) => test(name, { skip: "fixture esbuild not installed" }, () => {});
+const it = build ? test : (name) => test(name, { skip: "fixture rolldown not installed" }, () => {});
 
 const emit = async (abs) => "/assets/" + basename(abs);
 
@@ -56,12 +56,13 @@ async function bundle(files, plugins) {
       mkdirSync(dirname(p), { recursive: true });
       writeFileSync(p, contents);
     }
-    const res = await esbuild.build({
-      entryPoints: [join(dir, "entry.js")],
-      bundle: true, write: false, format: "esm", logLevel: "silent",
+    const res = await build({
+      input: join(dir, "entry.js"),
+      write: false,
+      output: { format: "esm" },
       plugins: plugins(dir),
     });
-    return { text: res.outputFiles.map((f) => f.text).join("\n"), dir };
+    return { text: res.output.map((f) => f.code || "").join("\n"), dir };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -10,7 +10,7 @@ import {
   workspaceRoot,
   pnpmStorePaths,
   contentHashEmitter,
-} from "../../crates/oj_server/src/assets/start/esbuild-assets.mjs";
+} from "../../crates/oj_server/src/assets/start/rolldown-assets.mjs";
 
 const tmp = (p) => mkdtempSync(join(tmpdir(), "oj-assets-" + p + "-"));
 

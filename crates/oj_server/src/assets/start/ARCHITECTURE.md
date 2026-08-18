@@ -32,10 +32,10 @@ plus one manifest specifier:
 - `tanstack-start-manifest:v` becomes the client asset manifest.
 
 In dev these are resolved at runtime by `loader.mjs`. In prod they are resolved
-at build time by esbuild's `alias` map. This seam is the reason the prod server
-is fully bundled: `createStartHandler` (inside `@tanstack/start-server-core`)
+at build time by rolldown's `resolve.alias` map. This seam is the reason the prod
+server is fully bundled: `createStartHandler` (inside `@tanstack/start-server-core`)
 runs `import("#tanstack-router-entry")`, and that import only resolves if the
-framework package is bundled so esbuild can apply the alias. See "Known limits".
+framework package is bundled so rolldown can apply the alias. See "Known limits".
 
 ## Asset files
 
@@ -44,7 +44,7 @@ Shared build helpers:
 - `resolve-pkg.mjs` resolves a package under a pnpm-strict layout (a transitive
   dep is not reachable from the app root, so it is resolved through the app's
   direct deps as anchors). Also exports `viteEnvDefine` for `import.meta.env`.
-- `esbuild-assets.mjs` holds the esbuild building blocks shared by dev and prod:
+- `rolldown-assets.mjs` holds the rolldown building blocks shared by dev and prod:
   `assetsPlugin` (Vite-style `?url` / `?raw` / `?inline` / bare-asset / css
   imports), `makeVitePlugins` (routes `virtual:` ids, `.mdx`, bare `.svg`, and
   the `.svg?react` query through the plugin container), `nodeBuiltinShims`,
@@ -59,14 +59,14 @@ Dev:
 - `loader.mjs` is a Node ESM loader hook. It resolves the framework aliases,
   the app's `#`-imports and tsconfig `paths`, asset conventions, `virtual:`
   ids, `.mdx` and `.svg`, and provides CJS-to-ESM interop; it compiles TS/JSX
-  with esbuild on the fly.
+  with rolldown's `transformSync` on the fly.
 - `runner.mjs` is the persistent SSR process. It registers `loader.mjs`,
   imports the server entry, and answers render requests over stdio. A reload
   message re-imports the entry in place (warm reload).
 - `generate.mjs` runs `@tanstack/router-generator` to write `routeTree.gen.ts`.
 - `gen-resolver.mjs` scans `src` for `createServerFn` and emits the server-fn
   resolver (`getServerFnById`) with static imports.
-- `bundle-client.mjs` bundles the browser client entry with esbuild.
+- `bundle-client.mjs` bundles the browser client entry with rolldown.
 - `live-reload.js` is the dev client that snapshots and restores form state
   across a warm reload.
 
@@ -165,7 +165,7 @@ banner therefore surface on stderr, keeping stdout pure JSON.
 
 The entry and loader paths default to the assets beside `runner.mjs` but are
 overridable with `OJ_RUNNER_ENTRY` and `OJ_RUNNER_LOADER`, which the protocol
-test uses to drive the framing against stubs without the loader's esbuild
+test uses to drive the framing against stubs without the loader's rolldown
 bootstrap.
 
 ### The watcher
@@ -207,11 +207,11 @@ about 40ms instead of respawning the process.
 ## Prod flow (`start_build` and `build.mjs`)
 
 1. Generate the route tree and the server-fn resolver.
-2. Client bundle: esbuild, minified, hashed, code-split, with the plugin
+2. Client bundle: rolldown, minified, hashed, code-split, with the plugin
    container, `import.meta.glob`, `import.meta.env`, asset loaders, svgr, mdx,
    and pnpm nodePaths.
 3. Manifest pointing at the hashed client entry.
-4. Server bundle: esbuild, minified, code-split (splitting preserves the
+4. Server bundle: rolldown, minified, code-split (splitting preserves the
    framework's top-level await, which a single-file bundle cannot), fully
    bundled so the framework `#`-imports resolve at build time. Node builtins
    stay external.
@@ -230,14 +230,14 @@ stylesheet urls, which the manifest lists under the root route's `css` so
 `HeadContent` links them in the SSR `<head>` (no flash of unstyled content); the
 client bundle no longer injects the link in production.
 
-### The two esbuild passes
+### The two rolldown passes
 
 The client pass targets the browser: minified, hashed, code-split, with browser
 conditions and the node-builtin shims, entered at the hydration `client-entry`.
 The server pass targets Node: `platform: node`, node builtins external, fully
 bundled so the framework's `#`-import aliases resolve at build time, and
 code-split rather than single-file because the framework's server module uses
-top-level await that esbuild's single-file lazy-init wrapper cannot always
+top-level await that a single-file bundle cannot always
 propagate. Both passes run the same plugin container (svgr, mdx, virtuals) and
 the same asset plugins; the server container falls back to the client one for
 `load`, since some ssr plugins expect cross-environment state Vite would share.
@@ -285,24 +285,24 @@ client and ssr builds and our separate containers do not.
 svgr keys its `load` filter on the import id, so both svg import styles reach
 it as an id the plugin recognizes:
 
-- Bare `import Logo from "./logo.svg"`. esbuild resolves the file normally and
+- Bare `import Logo from "./logo.svg"`. rolldown resolves the file normally and
   `makeVitePlugins` runs its `.svg` `load` for the resolved path. svgr claims
   it when configured with `exportType: "default"` (or an `include` that matches
   the file); otherwise the id falls back to an asset URL.
-- Explicit `import Logo from "./logo.svg?react"`. esbuild's resolver cannot
+- Explicit `import Logo from "./logo.svg?react"`. rolldown's resolver cannot
   find a file named `logo.svg?react`, so `makeVitePlugins` strips the query,
-  resolves the real `.svg`, parks it in an `oj-svg-react` namespace, and calls
+  resolves the real `.svg`, parks it in a `\0oj-svg-react:` virtual id, and calls
   `container.load(path + "?react")` so svgr sees the query it filters on. The
   dev loader mirrors this: it resolves the file and tags the url `?ojsvg=react`,
   then `load()` hands svgr the `path + "?react"` id. Either way the URL fallback
   applies when no plugin claims the id.
 
-The bare `.svg` `load` is pinned to the `file` namespace so it does not also
+The bare `.svg` `load` skips `\0`-prefixed ids so it does not also
 claim the `?react`-tagged files, which would drop the query before svgr runs.
 
 ## Resolution chain
 
-For app-owned specifiers the dev loader and the esbuild builds resolve in this
+For app-owned specifiers the dev loader and the rolldown builds resolve in this
 order:
 
 1. framework aliases and the CF shim,
@@ -319,7 +319,7 @@ order:
    re-export its actual runtime keys; ESM files, including syntax-detected
    dual-package `.js`, are left to Node).
 
-esbuild handles CJS interop, `#`-imports, tsconfig paths, `.js`-to-`.ts`, and
+rolldown handles CJS interop, `#`-imports, tsconfig paths, `.js`-to-`.ts`, and
 directory resolution natively when bundling, so the prod builds only need the
 plugin container, glob, env, assets, and shims.
 
@@ -368,10 +368,10 @@ Rust unit tests live beside the code they exercise:
 - `oj/src/start_dev.rs`: `document_url`, `percent_decode`, `asset_mime`,
   `needs_css_compile`, `workspace_root`, `app_uses_tailwind`, and `classify`.
 
-JS unit tests are `node --test e2e/unit/*.test.mjs` (esbuild for the harness
+JS unit tests are `node --test e2e/unit/*.test.mjs` (rolldown for the harness
 comes from the fixture; the suite skips cleanly when it is not installed):
 
-- `glob-transform` expands `import.meta.glob`; `esbuild-assets` covers the
+- `glob-transform` expands `import.meta.glob`; `rolldown-assets` covers the
   content-hash emitter, css `url()` rewriting, the Tailwind compile hook,
   `workspaceRoot`, and `pnpmStorePaths`; `resolve-pkg` covers `viteEnvDefine`
   and the pnpm-anchor resolver.
@@ -382,7 +382,7 @@ comes from the fixture; the suite skips cleanly when it is not installed):
   detection and the CJS-to-ESM facade, JSONC parsing, the server-fn rewrite,
   single-`*` alias matching, and the package `imports` / tsconfig-chain parsers.
 - `asset-routing` is a build-level harness: it drives `assetsPlugin`,
-  `makeVitePlugins`, and `nodeBuiltinShims` through a real esbuild bundle over
+  `makeVitePlugins`, and `nodeBuiltinShims` through a real rolldown bundle over
   temp files with a stub plugin container, asserting the `?url` / `?raw` /
   `?inline` / bare-asset / css routing, the `virtual:` / `.mdx` / `.svg` (bare
   and `?react`) container routing, and the node-builtin shims.
