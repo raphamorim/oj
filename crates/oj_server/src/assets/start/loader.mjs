@@ -14,7 +14,7 @@ import {
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
-const { transformSync } = await importPkg(APP, "esbuild", ["vite", "@tanstack/react-start"]);
+const { transformSync } = await importPkg(APP, "rolldown/experimental", ["vite", "@tanstack/react-start"]);
 const container = await loadPluginContainer(APP, { command: "serve", environment: "ssr" });
 const VIRTUAL_SCHEME = "ojvirtual:///";
 
@@ -188,9 +188,9 @@ export async function load(url, context, next) {
       if (t != null) raw = t;
     }
     const src = transformServerFns(transformGlob(raw, path), path);
-    const out = transformSync(src, {
-      loader: clean.endsWith("tsx") ? "tsx" : "ts",
-      format: "esm", jsx: "automatic", sourcefile: path,
+    const out = transformSync(path, src, {
+      lang: clean.endsWith("tsx") ? "tsx" : "ts",
+      jsx: { runtime: "automatic" },
       define: viteEnvDefine({ ssr: true }),
     });
     return { format: "module", source: out.code, shortCircuit: true };
@@ -209,8 +209,8 @@ export async function load(url, context, next) {
     const path = fileURLToPath(clean);
     const compiled = await container.transform(readFileSync(path, "utf8"), path);
     if (compiled != null) {
-      const out = transformSync(compiled, {
-        loader: "jsx", format: "esm", jsx: "automatic", sourcefile: path,
+      const out = transformSync(path, compiled, {
+        lang: "jsx", jsx: { runtime: "automatic" },
         define: viteEnvDefine({ ssr: true }),
       });
       return { format: "module", source: out.code, shortCircuit: true };

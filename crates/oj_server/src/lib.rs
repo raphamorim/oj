@@ -93,7 +93,7 @@ const COMPILABLE: &[&str] = &["tsx", "ts", "jsx", "js", "mjs", "svelte"];
 
 const START_ASSETS: &[(&str, &str)] = &[
     ("resolve-pkg.mjs", include_str!("assets/start/resolve-pkg.mjs")),
-    ("esbuild-assets.mjs", include_str!("assets/start/esbuild-assets.mjs")),
+    ("rolldown-assets.mjs", include_str!("assets/start/rolldown-assets.mjs")),
     ("vite-plugin-bridge.mjs", include_str!("assets/start/vite-plugin-bridge.mjs")),
     ("glob-transform.mjs", include_str!("assets/start/glob-transform.mjs")),
     ("cf-server.mjs", include_str!("assets/start/cf-server.mjs")),

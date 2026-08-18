@@ -4,56 +4,40 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { importPkg, viteEnvDefine } from "./resolve-pkg.mjs";
-import { assetsPlugin, makeVitePlugins, nodeBuiltinShims, pnpmStorePaths, workspaceRoot } from "./esbuild-assets.mjs";
+import { assetsPlugin, makeVitePlugins, nodeBuiltinShims, workspaceRoot } from "./rolldown-assets.mjs";
 import { loadPluginContainer } from "./vite-plugin-bridge.mjs";
 import { transformGlob } from "./glob-transform.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
-const esbuild = await importPkg(APP, "esbuild", ["vite", "@tanstack/react-start"]);
+const { build } = await importPkg(APP, "rolldown", ["vite", "@tanstack/react-start"]);
 const WORKSPACE = workspaceRoot(APP);
 const SERVER_FN_BASE = process.env.TSS_SERVER_FN_BASE ?? "/_serverFn/";
 
-const serverFnClient = {
-  name: "server-fn-client",
-  setup(build) {
-    build.onLoad({ filter: /\.(ts|tsx)$/ }, async (args) => {
-      if (args.path.includes("/node_modules/")) return null;
-      const loader = args.path.endsWith("tsx") ? "tsx" : "ts";
-      let code = readFileSync(args.path, "utf8");
-      if (container) {
-        const t = await container.transformUserCode(code, args.path);
-        if (t != null) code = t;
-      }
-      code = transformGlob(code, args.path);
-      if (!code.includes("createServerFn")) return { contents: code, loader };
-      const rel = relative(APP, args.path);
-      const re = /(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*createServerFn\b[\s\S]*?\.handler\s*\(/g;
-      const edits = [];
-      let m;
-      while ((m = re.exec(code))) {
-        const open = m.index + m[0].length;
-        let depth = 1;
-        let i = open;
-        for (; i < code.length && depth > 0; i++) {
-          if (code[i] === "(") depth++;
-          else if (code[i] === ")") depth--;
-        }
-        edits.push({ name: m[1], open, close: i - 1 });
-      }
-      if (!edits.length) return { contents: code, loader };
-      let out = code;
-      for (const e of edits.reverse()) {
-        const id = Buffer.from(`${rel}#${e.name}`).toString("base64url");
-        out = out.slice(0, e.open) + `createClientRpc(${JSON.stringify(id)})` + out.slice(e.close);
-      }
-      return {
-        contents: `import { createClientRpc } from "@tanstack/react-start/client-rpc";\n${out}`,
-        loader,
-      };
-    });
-  },
-};
+function rewriteServerFns(code, id) {
+  if (!code.includes("createServerFn")) return null;
+  const rel = relative(APP, id);
+  const re = /(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*createServerFn\b[\s\S]*?\.handler\s*\(/g;
+  const edits = [];
+  let m;
+  while ((m = re.exec(code))) {
+    const open = m.index + m[0].length;
+    let depth = 1;
+    let i = open;
+    for (; i < code.length && depth > 0; i++) {
+      if (code[i] === "(") depth++;
+      else if (code[i] === ")") depth--;
+    }
+    edits.push({ name: m[1], open, close: i - 1 });
+  }
+  if (!edits.length) return null;
+  let out = code;
+  for (const e of edits.reverse()) {
+    const id2 = Buffer.from(`${rel}#${e.name}`).toString("base64url");
+    out = out.slice(0, e.open) + `createClientRpc(${JSON.stringify(id2)})` + out.slice(e.close);
+  }
+  return `import { createClientRpc } from "@tanstack/react-start/client-rpc";\n${out}`;
+}
 
 function routerEntry() {
   for (const ext of [".tsx", ".ts", ".jsx", ".js"]) {
@@ -67,29 +51,42 @@ const container = await loadPluginContainer(APP, { command: "serve", environment
 
 const cssUrls = [];
 
-await esbuild.build({
-  entryPoints: [join(HERE, "client-entry.tsx")],
-  bundle: true,
-  format: "esm",
+const serverFnClient = {
+  name: "server-fn-client",
+  async transform(code, id) {
+    if (id.includes("/node_modules/") || id.startsWith("\0") || !/\.(ts|tsx)$/.test(id)) return null;
+    let out = code;
+    if (container) {
+      const t = await container.transformUserCode(out, id);
+      if (t != null) out = t;
+    }
+    out = transformGlob(out, id);
+    const rpc = rewriteServerFns(out, id);
+    if (rpc != null) return rpc;
+    return out === code ? null : out;
+  },
+};
+
+const result = await build({
+  input: join(HERE, "client-entry.tsx"),
   platform: "browser",
-  jsx: "automatic",
-  conditions: ["browser", "module", "import"],
-  alias: {
-    "#tanstack-router-entry": routerEntry(),
-    "#tanstack-start-entry": join(HERE, "start-entry.ts"),
-    "#tanstack-start-plugin-adapters": join(HERE, "plugin-adapters.ts"),
-    "tanstack-start-manifest:v": join(HERE, "manifest.ts"),
-    "@tanstack/start-fn-stubs": join(HERE, "fn-stubs.mjs"),
+  transform: {
+    jsx: { runtime: "automatic" },
+    define: {
+      "process.env": JSON.stringify({ NODE_ENV: "development", TSS_SERVER_FN_BASE: SERVER_FN_BASE }),
+      global: "globalThis",
+      ...viteEnvDefine({ ssr: false }),
+    },
   },
-  define: {
-    "process.env": JSON.stringify({ NODE_ENV: "development", TSS_SERVER_FN_BASE: SERVER_FN_BASE }),
-    global: "globalThis",
-    ...viteEnvDefine({ ssr: false }),
-  },
-  banner: {
-    js:
-      `globalThis.process=globalThis.process||{env:{NODE_ENV:"development",TSS_SERVER_FN_BASE:${JSON.stringify(SERVER_FN_BASE)}}};` +
-      "globalThis.global=globalThis.global||globalThis;",
+  resolve: {
+    conditionNames: ["browser", "module", "import"],
+    alias: {
+      "#tanstack-router-entry": routerEntry(),
+      "#tanstack-start-entry": join(HERE, "start-entry.ts"),
+      "#tanstack-start-plugin-adapters": join(HERE, "plugin-adapters.ts"),
+      "tanstack-start-manifest:v": join(HERE, "manifest.ts"),
+      "@tanstack/start-fn-stubs": join(HERE, "fn-stubs.mjs"),
+    },
   },
   plugins: [
     makeVitePlugins({ container, appRoot: APP, mode: "dev" }),
@@ -97,10 +94,17 @@ await esbuild.build({
     serverFnClient,
     nodeBuiltinShims,
   ],
-  nodePaths: pnpmStorePaths(WORKSPACE),
-  outfile: join(HERE, "client-entry.js"),
-  logLevel: "silent",
+  output: {
+    format: "esm",
+    banner:
+      `globalThis.process=globalThis.process||{env:{NODE_ENV:"development",TSS_SERVER_FN_BASE:${JSON.stringify(SERVER_FN_BASE)}}};` +
+      "globalThis.global=globalThis.global||globalThis;",
+  },
+  write: false,
 });
+
+const chunk = result.output.find((o) => o.type === "chunk" && o.isEntry) ?? result.output[0];
+writeFileSync(join(HERE, "client-entry.js"), chunk.code);
 
 const devManifest = {
   routes: {

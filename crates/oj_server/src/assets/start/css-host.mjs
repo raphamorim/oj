@@ -1,21 +1,69 @@
 // SPDX-License-Identifier: MIT
 
-import { importPkg } from "./resolve-pkg.mjs";
-import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { existsSync, readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import readline from "node:readline";
 
 const send = process.stdout.write.bind(process.stdout);
 process.stdout.write = process.stderr.write.bind(process.stderr);
 
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
-const postcss = await importPkg(APP, "postcss", []);
-const twMod = await importPkg(APP, "@tailwindcss/postcss", ["tailwindcss"]);
-const tailwind = twMod.default ?? twMod;
+const req = createRequire(APP + "/package.json");
+
+let postcssProcessor;
+async function loadPostcss() {
+  if (postcssProcessor !== undefined) return postcssProcessor;
+  const cfgPath = ["postcss.config.js", "postcss.config.cjs", "postcss.config.mjs"]
+    .map((n) => `${APP}/${n}`)
+    .find((p) => existsSync(p));
+  postcssProcessor = null;
+  if (cfgPath) {
+    let postcss;
+    try {
+      postcss = (await import(req.resolve("postcss"))).default;
+    } catch {
+      postcss = null;
+    }
+    if (postcss) {
+      const mod = await import(pathToFileURL(cfgPath).href);
+      const config = mod.default ?? mod;
+      const raw = config.plugins ?? {};
+      const plugins = [];
+      if (Array.isArray(raw)) {
+        for (const p of raw) if (p) plugins.push(p);
+      } else {
+        for (const [name, opts] of Object.entries(raw)) {
+          if (opts === false) continue;
+          const imported = await import(req.resolve(name));
+          const factory = imported.default ?? imported;
+          plugins.push(typeof factory === "function" ? factory(opts ?? {}) : factory);
+        }
+      }
+      postcssProcessor = postcss(plugins);
+    }
+  }
+  return postcssProcessor;
+}
+
+// Tailwind v4 via @tailwindcss/vite: no PostCSS plugin, compile through
+// @tailwindcss/node + scan class candidates with @tailwindcss/oxide.
+async function v4Compile(css, from) {
+  const tw = await import(req.resolve("@tailwindcss/node"));
+  const oxide = await import(req.resolve("@tailwindcss/oxide"));
+  const compiler = await tw.compile(css, { base: APP, from, onDependency: () => {} });
+  const scanner = new oxide.Scanner({ sources: [{ base: APP, pattern: "**/*", negated: false }] });
+  return compiler.build(scanner.scan());
+}
 
 async function compile(path) {
   const src = readFileSync(path, "utf8");
-  const result = await postcss([tailwind()]).process(src, { from: path });
-  return result.css;
+  const processor = await loadPostcss();
+  if (processor) {
+    const result = await processor.process(src, { from: path, map: false });
+    return result.css;
+  }
+  return v4Compile(src, path);
 }
 
 const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
