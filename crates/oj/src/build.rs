@@ -1053,34 +1053,46 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>, mod
     let mut entry_files: Vec<String> = Vec::new();
     for asset in &output.assets {
         if let rolldown_common::Output::Chunk(chunk) = asset {
-            emitted.push((chunk.filename.to_string(), chunk.code.len()));
-            imports_map.insert(
-                chunk.filename.to_string(),
-                chunk.imports.iter().map(|i| i.to_string()).collect(),
-            );
-            if !chunk.is_entry {
-                continue;
-            }
-            entry_files.push(chunk.filename.to_string());
-            let Some(facade) = &chunk.facade_module_id else { continue };
-            let src = Path::new(facade.as_ref())
-                .strip_prefix(&root)
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_else(|_| chunk.name.to_string());
+            let filename = chunk.filename.to_string();
+            emitted.push((filename.clone(), chunk.code.len()));
+            imports_map.insert(filename.clone(), chunk.imports.iter().map(|i| i.to_string()).collect());
+            // Entry chunks are keyed by their source path; shared/non-entry
+            // chunks by `_<filename>` (Vite's manifest shape).
+            let src = if chunk.is_entry {
+                chunk.facade_module_id.as_ref().and_then(|f| {
+                    Path::new(f.as_ref())
+                        .strip_prefix(&root)
+                        .ok()
+                        .map(|p| p.to_string_lossy().replace('\\', "/"))
+                })
+            } else {
+                None
+            };
+            let key = src.clone().unwrap_or_else(|| {
+                format!("_{}", Path::new(&filename).file_name().and_then(|n| n.to_str()).unwrap_or(&filename))
+            });
             manifest_entries.push(ManifestEntry {
+                key,
                 name: chunk.name.to_string(),
-                file: chunk.filename.to_string(),
-                src: src.clone(),
-                is_entry: true,
+                file: filename.clone(),
+                src,
+                is_entry: chunk.is_entry,
+                is_dynamic_entry: chunk.is_dynamic_entry,
                 imports: chunk.imports.iter().map(|i| i.to_string()).collect(),
+                dynamic_imports: chunk.dynamic_imports.iter().map(|i| i.to_string()).collect(),
                 css: Vec::new(),
             });
-            for entry in &entries {
-                let resolved = oj_server::html_entry_src(entry).unwrap_or_else(|| entry.clone());
-                let entry_abs = root.join(resolved.trim_start_matches('/'));
-                if Path::new(facade.as_ref()) == entry_abs.as_path() {
-                    rewritten_html =
-                        rewritten_html.replace(entry.as_str(), &with_base(&chunk.filename, &base));
+            if chunk.is_entry {
+                entry_files.push(filename.clone());
+                if let Some(facade) = &chunk.facade_module_id {
+                    for entry in &entries {
+                        let resolved = oj_server::html_entry_src(entry).unwrap_or_else(|| entry.clone());
+                        let entry_abs = root.join(resolved.trim_start_matches('/'));
+                        if Path::new(facade.as_ref()) == entry_abs.as_path() {
+                            rewritten_html =
+                                rewritten_html.replace(entry.as_str(), &with_base(&filename, &base));
+                        }
+                    }
                 }
             }
         } else if let rolldown_common::Output::Asset(asset) = asset {
@@ -1156,7 +1168,9 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>, mod
             None => format!("{link}\n{rewritten_html}"),
         };
         for entry in &mut manifest_entries {
-            entry.css.push(css_name.clone());
+            if entry.is_entry {
+                entry.css.push(css_name.clone());
+            }
         }
     }
 
@@ -2026,31 +2040,56 @@ fn rebase_css_urls(
 }
 
 struct ManifestEntry {
+    /// Manifest key: the entry's `src` path, or `_<filename>` for a shared chunk.
+    key: String,
     name: String,
     file: String,
-    src: String,
+    src: Option<String>,
     is_entry: bool,
+    is_dynamic_entry: bool,
+    /// Statically-imported chunk filenames (remapped to manifest keys on output).
     imports: Vec<String>,
+    dynamic_imports: Vec<String>,
     css: Vec<String>,
 }
 
 fn build_manifest(entries: &[ManifestEntry]) -> serde_json::Value {
+    // Vite's manifest references imports/dynamicImports by manifest KEY, not by
+    // output filename, so build a filename -> key map first.
+    let file_to_key: std::collections::HashMap<&str, &str> =
+        entries.iter().map(|e| (e.file.as_str(), e.key.as_str())).collect();
+    let remap = |files: &[String]| -> Vec<serde_json::Value> {
+        files
+            .iter()
+            .filter_map(|f| file_to_key.get(f.as_str()).map(|k| serde_json::Value::from(*k)))
+            .collect()
+    };
     let mut map = serde_json::Map::new();
     for e in entries {
         let mut row = serde_json::Map::new();
         row.insert("file".into(), e.file.clone().into());
         row.insert("name".into(), e.name.clone().into());
-        row.insert("src".into(), e.src.clone().into());
+        if let Some(src) = &e.src {
+            row.insert("src".into(), src.clone().into());
+        }
         if e.is_entry {
             row.insert("isEntry".into(), true.into());
         }
-        if !e.imports.is_empty() {
-            row.insert("imports".into(), e.imports.clone().into());
+        if e.is_dynamic_entry {
+            row.insert("isDynamicEntry".into(), true.into());
+        }
+        let imports = remap(&e.imports);
+        if !imports.is_empty() {
+            row.insert("imports".into(), imports.into());
+        }
+        let dyn_imports = remap(&e.dynamic_imports);
+        if !dyn_imports.is_empty() {
+            row.insert("dynamicImports".into(), dyn_imports.into());
         }
         if !e.css.is_empty() {
             row.insert("css".into(), e.css.clone().into());
         }
-        map.insert(e.src.clone(), serde_json::Value::Object(row));
+        map.insert(e.key.clone(), serde_json::Value::Object(row));
     }
     serde_json::Value::Object(map)
 }
@@ -2061,37 +2100,61 @@ mod tests {
 
     #[test]
     fn manifest_matches_vite_shape() {
-        let m = build_manifest(&[ManifestEntry {
-            name: "main".into(),
-            file: "assets/main-abc123.js".into(),
-            src: "src/main.tsx".into(),
-            is_entry: true,
-            imports: vec!["assets/vendor-def456.js".into()],
-            css: vec!["assets/style-99.css".into()],
-        }]);
+        let mk = |key: &str, name: &str, file: &str, src: Option<&str>, is_entry: bool, is_dyn: bool,
+                  imports: Vec<&str>, dyn_imports: Vec<&str>, css: Vec<&str>| ManifestEntry {
+            key: key.into(),
+            name: name.into(),
+            file: file.into(),
+            src: src.map(str::to_string),
+            is_entry,
+            is_dynamic_entry: is_dyn,
+            imports: imports.into_iter().map(str::to_string).collect(),
+            dynamic_imports: dyn_imports.into_iter().map(str::to_string).collect(),
+            css: css.into_iter().map(str::to_string).collect(),
+        };
+        let m = build_manifest(&[
+            mk("src/main.tsx", "main", "assets/main-abc123.js", Some("src/main.tsx"), true, false,
+               vec!["assets/vendor-def456.js"], vec!["assets/lazy-xyz.js"], vec!["assets/style-99.css"]),
+            mk("_vendor-def456.js", "vendor", "assets/vendor-def456.js", None, false, false,
+               vec![], vec![], vec![]),
+            mk("_lazy-xyz.js", "lazy", "assets/lazy-xyz.js", None, false, true, vec![], vec![], vec![]),
+        ]);
         let row = &m["src/main.tsx"];
         assert_eq!(row["file"], "assets/main-abc123.js");
         assert_eq!(row["name"], "main");
         assert_eq!(row["src"], "src/main.tsx");
         assert_eq!(row["isEntry"], true);
-        assert_eq!(row["imports"][0], "assets/vendor-def456.js");
+        // imports/dynamicImports reference manifest KEYS, not output filenames.
+        assert_eq!(row["imports"][0], "_vendor-def456.js");
+        assert_eq!(row["dynamicImports"][0], "_lazy-xyz.js");
         assert_eq!(row["css"][0], "assets/style-99.css");
+        // Non-entry chunk is present, keyed by _<filename>, with no src.
+        assert_eq!(m["_vendor-def456.js"]["file"], "assets/vendor-def456.js");
+        assert!(m["_vendor-def456.js"].get("src").is_none());
+        // Dynamic entry is flagged.
+        assert_eq!(m["_lazy-xyz.js"]["isDynamicEntry"], true);
     }
 
     #[test]
     fn non_entry_omits_isentry_and_empty_fields() {
         let m = build_manifest(&[ManifestEntry {
+            key: "_chunk-1.js".into(),
             name: "chunk".into(),
             file: "assets/chunk-1.js".into(),
-            src: "chunk".into(),
+            src: None,
             is_entry: false,
+            is_dynamic_entry: false,
             imports: vec![],
+            dynamic_imports: vec![],
             css: vec![],
         }]);
-        let row = m["chunk"].as_object().unwrap();
+        let row = m["_chunk-1.js"].as_object().unwrap();
         assert!(!row.contains_key("isEntry"));
+        assert!(!row.contains_key("isDynamicEntry"));
         assert!(!row.contains_key("imports"));
+        assert!(!row.contains_key("dynamicImports"));
         assert!(!row.contains_key("css"));
+        assert!(!row.contains_key("src"));
     }
 
     #[test]
