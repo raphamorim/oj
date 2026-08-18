@@ -2839,6 +2839,50 @@ async fn hmr_gate_status(State(state): State<Arc<ServerState>>) -> Response {
     }
 }
 
+/// True for config / env files whose change requires a full server restart
+/// (they are read once at startup and cannot be hot-applied).
+fn is_restart_trigger(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if name == ".env" || name.starts_with(".env.") {
+        return true;
+    }
+    let stem_ext = |bases: &[&str], exts: &[&str]| {
+        bases.iter().any(|b| exts.iter().any(|e| name == format!("{b}.{e}")))
+    };
+    stem_ext(
+        &["vite.config", "oj.config", "postcss.config", "tailwind.config"],
+        &["ts", "js", "mjs", "cjs", "mts", "cts"],
+    )
+}
+
+/// Re-exec the current binary with the same arguments so a fresh process
+/// re-reads config and .env. Rust sets CLOEXEC on the listening socket, so the
+/// dev port is released as the image is replaced. Does not return on success.
+fn restart_process() -> ! {
+    eprintln!("{} config/env changed — restarting dev server", oj_brand());
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("oj"));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&exe).args(&args).exec();
+        eprintln!("oj: restart failed: {err}");
+        std::process::exit(1);
+    }
+    #[cfg(not(unix))]
+    {
+        let code = std::process::Command::new(&exe)
+            .args(&args)
+            .status()
+            .ok()
+            .and_then(|s| s.code())
+            .unwrap_or(0);
+        std::process::exit(code);
+    }
+}
+
 fn spawn_watcher(state: Arc<ServerState>) {
     std::thread::spawn(move || {
         use notify::{RecursiveMode, Watcher};
@@ -2909,6 +2953,11 @@ fn spawn_watcher(state: Arc<ServerState>) {
                 }
             }
             let paths: Vec<PathBuf> = paths.into_iter().collect();
+            // A config or .env change can't be hot-applied (config is read once at
+            // startup), so restart the process to pick it up — matching Vite.
+            if paths.iter().any(|p| is_restart_trigger(p)) {
+                restart_process();
+            }
             if let Some(gate) = &state.hmr_gate {
                 if gate.hold(&state, &paths) {
                     continue;

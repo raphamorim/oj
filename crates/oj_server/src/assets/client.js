@@ -114,22 +114,75 @@ async function applyUpdate(update) {
 }
 
 let overlayEl = null;
+let overlayKeyHandler = null;
+
+function parseError(text) {
+  const s = String(text);
+  const title = (s.split("\n").find((l) => l.trim()) || "Build error").trim();
+  const loc = s.match(/([^\s():]+\.[A-Za-z0-9]+):(\d+)(?::(\d+))?/);
+  return { title, file: loc && loc[1], line: loc && loc[2], col: loc && loc[3], frame: s };
+}
 
 function showOverlay(text) {
   clearOverlay();
+  const e = parseError(text);
   overlayEl = document.createElement("div");
+  overlayEl.setAttribute("role", "dialog");
+  overlayEl.setAttribute("aria-label", "Build error");
   overlayEl.style.cssText =
-    "position:fixed;inset:0;z-index:99999;background:rgba(12,12,14,0.92);" +
-    "color:#ff8484;font:13px/1.5 ui-monospace,Menlo,monospace;padding:2rem;overflow:auto";
-  const pre = document.createElement("pre");
-  pre.style.cssText = "white-space:pre-wrap;margin:0";
-  pre.textContent = "[oj] " + text + "\n\n(click to dismiss — fix the file and save to retry)";
-  overlayEl.appendChild(pre);
-  overlayEl.addEventListener("click", clearOverlay);
+    "position:fixed;inset:0;z-index:99999;background:rgba(10,10,14,.86);" +
+    "display:flex;align-items:flex-start;justify-content:center;padding:6vh 4vw;overflow:auto;" +
+    "font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace";
+  const card = document.createElement("div");
+  card.style.cssText =
+    "max-width:920px;width:100%;background:#16161c;border:1px solid #33333f;border-radius:12px;" +
+    "box-shadow:0 20px 60px rgba(0,0,0,.5);overflow:hidden;color:#e6e6ea";
+  const bar = document.createElement("div");
+  bar.style.cssText =
+    "display:flex;align-items:center;gap:10px;padding:12px 18px;background:#2a1417;border-bottom:1px solid #4a2028";
+  const brand = document.createElement("span");
+  brand.style.cssText = "font-weight:700;letter-spacing:.08em;color:#ff6b6b";
+  brand.textContent = "oj";
+  const label = document.createElement("span");
+  label.style.cssText = "color:#ff9a9a;font-weight:600";
+  label.textContent = "Build error";
+  bar.append(brand, label);
+  const body = document.createElement("div");
+  body.style.cssText = "padding:18px";
+  const title = document.createElement("div");
+  title.style.cssText = "color:#ff8a8a;font-weight:600;font-size:14px;white-space:pre-wrap;margin-bottom:10px";
+  title.textContent = e.title;
+  body.appendChild(title);
+  if (e.file) {
+    const loc = document.createElement("div");
+    loc.style.cssText = "color:#8ab4ff;margin-bottom:12px;font-size:12px";
+    loc.textContent = e.file + (e.line ? ":" + e.line + (e.col ? ":" + e.col : "") : "");
+    body.appendChild(loc);
+  }
+  const frame = document.createElement("pre");
+  frame.style.cssText =
+    "margin:0;white-space:pre-wrap;background:#0d0d12;border:1px solid #26262f;border-radius:8px;" +
+    "padding:12px 14px;color:#c9c9d4;max-height:52vh;overflow:auto";
+  frame.textContent = e.frame;
+  body.appendChild(frame);
+  const hint = document.createElement("div");
+  hint.style.cssText = "margin-top:12px;color:#6f6f80;font-size:12px";
+  hint.textContent = "Fix the file and save to retry · click outside or press Esc to dismiss";
+  body.appendChild(hint);
+  card.append(bar, body);
+  overlayEl.appendChild(card);
+  // Dismiss on backdrop click only, so text inside the card stays selectable.
+  overlayEl.addEventListener("click", (ev) => { if (ev.target === overlayEl) clearOverlay(); });
+  overlayKeyHandler = (ev) => { if (ev.key === "Escape") clearOverlay(); };
+  window.addEventListener("keydown", overlayKeyHandler);
   document.body.appendChild(overlayEl);
 }
 
 function clearOverlay() {
+  if (overlayKeyHandler) {
+    window.removeEventListener("keydown", overlayKeyHandler);
+    overlayKeyHandler = null;
+  }
   if (overlayEl) {
     overlayEl.remove();
     overlayEl = null;
