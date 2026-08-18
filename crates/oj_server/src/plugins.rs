@@ -572,6 +572,8 @@ mod vite_values_tests {
             rollup_options: None,
             assets_inline_limit: None,
             proxy: None,
+            dedupe: None,
+            optimize_deps: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/vite-base/"));
@@ -595,6 +597,8 @@ mod vite_values_tests {
             rollup_options: None,
             assets_inline_limit: None,
             proxy: None,
+            dedupe: None,
+            optimize_deps: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/oj-base/"));
