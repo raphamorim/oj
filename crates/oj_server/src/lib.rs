@@ -386,7 +386,18 @@ impl DevServer {
             optimized: Arc::new(if bundle {
                 optimize::OptimizedDeps::disabled()
             } else {
-                optimize::OptimizedDeps::prepare(&root, env!("CARGO_PKG_VERSION"))
+                let (include, exclude, entries) = oj_config::optimize_deps_lists(&config);
+                optimize::OptimizedDeps::prepare(
+                    &root,
+                    env!("CARGO_PKG_VERSION"),
+                    optimize::OptimizeInput {
+                        include,
+                        exclude,
+                        entries,
+                        dedupe: oj_config::resolve_dedupe(&config),
+                        alias: oj_config::resolve_alias(&config, "client"),
+                    },
+                )
             }),
         });
         if let Some(host) = &state.plugins {

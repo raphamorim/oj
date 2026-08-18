@@ -43,9 +43,9 @@ impl OptimizedDeps {
         OptimizedDeps { rx, dir: PathBuf::new() }
     }
 
-    pub fn prepare(root: &Path, version: &str) -> Self {
+    pub fn prepare(root: &Path, version: &str, input: OptimizeInput) -> Self {
         let dir = root.join(".oj-cache").join("deps");
-        let hash = lockfile_hash(root, version);
+        let hash = lockfile_hash(root, version, &input);
         let (tx, rx) = watch::channel(None);
 
         if let Some(map) = load_manifest(&dir, &hash) {
@@ -56,14 +56,25 @@ impl OptimizedDeps {
         let root = root.to_path_buf();
         let dir_task = dir.clone();
         tokio::spawn(async move {
-            let map = run_optimizer(&root, &dir_task, &hash).await.unwrap_or_default();
+            let map = run_optimizer(&root, &dir_task, &hash, &input).await.unwrap_or_default();
             let _ = tx.send(Some(Arc::new(map)));
         });
         OptimizedDeps { rx, dir }
     }
 }
 
-fn lockfile_hash(root: &Path, version: &str) -> String {
+/// Dependency-optimizer inputs derived from the resolved config
+/// (`optimizeDeps.include/exclude/entries`, `resolve.dedupe`, `resolve.alias`).
+#[derive(Default, Clone)]
+pub struct OptimizeInput {
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub entries: Vec<String>,
+    pub dedupe: Vec<String>,
+    pub alias: Vec<(String, String)>,
+}
+
+fn lockfile_hash(root: &Path, version: &str, input: &OptimizeInput) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(version.as_bytes());
     for name in ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "package.json"] {
@@ -71,6 +82,18 @@ fn lockfile_hash(root: &Path, version: &str) -> String {
             hasher.update(name.as_bytes());
             hasher.update(&bytes);
         }
+    }
+    // Fold the optimizer config into the key so include/exclude/entries/dedupe/alias
+    // changes invalidate a stale prebundle.
+    for s in input.include.iter().chain(&input.exclude).chain(&input.entries).chain(&input.dedupe) {
+        hasher.update(b"\0");
+        hasher.update(s.as_bytes());
+    }
+    for (find, replacement) in &input.alias {
+        hasher.update(b"\0a");
+        hasher.update(find.as_bytes());
+        hasher.update(b"=");
+        hasher.update(replacement.as_bytes());
     }
     hasher.finalize().to_hex().to_string()
 }
@@ -101,16 +124,28 @@ fn load_manifest(dir: &Path, hash: &str) -> Option<DepMap> {
     Some(map)
 }
 
-async fn run_optimizer(root: &Path, dir: &Path, hash: &str) -> Option<DepMap> {
+async fn run_optimizer(root: &Path, dir: &Path, hash: &str, input: &OptimizeInput) -> Option<DepMap> {
     let cache = root.join(".oj-cache");
     std::fs::create_dir_all(&cache).ok()?;
     let script = cache.join("optimize-deps.mjs");
     std::fs::write(&script, OPTIMIZE_JS).ok()?;
+    // react/jsx-dev-runtime is always prebundled (oj injects the dev JSX runtime);
+    // merge it with any user optimizeDeps.include.
+    let mut include = vec!["react/jsx-dev-runtime".to_string()];
+    for dep in &input.include {
+        if !include.contains(dep) {
+            include.push(dep.clone());
+        }
+    }
+    let alias: Vec<[&str; 2]> = input.alias.iter().map(|(f, r)| [f.as_str(), r.as_str()]).collect();
     let cfg = serde_json::json!({
         "root": root,
         "outDir": dir,
-        "entries": [],
-        "include": ["react/jsx-dev-runtime"],
+        "entries": input.entries,
+        "include": include,
+        "exclude": input.exclude,
+        "dedupe": input.dedupe,
+        "alias": alias,
     })
     .to_string();
     let out = tokio::process::Command::new("node")

@@ -21,6 +21,15 @@ pub struct OjConfig {
     pub virtual_modules: Option<BTreeMap<String, String>>,
     pub bundle: Option<bool>,
     pub environments: Option<BTreeMap<String, serde_json::Value>>,
+    pub optimize_deps: Option<OptimizeDepsConfig>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct OptimizeDepsConfig {
+    pub include: Option<Vec<String>>,
+    pub exclude: Option<Vec<String>>,
+    pub entries: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]

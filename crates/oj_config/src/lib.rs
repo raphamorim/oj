@@ -66,6 +66,25 @@ pub fn resolve_conditions(config: &OjConfig, env_name: &str) -> Vec<String> {
     [base, "import", "module", "default"].map(String::from).to_vec()
 }
 
+pub fn resolve_dedupe(config: &OjConfig) -> Vec<String> {
+    config
+        .resolve
+        .as_ref()
+        .and_then(|r| r.dedupe.as_ref())
+        .cloned()
+        .unwrap_or_default()
+}
+
+pub fn optimize_deps_lists(config: &OjConfig) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let od = config.optimize_deps.as_ref();
+    let take = |f: Option<&Vec<String>>| f.cloned().unwrap_or_default();
+    (
+        take(od.and_then(|o| o.include.as_ref())),
+        take(od.and_then(|o| o.exclude.as_ref())),
+        take(od.and_then(|o| o.entries.as_ref())),
+    )
+}
+
 pub fn resolve_alias(config: &OjConfig, env_name: &str) -> Vec<(String, String)> {
     let mut merged: std::collections::BTreeMap<String, String> = config
         .resolve
@@ -231,6 +250,26 @@ mod tests {
     fn no_config_is_default() {
         let cfg = load(std::path::Path::new("/nonexistent-oj-root")).unwrap();
         assert!(cfg.server.is_none());
+    }
+
+    #[test]
+    fn optimize_deps_and_dedupe_accessors() {
+        let json = r#"{"resolve":{"dedupe":["react","react-dom"]},
+            "optimizeDeps":{"include":["cjs-dep"],"exclude":["big-esm"],"entries":["src/main.tsx"]}}"#;
+        let cfg: OjConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(resolve_dedupe(&cfg), vec!["react".to_string(), "react-dom".to_string()]);
+        let (inc, exc, ent) = optimize_deps_lists(&cfg);
+        assert_eq!(inc, vec!["cjs-dep".to_string()]);
+        assert_eq!(exc, vec!["big-esm".to_string()]);
+        assert_eq!(ent, vec!["src/main.tsx".to_string()]);
+    }
+
+    #[test]
+    fn optimize_deps_absent_is_empty() {
+        let cfg: OjConfig = serde_json::from_str("{}").unwrap();
+        assert!(resolve_dedupe(&cfg).is_empty());
+        let (inc, exc, ent) = optimize_deps_lists(&cfg);
+        assert!(inc.is_empty() && exc.is_empty() && ent.is_empty());
     }
 
     #[test]

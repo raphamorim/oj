@@ -73,6 +73,8 @@ pub struct ViteValues {
     pub rollup_options: Option<serde_json::Value>,
     pub assets_inline_limit: Option<u64>,
     pub proxy: Option<serde_json::Value>,
+    pub dedupe: Option<Vec<String>>,
+    pub optimize_deps: Option<serde_json::Value>,
 }
 
 pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
@@ -113,6 +115,10 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
         rollup_options: json.get("rollupOptions").filter(|v| !v.is_null()).cloned(),
         assets_inline_limit: json.get("assetsInlineLimit").and_then(|v| v.as_u64()),
         proxy: json.get("proxy").filter(|v| !v.is_null()).cloned(),
+        dedupe: json.get("dedupe").and_then(|v| v.as_array()).map(|a| {
+            a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()
+        }),
+        optimize_deps: json.get("optimizeDeps").filter(|v| !v.is_null()).cloned(),
     }
 }
 
@@ -188,6 +194,19 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
                 if !map.is_empty() {
                     sc.proxy = Some(map);
                 }
+            }
+        }
+    }
+    if let Some(dedupe) = v.dedupe {
+        if !dedupe.is_empty() {
+            let rc = config.resolve.get_or_insert_with(Default::default);
+            rc.dedupe.get_or_insert(dedupe);
+        }
+    }
+    if let Some(od) = v.optimize_deps {
+        if config.optimize_deps.is_none() {
+            if let Ok(parsed) = serde_json::from_value::<oj_config::OptimizeDepsConfig>(od) {
+                config.optimize_deps = Some(parsed);
             }
         }
     }

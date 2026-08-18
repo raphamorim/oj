@@ -114,10 +114,26 @@ function extractProxy(proxy) {
   return Object.keys(out).length ? out : null;
 }
 
+function extractOptimizeDeps(od) {
+  if (!od || typeof od !== "object") return null;
+  const strArr = (v) =>
+    typeof v === "string" ? [v] : Array.isArray(v) ? v.filter((x) => typeof x === "string") : undefined;
+  const out = {};
+  const inc = strArr(od.include);
+  const exc = strArr(od.exclude);
+  const ent = strArr(od.entries);
+  if (inc) out.include = inc;
+  if (exc) out.exclude = exc;
+  if (ent) out.entries = ent;
+  return Object.keys(out).length ? out : null;
+}
+
 function warnUnsupported(c) {
   if (c.css?.preprocessorOptions) warn("css.preprocessorOptions is not applied yet");
   if (c.esbuild && typeof c.esbuild === "object") warn("esbuild options are not applied");
-  if (c.optimizeDeps) warn("optimizeDeps is ignored; oj has its own dependency optimizer");
+  if (c.optimizeDeps?.esbuildOptions || c.optimizeDeps?.rollupOptions) {
+    warn("optimizeDeps.esbuildOptions/rollupOptions are not applied; include/exclude/entries are");
+  }
   if (c.worker) warn("worker config is not applied");
   if (c.ssr) warn("ssr config is not applied");
   for (const k of ["strictPort", "open", "cors", "allowedHosts"]) {
@@ -141,6 +157,10 @@ try {
       rollupOptions: c.build?.rolldownOptions ?? c.build?.rollupOptions ?? null,
       assetsInlineLimit:
         typeof c.build?.assetsInlineLimit === "number" ? c.build.assetsInlineLimit : null,
+      dedupe: Array.isArray(c.resolve?.dedupe)
+        ? c.resolve.dedupe.filter((x) => typeof x === "string")
+        : null,
+      optimizeDeps: extractOptimizeDeps(c.optimizeDeps),
     }),
   );
 } catch (e) {
