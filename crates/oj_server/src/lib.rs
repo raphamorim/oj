@@ -3041,7 +3041,7 @@ impl HmrGate {
         true
     }
 
-    fn flush(&self, state: &Arc<ServerState>) -> (Vec<String>, usize) {
+    async fn flush(&self, state: &Arc<ServerState>) -> (Vec<String>, usize) {
         let entries: Vec<(PathBuf, std::collections::BTreeSet<String>)> = {
             let mut inner = self.inner.lock().unwrap();
             inner.generation += 1;
@@ -3059,7 +3059,7 @@ impl HmrGate {
             } else {
                 let paths: Vec<PathBuf> = entries.into_iter().map(|(p, _)| p).collect();
                 let sref: &ServerState = state;
-                for message in decide(sref, &paths) {
+                for message in decide(sref, &paths).await {
                     let _ = state.reload_tx.send(message);
                 }
             }
@@ -3090,7 +3090,7 @@ async fn hmr_flush(State(state): State<Arc<ServerState>>) -> Response {
     let Some(gate) = &state.hmr_gate else {
         return js_response_json(serde_json::json!({ "flushed": [], "count": 0, "mode": "disabled" }));
     };
-    let (files, count) = gate.flush(&state);
+    let (files, count) = gate.flush(&state).await;
     js_response_json(serde_json::json!({ "flushed": files, "count": count, "mode": gate.mode() }))
 }
 
@@ -3225,7 +3225,7 @@ fn spawn_watcher(state: Arc<ServerState>) {
                     continue;
                 }
             }
-            let messages = decide(&state, &paths);
+            let messages = state.rt.block_on(decide(&state, &paths));
             if messages.is_empty() {
                 continue;
             }
@@ -3238,13 +3238,16 @@ fn spawn_watcher(state: Arc<ServerState>) {
     });
 }
 
-fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
+// Async because it is reached both from the watcher thread (via block_on) and
+// from the async /__hmr_flush handler; using block_on here panicked ("runtime
+// within a runtime") when the gate flushed on an async worker thread.
+async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
     let mut messages: Vec<String> = Vec::new();
     let mut updates: Vec<serde_json::Value> = Vec::new();
 
     let plugin_watched: std::collections::HashSet<PathBuf> = {
         let mut raw: Vec<String> = match &state.plugins {
-            Some(host) => state.rt.block_on(host.watch_files()).unwrap_or_default(),
+            Some(host) => host.watch_files().await.unwrap_or_default(),
             None => Vec::new(),
         };
         raw.extend(
@@ -3285,11 +3288,11 @@ fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
         if let Some(host) = &state.plugins {
             let file = path.display().to_string();
             if state.plugins_watch_change {
-                let _ = state.rt.block_on(host.watch_change(&file, "update"));
+                let _ = host.watch_change(&file, "update").await;
             }
             if state.plugins_hot_update {
                 let ts = now_millis() as u64;
-                match state.rt.block_on(host.handle_hot_update(&file, ts)) {
+                match host.handle_hot_update(&file, ts).await {
                     Ok(Some(d)) if d == "skip" => {
                         println!("oj: change {file} -> HMR suppressed by plugin");
                         continue;
