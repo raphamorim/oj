@@ -10,7 +10,9 @@ fn resolve_stats(dir: &Path, name: &str) -> bool {
     if joined.is_file() {
         return true;
     }
-    COMPILABLE.iter().any(|ext| joined.with_extension(ext).is_file())
+    COMPILABLE
+        .iter()
+        .any(|ext| joined.with_extension(ext).is_file())
 }
 
 fn resolve_cached(entries: &std::collections::HashSet<OsString>, name: &str) -> bool {
@@ -59,10 +61,19 @@ fn main() {
     }
     let new = t.elapsed();
 
-    assert_eq!(hits_old, hits_new, "both paths must resolve the same imports");
+    assert_eq!(
+        hits_old, hits_new,
+        "both paths must resolve the same imports"
+    );
     let per = (names.len() * crawls) as f64;
     println!("resolve {} sibling imports x {crawls} crawls:", names.len());
-    println!("  OLD (per-import stats):   {old:?}  = {:.2} us/import", old.as_nanos() as f64 / per / 1000.0);
-    println!("  NEW (read_dir + lookup):  {new:?}  = {:.2} us/import", new.as_nanos() as f64 / per / 1000.0);
+    println!(
+        "  OLD (per-import stats):   {old:?}  = {:.2} us/import",
+        old.as_nanos() as f64 / per / 1000.0
+    );
+    println!(
+        "  NEW (read_dir + lookup):  {new:?}  = {:.2} us/import",
+        new.as_nanos() as f64 / per / 1000.0
+    );
     println!("  speedup: {:.1}x", old.as_secs_f64() / new.as_secs_f64());
 }

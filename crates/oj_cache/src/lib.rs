@@ -33,7 +33,10 @@ pub struct PersistentCache {
 
 impl PersistentCache {
     pub fn new(dir: PathBuf, tool_version: &str) -> Self {
-        Self { dir, salt: format!("{tool_version}:{CACHE_FORMAT}") }
+        Self {
+            dir,
+            salt: format!("{tool_version}:{CACHE_FORMAT}"),
+        }
     }
 
     pub fn key(&self, source: &[u8], url: &str, mode: &str) -> String {
@@ -82,7 +85,8 @@ mod tests {
     use super::*;
 
     fn temp_cache(label: &str) -> PersistentCache {
-        let dir = std::env::temp_dir().join(format!("oj-cache-test-{}-{label}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("oj-cache-test-{}-{label}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         PersistentCache::new(dir, "0.0.1-test")
     }
@@ -114,11 +118,19 @@ mod tests {
     fn every_input_changes_the_key() {
         let cache = temp_cache("keys");
         let base = cache.key(b"source", "/src/App.tsx", "dev");
-        assert_ne!(base, cache.key(b"source2", "/src/App.tsx", "dev"), "content");
+        assert_ne!(
+            base,
+            cache.key(b"source2", "/src/App.tsx", "dev"),
+            "content"
+        );
         assert_ne!(base, cache.key(b"source", "/src/Other.tsx", "dev"), "url");
         assert_ne!(base, cache.key(b"source", "/src/App.tsx", "prod"), "mode");
         let other_version = PersistentCache::new(std::env::temp_dir(), "9.9.9");
-        assert_ne!(base, other_version.key(b"source", "/src/App.tsx", "dev"), "version");
+        assert_ne!(
+            base,
+            other_version.key(b"source", "/src/App.tsx", "dev"),
+            "version"
+        );
     }
 
     #[test]
@@ -138,9 +150,20 @@ mod tests {
         let key = cache.key(b"s", "/u", "dev");
         cache.put(&key, &sample());
         let path = cache.path_for(&key);
-        assert_eq!(path.parent().unwrap().file_name().unwrap().to_str().unwrap(), &key[..2]);
+        assert_eq!(
+            path.parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            &key[..2]
+        );
         assert!(path.exists());
-        assert!(!path.with_extension("tmp").exists(), "temp file must be renamed away");
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "temp file must be renamed away"
+        );
     }
 
     #[test]

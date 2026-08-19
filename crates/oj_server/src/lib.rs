@@ -9,23 +9,23 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use axum::{
-    Router,
     body::Body,
-    extract::{Query, State, WebSocketUpgrade, ws::Message},
-    http::{HeaderMap, Method, StatusCode, Uri, header},
+    extract::{ws::Message, Query, State, WebSocketUpgrade},
+    http::{header, HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{get, post},
+    Router,
 };
 use oj_cache::{CachedModule, PersistentCache};
 
-pub mod sidecar;
-pub mod plugins;
 pub mod optimize;
+pub mod plugins;
+pub mod sidecar;
 pub mod svgr;
-use sidecar::{Sidecar, is_tailwind_css};
-use plugins::PluginHost;
 use oj_graph::{HmrDecision, ModuleGraph};
 use oj_resolver::OjResolver;
+use plugins::PluginHost;
+use sidecar::{is_tailwind_css, Sidecar};
 use tokio::sync::broadcast;
 
 #[inline]
@@ -92,25 +92,61 @@ pub const SSR_RUNNER_JS: &str = include_str!("assets/ssr-runner.mjs");
 const COMPILABLE: &[&str] = &["tsx", "ts", "jsx", "js", "mjs", "svelte"];
 
 const START_ASSETS: &[(&str, &str)] = &[
-    ("resolve-pkg.mjs", include_str!("assets/start/resolve-pkg.mjs")),
-    ("rolldown-assets.mjs", include_str!("assets/start/rolldown-assets.mjs")),
-    ("vite-plugin-bridge.mjs", include_str!("assets/start/vite-plugin-bridge.mjs")),
-    ("glob-transform.mjs", include_str!("assets/start/glob-transform.mjs")),
+    (
+        "resolve-pkg.mjs",
+        include_str!("assets/start/resolve-pkg.mjs"),
+    ),
+    (
+        "rolldown-assets.mjs",
+        include_str!("assets/start/rolldown-assets.mjs"),
+    ),
+    (
+        "vite-plugin-bridge.mjs",
+        include_str!("assets/start/vite-plugin-bridge.mjs"),
+    ),
+    (
+        "glob-transform.mjs",
+        include_str!("assets/start/glob-transform.mjs"),
+    ),
     ("cf-server.mjs", include_str!("assets/start/cf-server.mjs")),
     ("css-host.mjs", include_str!("assets/start/css-host.mjs")),
     ("loader.mjs", include_str!("assets/start/loader.mjs")),
-    ("loader-util.mjs", include_str!("assets/start/loader-util.mjs")),
+    (
+        "loader-util.mjs",
+        include_str!("assets/start/loader-util.mjs"),
+    ),
     ("runner.mjs", include_str!("assets/start/runner.mjs")),
     ("generate.mjs", include_str!("assets/start/generate.mjs")),
-    ("gen-resolver.mjs", include_str!("assets/start/gen-resolver.mjs")),
+    (
+        "gen-resolver.mjs",
+        include_str!("assets/start/gen-resolver.mjs"),
+    ),
     ("fn-stubs.mjs", include_str!("assets/start/fn-stubs.mjs")),
-    ("bundle-client.mjs", include_str!("assets/start/bundle-client.mjs")),
+    (
+        "bundle-client.mjs",
+        include_str!("assets/start/bundle-client.mjs"),
+    ),
     ("build.mjs", include_str!("assets/start/build.mjs")),
-    ("live-reload.js", include_str!("assets/start/live-reload.js")),
-    ("server-entry.tsx", include_str!("assets/start/server-entry.tsx")),
-    ("client-entry.tsx", include_str!("assets/start/client-entry.tsx")),
-    ("start-entry.ts", include_str!("assets/start/start-entry.ts")),
-    ("plugin-adapters.ts", include_str!("assets/start/plugin-adapters.ts")),
+    (
+        "live-reload.js",
+        include_str!("assets/start/live-reload.js"),
+    ),
+    (
+        "server-entry.tsx",
+        include_str!("assets/start/server-entry.tsx"),
+    ),
+    (
+        "client-entry.tsx",
+        include_str!("assets/start/client-entry.tsx"),
+    ),
+    (
+        "start-entry.ts",
+        include_str!("assets/start/start-entry.ts"),
+    ),
+    (
+        "plugin-adapters.ts",
+        include_str!("assets/start/plugin-adapters.ts"),
+    ),
     ("manifest.ts", include_str!("assets/start/manifest.ts")),
 ];
 
@@ -221,7 +257,11 @@ impl DevServer {
             .with_context(|| format!("app root not found: {}", self.root.display()))?;
 
         if let Some(cfg) = &self.config {
-            let cfg = if cfg.is_absolute() { cfg.clone() } else { root.join(cfg) };
+            let cfg = if cfg.is_absolute() {
+                cfg.clone()
+            } else {
+                root.join(cfg)
+            };
             plugins::set_vite_config_override(cfg);
         }
 
@@ -229,7 +269,11 @@ impl DevServer {
         plugins::adopt_vite_config_values(&mut config, &root);
 
         let env_prefix = config.env_prefix.as_deref().unwrap_or("VITE_");
-        let env_dir = config.env_dir.as_deref().map(|d| root.join(d)).unwrap_or_else(|| root.clone());
+        let env_dir = config
+            .env_dir
+            .as_deref()
+            .map(|d| root.join(d))
+            .unwrap_or_else(|| root.clone());
         let env = oj_env::load(&env_dir, "development");
         let mut defines = oj_env::import_meta_env_defines(
             &env,
@@ -243,10 +287,17 @@ impl DevServer {
         defines.extend(oj_config::environment_defines(&config, "ssr"));
         // Vite defines process.env.NODE_ENV in dev too (nodeEnv = NODE_ENV || mode);
         // without it, library code that reads it throws a ReferenceError in dev.
-        let node_env =
-            std::env::var("NODE_ENV").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "development".into());
-        let node_env_json = serde_json::to_string(&node_env).unwrap_or_else(|_| "\"development\"".into());
-        for key in ["process.env.NODE_ENV", "global.process.env.NODE_ENV", "globalThis.process.env.NODE_ENV"] {
+        let node_env = std::env::var("NODE_ENV")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "development".into());
+        let node_env_json =
+            serde_json::to_string(&node_env).unwrap_or_else(|_| "\"development\"".into());
+        for key in [
+            "process.env.NODE_ENV",
+            "global.process.env.NODE_ENV",
+            "globalThis.process.env.NODE_ENV",
+        ] {
             if !defines.iter().any(|(k, _)| k == key) {
                 defines.push((key.to_string(), node_env_json.clone()));
             }
@@ -258,8 +309,12 @@ impl DevServer {
         let port = self.port.or(server_cfg.port).unwrap_or(5199);
         let bundle = self.bundle || config.bundle.unwrap_or(false);
         let host = resolve_host(self.host.as_deref().or(server_cfg.host.as_deref()));
-        let proxy: Vec<(String, oj_config::ProxyEntry)> =
-            server_cfg.proxy.clone().unwrap_or_default().into_iter().collect();
+        let proxy: Vec<(String, oj_config::ProxyEntry)> = server_cfg
+            .proxy
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
 
         // TanStack Start owns its module graph and SSR; oj runs the plugin host
         // only to host configureServer middleware (the editor dev-server bridge),
@@ -271,7 +326,9 @@ impl DevServer {
                 let label = p.file_name().unwrap().to_string_lossy().into_owned();
                 (Some(p), "oj", label)
             }
-            Some(plugins::PluginSource::ViteConfig(p)) => (Some(p), "vite", "vite.config".to_string()),
+            Some(plugins::PluginSource::ViteConfig(p)) => {
+                (Some(p), "vite", "vite.config".to_string())
+            }
             None => (None, "oj", String::new()),
         };
 
@@ -356,8 +413,16 @@ impl DevServer {
             let enabled = server_cfg.hmr_gate == Some(true)
                 || std::env::var("LOVABLE_DEV_SERVER").as_deref() == Ok("true");
             if enabled {
-                let full_reload = std::env::var("LOVABLE_HMR_FULL_RELOAD").as_deref() != Ok("false");
-                println!("  hmr gate: on ({})", if full_reload { "full-reload" } else { "granular" });
+                let full_reload =
+                    std::env::var("LOVABLE_HMR_FULL_RELOAD").as_deref() != Ok("false");
+                println!(
+                    "  hmr gate: on ({})",
+                    if full_reload {
+                        "full-reload"
+                    } else {
+                        "granular"
+                    }
+                );
                 Some(Arc::new(HmrGate {
                     full_reload,
                     max_hold: Duration::from_millis(240_000),
@@ -396,10 +461,7 @@ impl DevServer {
                 &oj_config::resolve_alias(&config, "ssr"),
                 &oj_config::resolve_dedupe(&config),
             )),
-            cache: PersistentCache::new(
-                root.join(".oj-cache"),
-                env!("CARGO_PKG_VERSION"),
-            ),
+            cache: PersistentCache::new(root.join(".oj-cache"), env!("CARGO_PKG_VERSION")),
             memory: Mutex::new(MemoryCache::new(memory_cache_budget())),
             mtime_keys: Mutex::new(HashMap::new()),
             compile_locks: Mutex::new(HashMap::new()),
@@ -419,7 +481,11 @@ impl DevServer {
                             .iter()
                             .map(|p| {
                                 let pb = PathBuf::from(p);
-                                if pb.is_absolute() { pb } else { root.join(&pb) }
+                                if pb.is_absolute() {
+                                    pb
+                                } else {
+                                    root.join(&pb)
+                                }
                             })
                             .collect()
                     })
@@ -481,9 +547,18 @@ impl DevServer {
 
         let mut app = Router::new()
             .route("/@oj/client.js", get(|| async { js(CLIENT_JS) }))
-            .route("/@oj/refresh-runtime.js", get(|| async { js(REFRESH_RUNTIME_JS) }))
-            .route("/@oj/refresh-preamble.js", get(|| async { js(REFRESH_PREAMBLE_JS) }))
-            .route("/@oj/bundle-runtime.js", get(|| async { js(BUNDLE_RUNTIME_JS) }))
+            .route(
+                "/@oj/refresh-runtime.js",
+                get(|| async { js(REFRESH_RUNTIME_JS) }),
+            )
+            .route(
+                "/@oj/refresh-preamble.js",
+                get(|| async { js(REFRESH_PREAMBLE_JS) }),
+            )
+            .route(
+                "/@oj/bundle-runtime.js",
+                get(|| async { js(BUNDLE_RUNTIME_JS) }),
+            )
             .route("/@oj/chunk.js", get(serve_chunk))
             .route("/@oj/patch.js", get(serve_patch))
             .route("/@oj/lazy.js", get(serve_lazy))
@@ -518,8 +593,7 @@ impl DevServer {
                 proxy_middleware,
             ));
         }
-        let proxy_prefixes: Vec<String> =
-            state.proxy.iter().map(|(p, _)| p.clone()).collect();
+        let proxy_prefixes: Vec<String> = state.proxy.iter().map(|(p, _)| p.clone()).collect();
         let app = app.with_state(state);
 
         Ok(BuiltApp {
@@ -566,7 +640,11 @@ async fn ssr_resolve(
             if !spec.starts_with('.') && !spec.starts_with('/') {
                 return js_response_json(serde_json::json!({ "external": true, "spec": spec }));
             }
-            (StatusCode::NOT_FOUND, format!("cannot resolve {spec}: {}", e.reason)).into_response()
+            (
+                StatusCode::NOT_FOUND,
+                format!("cannot resolve {spec}: {}", e.reason),
+            )
+                .into_response()
         }
     }
 }
@@ -615,11 +693,18 @@ async fn ssr_module(
         };
     }
     let source = match ssr_plugin_host(&state).await {
-        Some(host) => host.transform(&source, id).await.map(|(code, _)| code).unwrap_or(source),
+        Some(host) => host
+            .transform(&source, id)
+            .await
+            .map(|(code, _)| code)
+            .unwrap_or(source),
         None => source,
     };
-    let compile_path: PathBuf =
-        if from_plugin { PathBuf::from("virtual.tsx") } else { path };
+    let compile_path: PathBuf = if from_plugin {
+        PathBuf::from("virtual.tsx")
+    } else {
+        path
+    };
     match oj_compiler::compile(&compile_path, &source, &oj_compiler::CompileOptions::prod()) {
         Ok(out) => js(out.code),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
@@ -661,8 +746,10 @@ fn ssr_css_module(root: &Path, path: &Path, source: &str) -> Result<String, Stri
     let output = oj_css::compile_css(&css_id, &css_src, true)?;
     Ok(match output.exports {
         Some(exports) => {
-            let map: serde_json::Map<String, serde_json::Value> =
-                exports.into_iter().map(|(k, v)| (k, serde_json::Value::String(v))).collect();
+            let map: serde_json::Map<String, serde_json::Value> = exports
+                .into_iter()
+                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                .collect();
             format!("export default {};", serde_json::Value::Object(map))
         }
         None => "export default {};".to_string(),
@@ -684,9 +771,12 @@ pub async fn preview(
     headers: Vec<(String, String)>,
     host: Option<String>,
 ) -> anyhow::Result<()> {
-    let dir = dir
-        .canonicalize()
-        .with_context(|| format!("build dir not found: {} (run `oj build` first)", dir.display()))?;
+    let dir = dir.canonicalize().with_context(|| {
+        format!(
+            "build dir not found: {} (run `oj build` first)",
+            dir.display()
+        )
+    })?;
     let headers: Vec<(header::HeaderName, header::HeaderValue)> = headers
         .iter()
         .filter_map(|(k, v)| Some((k.parse().ok()?, v.parse().ok()?)))
@@ -706,16 +796,28 @@ pub async fn preview(
 }
 
 fn preview_rel<'a>(path: &'a str, base: &str) -> Option<String> {
-    let trimmed = path.strip_prefix(base.trim_end_matches('/')).unwrap_or(path);
+    let trimmed = path
+        .strip_prefix(base.trim_end_matches('/'))
+        .unwrap_or(path);
     let rel = trimmed.trim_start_matches('/');
     if rel.split('/').any(|seg| seg == "..") {
         return None;
     }
-    Some(if rel.is_empty() { "index.html".to_string() } else { rel.to_string() })
+    Some(if rel.is_empty() {
+        "index.html".to_string()
+    } else {
+        rel.to_string()
+    })
 }
 
 async fn preview_serve(
-    State(state): State<Arc<(PathBuf, String, Vec<(header::HeaderName, header::HeaderValue)>)>>,
+    State(state): State<
+        Arc<(
+            PathBuf,
+            String,
+            Vec<(header::HeaderName, header::HeaderValue)>,
+        )>,
+    >,
     uri: Uri,
 ) -> Response {
     let (dir, base, extra_headers) = &*state;
@@ -723,7 +825,10 @@ async fn preview_serve(
         return (StatusCode::FORBIDDEN, "oj: path traversal denied").into_response();
     };
     let file = dir.join(&rel);
-    let ext = Path::new(&rel).extension().and_then(|e| e.to_str()).unwrap_or("");
+    let ext = Path::new(&rel)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
 
     let (target, ctype) = if file.is_file() {
         (file, content_type(ext))
@@ -748,7 +853,10 @@ async fn preview_serve(
             let mut resp = ([(header::CONTENT_TYPE, ctype)], bytes).into_response();
             let h = resp.headers_mut();
             if !cache_control.is_empty() {
-                h.insert(header::CACHE_CONTROL, header::HeaderValue::from_static(cache_control));
+                h.insert(
+                    header::CACHE_CONTROL,
+                    header::HeaderValue::from_static(cache_control),
+                );
             }
             for (name, value) in extra_headers {
                 h.insert(name.clone(), value.clone());
@@ -762,7 +870,11 @@ async fn preview_serve(
 /// A `lovable:boot-progress` custom HMR frame (editor boot narration). Shape
 /// mirrors web/shared/lib/preview/bootProgress.ts; ssrModules + clientModules
 /// are required non-negative ints or the editor drops the frame.
-pub fn boot_progress_frame(ssr_modules: usize, client_modules: usize, client_idle_ms: Option<u64>) -> String {
+pub fn boot_progress_frame(
+    ssr_modules: usize,
+    client_modules: usize,
+    client_idle_ms: Option<u64>,
+) -> String {
     serde_json::json!({
         "type": "custom",
         "event": "lovable:boot-progress",
@@ -880,8 +992,17 @@ async fn proxy_middleware(
             fwd_path = fwd_path.replacen(from, to, 1);
         }
     }
-    let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
-    let target = format!("{}{}{}", entry.target().trim_end_matches('/'), fwd_path, query);
+    let query = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let target = format!(
+        "{}{}{}",
+        entry.target().trim_end_matches('/'),
+        fwd_path,
+        query
+    );
 
     let method = req.method().clone();
     let req_headers = req.headers().clone();
@@ -892,7 +1013,10 @@ async fn proxy_middleware(
         }
     };
 
-    let mut out = state.http.request(method, &target).body(body_bytes.to_vec());
+    let mut out = state
+        .http
+        .request(method, &target)
+        .body(body_bytes.to_vec());
     for (name, value) in req_headers.iter() {
         if entry.change_origin() && name == header::HOST {
             continue;
@@ -916,8 +1040,15 @@ async fn proxy_middleware(
             response
         }
         Err(e) => {
-            let via = if entry.ws() { " (ws proxying not yet supported)" } else { "" };
-            (StatusCode::BAD_GATEWAY, format!("oj proxy to {}{} failed: {e}", prefix, via))
+            let via = if entry.ws() {
+                " (ws proxying not yet supported)"
+            } else {
+                ""
+            };
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("oj proxy to {}{} failed: {e}", prefix, via),
+            )
                 .into_response()
         }
     }
@@ -965,7 +1096,10 @@ fn is_spa_navigation(rel: &str, headers: &HeaderMap) -> bool {
     no_extension || accepts_html
 }
 
-async fn serve_fallback(State(state): State<Arc<ServerState>>, req: axum::extract::Request) -> Response {
+async fn serve_fallback(
+    State(state): State<Arc<ServerState>>,
+    req: axum::extract::Request,
+) -> Response {
     if req.method() == Method::GET {
         let headers = req.headers().clone();
         let uri = req.uri().clone();
@@ -974,7 +1108,10 @@ async fn serve_fallback(State(state): State<Arc<ServerState>>, req: axum::extrac
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
-    let body = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap_or_default().to_vec();
+    let body = axum::body::to_bytes(req.into_body(), usize::MAX)
+        .await
+        .unwrap_or_default()
+        .to_vec();
     forward_to_plugin_middleware(&state, &method, &uri, &headers, body)
         .await
         .unwrap_or_else(|| (StatusCode::NOT_FOUND, "oj: not found").into_response())
@@ -988,7 +1125,10 @@ async fn forward_to_plugin_middleware(
     body: Vec<u8>,
 ) -> Option<Response> {
     let port = state.plugin_mw_port?;
-    let pq = uri.path_and_query().map(|p| p.as_str()).unwrap_or(uri.path());
+    let pq = uri
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or(uri.path());
     let target = format!("http://127.0.0.1:{port}{pq}");
     let rmethod = reqwest::Method::from_bytes(method.as_str().as_bytes()).ok()?;
     let mut out = state.http.request(rmethod, &target);
@@ -1076,18 +1216,28 @@ async fn serve_path(
         state.optimized.ready().await;
         return match tokio::fs::read(state.optimized.dir().join(name)).await {
             Ok(bytes) => (
-                [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
+                [
+                    (header::CONTENT_TYPE, "text/javascript"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
                 bytes,
             )
                 .into_response(),
-            Err(_) => (StatusCode::NOT_FOUND, format!("oj: no optimized dep {name}")).into_response(),
+            Err(_) => (
+                StatusCode::NOT_FOUND,
+                format!("oj: no optimized dep {name}"),
+            )
+                .into_response(),
         };
     }
 
     if let Some(id) = uri.path().strip_prefix("/@virtual/") {
         return match state.virtual_modules.get(id) {
             Some(code) => (
-                [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
+                [
+                    (header::CONTENT_TYPE, "text/javascript"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
                 code.clone(),
             )
                 .into_response(),
@@ -1125,7 +1275,8 @@ async fn serve_path(
             Some(file) => file,
             None => {
                 if let Some(resp) =
-                    forward_to_plugin_middleware(&state, &Method::GET, &uri, &headers, Vec::new()).await
+                    forward_to_plugin_middleware(&state, &Method::GET, &uri, &headers, Vec::new())
+                        .await
                 {
                     return resp;
                 }
@@ -1143,16 +1294,17 @@ async fn serve_path(
         let url = url_of(&state.root, &file);
         return match asset_module(&file, &url, kind).await {
             Ok(js) => (
-                [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
+                [
+                    (header::CONTENT_TYPE, "text/javascript"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
                 js,
             )
                 .into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {e}")).into_response(),
         };
     }
-    if is_style_ext(ext)
-        && uri.query().is_some_and(|q| q.contains("import"))
-    {
+    if is_style_ext(ext) && uri.query().is_some_and(|q| q.contains("import")) {
         let url = url_of(&state.root, &file);
         return serve_css_wrapper(&state, &file, &url).await;
     }
@@ -1160,7 +1312,11 @@ async fn serve_path(
         let url = url_of(&state.root, &file);
         return serve_compiled(&state, &file, &url, uri.query(), &headers).await;
     }
-    if ext == "svg" && uri.query().is_some_and(|q| q.split('&').any(|kv| kv == "react")) {
+    if ext == "svg"
+        && uri
+            .query()
+            .is_some_and(|q| q.split('&').any(|kv| kv == "react"))
+    {
         let url = format!("{}?react", url_of(&state.root, &file));
         return serve_compiled(&state, &file, &url, None, &headers).await;
     }
@@ -1176,10 +1332,14 @@ async fn serve_path(
             if is_tailwind_css(&source) {
                 let url = url_of(&state.root, &file);
                 return match compile_tailwind(&state, &url, &source).await {
-                    Ok(css) => {
-                        ([(header::CONTENT_TYPE, "text/css"), (header::CACHE_CONTROL, "no-cache")], css)
-                            .into_response()
-                    }
+                    Ok(css) => (
+                        [
+                            (header::CONTENT_TYPE, "text/css"),
+                            (header::CACHE_CONTROL, "no-cache"),
+                        ],
+                        css,
+                    )
+                        .into_response(),
                     Err(err) => {
                         let _ = state.reload_tx.send(
                             serde_json::json!({ "type": "error", "message": err.clone() })
@@ -1198,10 +1358,11 @@ async fn serve_path(
                 .insert(header::CONTENT_TYPE, content_type(ext).parse().unwrap());
             response
         }
-        Err(err) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: read error: {err}"))
-                .into_response()
-        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("oj: read error: {err}"),
+        )
+            .into_response(),
     }
 }
 
@@ -1227,20 +1388,26 @@ async fn serve_compiled(
     let (key, module) = match ensure_module(state, file, url).await {
         Ok(pair) => pair,
         Err(err) => {
-            let _ = state.reload_tx.send(
-                serde_json::json!({ "type": "error", "message": err.clone() }).to_string(),
-            );
+            let _ = state
+                .reload_tx
+                .send(serde_json::json!({ "type": "error", "message": err.clone() }).to_string());
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {err}")).into_response();
         }
     };
 
     let etag = format!("\"{key}\"");
     if query.is_none() {
-        if let Some(inm) = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) {
+        if let Some(inm) = headers
+            .get(header::IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok())
+        {
             if inm == etag {
                 return (
                     StatusCode::NOT_MODIFIED,
-                    [(header::ETAG, etag), (header::CACHE_CONTROL, "no-cache".to_string())],
+                    [
+                        (header::ETAG, etag),
+                        (header::CACHE_CONTROL, "no-cache".to_string()),
+                    ],
                 )
                     .into_response();
             }
@@ -1276,7 +1443,9 @@ async fn ensure_module(
     url: &str,
 ) -> Result<(String, Arc<CachedModule>), String> {
     let react_svg = file.extension().and_then(|e| e.to_str()) == Some("svg")
-        && url.split_once('?').is_some_and(|(_, q)| q.split('&').any(|kv| kv == "react"));
+        && url
+            .split_once('?')
+            .is_some_and(|(_, q)| q.split('&').any(|kv| kv == "react"));
     let is_svelte = file.extension().and_then(|e| e.to_str()) == Some("svelte");
 
     if !react_svg && state.bundle {
@@ -1305,7 +1474,11 @@ async fn ensure_module(
             }
             if matches!(kind, "worker" | "sharedworker") {
                 let clean = url.split('?').next().unwrap_or(url);
-                let ctor = if kind == "sharedworker" { "SharedWorker" } else { "Worker" };
+                let ctor = if kind == "sharedworker" {
+                    "SharedWorker"
+                } else {
+                    "Worker"
+                };
                 let code = format!(
                     "export default function () {{ return new {ctor}(\"/@oj/worker.js?entry={}\", {{ type: \"module\" }}); }}\n",
                     hex_encode(clean)
@@ -1335,7 +1508,10 @@ async fn ensure_module(
 
     if !react_svg && is_asset_path(file) {
         let clean = url.split('?').next().unwrap_or(url);
-        let default = format!("export default {};\n", serde_json::Value::String(clean.to_string()));
+        let default = format!(
+            "export default {};\n",
+            serde_json::Value::String(clean.to_string())
+        );
         let module = if state.bundle {
             let mut noop = |_: &str| None;
             let factory = oj_compiler::bundle::compile_factory(file, url, &default, &mut noop)
@@ -1392,7 +1568,9 @@ async fn ensure_module(
     }
 
     let source = bytes_to_string(
-        tokio::fs::read(file).await.map_err(|err| format!("read error for {url}: {err}"))?,
+        tokio::fs::read(file)
+            .await
+            .map_err(|err| format!("read error for {url}: {err}"))?,
     )
     .map_err(|err| format!("read error for {url}: {err}"))?;
     if file.extension().and_then(|e| e.to_str()) == Some("css") && is_tailwind_css(&source) {
@@ -1424,7 +1602,11 @@ async fn ensure_module(
     };
     let key = state.cache.key(source.as_bytes(), url, mode);
     if let Some((mtime, size)) = stamp {
-        state.mtime_keys.lock().unwrap().insert(url.to_string(), (mtime, size, key.clone()));
+        state
+            .mtime_keys
+            .lock()
+            .unwrap()
+            .insert(url.to_string(), (mtime, size, key.clone()));
     }
 
     if let Some(module) = memory_get(state, url, &key) {
@@ -1463,7 +1645,9 @@ async fn ensure_module(
             fs_allow: Vec::new(),
             watch_files: Vec::new(),
         });
-        let _ = state.cache_writes.try_send((key.clone(), Arc::clone(&module)));
+        let _ = state
+            .cache_writes
+            .try_send((key.clone(), Arc::clone(&module)));
         memory_put(state, url, &key, &module);
         register_in_graph(state, url, &module);
         return Ok((key, module));
@@ -1472,13 +1656,15 @@ async fn ensure_module(
     let is_dep = url.contains("/node_modules/") || url.starts_with("/@fs/");
     let mut plugin_watch_files: Vec<String> = Vec::new();
     let source = match &state.plugins {
-        Some(host) if !is_dep && state.plugins_have_transform => match host.transform(&source, &file.to_string_lossy()).await {
-            Ok((code, watches)) => {
-                plugin_watch_files = watches;
-                code
+        Some(host) if !is_dep && state.plugins_have_transform => {
+            match host.transform(&source, &file.to_string_lossy()).await {
+                Ok((code, watches)) => {
+                    plugin_watch_files = watches;
+                    code
+                }
+                Err(_) => source,
             }
-            Err(_) => source,
-        },
+        }
         _ => source,
     };
 
@@ -1497,7 +1683,11 @@ async fn ensure_module(
         source
     };
 
-    let source = if react_svg { svgr::svg_to_component(&source) } else { source };
+    let source = if react_svg {
+        svgr::svg_to_component(&source)
+    } else {
+        source
+    };
     let source = if is_svelte {
         run_svelte_sidecar(state, url, &source)
             .await
@@ -1587,18 +1777,28 @@ async fn ensure_module(
                     return Some(format!("/@oj-deps/{}", meta.file));
                 }
             }
-            if let Some(url) = rewrite_specifier(&root, &dir, &resolver, &fs_allow, &dir_cache, spec, !bundle) {
+            if let Some(url) =
+                rewrite_specifier(&root, &dir, &resolver, &fs_allow, &dir_cache, spec, !bundle)
+            {
                 return Some(url);
             }
             if plugin_fallback && is_bare_specifier(spec) {
-                return Some(format!("/@id/{}?importer={}", hex_encode(spec), hex_encode(&importer_abs)));
+                return Some(format!(
+                    "/@id/{}?importer={}",
+                    hex_encode(spec),
+                    hex_encode(&importer_abs)
+                ));
             }
             None
         };
         if bundle {
-            let factory =
-                oj_compiler::bundle::compile_factory(&file_owned, &url_owned, &source, &mut rewrite)
-                    .map_err(|err| format!("compile error:\n{err}"))?;
+            let factory = oj_compiler::bundle::compile_factory(
+                &file_owned,
+                &url_owned,
+                &source,
+                &mut rewrite,
+            )
+            .map_err(|err| format!("compile error:\n{err}"))?;
             Ok(CachedModule {
                 is_boundary: factory.is_boundary(),
                 kind: match factory.kind {
@@ -1617,14 +1817,19 @@ async fn ensure_module(
             let output = if is_dep {
                 oj_compiler::cjs::compile_dep(&file_owned, &url_owned, &source, &mut rewrite)
             } else {
-                let interopped = oj_compiler::interop::rewrite_cjs_interop(&source, &file_owned, &|spec| {
-                    dep_map
-                        .get(spec)
-                        .filter(|m| m.needs_interop)
-                        .map(|m| format!("/@oj-deps/{}", m.file))
-                });
+                let interopped =
+                    oj_compiler::interop::rewrite_cjs_interop(&source, &file_owned, &|spec| {
+                        dep_map
+                            .get(spec)
+                            .filter(|m| m.needs_interop)
+                            .map(|m| format!("/@oj-deps/{}", m.file))
+                    });
                 let opts = if is_svelte {
-                    oj_compiler::CompileOptions { dev: true, refresh: false, sourcemap: true }
+                    oj_compiler::CompileOptions {
+                        dev: true,
+                        refresh: false,
+                        sourcemap: true,
+                    }
                 } else {
                     oj_compiler::CompileOptions::dev()
                 };
@@ -1643,7 +1848,11 @@ async fn ensure_module(
                 fs_allow: fs_allow_from(&output.imports),
                 watch_files: Vec::new(),
                 imports: output.imports,
-                kind: if is_svelte { "svelte".into() } else { String::new() },
+                kind: if is_svelte {
+                    "svelte".into()
+                } else {
+                    String::new()
+                },
                 require_map: Vec::new(),
                 css_exports: Vec::new(),
             })
@@ -1659,7 +1868,9 @@ async fn ensure_module(
         Ok(Err(err)) => return Err(err),
         Err(join_err) => return Err(format!("compiler task failed: {join_err}")),
     };
-    let _ = state.cache_writes.try_send((key.clone(), Arc::clone(&module)));
+    let _ = state
+        .cache_writes
+        .try_send((key.clone(), Arc::clone(&module)));
     memory_put(state, url, &key, &module);
     register_in_graph(state, url, &module);
     if state.plugins_use_module_parsed && !is_dep && !is_server {
@@ -1706,7 +1917,12 @@ struct MemoryCache {
 
 impl MemoryCache {
     fn new(budget: usize) -> Self {
-        MemoryCache { map: HashMap::new(), total: 0, budget, seq: 0 }
+        MemoryCache {
+            map: HashMap::new(),
+            total: 0,
+            budget,
+            seq: 0,
+        }
     }
 
     fn get(&mut self, url: &str, key: &str) -> Option<Arc<CachedModule>> {
@@ -1724,7 +1940,12 @@ impl MemoryCache {
         let bytes = module_weight(module) + url.len() + key.len() + MEMORY_ENTRY_OVERHEAD;
         self.seq += 1;
         let seq = self.seq;
-        let entry = MemoryEntry { key: key.to_string(), module: Arc::clone(module), bytes, seq };
+        let entry = MemoryEntry {
+            key: key.to_string(),
+            module: Arc::clone(module),
+            bytes,
+            seq,
+        };
         if let Some(old) = self.map.insert(url.to_string(), entry) {
             self.total -= old.bytes;
         }
@@ -1739,8 +1960,11 @@ impl MemoryCache {
             return;
         }
         let low = self.budget - self.budget / 10;
-        let mut order: Vec<(u64, String)> =
-            self.map.iter().map(|(url, e)| (e.seq, url.clone())).collect();
+        let mut order: Vec<(u64, String)> = self
+            .map
+            .iter()
+            .map(|(url, e)| (e.seq, url.clone()))
+            .collect();
         order.sort_unstable_by_key(|(seq, _)| *seq);
         for (_, url) in order {
             if self.total <= low || self.map.len() <= 1 {
@@ -1755,10 +1979,14 @@ impl MemoryCache {
 
 fn module_weight(module: &CachedModule) -> usize {
     fn strs(v: &[String]) -> usize {
-        v.iter().map(|s| s.len() + std::mem::size_of::<String>()).sum::<usize>()
+        v.iter()
+            .map(|s| s.len() + std::mem::size_of::<String>())
+            .sum::<usize>()
     }
     fn pairs(v: &[(String, String)]) -> usize {
-        v.iter().map(|(a, b)| a.len() + b.len() + 2 * std::mem::size_of::<String>()).sum::<usize>()
+        v.iter()
+            .map(|(a, b)| a.len() + b.len() + 2 * std::mem::size_of::<String>())
+            .sum::<usize>()
     }
     module.code.len()
         + module.map_data_url.as_ref().map_or(0, String::len)
@@ -1771,10 +1999,15 @@ fn module_weight(module: &CachedModule) -> usize {
 }
 
 fn memory_cache_budget() -> usize {
-    if let Some(mb) =
-        std::env::var("OJ_MEMORY_CACHE_MB").ok().and_then(|v| v.trim().parse::<usize>().ok())
+    if let Some(mb) = std::env::var("OJ_MEMORY_CACHE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
     {
-        return if mb == 0 { usize::MAX } else { mb.saturating_mul(1024 * 1024) };
+        return if mb == 0 {
+            usize::MAX
+        } else {
+            mb.saturating_mul(1024 * 1024)
+        };
     }
     // No explicit budget: scale to the container memory limit (density) if one is
     // visible, else a sane fixed default for a dev machine.
@@ -1861,9 +2094,9 @@ async fn serve_css_wrapper(state: &Arc<ServerState>, file: &Path, url: &str) -> 
     let (_, module) = match ensure_module(state, file, url).await {
         Ok(pair) => pair,
         Err(err) => {
-            let _ = state.reload_tx.send(
-                serde_json::json!({ "type": "error", "message": err.clone() }).to_string(),
-            );
+            let _ = state
+                .reload_tx
+                .send(serde_json::json!({ "type": "error", "message": err.clone() }).to_string());
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {err}")).into_response();
         }
     };
@@ -1886,19 +2119,30 @@ async fn serve_css_wrapper(state: &Arc<ServerState>, file: &Path, url: &str) -> 
         css = serde_json::Value::String(module.code.clone()),
     );
     (
-        [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
+        [
+            (header::CONTENT_TYPE, "text/javascript"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
         body,
     )
         .into_response()
 }
 
 pub fn has_postcss_config(root: &Path) -> bool {
-    ["postcss.config.js", "postcss.config.cjs", "postcss.config.mjs"]
-        .iter()
-        .any(|f| root.join(f).is_file())
+    [
+        "postcss.config.js",
+        "postcss.config.cjs",
+        "postcss.config.mjs",
+    ]
+    .iter()
+    .any(|f| root.join(f).is_file())
 }
 
-async fn run_css_sidecar(state: &Arc<ServerState>, url: &str, source: &str) -> Result<String, String> {
+async fn run_css_sidecar(
+    state: &Arc<ServerState>,
+    url: &str,
+    source: &str,
+) -> Result<String, String> {
     let sidecar = state
         .tailwind
         .get_or_try_init(|| Sidecar::spawn(&state.root))
@@ -1917,7 +2161,10 @@ fn is_style_ext(ext: &str) -> bool {
 
 fn is_style_url(url: &str) -> bool {
     let f = url.split('?').next().unwrap_or(url);
-    std::path::Path::new(f).extension().and_then(|e| e.to_str()).is_some_and(is_style_ext)
+    std::path::Path::new(f)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(is_style_ext)
 }
 
 async fn run_preprocess_sidecar(
@@ -1957,17 +2204,29 @@ async fn compile_tailwind(
 }
 
 fn handle_client_message(state: &Arc<ServerState>, text: &str) {
-    let Ok(msg) = serde_json::from_str::<serde_json::Value>(text) else { return };
+    let Ok(msg) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
     if msg["type"] == "invalidate" {
-        let Some(path) = msg["path"].as_str() else { return };
+        let Some(path) = msg["path"].as_str() else {
+            return;
+        };
         let reply = if state.bundle {
-            match state.graph.lock().unwrap().update_plan_from_importers(Path::new(path)) {
+            match state
+                .graph
+                .lock()
+                .unwrap()
+                .update_plan_from_importers(Path::new(path))
+            {
                 Ok(plan) => {
                     println!("oj: invalidate {path} -> patch {:?}", plan.boundaries);
-                    let seq =
-                        state.patch_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    let to_urls =
-                        |v: &[PathBuf]| -> Vec<String> { v.iter().map(|p| p.display().to_string()).collect() };
+                    let seq = state
+                        .patch_seq
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    let to_urls = |v: &[PathBuf]| -> Vec<String> {
+                        v.iter().map(|p| p.display().to_string()).collect()
+                    };
                     serde_json::json!({
                         "type": "patch",
                         "changed": [],
@@ -1983,7 +2242,12 @@ fn handle_client_message(state: &Arc<ServerState>, text: &str) {
                 }
             }
         } else {
-            match state.graph.lock().unwrap().propagate_update_from_importers(Path::new(path)) {
+            match state
+                .graph
+                .lock()
+                .unwrap()
+                .propagate_update_from_importers(Path::new(path))
+            {
                 HmrDecision::Update { boundaries } => {
                     println!("oj: invalidate {path} -> update {boundaries:?}");
                     let timestamp = now_millis() as u64;
@@ -2064,7 +2328,10 @@ fn svelte_hot_glue(url: &str) -> String {
     )
 }
 
-type DirCache = std::collections::HashMap<PathBuf, std::sync::Arc<std::collections::HashMap<std::ffi::OsString, bool>>>;
+type DirCache = std::collections::HashMap<
+    PathBuf,
+    std::sync::Arc<std::collections::HashMap<std::ffi::OsString, bool>>,
+>;
 
 fn is_file_cached(cache: &Mutex<DirCache>, path: &Path) -> bool {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
@@ -2104,7 +2371,10 @@ fn rewrite_specifier(
     }
 
     if let Some((base, query)) = spec.split_once('?') {
-        if matches!(query, "url" | "raw" | "inline" | "worker" | "sharedworker" | "init" | "react") {
+        if matches!(
+            query,
+            "url" | "raw" | "inline" | "worker" | "sharedworker" | "init" | "react"
+        ) {
             let resolved = rewrite_specifier(root, dir, resolver, fs_allow, dir_cache, base, false)
                 .or_else(|| {
                     resolver.resolve(dir, base).ok().map(|p| {
@@ -2134,7 +2404,10 @@ fn rewrite_specifier(
         let quick = if is_file_cached(dir_cache, &joined) {
             Some(joined)
         } else if joined.extension().is_none() {
-            COMPILABLE.iter().map(|ext| joined.with_extension(ext)).find(|c| is_file_cached(dir_cache, c))
+            COMPILABLE
+                .iter()
+                .map(|ext| joined.with_extension(ext))
+                .find(|c| is_file_cached(dir_cache, c))
         } else {
             None
         };
@@ -2211,7 +2484,9 @@ fn locate(root: &Path, public_dir: &Path, rel: &str) -> Option<PathBuf> {
 
 fn is_worker_query(url: &str) -> bool {
     match url.split_once('?') {
-        Some((_, q)) => q.split('&').any(|kv| kv == "worker" || kv == "sharedworker"),
+        Some((_, q)) => q
+            .split('&')
+            .any(|kv| kv == "worker" || kv == "sharedworker"),
         None => false,
     }
 }
@@ -2272,12 +2547,24 @@ fn base64_encode(bytes: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
         out.push(T[(n >> 18 & 63) as usize] as char);
         out.push(T[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -2317,7 +2604,8 @@ async fn serve_oj_routes(State(state): State<Arc<ServerState>>) -> Response {
     let synthetic = root.join("oj-routes.tsx");
     let compiled = tokio::task::spawn_blocking(move || {
         let dir = root.clone();
-        let mut rewrite = |s: &str| rewrite_specifier(&root, &dir, &resolver, &fs_allow, &dir_cache, s, true);
+        let mut rewrite =
+            |s: &str| rewrite_specifier(&root, &dir, &resolver, &fs_allow, &dir_cache, s, true);
         oj_compiler::compile_module(
             &synthetic,
             OJ_ROUTES_JS,
@@ -2330,12 +2618,23 @@ async fn serve_oj_routes(State(state): State<Arc<ServerState>>) -> Response {
     .await;
     match compiled {
         Ok(Ok(code)) => (
-            [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
+            [
+                (header::CONTENT_TYPE, "text/javascript"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
             code,
         )
             .into_response(),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: routes manifest: {e}")).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("compile task failed: {e}")).into_response(),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("oj: routes manifest: {e}"),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("compile task failed: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -2362,7 +2661,9 @@ async fn serve_plugin_resolve(state: &Arc<ServerState>, id: &str) -> Response {
     };
     let source = match host.load(id).await {
         Ok(Some(src)) => src,
-        Ok(None) => return (StatusCode::NOT_FOUND, format!("oj: no plugin loaded {id}")).into_response(),
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, format!("oj: no plugin loaded {id}")).into_response()
+        }
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
     let dep_map = state.optimized.ready().await;
@@ -2384,11 +2685,17 @@ async fn serve_plugin_resolve(state: &Arc<ServerState>, id: &str) -> Response {
                     return Some(format!("/@oj-deps/{}", meta.file));
                 }
             }
-            if let Some(url) = rewrite_specifier(&root, &root, &resolver, &fs_allow, &dir_cache, spec, true) {
+            if let Some(url) =
+                rewrite_specifier(&root, &root, &resolver, &fs_allow, &dir_cache, spec, true)
+            {
                 return Some(url);
             }
             if plugin_fallback && is_bare_specifier(spec) {
-                return Some(format!("/@id/{}?importer={}", hex_encode(spec), hex_encode(&importer_abs)));
+                return Some(format!(
+                    "/@id/{}?importer={}",
+                    hex_encode(spec),
+                    hex_encode(&importer_abs)
+                ));
             }
             None
         };
@@ -2404,12 +2711,19 @@ async fn serve_plugin_resolve(state: &Arc<ServerState>, id: &str) -> Response {
     .await;
     match compiled {
         Ok(Ok(code)) => (
-            [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
+            [
+                (header::CONTENT_TYPE, "text/javascript"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
             code,
         )
             .into_response(),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("compile task failed: {e}")).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("compile task failed: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -2420,7 +2734,11 @@ async fn serve_plugin_id(state: &Arc<ServerState>, spec: &str, importer: &str) -
     let id = match host.resolve_id(spec, importer).await {
         Ok(Some(id)) => id,
         Ok(None) => {
-            return (StatusCode::NOT_FOUND, format!("oj: no plugin resolved {spec}")).into_response();
+            return (
+                StatusCode::NOT_FOUND,
+                format!("oj: no plugin resolved {spec}"),
+            )
+                .into_response();
         }
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
@@ -2436,7 +2754,8 @@ async fn serve_plugin_id(state: &Arc<ServerState>, spec: &str, importer: &str) -
     let fs_allow = Arc::clone(&state.fs_allow);
     let dir_cache = Arc::clone(&state.dir_cache);
     let compiled = tokio::task::spawn_blocking(move || {
-        let mut rewrite = |s: &str| rewrite_specifier(&root, &root, &resolver, &fs_allow, &dir_cache, s, true);
+        let mut rewrite =
+            |s: &str| rewrite_specifier(&root, &root, &resolver, &fs_allow, &dir_cache, s, true);
         oj_compiler::compile_module(
             Path::new("plugin.tsx"),
             &source,
@@ -2449,12 +2768,19 @@ async fn serve_plugin_id(state: &Arc<ServerState>, spec: &str, importer: &str) -
     .await;
     match compiled {
         Ok(Ok(code)) => (
-            [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
+            [
+                (header::CONTENT_TYPE, "text/javascript"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
             code,
         )
             .into_response(),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("compile task failed: {e}")).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("compile task failed: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -2488,13 +2814,35 @@ fn hex_decode(s: &str) -> Option<String> {
 fn is_asset_ext(ext: &str) -> bool {
     matches!(
         ext,
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "ico" | "bmp" | "svg" | "woff" | "woff2"
-            | "ttf" | "otf" | "eot" | "mp4" | "webm" | "mov" | "mp3" | "wav" | "ogg" | "wasm"
+        "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "avif"
+            | "ico"
+            | "bmp"
+            | "svg"
+            | "woff"
+            | "woff2"
+            | "ttf"
+            | "otf"
+            | "eot"
+            | "mp4"
+            | "webm"
+            | "mov"
+            | "mp3"
+            | "wav"
+            | "ogg"
+            | "wasm"
     )
 }
 
 fn is_asset_path(file: &Path) -> bool {
-    file.extension().and_then(|e| e.to_str()).map(is_asset_ext).unwrap_or(false)
+    file.extension()
+        .and_then(|e| e.to_str())
+        .map(is_asset_ext)
+        .unwrap_or(false)
 }
 
 fn content_type(ext: &str) -> &'static str {
@@ -2521,7 +2869,10 @@ fn content_type(ext: &str) -> &'static str {
 }
 
 fn now_millis() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn inject_module_preloads(html: String, state: &ServerState) -> String {
@@ -2560,7 +2911,9 @@ fn inject_bundle_scripts(html: String) -> String {
     let mut out = String::with_capacity(html.len());
     let mut rest = html.as_str();
     while let Some(start) = rest.find("<script") {
-        let Some(tag_close) = rest[start..].find('>') else { break };
+        let Some(tag_close) = rest[start..].find('>') else {
+            break;
+        };
         let tag = &rest[start..start + tag_close];
         let entry_src = tag.contains("type=\"module\"")
             && tag
@@ -2630,14 +2983,20 @@ async fn serve_chunk(State(state): State<Arc<ServerState>>, headers: HeaderMap) 
         let file = match locate_url(&state, &url) {
             Ok(file) => file,
             Err(err) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: chunk: {err}"))
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("oj: chunk: {err}"),
+                )
                     .into_response();
             }
         };
         let module = match ensure_module(&state, &file, &url).await {
             Ok((_, module)) => module,
             Err(err) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: chunk: {err}"))
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("oj: chunk: {err}"),
+                )
                     .into_response();
             }
         };
@@ -2651,17 +3010,27 @@ async fn serve_chunk(State(state): State<Arc<ServerState>>, headers: HeaderMap) 
     for entry in html_entries(&state.root) {
         chunk.push_str(&format!("__oj_start({entry:?});\n"));
     }
-    let etag = format!("\"{}\"", state.cache.key(chunk.as_bytes(), "/@oj/chunk.js", "chunk"));
+    let etag = format!(
+        "\"{}\"",
+        state.cache.key(chunk.as_bytes(), "/@oj/chunk.js", "chunk")
+    );
     let body = Arc::new(chunk);
     *state.chunk_cache.lock().unwrap() = Some((etag.clone(), Arc::clone(&body)));
     chunk_response(&headers, etag, body)
 }
 
 fn chunk_response(headers: &HeaderMap, etag: String, body: Arc<String>) -> Response {
-    if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(etag.as_str()) {
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        == Some(etag.as_str())
+    {
         return (
             StatusCode::NOT_MODIFIED,
-            [(header::ETAG, etag), (header::CACHE_CONTROL, "no-cache".to_string())],
+            [
+                (header::ETAG, etag),
+                (header::CACHE_CONTROL, "no-cache".to_string()),
+            ],
         )
             .into_response();
     }
@@ -2673,7 +3042,8 @@ fn chunk_response(headers: &HeaderMap, etag: String, body: Arc<String>) -> Respo
         ],
         body.as_str().to_string(),
     )
-        .into_response()}
+        .into_response()
+}
 
 async fn serve_patch(State(state): State<Arc<ServerState>>, uri: Uri) -> Response {
     let query = uri.query().unwrap_or("");
@@ -2691,13 +3061,19 @@ async fn serve_patch(State(state): State<Arc<ServerState>>, uri: Uri) -> Respons
                 let _ = state.reload_tx.send(
                     serde_json::json!({ "type": "error", "message": err.clone() }).to_string(),
                 );
-                return (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: patch: {err}"))
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("oj: patch: {err}"),
+                )
                     .into_response();
             }
         }
     }
     (
-        [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
+        [
+            (header::CONTENT_TYPE, "text/javascript"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
         patch,
     )
         .into_response()
@@ -2721,11 +3097,17 @@ async fn serve_worker_chunk(State(state): State<Arc<ServerState>>, uri: Uri) -> 
         if url.starts_with("/@oj/") || !seen.insert(url.clone()) {
             continue;
         }
-        let Ok(file) = locate_url(&state, &url) else { continue };
+        let Ok(file) = locate_url(&state, &url) else {
+            continue;
+        };
         let module = match ensure_module(&state, &file, &url).await {
             Ok((_, module)) => module,
             Err(err) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: worker: {err}")).into_response();
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("oj: worker: {err}"),
+                )
+                    .into_response();
             }
         };
         chunk.push_str(&render_registration(&url, &module));
@@ -2740,9 +3122,15 @@ async fn serve_worker_chunk(State(state): State<Arc<ServerState>>, uri: Uri) -> 
             }
         }
     }
-    chunk.push_str(&format!("__oj_start({});\n", serde_json::Value::String(entry)));
+    chunk.push_str(&format!(
+        "__oj_start({});\n",
+        serde_json::Value::String(entry)
+    ));
     (
-        [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
+        [
+            (header::CONTENT_TYPE, "text/javascript"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
         chunk,
     )
         .into_response()
@@ -2801,12 +3189,22 @@ async fn registration_for(state: &Arc<ServerState>, url: &str) -> Result<String,
 
 async fn serve_lazy(State(state): State<Arc<ServerState>>, uri: Uri) -> Response {
     let query = uri.query().unwrap_or("");
-    let field = |k: &str| query.split('&').find_map(|kv| kv.strip_prefix(k)).map(urldecode);
+    let field = |k: &str| {
+        query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix(k))
+            .map(urldecode)
+    };
     let Some(id) = field("id=").filter(|s| !s.is_empty()) else {
         return (StatusCode::BAD_REQUEST, "oj: lazy: id required").into_response();
     };
     let mut visited: std::collections::HashSet<String> = field("have=")
-        .map(|v| v.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect())
+        .map(|v| {
+            v.split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
 
     let mut chunk = String::new();
@@ -2820,10 +3218,18 @@ async fn serve_lazy(State(state): State<Arc<ServerState>>, uri: Uri) -> Response
         if url.starts_with("/@oj/") || !visited.insert(url.clone()) {
             continue;
         }
-        let Ok(file) = locate_url(&state, &url) else { continue };
+        let Ok(file) = locate_url(&state, &url) else {
+            continue;
+        };
         let module = match ensure_module(&state, &file, &url).await {
             Ok((_, module)) => module,
-            Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: lazy: {err}")).into_response(),
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("oj: lazy: {err}"),
+                )
+                    .into_response()
+            }
         };
         chunk.push_str(&render_registration(&url, &module));
         for imp in &module.imports {
@@ -2838,7 +3244,10 @@ async fn serve_lazy(State(state): State<Arc<ServerState>>, uri: Uri) -> Response
         }
     }
     (
-        [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
+        [
+            (header::CONTENT_TYPE, "text/javascript"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
         chunk,
     )
         .into_response()
@@ -2882,7 +3291,11 @@ pub fn html_entry_src(src: &str) -> Option<String> {
         return None;
     }
     let s = s.strip_prefix("./").unwrap_or(s);
-    Some(if s.starts_with('/') { s.to_string() } else { format!("/{s}") })
+    Some(if s.starts_with('/') {
+        s.to_string()
+    } else {
+        format!("/{s}")
+    })
 }
 
 fn html_entries(root: &Path) -> Vec<String> {
@@ -2891,7 +3304,9 @@ fn html_entries(root: &Path) -> Vec<String> {
     };
     let mut entries = Vec::new();
     for tag_start in html.match_indices("<script").map(|(i, _)| i) {
-        let Some(tag_end) = html[tag_start..].find('>') else { continue };
+        let Some(tag_end) = html[tag_start..].find('>') else {
+            continue;
+        };
         let tag = &html[tag_start..tag_start + tag_end];
         if !tag.contains("type=\"module\"") {
             continue;
@@ -2922,13 +3337,20 @@ fn spawn_crawl(state: Arc<ServerState>, done_tx: tokio::sync::watch::Sender<bool
                 }
                 let file = if let Some(abs) = url.strip_prefix("/@fs") {
                     let f = PathBuf::from(abs);
-                    let ok = { let a = state.fs_allow.lock().unwrap();
-                        a.iter().any(|r| f.starts_with(r)) };
-                    if !ok { continue; }
+                    let ok = {
+                        let a = state.fs_allow.lock().unwrap();
+                        a.iter().any(|r| f.starts_with(r))
+                    };
+                    if !ok {
+                        continue;
+                    }
                     f
                 } else {
                     let rel = url.trim_start_matches('/').to_string();
-                    match locate(&state.root, &state.public_dir, &rel) { Some(f) => f, None => continue }
+                    match locate(&state.root, &state.public_dir, &rel) {
+                        Some(f) => f,
+                        None => continue,
+                    }
                 };
                 let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
                 if !COMPILABLE.contains(&ext) && !(is_style_ext(ext) || ext == "json") {
@@ -2949,8 +3371,7 @@ fn spawn_crawl(state: Arc<ServerState>, done_tx: tokio::sync::watch::Sender<bool
                 None => break,
                 Some(imports) => {
                     for import in imports.unwrap_or_default() {
-                        let import =
-                            import.split('?').next().unwrap_or(&import).to_string();
+                        let import = import.split('?').next().unwrap_or(&import).to_string();
                         if import.starts_with('/')
                             && !import.starts_with("/@oj/")
                             && !visited.contains(&import)
@@ -2963,7 +3384,12 @@ fn spawn_crawl(state: Arc<ServerState>, done_tx: tokio::sync::watch::Sender<bool
         }
 
         let paths = state.graph.lock().unwrap().module_paths();
-        println!("{} eager graph ready: {} modules in {:?}", oj_tag(), paths.len(), started.elapsed());
+        println!(
+            "{} eager graph ready: {} modules in {:?}",
+            oj_tag(),
+            paths.len(),
+            started.elapsed()
+        );
         save_graph_snapshot(&state.root, &paths);
         let _ = done_tx.send(true);
     });
@@ -3017,7 +3443,11 @@ impl HmrGate {
         let mut inner = self.inner.lock().unwrap();
         let was_empty = inner.pending.is_empty();
         for p in relevant {
-            inner.pending.entry(p.clone()).or_default().insert("change".to_string());
+            inner
+                .pending
+                .entry(p.clone())
+                .or_default()
+                .insert("change".to_string());
         }
         if was_empty {
             inner.generation += 1;
@@ -3047,7 +3477,10 @@ impl HmrGate {
             inner.generation += 1;
             std::mem::take(&mut inner.pending).into_iter().collect()
         };
-        let files: Vec<String> = entries.iter().map(|(p, _)| p.display().to_string()).collect();
+        let files: Vec<String> = entries
+            .iter()
+            .map(|(p, _)| p.display().to_string())
+            .collect();
         let count = entries.len();
         if !entries.is_empty() {
             *state.chunk_cache.lock().unwrap() = None;
@@ -3068,14 +3501,21 @@ impl HmrGate {
     }
 
     fn mode(&self) -> &'static str {
-        if self.full_reload { "full-reload" } else { "granular" }
+        if self.full_reload {
+            "full-reload"
+        } else {
+            "granular"
+        }
     }
 
     fn status(&self) -> serde_json::Value {
         let inner = self.inner.lock().unwrap();
         let mut pending = serde_json::Map::new();
         for (p, events) in &inner.pending {
-            pending.insert(p.display().to_string(), serde_json::json!(events.iter().collect::<Vec<_>>()));
+            pending.insert(
+                p.display().to_string(),
+                serde_json::json!(events.iter().collect::<Vec<_>>()),
+            );
         }
         serde_json::json!({
             "enabled": true,
@@ -3088,7 +3528,9 @@ impl HmrGate {
 
 async fn hmr_flush(State(state): State<Arc<ServerState>>) -> Response {
     let Some(gate) = &state.hmr_gate else {
-        return js_response_json(serde_json::json!({ "flushed": [], "count": 0, "mode": "disabled" }));
+        return js_response_json(
+            serde_json::json!({ "flushed": [], "count": 0, "mode": "disabled" }),
+        );
     };
     let (files, count) = gate.flush(&state).await;
     js_response_json(serde_json::json!({ "flushed": files, "count": count, "mode": gate.mode() }))
@@ -3111,10 +3553,17 @@ fn is_restart_trigger(path: &Path) -> bool {
         return true;
     }
     let stem_ext = |bases: &[&str], exts: &[&str]| {
-        bases.iter().any(|b| exts.iter().any(|e| name == format!("{b}.{e}")))
+        bases
+            .iter()
+            .any(|b| exts.iter().any(|e| name == format!("{b}.{e}")))
     };
     stem_ext(
-        &["vite.config", "oj.config", "postcss.config", "tailwind.config"],
+        &[
+            "vite.config",
+            "oj.config",
+            "postcss.config",
+            "tailwind.config",
+        ],
         &["ts", "js", "mjs", "cjs", "mts", "cts"],
     )
 }
@@ -3164,7 +3613,10 @@ fn spawn_watcher(state: Arc<ServerState>) {
         // events. Skipping them at watch time is more robust than filtering
         // after the fact.
         let ignore = |name: &std::ffi::OsStr| {
-            matches!(name.to_str(), Some("node_modules" | ".oj-cache" | "dist" | ".git"))
+            matches!(
+                name.to_str(),
+                Some("node_modules" | ".oj-cache" | "dist" | ".git")
+            )
         };
         let mut watched_any = false;
         if let Ok(entries) = std::fs::read_dir(&state.root) {
@@ -3173,7 +3625,11 @@ fn spawn_watcher(state: Arc<ServerState>) {
                     continue;
                 }
                 let path = entry.path();
-                let mode = if path.is_dir() { RecursiveMode::Recursive } else { RecursiveMode::NonRecursive };
+                let mode = if path.is_dir() {
+                    RecursiveMode::Recursive
+                } else {
+                    RecursiveMode::NonRecursive
+                };
                 if watcher.watch(&path, mode).is_ok() {
                     watched_any = true;
                 }
@@ -3202,8 +3658,7 @@ fn spawn_watcher(state: Arc<ServerState>) {
             if matches!(first.kind, notify::EventKind::Access(_)) {
                 continue;
             }
-            let mut paths: std::collections::HashSet<PathBuf> =
-                first.paths.into_iter().collect();
+            let mut paths: std::collections::HashSet<PathBuf> = first.paths.into_iter().collect();
             loop {
                 match rx.recv_timeout(Duration::from_millis(debounce_ms)) {
                     Ok(Ok(ev)) if !matches!(ev.kind, notify::EventKind::Access(_)) => {
@@ -3251,7 +3706,12 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
             None => Vec::new(),
         };
         raw.extend(
-            state.plugin_watched.lock().unwrap().iter().map(|p| p.to_string_lossy().into_owned()),
+            state
+                .plugin_watched
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned()),
         );
         raw.into_iter()
             .map(|p| std::fs::canonicalize(&p).unwrap_or_else(|_| PathBuf::from(p)))
@@ -3262,10 +3722,10 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
         !p.components().any(|c| {
             let c = c.as_os_str();
             c == "node_modules" || c == ".oj-cache" || c == "dist"
-        })
-            && p.extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| COMPILABLE.contains(&e))
+        }) && p
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| COMPILABLE.contains(&e))
     });
     if source_changed {
         let timestamp = now_millis() as u64;
@@ -3300,7 +3760,8 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
                     Ok(Some(d)) if d == "full-reload" => {
                         println!("oj: change {file} -> full-reload (plugin)");
                         messages.push(
-                            serde_json::json!({ "type": "full-reload", "reason": "plugin" }).to_string(),
+                            serde_json::json!({ "type": "full-reload", "reason": "plugin" })
+                                .to_string(),
                         );
                         return messages;
                     }
@@ -3312,9 +3773,13 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
         if !plugin_watched.is_empty() {
             let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
             if plugin_watched.contains(&canon) {
-                println!("oj: change {} -> full-reload (plugin watch)", path.display());
+                println!(
+                    "oj: change {} -> full-reload (plugin watch)",
+                    path.display()
+                );
                 messages.push(
-                    serde_json::json!({ "type": "full-reload", "reason": "plugin-watch" }).to_string(),
+                    serde_json::json!({ "type": "full-reload", "reason": "plugin-watch" })
+                        .to_string(),
                 );
                 return messages;
             }
@@ -3386,7 +3851,11 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
                 }
             }
         }
-        let decision = state.graph.lock().unwrap().propagate_update(Path::new(&url));
+        let decision = state
+            .graph
+            .lock()
+            .unwrap()
+            .propagate_update(Path::new(&url));
         match decision {
             HmrDecision::Update { boundaries } => {
                 println!("oj: change {url} -> update {boundaries:?}");
@@ -3463,17 +3932,32 @@ mod tests {
     #[test]
     fn preview_rel_maps_base_and_guards_traversal() {
         assert_eq!(preview_rel("/", "/").as_deref(), Some("index.html"));
-        assert_eq!(preview_rel("/assets/x.js", "/").as_deref(), Some("assets/x.js"));
-        assert_eq!(preview_rel("/app/assets/x.js", "/app/").as_deref(), Some("assets/x.js"));
+        assert_eq!(
+            preview_rel("/assets/x.js", "/").as_deref(),
+            Some("assets/x.js")
+        );
+        assert_eq!(
+            preview_rel("/app/assets/x.js", "/app/").as_deref(),
+            Some("assets/x.js")
+        );
         assert_eq!(preview_rel("/app/", "/app/").as_deref(), Some("index.html"));
         assert_eq!(preview_rel("/../etc/passwd", "/"), None);
     }
 
     #[test]
     fn html_entry_src_normalizes_relative_and_excludes_external() {
-        assert_eq!(html_entry_src("src/index.tsx").as_deref(), Some("/src/index.tsx"));
-        assert_eq!(html_entry_src("./src/index.tsx").as_deref(), Some("/src/index.tsx"));
-        assert_eq!(html_entry_src("/src/index.tsx").as_deref(), Some("/src/index.tsx"));
+        assert_eq!(
+            html_entry_src("src/index.tsx").as_deref(),
+            Some("/src/index.tsx")
+        );
+        assert_eq!(
+            html_entry_src("./src/index.tsx").as_deref(),
+            Some("/src/index.tsx")
+        );
+        assert_eq!(
+            html_entry_src("/src/index.tsx").as_deref(),
+            Some("/src/index.tsx")
+        );
         assert_eq!(html_entry_src("https://cdn/x.js"), None);
         assert_eq!(html_entry_src("//cdn/x.js"), None);
         assert_eq!(html_entry_src("data:text/js,1"), None);
@@ -3483,7 +3967,10 @@ mod tests {
     fn spa_navigation_falls_back_only_for_routes() {
         let html = {
             let mut h = HeaderMap::new();
-            h.insert(header::ACCEPT, "text/html,application/xhtml+xml".parse().unwrap());
+            h.insert(
+                header::ACCEPT,
+                "text/html,application/xhtml+xml".parse().unwrap(),
+            );
             h
         };
         let empty = HeaderMap::new();
@@ -3514,13 +4001,25 @@ mod adapter_tests {
         let base = tmp("ts");
         let app = base.join("app");
         std::fs::create_dir_all(app.join("src").join("routes")).unwrap();
-        std::fs::write(app.join("package.json"), r#"{"dependencies":{"react":"19"}}"#).unwrap();
+        std::fs::write(
+            app.join("package.json"),
+            r#"{"dependencies":{"react":"19"}}"#,
+        )
+        .unwrap();
         assert!(!is_tanstack_start_app(&app));
-        std::fs::write(app.join("package.json"), r#"{"dependencies":{"@tanstack/react-start":"1"}}"#).unwrap();
+        std::fs::write(
+            app.join("package.json"),
+            r#"{"dependencies":{"@tanstack/react-start":"1"}}"#,
+        )
+        .unwrap();
         assert!(is_tanstack_start_app(&app));
         let app2 = base.join("app2");
         std::fs::create_dir_all(app2.join("src")).unwrap();
-        std::fs::write(app2.join("package.json"), r#"{"dependencies":{"@tanstack/react-start":"1"}}"#).unwrap();
+        std::fs::write(
+            app2.join("package.json"),
+            r#"{"dependencies":{"@tanstack/react-start":"1"}}"#,
+        )
+        .unwrap();
         assert!(!is_tanstack_start_app(&app2));
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -3535,8 +4034,14 @@ mod adapter_tests {
         std::fs::write(root.join("src").join("App.tsx"), "x").unwrap();
         std::fs::write(public.join("img").join("logo.webp"), "y").unwrap();
 
-        assert_eq!(locate(&root, &public, "src/App"), Some(root.join("src/App.tsx")));
-        assert_eq!(locate(&root, &public, "img/logo.webp"), Some(public.join("img/logo.webp")));
+        assert_eq!(
+            locate(&root, &public, "src/App"),
+            Some(root.join("src/App.tsx"))
+        );
+        assert_eq!(
+            locate(&root, &public, "img/logo.webp"),
+            Some(public.join("img/logo.webp"))
+        );
         assert_eq!(locate(&root, &public, "img/missing.webp"), None);
         assert_eq!(locate(&root, &public, "../secret"), None);
         let _ = std::fs::remove_dir_all(&base);

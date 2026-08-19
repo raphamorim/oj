@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
@@ -93,8 +93,12 @@ impl Sidecar {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
-                let Some(id) = msg["id"].as_u64() else { continue };
+                let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
+                    continue;
+                };
+                let Some(id) = msg["id"].as_u64() else {
+                    continue;
+                };
                 let result = match msg["css"].as_str() {
                     Some(css) => Ok(css.to_string()),
                     None => Err(msg["error"].as_str().unwrap_or("sidecar error").to_string()),
@@ -114,7 +118,11 @@ impl Sidecar {
         let request = serde_json::json!({ "id": id, "base": self.base, "css": css, "from": from });
         {
             let mut stdin = self.stdin.lock().await;
-            if stdin.write_all(format!("{request}\n").as_bytes()).await.is_err() {
+            if stdin
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .is_err()
+            {
                 return Err("tailwind sidecar died (is tailwindcss installed?)".into());
             }
         }

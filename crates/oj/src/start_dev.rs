@@ -6,8 +6,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use axum::{
-    extract::{FromRequestParts, Request, State, WebSocketUpgrade, ws::Message},
-    http::{Method, StatusCode, header},
+    extract::{ws::Message, FromRequestParts, Request, State, WebSocketUpgrade},
+    http::{header, Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -36,7 +36,11 @@ struct StartState {
     css_host: Option<Arc<tokio::sync::Mutex<Runner>>>,
 }
 
-pub async fn start_dev(root: PathBuf, port: Option<u16>, host: Option<String>) -> anyhow::Result<()> {
+pub async fn start_dev(
+    root: PathBuf,
+    port: Option<u16>,
+    host: Option<String>,
+) -> anyhow::Result<()> {
     let root = root
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("app root not found: {}: {e}", root.display()))?;
@@ -58,8 +62,14 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>, host: Option<String>) -
         let (root, cache) = (root.clone(), cache.clone());
         tokio::task::spawn_blocking(move || bundle_client_entry(&root, &cache))
     };
-    let built_fut =
-        oj_server::DevServer { root: root.clone(), port, bundle: false, host, config: None }.build_app();
+    let built_fut = oj_server::DevServer {
+        root: root.clone(),
+        port,
+        bundle: false,
+        host,
+        config: None,
+    }
+    .build_app();
     let (bundle_res, built_res) = tokio::join!(bundle, built_fut);
     bundle_res??;
     resolver.await??;
@@ -88,9 +98,10 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>, host: Option<String>) -
 
     spawn_start_watcher(root.clone(), cache.clone(), Arc::clone(&state));
 
-    let app = built
-        .router
-        .layer(axum::middleware::from_fn_with_state(Arc::clone(&state), start_route));
+    let app = built.router.layer(axum::middleware::from_fn_with_state(
+        Arc::clone(&state),
+        start_route,
+    ));
 
     let addr = std::net::SocketAddr::from((built.host, built.port));
     let listener = tokio::net::TcpListener::bind(addr)
@@ -105,7 +116,12 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>, host: Option<String>) -
 
 async fn reload_runner(state: &StartState) {
     let mut guard = state.runner.lock().await;
-    if guard.stdin.write_all(b"{\"cmd\":\"reload\"}\n").await.is_err() {
+    if guard
+        .stdin
+        .write_all(b"{\"cmd\":\"reload\"}\n")
+        .await
+        .is_err()
+    {
         return;
     }
     let _ = guard.stdin.flush().await;
@@ -115,7 +131,9 @@ async fn reload_runner(state: &StartState) {
 fn list_route_files(root: &Path) -> std::collections::BTreeSet<PathBuf> {
     let mut out = std::collections::BTreeSet::new();
     fn walk(dir: &Path, out: &mut std::collections::BTreeSet<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
         for e in entries.flatten() {
             let p = e.path();
             if p.is_dir() {
@@ -219,7 +237,9 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             }
             let server_fn_changed = paths.iter().any(|p| {
                 let is_ts = p.extension().is_some_and(|e| e == "ts" || e == "tsx");
-                is_ts && (!p.exists() || std::fs::read_to_string(p).is_ok_and(|s| s.contains("createServerFn")))
+                is_ts
+                    && (!p.exists()
+                        || std::fs::read_to_string(p).is_ok_and(|s| s.contains("createServerFn")))
             });
             if routes_changed || server_fn_changed {
                 let _ = run_node(&root, &cache.join("gen-resolver.mjs"), "server-fn resolver");
@@ -227,7 +247,9 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             // Narrate the compile batch to the editor: "Applying changes…" while
             // it rebuilds, then done so the pill clears.
             batch += 1;
-            let _ = state.ws_tx.send(oj_server::update_progress_frame(batch, "watch", 0, 0, None, false));
+            let _ = state.ws_tx.send(oj_server::update_progress_frame(
+                batch, "watch", 0, 0, None, false,
+            ));
             rt.block_on(async {
                 let (r, c) = (root.clone(), cache.clone());
                 let client = tokio::task::spawn_blocking(move || {
@@ -237,7 +259,14 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             });
             let _ = state.reload_tx.send(());
             let modules = client_module_count(&cache);
-            let _ = state.ws_tx.send(oj_server::update_progress_frame(batch, "watch", 0, modules, Some(0), true));
+            let _ = state.ws_tx.send(oj_server::update_progress_frame(
+                batch,
+                "watch",
+                0,
+                modules,
+                Some(0),
+                true,
+            ));
             println!("  oj start: rebuilt, reloading");
         }
     });
@@ -268,7 +297,11 @@ pub async fn start_build(root: PathBuf) -> anyhow::Result<()> {
     if !status.success() {
         anyhow::bail!("production build failed");
     }
-    println!("  {} build (tanstack start) -> {}/dist", oj_server::oj_brand(), root.display());
+    println!(
+        "  {} build (tanstack start) -> {}/dist",
+        oj_server::oj_brand(),
+        root.display()
+    );
     println!("  run: node dist/server.mjs");
     Ok(())
 }
@@ -278,7 +311,11 @@ fn generate_route_tree(root: &Path, cache: &Path) -> anyhow::Result<()> {
 }
 
 fn bundle_client_entry(root: &Path, cache: &Path) -> anyhow::Result<()> {
-    run_node(root, &cache.join("bundle-client.mjs"), "client entry bundling")
+    run_node(
+        root,
+        &cache.join("bundle-client.mjs"),
+        "client entry bundling",
+    )
 }
 
 // Client module count written by bundle-client.mjs, for update/boot narration.
@@ -321,7 +358,11 @@ async fn spawn_node_service(root: &Path, script: &Path) -> anyhow::Result<Runner
         .map_err(|e| anyhow::anyhow!("could not spawn node service {}: {e}", script.display()))?;
     let stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
-    Ok(Runner { stdin, lines: BufReader::new(stdout).lines(), _child: child })
+    Ok(Runner {
+        stdin,
+        lines: BufReader::new(stdout).lines(),
+        _child: child,
+    })
 }
 
 fn app_uses_tailwind(root: &Path) -> bool {
@@ -335,13 +376,20 @@ fn app_uses_tailwind(root: &Path) -> bool {
 }
 
 fn needs_css_compile(src: &str) -> bool {
-    src.contains("tailwindcss") || src.contains("@tailwind") || src.contains("@plugin") || src.contains("@apply")
+    src.contains("tailwindcss")
+        || src.contains("@tailwind")
+        || src.contains("@plugin")
+        || src.contains("@apply")
 }
 
 async fn compile_css(host: &Arc<tokio::sync::Mutex<Runner>>, path: &Path) -> Option<String> {
     let mut guard = host.lock().await;
     let req = serde_json::json!({ "path": path.to_string_lossy() });
-    guard.stdin.write_all(format!("{req}\n").as_bytes()).await.ok()?;
+    guard
+        .stdin
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .ok()?;
     guard.stdin.flush().await.ok()?;
     let line = tokio::time::timeout(std::time::Duration::from_secs(30), guard.lines.next_line())
         .await
@@ -414,7 +462,12 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
     }
     if req.uri().path().starts_with("/_serverFn/") {
         let method = req.method().to_string();
-        let url = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
+        let url = req
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str())
+            .unwrap_or("/")
+            .to_string();
         let headers = collect_headers(req.headers());
         let body = axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024)
             .await
@@ -424,7 +477,12 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
     }
     match classify(&req, &state.proxy_prefixes) {
         Route::Document => {
-            let raw = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
+            let raw = req
+                .uri()
+                .path_and_query()
+                .map(|p| p.as_str())
+                .unwrap_or("/")
+                .to_string();
             // Editor plugins (dev-server bridge) register configureServer routes
             // with no path prefix, so a GET like /_sandbox/preview/viewers can only
             // be told from an app route by asking the middleware first; it returns
@@ -445,11 +503,18 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
 async fn serve_js(path: &Path, what: &str) -> Response {
     match tokio::fs::read(path).await {
         Ok(bytes) => (
-            [(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")],
+            [
+                (header::CONTENT_TYPE, "text/javascript"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
             bytes,
         )
             .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj start: {what}: {e}")).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("oj start: {what}: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -469,7 +534,10 @@ async fn serve_fs_asset(state: &StartState, abs: &str) -> Response {
                 if needs_css_compile(&src) {
                     if let Some(css) = compile_css(host, &canon).await {
                         return (
-                            [(header::CONTENT_TYPE, "text/css; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")],
+                            [
+                                (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+                                (header::CACHE_CONTROL, "no-cache"),
+                            ],
                             css,
                         )
                             .into_response();
@@ -482,12 +550,19 @@ async fn serve_fs_asset(state: &StartState, abs: &str) -> Response {
         Ok(bytes) => {
             let ext = canon.extension().and_then(|e| e.to_str()).unwrap_or("");
             (
-                [(header::CONTENT_TYPE, asset_mime(ext)), (header::CACHE_CONTROL, "no-cache")],
+                [
+                    (header::CONTENT_TYPE, asset_mime(ext)),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
                 bytes,
             )
                 .into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj start: asset: {e}")).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("oj start: asset: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -537,10 +612,17 @@ async fn forward(
     tokio::spawn(async move {
         let mut guard = runner.lock_owned().await;
         let result = async {
-            let hdrs: serde_json::Map<String, serde_json::Value> =
-                req_headers.into_iter().map(|(k, v)| (k, serde_json::Value::String(v))).collect();
-            let cmd = serde_json::json!({ "method": method, "url": url, "headers": hdrs, "body": body });
-            guard.stdin.write_all(format!("{cmd}\n").as_bytes()).await.map_err(|e| e.to_string())?;
+            let hdrs: serde_json::Map<String, serde_json::Value> = req_headers
+                .into_iter()
+                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                .collect();
+            let cmd =
+                serde_json::json!({ "method": method, "url": url, "headers": hdrs, "body": body });
+            guard
+                .stdin
+                .write_all(format!("{cmd}\n").as_bytes())
+                .await
+                .map_err(|e| e.to_string())?;
             guard.stdin.flush().await.map_err(|e| e.to_string())?;
             let line = guard
                 .lines
@@ -553,10 +635,17 @@ async fn forward(
         .await;
         let _ = tx.send(result);
     });
-    match rx.await.unwrap_or_else(|_| Err("start runner task cancelled".to_string())) {
+    match rx
+        .await
+        .unwrap_or_else(|_| Err("start runner task cancelled".to_string()))
+    {
         Ok(v) => {
             let status = v.get("status").and_then(|s| s.as_u64()).unwrap_or(200) as u16;
-            let mut body = v.get("body").and_then(|b| b.as_str()).unwrap_or("").to_owned();
+            let mut body = v
+                .get("body")
+                .and_then(|b| b.as_str())
+                .unwrap_or("")
+                .to_owned();
             let is_html = v
                 .get("headers")
                 .and_then(|h| h.get("content-type"))
@@ -574,10 +663,15 @@ async fn forward(
             if let Some(h) = v.get("headers").and_then(|h| h.as_object()) {
                 for (k, val) in h {
                     let lower = k.to_ascii_lowercase();
-                    if lower == "content-length" || lower == "content-encoding" || lower == "transfer-encoding" {
+                    if lower == "content-length"
+                        || lower == "content-encoding"
+                        || lower == "transfer-encoding"
+                    {
                         continue;
                     }
-                    if let (Ok(name), Some(vs)) = (header::HeaderName::from_bytes(k.as_bytes()), val.as_str()) {
+                    if let (Ok(name), Some(vs)) =
+                        (header::HeaderName::from_bytes(k.as_bytes()), val.as_str())
+                    {
                         if let Ok(value) = header::HeaderValue::from_str(vs) {
                             resp.headers_mut().insert(name, value);
                         }
@@ -694,9 +788,17 @@ mod tests {
     #[test]
     fn app_uses_tailwind_reads_package_json() {
         let base = tmp("tw");
-        std::fs::write(base.join("package.json"), r#"{"devDependencies":{"@tailwindcss/postcss":"4"}}"#).unwrap();
+        std::fs::write(
+            base.join("package.json"),
+            r#"{"devDependencies":{"@tailwindcss/postcss":"4"}}"#,
+        )
+        .unwrap();
         assert!(app_uses_tailwind(&base));
-        std::fs::write(base.join("package.json"), r#"{"dependencies":{"react":"19"}}"#).unwrap();
+        std::fs::write(
+            base.join("package.json"),
+            r#"{"dependencies":{"react":"19"}}"#,
+        )
+        .unwrap();
         assert!(!app_uses_tailwind(&base));
         let none = tmp("tw-none");
         assert!(!app_uses_tailwind(&none));
@@ -707,17 +809,47 @@ mod tests {
     #[test]
     fn classify_documents_vs_passes() {
         let no_proxy: Vec<String> = vec![];
-        assert!(matches!(classify(&req("GET", "/"), &no_proxy), Route::Document));
-        assert!(matches!(classify(&req("GET", "/about"), &no_proxy), Route::Document));
-        assert!(matches!(classify(&req("GET", "/index.html"), &no_proxy), Route::Document));
-        assert!(matches!(classify(&req("GET", "/guides/index.html"), &no_proxy), Route::Document));
-        assert!(matches!(classify(&req("GET", "/main.js"), &no_proxy), Route::Pass));
-        assert!(matches!(classify(&req("GET", "/styles.css"), &no_proxy), Route::Pass));
-        assert!(matches!(classify(&req("GET", "/@oj-start/hmr"), &no_proxy), Route::Pass));
-        assert!(matches!(classify(&req("GET", "/__health"), &no_proxy), Route::Pass));
-        assert!(matches!(classify(&req("POST", "/about"), &no_proxy), Route::Pass));
+        assert!(matches!(
+            classify(&req("GET", "/"), &no_proxy),
+            Route::Document
+        ));
+        assert!(matches!(
+            classify(&req("GET", "/about"), &no_proxy),
+            Route::Document
+        ));
+        assert!(matches!(
+            classify(&req("GET", "/index.html"), &no_proxy),
+            Route::Document
+        ));
+        assert!(matches!(
+            classify(&req("GET", "/guides/index.html"), &no_proxy),
+            Route::Document
+        ));
+        assert!(matches!(
+            classify(&req("GET", "/main.js"), &no_proxy),
+            Route::Pass
+        ));
+        assert!(matches!(
+            classify(&req("GET", "/styles.css"), &no_proxy),
+            Route::Pass
+        ));
+        assert!(matches!(
+            classify(&req("GET", "/@oj-start/hmr"), &no_proxy),
+            Route::Pass
+        ));
+        assert!(matches!(
+            classify(&req("GET", "/__health"), &no_proxy),
+            Route::Pass
+        ));
+        assert!(matches!(
+            classify(&req("POST", "/about"), &no_proxy),
+            Route::Pass
+        ));
         let proxy = vec!["/api".to_string()];
-        assert!(matches!(classify(&req("GET", "/api/users"), &proxy), Route::Pass));
+        assert!(matches!(
+            classify(&req("GET", "/api/users"), &proxy),
+            Route::Pass
+        ));
     }
 
     #[test]
@@ -731,13 +863,20 @@ mod tests {
         std::fs::write(routes.join("data.json"), "").unwrap();
         std::fs::write(routes.join("nested").join("deep.tsx"), "").unwrap();
         let found = list_route_files(&root);
-        let names: Vec<String> =
-            found.iter().filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).collect();
+        let names: Vec<String> = found
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
         assert_eq!(found.len(), 3, "only ts/tsx counted: {names:?}");
         assert!(names.contains(&"index.tsx".to_string()));
         assert!(names.contains(&"about.ts".to_string()));
-        assert!(names.contains(&"deep.tsx".to_string()), "recursion into subdirs: {names:?}");
-        assert!(!names.iter().any(|n| n.ends_with(".css") || n.ends_with(".json")));
+        assert!(
+            names.contains(&"deep.tsx".to_string()),
+            "recursion into subdirs: {names:?}"
+        );
+        assert!(!names
+            .iter()
+            .any(|n| n.ends_with(".css") || n.ends_with(".json")));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -751,12 +890,27 @@ mod tests {
     #[test]
     fn collect_headers_serializes_utf8_and_skips_non_utf8() {
         let mut h = header::HeaderMap::new();
-        h.insert("content-type", header::HeaderValue::from_static("text/html"));
+        h.insert(
+            "content-type",
+            header::HeaderValue::from_static("text/html"),
+        );
         h.insert("x-custom", header::HeaderValue::from_static("hello"));
-        h.insert("x-bin", header::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap());
+        h.insert(
+            "x-bin",
+            header::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
         let out = collect_headers(&h);
-        assert!(out.contains(&("content-type".to_string(), "text/html".to_string())), "{out:?}");
-        assert!(out.contains(&("x-custom".to_string(), "hello".to_string())), "{out:?}");
-        assert!(!out.iter().any(|(k, _)| k == "x-bin"), "non-utf8 value dropped: {out:?}");
+        assert!(
+            out.contains(&("content-type".to_string(), "text/html".to_string())),
+            "{out:?}"
+        );
+        assert!(
+            out.contains(&("x-custom".to_string(), "hello".to_string())),
+            "{out:?}"
+        );
+        assert!(
+            !out.iter().any(|(k, _)| k == "x-bin"),
+            "non-utf8 value dropped: {out:?}"
+        );
     }
 }

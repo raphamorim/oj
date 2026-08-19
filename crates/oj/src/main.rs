@@ -11,7 +11,11 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "oj", version, about = "A Rust-native build tool for React apps")]
+#[command(
+    name = "oj",
+    version,
+    about = "A Rust-native build tool for React apps"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -60,17 +64,36 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
-        Command::Dev { root, port, bundle, ssr, host, config } => {
+        Command::Dev {
+            root,
+            port,
+            bundle,
+            ssr,
+            host,
+            config,
+        } => {
             let root = root.unwrap_or_else(|| {
                 let playground = PathBuf::from("playground");
-                if playground.join("index.html").is_file() { playground } else { PathBuf::from(".") }
+                if playground.join("index.html").is_file() {
+                    playground
+                } else {
+                    PathBuf::from(".")
+                }
             });
             if let Some(entry) = ssr {
                 ssr_dev::ssr_dev(root, entry, port, host).await
             } else if oj_server::is_tanstack_start_app(&root) {
                 start_dev::start_dev(root, port, host).await
             } else {
-                oj_server::DevServer { root, port, bundle, host, config }.run().await
+                oj_server::DevServer {
+                    root,
+                    port,
+                    bundle,
+                    host,
+                    config,
+                }
+                .run()
+                .await
             }
         }
         Command::Compile { file, prod } => {
@@ -85,10 +108,19 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", output.code);
             Ok(())
         }
-        Command::Build { root, out, ssr, mode } => {
+        Command::Build {
+            root,
+            out,
+            ssr,
+            mode,
+        } => {
             let root = root.unwrap_or_else(|| {
                 let playground = PathBuf::from("playground");
-                if playground.join("index.html").is_file() { playground } else { PathBuf::from(".") }
+                if playground.join("index.html").is_file() {
+                    playground
+                } else {
+                    PathBuf::from(".")
+                }
             });
             let mode = mode.unwrap_or_else(|| "production".to_string());
             if oj_server::is_tanstack_start_app(&root) {
@@ -97,7 +129,12 @@ async fn main() -> anyhow::Result<()> {
                 build::build(root, out, ssr, &mode).await
             }
         }
-        Command::Preview { root, out, port, host } => {
+        Command::Preview {
+            root,
+            out,
+            port,
+            host,
+        } => {
             let root = root
                 .unwrap_or_else(|| {
                     let playground = PathBuf::from("playground");
@@ -111,9 +148,19 @@ async fn main() -> anyhow::Result<()> {
                 .with_context(|| "app root not found")?;
             let config = oj_config::load(&root).map_err(|e| anyhow::anyhow!("{e}"))?;
             let out_dir = out
-                .or_else(|| config.build.as_ref().and_then(|b| b.out_dir.as_ref()).map(PathBuf::from))
+                .or_else(|| {
+                    config
+                        .build
+                        .as_ref()
+                        .and_then(|b| b.out_dir.as_ref())
+                        .map(PathBuf::from)
+                })
                 .unwrap_or_else(|| PathBuf::from("dist"));
-            let out_dir = if out_dir.is_absolute() { out_dir } else { root.join(out_dir) };
+            let out_dir = if out_dir.is_absolute() {
+                out_dir
+            } else {
+                root.join(out_dir)
+            };
             let port = port
                 .or_else(|| config.preview.as_ref().and_then(|p| p.port))
                 .unwrap_or(4173);

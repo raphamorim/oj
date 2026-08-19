@@ -16,7 +16,12 @@ pub enum ConfigError {
     Schema(PathBuf, String),
 }
 
-const CANDIDATES: &[&str] = &["oj.config.ts", "oj.config.mjs", "oj.config.js", "oj.config.json"];
+const CANDIDATES: &[&str] = &[
+    "oj.config.ts",
+    "oj.config.mjs",
+    "oj.config.js",
+    "oj.config.json",
+];
 
 fn define_value(v: &serde_json::Value) -> String {
     match v {
@@ -27,14 +32,21 @@ fn define_value(v: &serde_json::Value) -> String {
 
 pub fn rolldown_options(config: &OjConfig) -> Option<&serde_json::Value> {
     let build = config.build.as_ref()?;
-    build.rolldown_options.as_ref().or(build.rollup_options.as_ref())
+    build
+        .rolldown_options
+        .as_ref()
+        .or(build.rollup_options.as_ref())
 }
 
 pub fn config_defines(config: &OjConfig) -> Vec<(String, String)> {
     config
         .define
         .as_ref()
-        .map(|d| d.iter().map(|(k, v)| (k.clone(), define_value(v))).collect())
+        .map(|d| {
+            d.iter()
+                .map(|(k, v)| (k.clone(), define_value(v)))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -57,13 +69,18 @@ pub fn resolve_conditions(config: &OjConfig, env_name: &str) -> Vec<String> {
         .and_then(|r| r.get("conditions"))
         .and_then(|c| c.as_array())
     {
-        return c.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+        return c
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
     }
     if let Some(c) = config.resolve.as_ref().and_then(|r| r.conditions.as_ref()) {
         return c.clone();
     }
     let base = if env_name == "ssr" { "node" } else { "browser" };
-    [base, "import", "module", "default"].map(String::from).to_vec()
+    [base, "import", "module", "default"]
+        .map(String::from)
+        .to_vec()
 }
 
 pub fn resolve_dedupe(config: &OjConfig) -> Vec<String> {
@@ -116,7 +133,11 @@ pub fn environment_defines(config: &OjConfig, env_name: &str) -> Vec<(String, St
         .and_then(|envs| envs.get(env_name))
         .and_then(|env| env.get("define"))
         .and_then(|d| d.as_object())
-        .map(|d| d.iter().map(|(k, v)| (k.clone(), define_value(v))).collect())
+        .map(|d| {
+            d.iter()
+                .map(|(k, v)| (k.clone(), define_value(v)))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -125,7 +146,11 @@ pub fn load(root: &Path) -> Result<OjConfig, ConfigError> {
 }
 
 pub fn load_with(root: &Path, command: &str, mode: &str) -> Result<OjConfig, ConfigError> {
-    let Some(path) = CANDIDATES.iter().map(|c| root.join(c)).find(|p| p.is_file()) else {
+    let Some(path) = CANDIDATES
+        .iter()
+        .map(|c| root.join(c))
+        .find(|p| p.is_file())
+    else {
         return Ok(OjConfig::default());
     };
     let source = std::fs::read_to_string(&path)
@@ -150,7 +175,13 @@ fn evaluate(path: &Path, source: &str, command: &str, mode: &str) -> Result<Stri
 
     ctx.with(|ctx| {
         let env_obj: String = std::env::vars()
-            .map(|(k, v)| format!("{}:{}", serde_json::to_string(&k).unwrap(), serde_json::to_string(&v).unwrap()))
+            .map(|(k, v)| {
+                format!(
+                    "{}:{}",
+                    serde_json::to_string(&k).unwrap(),
+                    serde_json::to_string(&v).unwrap()
+                )
+            })
             .collect::<Vec<_>>()
             .join(",");
         let prelude = format!(
@@ -171,8 +202,10 @@ fn evaluate(path: &Path, source: &str, command: &str, mode: &str) -> Result<Stri
         );
         let result: rquickjs::Value = ctx.eval(full).map_err(|e| {
             let caught = ctx.catch();
-            let mut detail =
-                caught.as_exception().map(|ex| ex.to_string()).unwrap_or_else(|| format!("{e}"));
+            let mut detail = caught
+                .as_exception()
+                .map(|ex| ex.to_string())
+                .unwrap_or_else(|| format!("{e}"));
             if detail.contains("is not defined") {
                 detail.push_str(
                     "\nnote: oj.config is evaluated in a sandbox without module imports; \
@@ -199,16 +232,26 @@ fn strip_types(path: &Path, source: &str) -> Result<String, ConfigError> {
     let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::ts());
     let parsed = Parser::new(&allocator, source, source_type).parse();
     if parsed.panicked {
-        return Err(ConfigError::Parse(path.to_path_buf(), "syntax error".into()));
+        return Err(ConfigError::Parse(
+            path.to_path_buf(),
+            "syntax error".into(),
+        ));
     }
     let mut program = parsed.program;
-    let scoping = SemanticBuilder::new().build(&program).semantic.into_scoping();
+    let scoping = SemanticBuilder::new()
+        .build(&program)
+        .semantic
+        .into_scoping();
     let ret = Transformer::new(&allocator, path, &TransformOptions::default())
         .build_with_scoping(scoping, &mut program);
     if !ret.diagnostics.is_empty() {
         return Err(ConfigError::Parse(
             path.to_path_buf(),
-            ret.diagnostics.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("; "),
+            ret.diagnostics
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join("; "),
         ));
     }
     Ok(Codegen::new().build(&program).code)
@@ -257,7 +300,10 @@ mod tests {
         let json = r#"{"resolve":{"dedupe":["react","react-dom"]},
             "optimizeDeps":{"include":["cjs-dep"],"exclude":["big-esm"],"entries":["src/main.tsx"]}}"#;
         let cfg: OjConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(resolve_dedupe(&cfg), vec!["react".to_string(), "react-dom".to_string()]);
+        assert_eq!(
+            resolve_dedupe(&cfg),
+            vec!["react".to_string(), "react-dom".to_string()]
+        );
         let (inc, exc, ent) = optimize_deps_lists(&cfg);
         assert_eq!(inc, vec!["cjs-dep".to_string()]);
         assert_eq!(exc, vec!["big-esm".to_string()]);
@@ -295,7 +341,8 @@ mod tests {
 
     #[test]
     fn evaluates_ts_config_with_types_and_define_config() {
-        let cfg = eval_config_in("define",
+        let cfg = eval_config_in(
+            "define",
             "import { defineConfig } from \"oj\";\n\
              export default defineConfig({\n\
                server: { port: 3000, proxy: { \"/api\": \"http://localhost:8080\" } },\n\
@@ -308,7 +355,10 @@ mod tests {
             server.proxy.unwrap().get("/api").unwrap().target(),
             "http://localhost:8080"
         );
-        assert_eq!(cfg.resolve.unwrap().alias.unwrap().get("@").unwrap(), "./src");
+        assert_eq!(
+            cfg.resolve.unwrap().alias.unwrap().get("@").unwrap(),
+            "./src"
+        );
     }
 
     #[test]
@@ -353,7 +403,8 @@ mod tests {
     #[test]
     fn computed_values_and_process_env_work() {
         unsafe { std::env::set_var("OJ_TEST_PORT", "4321") };
-        let cfg = eval_config_in("computed",
+        let cfg = eval_config_in(
+            "computed",
             "export default { server: { port: Number(process.env.OJ_TEST_PORT), open: 1 > 0 } };\n",
         );
         let server = cfg.server.unwrap();
@@ -369,8 +420,14 @@ mod tests {
         assert!(environment_defines(&cfg, "ssr").is_empty());
         assert!(resolve_alias(&cfg, "client").is_empty());
         assert_eq!(environment_build_bool(&cfg, "client", "minify"), None);
-        assert_eq!(resolve_conditions(&cfg, "ssr"), s(&["node", "import", "module", "default"]));
-        assert_eq!(resolve_conditions(&cfg, "client"), s(&["browser", "import", "module", "default"]));
+        assert_eq!(
+            resolve_conditions(&cfg, "ssr"),
+            s(&["node", "import", "module", "default"])
+        );
+        assert_eq!(
+            resolve_conditions(&cfg, "client"),
+            s(&["browser", "import", "module", "default"])
+        );
     }
 
     #[test]
@@ -393,21 +450,34 @@ mod tests {
         assert_eq!(defines.get("__FLAG__").unwrap(), "true");
         assert_eq!(defines.get("__COUNT__").unwrap(), "3");
 
-        assert_eq!(resolve_conditions(&cfg, "ssr"), vec!["node-only".to_string()]);
-        assert_eq!(resolve_conditions(&cfg, "client"), vec!["custom".to_string()]);
+        assert_eq!(
+            resolve_conditions(&cfg, "ssr"),
+            vec!["node-only".to_string()]
+        );
+        assert_eq!(
+            resolve_conditions(&cfg, "client"),
+            vec!["custom".to_string()]
+        );
 
         assert_eq!(
             resolve_alias(&cfg, "ssr"),
-            vec![("@".to_string(), "/src".to_string()), ("old".to_string(), "/ssr-legacy".to_string())]
+            vec![
+                ("@".to_string(), "/src".to_string()),
+                ("old".to_string(), "/ssr-legacy".to_string())
+            ]
         );
         assert_eq!(
             resolve_alias(&cfg, "client"),
-            vec![("@".to_string(), "/src".to_string()), ("old".to_string(), "/legacy".to_string())]
+            vec![
+                ("@".to_string(), "/src".to_string()),
+                ("old".to_string(), "/legacy".to_string())
+            ]
         );
 
         assert_eq!(environment_build_bool(&cfg, "ssr", "minify"), Some(false));
         assert_eq!(environment_build_bool(&cfg, "ssr", "sourcemap"), None);
-        let ssr_defines: std::collections::BTreeMap<_, _> = environment_defines(&cfg, "ssr").into_iter().collect();
+        let ssr_defines: std::collections::BTreeMap<_, _> =
+            environment_defines(&cfg, "ssr").into_iter().collect();
         assert_eq!(ssr_defines.get("__SSR__").unwrap(), "true");
         assert!(environment_defines(&cfg, "client").is_empty());
     }
@@ -416,7 +486,11 @@ mod tests {
     fn json_config_loads_directly() {
         let dir = std::env::temp_dir().join(format!("oj-cfg-json-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("oj.config.json"), r#"{"bundle":true,"base":"/app/"}"#).unwrap();
+        std::fs::write(
+            dir.join("oj.config.json"),
+            r#"{"bundle":true,"base":"/app/"}"#,
+        )
+        .unwrap();
         let cfg = load(&dir).unwrap();
         assert_eq!(cfg.bundle, Some(true));
         assert_eq!(cfg.base.as_deref(), Some("/app/"));

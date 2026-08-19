@@ -38,8 +38,12 @@ impl ModuleGraph {
     }
 
     pub fn add_import(&mut self, importer: &Path, imported: &Path) {
-        self.ensure_module(importer).imports.insert(imported.to_path_buf());
-        self.ensure_module(imported).importers.insert(importer.to_path_buf());
+        self.ensure_module(importer)
+            .imports
+            .insert(imported.to_path_buf());
+        self.ensure_module(imported)
+            .importers
+            .insert(importer.to_path_buf());
     }
 
     pub fn set_self_accepting(&mut self, path: &Path, accepting: bool) {
@@ -94,18 +98,20 @@ impl ModuleGraph {
     pub fn update_plan(&self, changed: &Path) -> Result<UpdatePlan, String> {
         match self.propagate_update(changed) {
             HmrDecision::FullReload { reason } => Err(reason),
-            HmrDecision::Update { boundaries } => {
-                Ok(UpdatePlan { dirty: self.dirty_closure(changed), boundaries })
-            }
+            HmrDecision::Update { boundaries } => Ok(UpdatePlan {
+                dirty: self.dirty_closure(changed),
+                boundaries,
+            }),
         }
     }
 
     pub fn update_plan_from_importers(&self, changed: &Path) -> Result<UpdatePlan, String> {
         match self.propagate_update_from_importers(changed) {
             HmrDecision::FullReload { reason } => Err(reason),
-            HmrDecision::Update { boundaries } => {
-                Ok(UpdatePlan { dirty: self.dirty_closure(changed), boundaries })
-            }
+            HmrDecision::Update { boundaries } => Ok(UpdatePlan {
+                dirty: self.dirty_closure(changed),
+                boundaries,
+            }),
         }
     }
 
@@ -114,7 +120,9 @@ impl ModuleGraph {
         let mut queue = vec![changed.to_path_buf()];
         let mut seen: HashSet<PathBuf> = queue.iter().cloned().collect();
         while let Some(current) = queue.pop() {
-            let Some(node) = self.modules.get(&current) else { continue };
+            let Some(node) = self.modules.get(&current) else {
+                continue;
+            };
             if node.is_self_accepting && current != changed {
                 continue;
             }
@@ -230,7 +238,12 @@ mod tests {
     #[test]
     fn change_to_self_accepting_leaf_updates_in_place() {
         let decision = graph().propagate_update(&p("Button.tsx"));
-        assert_eq!(decision, HmrDecision::Update { boundaries: vec![p("Button.tsx")] });
+        assert_eq!(
+            decision,
+            HmrDecision::Update {
+                boundaries: vec![p("Button.tsx")]
+            }
+        );
     }
 
     #[test]
@@ -238,7 +251,12 @@ mod tests {
         let mut g = graph();
         g.add_import(&p("Button.tsx"), &p("utils.ts"));
         let decision = g.propagate_update(&p("utils.ts"));
-        assert_eq!(decision, HmrDecision::Update { boundaries: vec![p("Button.tsx")] });
+        assert_eq!(
+            decision,
+            HmrDecision::Update {
+                boundaries: vec![p("Button.tsx")]
+            }
+        );
     }
 
     #[test]
@@ -274,7 +292,12 @@ mod tests {
     #[test]
     fn invalidate_skips_own_acceptance_and_climbs_to_importer() {
         let decision = graph().propagate_update_from_importers(&p("Button.tsx"));
-        assert_eq!(decision, HmrDecision::Update { boundaries: vec![p("App.tsx")] });
+        assert_eq!(
+            decision,
+            HmrDecision::Update {
+                boundaries: vec![p("App.tsx")]
+            }
+        );
         assert!(matches!(
             graph().propagate_update_from_importers(&p("App.tsx")),
             HmrDecision::FullReload { .. }
@@ -292,7 +315,9 @@ mod tests {
         ));
         assert_eq!(
             g.propagate_update(&p("Button.tsx")),
-            HmrDecision::Update { boundaries: vec![p("Button.tsx")] }
+            HmrDecision::Update {
+                boundaries: vec![p("Button.tsx")]
+            }
         );
     }
 
@@ -307,7 +332,9 @@ mod tests {
         let decision = g.propagate_update(&p("shared.ts"));
         assert_eq!(
             decision,
-            HmrDecision::Update { boundaries: vec![p("A.tsx"), p("B.tsx")] }
+            HmrDecision::Update {
+                boundaries: vec![p("A.tsx"), p("B.tsx")]
+            }
         );
         let plan = g.update_plan(&p("shared.ts")).unwrap();
         assert_eq!(plan.dirty, vec![p("A.tsx"), p("B.tsx"), p("shared.ts")]);
@@ -315,10 +342,18 @@ mod tests {
 
     #[test]
     fn invalidate_plan_escalates_to_importer_boundaries() {
-        let plan = graph().update_plan_from_importers(&p("Button.tsx")).unwrap();
+        let plan = graph()
+            .update_plan_from_importers(&p("Button.tsx"))
+            .unwrap();
         assert_eq!(plan.boundaries, vec![p("App.tsx")]);
-        assert!(plan.dirty.contains(&p("Button.tsx")), "changed module is dirty");
-        assert!(plan.dirty.contains(&p("App.tsx")), "importer boundary is dirty");
+        assert!(
+            plan.dirty.contains(&p("Button.tsx")),
+            "changed module is dirty"
+        );
+        assert!(
+            plan.dirty.contains(&p("App.tsx")),
+            "importer boundary is dirty"
+        );
         assert!(graph().update_plan_from_importers(&p("App.tsx")).is_err());
     }
 
@@ -339,7 +374,9 @@ mod tests {
 
         assert_eq!(
             g.propagate_update(&m(0)),
-            HmrDecision::Update { boundaries: vec![p("Root.tsx")] }
+            HmrDecision::Update {
+                boundaries: vec![p("Root.tsx")]
+            }
         );
     }
 
@@ -348,6 +385,9 @@ mod tests {
         let mut g = ModuleGraph::new();
         g.add_import(&p("a.ts"), &p("b.ts"));
         g.add_import(&p("b.ts"), &p("a.ts"));
-        assert!(matches!(g.propagate_update(&p("a.ts")), HmrDecision::FullReload { .. }));
+        assert!(matches!(
+            g.propagate_update(&p("a.ts")),
+            HmrDecision::FullReload { .. }
+        ));
     }
 }

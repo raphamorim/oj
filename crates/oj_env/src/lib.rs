@@ -13,7 +13,9 @@ pub fn parse(contents: &str, base: &BTreeMap<String, String>) -> Vec<(String, St
             continue;
         }
         let line = line.strip_prefix("export ").unwrap_or(line);
-        let Some((key, rest)) = line.split_once('=') else { continue };
+        let Some((key, rest)) = line.split_once('=') else {
+            continue;
+        };
         let key = key.trim();
         if key.is_empty() {
             continue;
@@ -29,12 +31,19 @@ fn parse_value(raw: &str, vars: &BTreeMap<String, String>) -> String {
     let bytes = raw.as_bytes();
     if bytes.first() == Some(&b'\'') {
         let inner = &raw[1..];
-        return inner.split_once('\'').map(|(v, _)| v).unwrap_or(inner).to_string();
+        return inner
+            .split_once('\'')
+            .map(|(v, _)| v)
+            .unwrap_or(inner)
+            .to_string();
     }
     if bytes.first() == Some(&b'"') {
         let inner = &raw[1..];
         let inner = inner.split_once('"').map(|(v, _)| v).unwrap_or(inner);
-        let unescaped = inner.replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", "\"");
+        let unescaped = inner
+            .replace("\\n", "\n")
+            .replace("\\t", "\t")
+            .replace("\\\"", "\"");
         return expand(&unescaped, vars);
     }
     let end = raw.find(" #").unwrap_or(raw.len());
@@ -83,8 +92,15 @@ fn expand(input: &str, vars: &BTreeMap<String, String>) -> String {
 pub fn load(dir: &Path, mode: &str) -> Vec<(String, String)> {
     let mut base: BTreeMap<String, String> = std::env::vars().collect();
     let mut merged: BTreeMap<String, String> = BTreeMap::new();
-    for name in [".env", ".env.local", &format!(".env.{mode}"), &format!(".env.{mode}.local")] {
-        let Ok(contents) = std::fs::read_to_string(dir.join(name)) else { continue };
+    for name in [
+        ".env",
+        ".env.local",
+        &format!(".env.{mode}"),
+        &format!(".env.{mode}.local"),
+    ] {
+        let Ok(contents) = std::fs::read_to_string(dir.join(name)) else {
+            continue;
+        };
         for (k, v) in parse(&contents, &base) {
             base.insert(k.clone(), v.clone());
             merged.insert(k, v);
@@ -116,7 +132,10 @@ pub fn import_meta_env_defines(
     for (k, v) in &obj {
         defines.push((format!("import.meta.env.{k}"), v.to_string()));
     }
-    defines.push(("import.meta.env".into(), serde_json::Value::Object(obj).to_string()));
+    defines.push((
+        "import.meta.env".into(),
+        serde_json::Value::Object(obj).to_string(),
+    ));
     defines
 }
 
@@ -185,12 +204,15 @@ mod tests {
     fn parses_basic_quotes_and_comments() {
         let src = "# comment\nexport A=1\nB=\"two words\"\nC='literal $A'\nD=trailing # note\n";
         let v = parse(src, &base());
-        assert_eq!(v, vec![
-            ("A".into(), "1".into()),
-            ("B".into(), "two words".into()),
-            ("C".into(), "literal $A".into()),
-            ("D".into(), "trailing".into()),
-        ]);
+        assert_eq!(
+            v,
+            vec![
+                ("A".into(), "1".into()),
+                ("B".into(), "two words".into()),
+                ("C".into(), "literal $A".into()),
+                ("D".into(), "trailing".into()),
+            ]
+        );
     }
 
     #[test]
@@ -203,17 +225,24 @@ mod tests {
             "VITE_",
         );
         let env = html_env_map(&defines);
-        let html = "<title>%VITE_TITLE%</title><meta content=\"%MODE%\"><b>%VITE_MISSING%</b> 50%% off";
+        let html =
+            "<title>%VITE_TITLE%</title><meta content=\"%MODE%\"><b>%VITE_MISSING%</b> 50%% off";
         let out = replace_html_env(html, &env);
         assert!(out.contains("<title>My App</title>"), "{out}");
         assert!(out.contains("content=\"development\""), "{out}");
-        assert!(out.contains("%VITE_MISSING%"), "unknown key left as-is: {out}");
+        assert!(
+            out.contains("%VITE_MISSING%"),
+            "unknown key left as-is: {out}"
+        );
         assert!(out.contains("50%% off"), "bare percents untouched: {out}");
     }
 
     #[test]
     fn expands_prior_vars_but_not_in_single_quotes() {
-        let v = parse("HOST=example.com\nURL=https://${HOST}/api\nRAW='${HOST}'\n", &base());
+        let v = parse(
+            "HOST=example.com\nURL=https://${HOST}/api\nRAW='${HOST}'\n",
+            &base(),
+        );
         assert_eq!(v[1], ("URL".into(), "https://example.com/api".into()));
         assert_eq!(v[2], ("RAW".into(), "${HOST}".into()));
     }
@@ -236,7 +265,10 @@ mod tests {
         assert_eq!(map["import.meta.env.DEV"], "true");
         assert_eq!(map["import.meta.env.PROD"], "false");
         assert_eq!(map["import.meta.env.VITE_API"], "\"https://api.test\"");
-        assert!(!map.contains_key("import.meta.env.SECRET"), "unprefixed var must not leak");
+        assert!(
+            !map.contains_key("import.meta.env.SECRET"),
+            "unprefixed var must not leak"
+        );
         assert!(map["import.meta.env"].contains("VITE_API"));
         assert!(!map["import.meta.env"].contains("SECRET"));
     }

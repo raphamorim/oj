@@ -4,16 +4,21 @@
 use crate::CompileError;
 
 fn named_keys(value: &serde_json::Value) -> Vec<String> {
-    let Some(obj) = value.as_object() else { return Vec::new() };
-    obj.keys().filter(|k| is_safe_export_name(k)).cloned().collect()
+    let Some(obj) = value.as_object() else {
+        return Vec::new();
+    };
+    obj.keys()
+        .filter(|k| is_safe_export_name(k))
+        .cloned()
+        .collect()
 }
 
 fn is_safe_export_name(name: &str) -> bool {
     const RESERVED: &[&str] = &[
-        "default", "class", "const", "let", "var", "function", "return", "import", "export",
-        "new", "delete", "void", "typeof", "in", "of", "do", "if", "else", "switch", "case",
-        "for", "while", "break", "continue", "this", "super", "null", "true", "false", "enum",
-        "await", "yield",
+        "default", "class", "const", "let", "var", "function", "return", "import", "export", "new",
+        "delete", "void", "typeof", "in", "of", "do", "if", "else", "switch", "case", "for",
+        "while", "break", "continue", "this", "super", "null", "true", "false", "enum", "await",
+        "yield",
     ];
     if RESERVED.contains(&name) {
         return false;
@@ -61,9 +66,15 @@ mod tests {
     fn esm_default_and_named_exports() {
         let out = to_esm(r#"{"name":"oj","version":2,"is-kebab":1}"#, "/x.json").unwrap();
         assert!(out.contains("export default __oj_json"));
-        assert!(out.contains(r#"export const name = __oj_json["name"]"#), "{out}");
+        assert!(
+            out.contains(r#"export const name = __oj_json["name"]"#),
+            "{out}"
+        );
         assert!(out.contains("export const version ="), "{out}");
-        assert!(!out.contains("is-kebab ="), "kebab key must be skipped: {out}");
+        assert!(
+            !out.contains("is-kebab ="),
+            "kebab key must be skipped: {out}"
+        );
     }
 
     #[test]
@@ -100,9 +111,16 @@ mod tests {
             "/k.json",
         )
         .unwrap();
-        assert_eq!(out.matches("export ").count(), 4, "only default + 3 valid keys: {out}");
+        assert_eq!(
+            out.matches("export ").count(),
+            4,
+            "only default + 3 valid keys: {out}"
+        );
         for ok in ["$ok", "_ok", "ok"] {
-            assert!(out.contains(&format!("export const {ok} = __oj_json[")), "{ok} should export: {out}");
+            assert!(
+                out.contains(&format!("export const {ok} = __oj_json[")),
+                "{ok} should export: {out}"
+            );
         }
     }
 
@@ -110,12 +128,28 @@ mod tests {
     fn nested_objects_and_scalars_export_only_default() {
         let nested = to_esm(r#"{"outer":{"inner":1}}"#, "/n.json").unwrap();
         assert!(nested.contains("export const outer ="), "{nested}");
-        assert!(!nested.contains("export const inner ="), "nested keys must not leak: {nested}");
-        assert_eq!(nested.matches("export ").count(), 2, "default + outer only: {nested}");
+        assert!(
+            !nested.contains("export const inner ="),
+            "nested keys must not leak: {nested}"
+        );
+        assert_eq!(
+            nested.matches("export ").count(),
+            2,
+            "default + outer only: {nested}"
+        );
 
-        for (src, label) in [("\"hello\"", "string"), ("42", "number"), ("true", "bool"), ("null", "null")] {
+        for (src, label) in [
+            ("\"hello\"", "string"),
+            ("42", "number"),
+            ("true", "bool"),
+            ("null", "null"),
+        ] {
             let out = to_esm(src, "/s.json").unwrap();
-            assert_eq!(out.matches("export ").count(), 1, "{label} has only default: {out}");
+            assert_eq!(
+                out.matches("export ").count(),
+                1,
+                "{label} has only default: {out}"
+            );
             assert!(out.contains("export default __oj_json"), "{label}: {out}");
         }
     }
@@ -123,9 +157,19 @@ mod tests {
     #[test]
     fn factory_body_filters_invalid_and_reserved_keys() {
         let out = to_factory_body(r#"{"ok":1,"bad-key":2,"default":3}"#, "/f.json").unwrap();
-        assert!(out.contains(r#""ok": () => __oj_json["ok"]"#), "valid key getter: {out}");
-        assert!(!out.contains(r#""bad-key": () =>"#), "invalid key gets no getter: {out}");
-        assert_eq!(out.matches(r#""default": () =>"#).count(), 1, "one default getter: {out}");
+        assert!(
+            out.contains(r#""ok": () => __oj_json["ok"]"#),
+            "valid key getter: {out}"
+        );
+        assert!(
+            !out.contains(r#""bad-key": () =>"#),
+            "invalid key gets no getter: {out}"
+        );
+        assert_eq!(
+            out.matches(r#""default": () =>"#).count(),
+            1,
+            "one default getter: {out}"
+        );
     }
 
     #[test]

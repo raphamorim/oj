@@ -38,7 +38,10 @@ pub struct ResolveFailure {
 
 impl OjResolver {
     pub fn new(root: &Path) -> Self {
-        Self::with_conditions(root, &["browser", "import", "module", "default"].map(String::from))
+        Self::with_conditions(
+            root,
+            &["browser", "import", "module", "default"].map(String::from),
+        )
     }
 
     pub fn with_conditions(root: &Path, conditions: &[String]) -> Self {
@@ -85,7 +88,11 @@ impl OjResolver {
             }),
             ..ResolveOptions::default()
         };
-        Self { inner: Resolver::new(options), root: root.to_path_buf(), dedupe: dedupe.to_vec() }
+        Self {
+            inner: Resolver::new(options),
+            root: root.to_path_buf(),
+            dedupe: dedupe.to_vec(),
+        }
     }
 
     /// A bare import of a `resolve.dedupe` package resolves from the project
@@ -98,13 +105,13 @@ impl OjResolver {
         self.dedupe.iter().any(|d| d == &pkg)
     }
 
-    pub fn resolve(
-        &self,
-        importer_dir: &Path,
-        specifier: &str,
-    ) -> Result<PathBuf, ResolveFailure> {
+    pub fn resolve(&self, importer_dir: &Path, specifier: &str) -> Result<PathBuf, ResolveFailure> {
         let deduped = self.should_dedupe(specifier);
-        let base = if deduped { self.root.as_path() } else { importer_dir };
+        let base = if deduped {
+            self.root.as_path()
+        } else {
+            importer_dir
+        };
         match self.inner.resolve(base, specifier) {
             Ok(resolution) => Ok(resolution.full_path()),
             Err(err) => {
@@ -190,20 +197,23 @@ mod tests {
     #[test]
     fn reports_unresolvable_specifier() {
         let resolver = OjResolver::new(&playground_root());
-        let err = resolver.resolve(&playground_src(), "./does-not-exist").unwrap_err();
+        let err = resolver
+            .resolve(&playground_src(), "./does-not-exist")
+            .unwrap_err();
         assert_eq!(err.specifier, "./does-not-exist");
     }
 
     #[test]
     fn resolves_exports_per_condition() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/dual");
-        let browser = OjResolver::with_conditions(
-            &dir,
-            &["browser", "import", "default"].map(String::from),
-        );
+        let browser =
+            OjResolver::with_conditions(&dir, &["browser", "import", "default"].map(String::from));
         let node =
             OjResolver::with_conditions(&dir, &["node", "import", "default"].map(String::from));
-        assert!(browser.resolve(&dir, "dual-pkg").unwrap().ends_with("browser.js"));
+        assert!(browser
+            .resolve(&dir, "dual-pkg")
+            .unwrap()
+            .ends_with("browser.js"));
         assert!(node.resolve(&dir, "dual-pkg").unwrap().ends_with("node.js"));
     }
 
@@ -211,7 +221,10 @@ mod tests {
     fn default_condition_resolves_the_fallback_export() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/dual");
         let resolver = OjResolver::with_conditions(&dir, &["default".to_string()]);
-        assert!(resolver.resolve(&dir, "dual-pkg").unwrap().ends_with("default.js"));
+        assert!(resolver
+            .resolve(&dir, "dual-pkg")
+            .unwrap()
+            .ends_with("default.js"));
     }
 
     #[test]
@@ -237,19 +250,37 @@ mod tests {
     fn resolves_package_subpath_exports_and_enforces_encapsulation() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/subpath");
         let resolver = OjResolver::new(&dir);
-        assert!(resolver.resolve(&dir, "sub-pkg").unwrap().ends_with("index.js"));
-        assert!(resolver.resolve(&dir, "sub-pkg/feature").unwrap().ends_with("feature.js"));
-        assert!(resolver.resolve(&dir, "sub-pkg/internal").is_err(), "unlisted subpath must not resolve");
+        assert!(resolver
+            .resolve(&dir, "sub-pkg")
+            .unwrap()
+            .ends_with("index.js"));
+        assert!(resolver
+            .resolve(&dir, "sub-pkg/feature")
+            .unwrap()
+            .ends_with("feature.js"));
+        assert!(
+            resolver.resolve(&dir, "sub-pkg/internal").is_err(),
+            "unlisted subpath must not resolve"
+        );
     }
 
     #[test]
     fn resolves_json_css_and_explicit_extensions() {
         let resolver = OjResolver::new(&playground_root());
         let src = playground_src();
-        assert!(resolver.resolve(&src, "./data.json").unwrap().ends_with("data.json"));
-        assert!(resolver.resolve(&src, "./App.tsx").unwrap().ends_with("App.tsx"));
+        assert!(resolver
+            .resolve(&src, "./data.json")
+            .unwrap()
+            .ends_with("data.json"));
+        assert!(resolver
+            .resolve(&src, "./App.tsx")
+            .unwrap()
+            .ends_with("App.tsx"));
         assert!(
-            resolver.resolve(&src, "./Counter.module.css").unwrap().ends_with("Counter.module.css"),
+            resolver
+                .resolve(&src, "./Counter.module.css")
+                .unwrap()
+                .ends_with("Counter.module.css"),
             "exact-path .css should resolve",
         );
     }

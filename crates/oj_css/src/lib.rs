@@ -15,7 +15,9 @@ pub struct CssOutput {
 }
 
 pub fn is_css_module(url: &str) -> bool {
-    url.rsplit('/').next().is_some_and(|f| f.contains(".module."))
+    url.rsplit('/')
+        .next()
+        .is_some_and(|f| f.contains(".module."))
 }
 
 pub fn is_sass(url: &str) -> bool {
@@ -47,8 +49,7 @@ pub fn compile_css(url: &str, source: &str, minify: bool) -> Result<CssOutput, S
     let options = ParserOptions {
         filename: url.to_string(),
         css_modules: is_module.then(|| css_modules::Config {
-            pattern: css_modules::Pattern::parse("[name]_[local]_[hash]")
-                .expect("static pattern"),
+            pattern: css_modules::Pattern::parse("[name]_[local]_[hash]").expect("static pattern"),
             ..css_modules::Config::default()
         }),
         ..ParserOptions::default()
@@ -59,21 +60,33 @@ pub fn compile_css(url: &str, source: &str, minify: bool) -> Result<CssOutput, S
 
     let targets = default_targets();
     stylesheet
-        .minify(MinifyOptions { targets: targets.clone(), ..MinifyOptions::default() })
+        .minify(MinifyOptions {
+            targets: targets.clone(),
+            ..MinifyOptions::default()
+        })
         .map_err(|err| format!("css transform error in {url}: {err}"))?;
 
     let result = stylesheet
-        .to_css(PrinterOptions { minify, targets, ..PrinterOptions::default() })
+        .to_css(PrinterOptions {
+            minify,
+            targets,
+            ..PrinterOptions::default()
+        })
         .map_err(|err| format!("css print error in {url}: {err}"))?;
 
     let exports = result.exports.map(|map| {
-        let mut pairs: Vec<(String, String)> =
-            map.into_iter().map(|(name, export)| (name, export.name)).collect();
+        let mut pairs: Vec<(String, String)> = map
+            .into_iter()
+            .map(|(name, export)| (name, export.name))
+            .collect();
         pairs.sort();
         pairs
     });
 
-    Ok(CssOutput { css: result.code, exports })
+    Ok(CssOutput {
+        css: result.code,
+        exports,
+    })
 }
 
 #[cfg(test)]
@@ -139,7 +152,11 @@ mod tests {
     #[test]
     fn autoprefixing_applies_for_targets() {
         let out = compile_css("/p.css", ".x { user-select: none; }", true).unwrap();
-        assert!(out.css.contains("-webkit-user-select"), "autoprefixed: {}", out.css);
+        assert!(
+            out.css.contains("-webkit-user-select"),
+            "autoprefixed: {}",
+            out.css
+        );
     }
 
     #[test]

@@ -6,9 +6,9 @@ use std::path::Path;
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{Expression, ImportDeclarationSpecifier, ModuleExportName, Statement};
-use oxc_ast_visit::{VisitMut, walk_mut};
-use oxc_ecmascript::BoundNames;
+use oxc_ast_visit::{walk_mut, VisitMut};
 use oxc_codegen::Codegen;
+use oxc_ecmascript::BoundNames;
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
@@ -102,11 +102,16 @@ fn compile_esm_factory(
             .map(|d| format!("{:?}", d.with_source_code(source_text.to_string())))
             .collect::<Vec<_>>()
             .join("\n");
-        return Err(CompileError::Parse { path: path.to_path_buf(), message });
+        return Err(CompileError::Parse {
+            path: path.to_path_buf(),
+            message,
+        });
     }
     let mut program = parsed.program;
 
-    let scoping = SemanticBuilder::new().with_excess_capacity(2.0).build(&program);
+    let scoping = SemanticBuilder::new()
+        .with_excess_capacity(2.0)
+        .build(&program);
     let scoping = scoping.semantic.into_scoping();
     let mut transform_options = TransformOptions::default();
     transform_options.jsx.jsx_plugin = true;
@@ -115,12 +120,19 @@ fn compile_esm_factory(
     if refresh {
         transform_options.jsx.refresh = Some(ReactRefreshOptions::default());
     }
-    let ret =
-        Transformer::new(&allocator, path, &transform_options).build_with_scoping(scoping, &mut program);
+    let ret = Transformer::new(&allocator, path, &transform_options)
+        .build_with_scoping(scoping, &mut program);
     if !ret.diagnostics.is_empty() {
-        let message =
-            ret.diagnostics.into_iter().map(|d| format!("{d:?}")).collect::<Vec<_>>().join("\n");
-        return Err(CompileError::Transform { path: path.to_path_buf(), message });
+        let message = ret
+            .diagnostics
+            .into_iter()
+            .map(|d| format!("{d:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(CompileError::Transform {
+            path: path.to_path_buf(),
+            message,
+        });
     }
 
     let is_refresh_boundary = refresh && crate::detect_refresh_registrations(&program);
@@ -136,7 +148,10 @@ fn compile_esm_factory(
 
     if source_text.contains("import.meta.env") {
         use oxc_transformer_plugins::{ReplaceGlobalDefines, ReplaceGlobalDefinesConfig};
-        let scoping = SemanticBuilder::new().build(&program).semantic.into_scoping();
+        let scoping = SemanticBuilder::new()
+            .build(&program)
+            .semantic
+            .into_scoping();
         let defines = crate::import_meta_env_defines(true);
         if let Ok(config) = ReplaceGlobalDefinesConfig::new(&defines) {
             let _ = ReplaceGlobalDefines::new(&allocator, config).build(scoping, &mut program);
@@ -147,9 +162,13 @@ fn compile_esm_factory(
         crate::glob::expand(&allocator, path.parent().unwrap_or(path), &mut program);
     }
 
-    let (_, dynamic_imports) = crate::rewrite_module_specifiers_pub(&allocator, &mut program, resolve);
+    let (_, dynamic_imports) =
+        crate::rewrite_module_specifiers_pub(&allocator, &mut program, resolve);
 
-    let semantic = SemanticBuilder::new().with_build_nodes(true).build(&program).semantic;
+    let semantic = SemanticBuilder::new()
+        .with_build_nodes(true)
+        .build(&program)
+        .semantic;
 
     let mut import_vars: Vec<String> = Vec::new();
     let mut var_of_url: HashMap<String, usize> = HashMap::new();
@@ -188,13 +207,16 @@ fn compile_esm_factory(
                         }
                         ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => (&s.local, None),
                     };
-                    let Some(symbol_id) = local.symbol_id.get() else { continue };
-                    for &reference_id in
-                        semantic.scoping().get_resolved_reference_ids(symbol_id)
-                    {
+                    let Some(symbol_id) = local.symbol_id.get() else {
+                        continue;
+                    };
+                    for &reference_id in semantic.scoping().get_resolved_reference_ids(symbol_id) {
                         replacements.insert(
                             reference_id,
-                            Replacement { var: format!("_oj_m{vi}"), member: member.clone() },
+                            Replacement {
+                                var: format!("_oj_m{vi}"),
+                                member: member.clone(),
+                            },
                         );
                     }
                 }
@@ -242,7 +264,11 @@ fn compile_esm_factory(
     }
     drop(semantic);
 
-    let mut rewriter = RefRewriter { allocator: &allocator, replacements: &replacements, url };
+    let mut rewriter = RefRewriter {
+        allocator: &allocator,
+        replacements: &replacements,
+        url,
+    };
     rewriter.visit_program(&mut program);
 
     let old_body = std::mem::replace(&mut program.body, oxc_allocator::Vec::new_in(&&allocator));
@@ -253,9 +279,14 @@ fn compile_esm_factory(
         prologue.push_str("var __oj_default;\n");
     }
     if !getters.is_empty() {
-        let entries: Vec<String> =
-            getters.iter().map(|(name, expr)| format!("{name:?}: () => {expr}")).collect();
-        prologue.push_str(&format!("__oj_esm(__oj_exports, {{ {} }});\n", entries.join(", ")));
+        let entries: Vec<String> = getters
+            .iter()
+            .map(|(name, expr)| format!("{name:?}: () => {expr}"))
+            .collect();
+        prologue.push_str(&format!(
+            "__oj_esm(__oj_exports, {{ {} }});\n",
+            entries.join(", ")
+        ));
     } else {
         prologue.push_str("__oj_esm(__oj_exports, {});\n");
     }
@@ -376,7 +407,9 @@ pub(crate) fn binding_names(declaration: &oxc_ast::ast::Declaration) -> Vec<Stri
     match declaration {
         D::VariableDeclaration(var) => {
             for declarator in &var.declarations {
-                declarator.id.bound_names(&mut |ident| names.push(ident.name.to_string()));
+                declarator
+                    .id
+                    .bound_names(&mut |ident| names.push(ident.name.to_string()));
             }
         }
         D::FunctionDeclaration(f) => {
@@ -479,7 +512,14 @@ mod tests {
         let mut resolve = |spec: &str| -> Option<String> {
             (spec.starts_with('.')).then(|| format!("/src{}.tsx", spec.trim_start_matches('.')))
         };
-        compile_esm_factory(Path::new("Mod.tsx"), "/src/Mod.tsx", src, &mut resolve, true).unwrap()
+        compile_esm_factory(
+            Path::new("Mod.tsx"),
+            "/src/Mod.tsx",
+            src,
+            &mut resolve,
+            true,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -496,10 +536,19 @@ export function Widget() {
 "#,
         );
         let code = &out.code;
-        assert!(code.contains(r#"var _oj_m0 = __oj_require("react")"#), "{code}");
+        assert!(
+            code.contains(r#"var _oj_m0 = __oj_require("react")"#),
+            "{code}"
+        );
         assert!(code.contains("_oj_m0.useState(0)"), "{code}");
-        assert!(code.contains("_oj_m1.helper(_oj_m1.default, _oj_m2.thing"), "{code}");
-        assert!(code.contains("h: _oj_m1.helper"), "shorthand must expand: {code}");
+        assert!(
+            code.contains("_oj_m1.helper(_oj_m1.default, _oj_m2.thing"),
+            "{code}"
+        );
+        assert!(
+            code.contains("h: _oj_m1.helper"),
+            "shorthand must expand: {code}"
+        );
         assert!(!code.contains("import "), "{code}");
     }
 
@@ -512,7 +561,11 @@ export function f(x) { return x + 1; }
 export const y = x;
 "#,
         );
-        assert!(out.code.contains("return x + 1"), "param x must stay: {}", out.code);
+        assert!(
+            out.code.contains("return x + 1"),
+            "param x must stay: {}",
+            out.code
+        );
         assert!(out.code.contains("const y = _oj_m0.x"), "{}", out.code);
     }
 
@@ -530,10 +583,17 @@ export { c } from "./third";
         let code = &out.code;
         let esm_at = code.find("__oj_esm").unwrap();
         let body_at = code.find("const a = 1").unwrap();
-        assert!(esm_at < body_at, "getters must be installed before the body: {code}");
-        for expected in
-            [r#""a": () => a"#, r#""default": () => App"#, r#""b": () => a"#, "__oj_export_star(", r#""c": () => _oj_m"#]
-        {
+        assert!(
+            esm_at < body_at,
+            "getters must be installed before the body: {code}"
+        );
+        for expected in [
+            r#""a": () => a"#,
+            r#""default": () => App"#,
+            r#""b": () => a"#,
+            "__oj_export_star(",
+            r#""c": () => _oj_m"#,
+        ] {
             assert!(code.contains(expected), "missing {expected:?} in: {code}");
         }
         assert!(code.contains("function App()"), "hoisted decl kept: {code}");
@@ -543,13 +603,22 @@ export { c } from "./third";
     fn anonymous_default_export_is_assigned() {
         let out = factory(r#"export default () => 42;"#);
         assert!(out.code.contains("__oj_default = () => 42"), "{}", out.code);
-        assert!(out.code.contains(r#""default": () => __oj_default"#), "{}", out.code);
+        assert!(
+            out.code.contains(r#""default": () => __oj_default"#),
+            "{}",
+            out.code
+        );
     }
 
     #[test]
     fn side_effect_imports_still_require() {
         let out = factory(r#"import "./global-setup"; export const x = 1;"#);
-        assert!(out.code.contains(r#"__oj_require("/src/global-setup.tsx")"#), "{}", out.code);
+        assert!(
+            out.code
+                .contains(r#"__oj_require("/src/global-setup.tsx")"#),
+            "{}",
+            out.code
+        );
     }
 
     #[test]
@@ -562,7 +631,10 @@ export { c } from "./third";
         )
         .unwrap();
         assert_eq!(out.kind, FactoryKind::Cjs);
-        assert_eq!(out.require_map, vec![("react".into(), "/node_modules/react/index.js".into())]);
+        assert_eq!(
+            out.require_map,
+            vec![("react".into(), "/node_modules/react/index.js".into())]
+        );
         assert!(out.code.contains("require('react')") || out.code.contains("require(\"react\")"));
         assert!(!out.is_boundary(), "cjs never a refresh boundary");
     }
@@ -574,7 +646,11 @@ export { c } from "./third";
 export function Thing() { return import.meta.url; }
 "#,
         );
-        assert!(out.code.contains(r#"location.origin + "/src/Mod.tsx""#), "{}", out.code);
+        assert!(
+            out.code.contains(r#"location.origin + "/src/Mod.tsx""#),
+            "{}",
+            out.code
+        );
         assert!(out.is_boundary(), "component module registers refresh");
     }
 
@@ -582,6 +658,10 @@ export function Thing() { return import.meta.url; }
     fn plain_esm_module_without_a_component_is_not_a_boundary() {
         let out = factory("export const x = 1; export function add(a, b) { return a + b; }");
         assert_eq!(out.kind, FactoryKind::Esm);
-        assert!(!out.is_boundary(), "no $RefreshReg$ means no boundary: {}", out.code);
+        assert!(
+            !out.is_boundary(),
+            "no $RefreshReg$ means no boundary: {}",
+            out.code
+        );
     }
 }

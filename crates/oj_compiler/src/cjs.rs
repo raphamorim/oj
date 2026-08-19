@@ -8,7 +8,7 @@ use oxc_ast::ast::{
     AssignmentExpression, AssignmentOperator, AssignmentTarget, CallExpression, Expression,
     ObjectPropertyKind, PropertyKey, Statement,
 };
-use oxc_ast_visit::{Visit, walk};
+use oxc_ast_visit::{walk, Visit};
 use oxc_codegen::Codegen;
 use oxc_minifier::{CompressOptions, Compressor};
 use oxc_parser::Parser;
@@ -25,8 +25,11 @@ pub fn compile_dep(
     resolve: &mut dyn FnMut(&str) -> Option<String>,
 ) -> Result<CompileOutput, CompileError> {
     if has_module_syntax(path, source_text) {
-        let opts =
-            crate::CompileOptions { dev: true, refresh: false, sourcemap: false };
+        let opts = crate::CompileOptions {
+            dev: true,
+            refresh: false,
+            sourcemap: false,
+        };
         crate::compile_module(path, source_text, &opts, Some(resolve))
     } else {
         wrap_cjs(path, url, source_text, resolve)
@@ -86,11 +89,17 @@ fn lower_and_analyze(
             .map(|d| format!("{d:?}"))
             .collect::<Vec<_>>()
             .join("\n");
-        return Err(CompileError::Parse { path: path.to_path_buf(), message });
+        return Err(CompileError::Parse {
+            path: path.to_path_buf(),
+            message,
+        });
     }
     let mut program = parsed.program;
 
-    let scoping = SemanticBuilder::new().build(&program).semantic.into_scoping();
+    let scoping = SemanticBuilder::new()
+        .build(&program)
+        .semantic
+        .into_scoping();
     let config = ReplaceGlobalDefinesConfig::new(&[("process.env.NODE_ENV", "'development'")])
         .expect("static define config");
     let _ = ReplaceGlobalDefines::new(&allocator, config).build(scoping, &mut program);
@@ -120,7 +129,10 @@ pub fn wrap_cjs(
     unique_requires.dedup();
     let unique_requires: Vec<String> = {
         let mut seen = std::collections::HashSet::new();
-        unique_requires.into_iter().filter(|s| seen.insert(s.clone())).collect()
+        unique_requires
+            .into_iter()
+            .filter(|s| seen.insert(s.clone()))
+            .collect()
     };
 
     for (i, spec) in unique_requires.iter().enumerate() {
@@ -209,7 +221,9 @@ struct CjsAnalyzer {
 }
 
 fn require_specifier<'a>(call: &'a CallExpression) -> Option<&'a str> {
-    let Expression::Identifier(callee) = &call.callee else { return None };
+    let Expression::Identifier(callee) = &call.callee else {
+        return None;
+    };
     if callee.name != "require" || call.arguments.len() != 1 {
         return None;
     }
@@ -308,16 +322,26 @@ if (process.env.NODE_ENV === 'production') {
 }
 "#;
         let mut resolve = |spec: &str| -> Option<String> {
-            Some(format!("/node_modules/react{}", spec.trim_start_matches('.')))
+            Some(format!(
+                "/node_modules/react{}",
+                spec.trim_start_matches('.')
+            ))
         };
-        let out = wrap_cjs(Path::new("index.js"), "/node_modules/react/index.js", src, &mut resolve)
-            .unwrap();
+        let out = wrap_cjs(
+            Path::new("index.js"),
+            "/node_modules/react/index.js",
+            src,
+            &mut resolve,
+        )
+        .unwrap();
         assert!(
             !out.code.contains("production.js"),
             "production branch must be DCE'd:\n{}",
             out.code
         );
-        assert!(out.code.contains(r#"export * from "/node_modules/react/cjs/react.development.js""#));
+        assert!(out
+            .code
+            .contains(r#"export * from "/node_modules/react/cjs/react.development.js""#));
         assert!(out.imports.iter().all(|i| !i.contains("production")));
     }
 
@@ -341,7 +365,11 @@ if (process.env.NODE_ENV === 'production') {
             "export const __cjs_exports = module.exports;",
             "export default",
         ] {
-            assert!(out.code.contains(expected), "missing {expected:?}:\n{}", out.code);
+            assert!(
+                out.code.contains(expected),
+                "missing {expected:?}:\n{}",
+                out.code
+            );
         }
     }
 
@@ -354,7 +382,9 @@ exports.render = function () { return react && scheduler; };
 "#;
         let mut resolve = |spec: &str| Some(format!("/node_modules/{spec}/index.js"));
         let out = wrap_cjs(Path::new("x.js"), "/n/x.js", src, &mut resolve).unwrap();
-        assert!(out.code.contains(r#"import { __cjs_exports as __oj_dep_0 } from "/node_modules/react/index.js""#));
+        assert!(out.code.contains(
+            r#"import { __cjs_exports as __oj_dep_0 } from "/node_modules/react/index.js""#
+        ));
         assert!(out.code.contains(r#""scheduler": __oj_dep_1"#));
         assert_eq!(out.imports.len(), 2);
     }
@@ -368,7 +398,9 @@ exports.named = 1;
 "#;
         let mut resolve = |_: &str| None;
         let out = wrap_cjs(Path::new("f.js"), "/n/f.js", src, &mut resolve).unwrap();
-        assert!(out.code.contains(r#"__esModule) ? module.exports["default"] : module.exports"#));
+        assert!(out
+            .code
+            .contains(r#"__esModule) ? module.exports["default"] : module.exports"#));
         assert!(out.code.contains("as named }"), "{}", out.code);
     }
 
@@ -417,19 +449,40 @@ exports.named = 1;
         for ok in ["foo", "_bar", "$x", "a1_$", "React"] {
             assert!(is_valid_export_name(ok), "{ok} should be valid");
         }
-        for bad in ["default", "__cjs_exports", "__oj_glob_0", "1foo", "foo-bar", "", "a.b"] {
+        for bad in [
+            "default",
+            "__cjs_exports",
+            "__oj_glob_0",
+            "1foo",
+            "foo-bar",
+            "",
+            "a.b",
+        ] {
             assert!(!is_valid_export_name(bad), "{bad:?} should be rejected");
         }
     }
 
     #[test]
     fn unresolved_require_is_omitted_and_guarded_at_runtime() {
-        let src = r#"var missing = require('./gone'); exports.use = function () { return missing; };"#;
+        let src =
+            r#"var missing = require('./gone'); exports.use = function () { return missing; };"#;
         let mut resolve = |_: &str| None;
         let out = wrap_cjs(Path::new("u.js"), "/n/u.js", src, &mut resolve).unwrap();
-        assert!(!out.code.contains("__oj_dep_0"), "unresolved dep must not import: {}", out.code);
-        assert!(out.imports.is_empty(), "unresolved dep is not an edge: {:?}", out.imports);
-        assert!(out.code.contains("unresolved require("), "runtime guard present: {}", out.code);
+        assert!(
+            !out.code.contains("__oj_dep_0"),
+            "unresolved dep must not import: {}",
+            out.code
+        );
+        assert!(
+            out.imports.is_empty(),
+            "unresolved dep is not an edge: {:?}",
+            out.imports
+        );
+        assert!(
+            out.code.contains("unresolved require("),
+            "runtime guard present: {}",
+            out.code
+        );
     }
 
     #[test]
@@ -439,7 +492,11 @@ exports.named = 1;
         let out = wrap_cjs(Path::new("d.js"), "/n/d.js", src, &mut resolve).unwrap();
         assert_eq!(out.imports, vec!["/node_modules/dep/index.js".to_string()]);
         assert!(out.code.contains("__oj_dep_0"));
-        assert!(!out.code.contains("__oj_dep_1"), "second require must dedupe: {}", out.code);
+        assert!(
+            !out.code.contains("__oj_dep_1"),
+            "second require must dedupe: {}",
+            out.code
+        );
     }
 
     #[test]
@@ -447,10 +504,26 @@ exports.named = 1;
         let src = r#"module.exports = { good: 1, "bad-name": 2, "with space": 3 };"#;
         let mut resolve = |_: &str| None;
         let out = wrap_cjs(Path::new("k.js"), "/n/k.js", src, &mut resolve).unwrap();
-        assert!(out.code.contains("as good }"), "valid key exported: {}", out.code);
-        assert!(!out.code.contains("as bad-name"), "hyphenated key not exported: {}", out.code);
-        assert!(!out.code.contains("as with space"), "spaced key not exported: {}", out.code);
-        assert!(!out.code.contains("__oj_export_1"), "only the valid key exported: {}", out.code);
+        assert!(
+            out.code.contains("as good }"),
+            "valid key exported: {}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("as bad-name"),
+            "hyphenated key not exported: {}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("as with space"),
+            "spaced key not exported: {}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("__oj_export_1"),
+            "only the valid key exported: {}",
+            out.code
+        );
         assert!(out.code.contains("export default"), "{}", out.code);
     }
 
@@ -458,8 +531,24 @@ exports.named = 1;
     fn wrapper_injects_filename_and_dirname_from_url() {
         let src = r#"exports.here = __dirname; exports.file = __filename;"#;
         let mut resolve = |_: &str| None;
-        let out = wrap_cjs(Path::new("x.js"), "/node_modules/pkg/sub/x.js", src, &mut resolve).unwrap();
-        assert!(out.code.contains(r#"const __filename = "/node_modules/pkg/sub/x.js""#), "{}", out.code);
-        assert!(out.code.contains(r#"const __dirname = "/node_modules/pkg/sub""#), "{}", out.code);
+        let out = wrap_cjs(
+            Path::new("x.js"),
+            "/node_modules/pkg/sub/x.js",
+            src,
+            &mut resolve,
+        )
+        .unwrap();
+        assert!(
+            out.code
+                .contains(r#"const __filename = "/node_modules/pkg/sub/x.js""#),
+            "{}",
+            out.code
+        );
+        assert!(
+            out.code
+                .contains(r#"const __dirname = "/node_modules/pkg/sub""#),
+            "{}",
+            out.code
+        );
     }
 }

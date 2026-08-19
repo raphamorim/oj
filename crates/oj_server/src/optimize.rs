@@ -40,7 +40,10 @@ impl OptimizedDeps {
 
     pub fn disabled() -> Self {
         let (_tx, rx) = watch::channel(Some(Arc::new(DepMap::new())));
-        OptimizedDeps { rx, dir: PathBuf::new() }
+        OptimizedDeps {
+            rx,
+            dir: PathBuf::new(),
+        }
     }
 
     pub fn prepare(root: &Path, version: &str, input: OptimizeInput) -> Self {
@@ -56,7 +59,9 @@ impl OptimizedDeps {
         let root = root.to_path_buf();
         let dir_task = dir.clone();
         tokio::spawn(async move {
-            let map = run_optimizer(&root, &dir_task, &hash, &input).await.unwrap_or_default();
+            let map = run_optimizer(&root, &dir_task, &hash, &input)
+                .await
+                .unwrap_or_default();
             let _ = tx.send(Some(Arc::new(map)));
         });
         OptimizedDeps { rx, dir }
@@ -77,7 +82,13 @@ pub struct OptimizeInput {
 fn lockfile_hash(root: &Path, version: &str, input: &OptimizeInput) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(version.as_bytes());
-    for name in ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "package.json"] {
+    for name in [
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "bun.lockb",
+        "package.json",
+    ] {
         if let Ok(bytes) = std::fs::read(root.join(name)) {
             hasher.update(name.as_bytes());
             hasher.update(&bytes);
@@ -85,7 +96,13 @@ fn lockfile_hash(root: &Path, version: &str, input: &OptimizeInput) -> String {
     }
     // Fold the optimizer config into the key so include/exclude/entries/dedupe/alias
     // changes invalidate a stale prebundle.
-    for s in input.include.iter().chain(&input.exclude).chain(&input.entries).chain(&input.dedupe) {
+    for s in input
+        .include
+        .iter()
+        .chain(&input.exclude)
+        .chain(&input.entries)
+        .chain(&input.dedupe)
+    {
         hasher.update(b"\0");
         hasher.update(s.as_bytes());
     }
@@ -103,8 +120,17 @@ fn parse_metadata(v: &serde_json::Value) -> Option<DepMap> {
     let mut map = DepMap::new();
     for (dep, meta) in obj {
         let file = meta.get("file")?.as_str()?.to_string();
-        let needs_interop = meta.get("needsInterop").and_then(serde_json::Value::as_bool).unwrap_or(true);
-        map.insert(dep.clone(), DepMeta { file, needs_interop });
+        let needs_interop = meta
+            .get("needsInterop")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        map.insert(
+            dep.clone(),
+            DepMeta {
+                file,
+                needs_interop,
+            },
+        );
     }
     Some(map)
 }
@@ -124,7 +150,12 @@ fn load_manifest(dir: &Path, hash: &str) -> Option<DepMap> {
     Some(map)
 }
 
-async fn run_optimizer(root: &Path, dir: &Path, hash: &str, input: &OptimizeInput) -> Option<DepMap> {
+async fn run_optimizer(
+    root: &Path,
+    dir: &Path,
+    hash: &str,
+    input: &OptimizeInput,
+) -> Option<DepMap> {
     let cache = root.join(".oj-cache");
     std::fs::create_dir_all(&cache).ok()?;
     let script = cache.join("optimize-deps.mjs");
@@ -137,7 +168,11 @@ async fn run_optimizer(root: &Path, dir: &Path, hash: &str, input: &OptimizeInpu
             include.push(dep.clone());
         }
     }
-    let alias: Vec<[&str; 2]> = input.alias.iter().map(|(f, r)| [f.as_str(), r.as_str()]).collect();
+    let alias: Vec<[&str; 2]> = input
+        .alias
+        .iter()
+        .map(|(f, r)| [f.as_str(), r.as_str()])
+        .collect();
     let cfg = serde_json::json!({
         "root": root,
         "outDir": dir,

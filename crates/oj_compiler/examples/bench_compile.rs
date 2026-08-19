@@ -44,8 +44,14 @@ fn main() {
     let path = Path::new("Widget.tsx");
 
     let out = compile(path, SRC, &opts).expect("compile");
-    assert!(out.code.contains("\"development\""), "define must be replaced");
-    assert!(!out.code.contains("import.meta.env"), "no bare import.meta.env left");
+    assert!(
+        out.code.contains("\"development\""),
+        "define must be replaced"
+    );
+    assert!(
+        !out.code.contains("import.meta.env"),
+        "no bare import.meta.env left"
+    );
 
     let warmup = 2_000;
     let iters = 40_000;

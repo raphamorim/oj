@@ -16,7 +16,10 @@ fn strip_noise(svg: &str) -> String {
     loop {
         let cut = rest.find("<?").map(|i| (i, "?>")).into_iter();
         let cut2 = rest.find("<!--").map(|i| (i, "-->"));
-        let doctype = rest.find("<!DOCTYPE").or_else(|| rest.find("<!doctype")).map(|i| (i, ">"));
+        let doctype = rest
+            .find("<!DOCTYPE")
+            .or_else(|| rest.find("<!doctype"))
+            .map(|i| (i, ">"));
         let next = cut.chain(cut2).chain(doctype).min_by_key(|(i, _)| *i);
         let Some((start, end_tok)) = next else {
             out.push_str(rest);
@@ -62,7 +65,9 @@ fn rewrite_tag(tag: &str, root_candidate: bool) -> (String, bool) {
     let self_closing = inner.ends_with('/');
     let inner = inner.strip_suffix('/').unwrap_or(inner);
 
-    let name_end = inner.find(|c: char| c.is_whitespace()).unwrap_or(inner.len());
+    let name_end = inner
+        .find(|c: char| c.is_whitespace())
+        .unwrap_or(inner.len());
     let name = &inner[..name_end];
     let attrs_src = inner[name_end..].trim();
     let is_root = root_candidate && name == "svg";
@@ -180,9 +185,15 @@ fn style_to_object(style: &str) -> String {
         if decl.is_empty() {
             continue;
         }
-        let Some((prop, val)) = decl.split_once(':') else { continue };
+        let Some((prop, val)) = decl.split_once(':') else {
+            continue;
+        };
         let key = css_prop_to_camel(prop.trim());
-        parts.push(format!("{}: {}", key, serde_json::Value::String(val.trim().to_string())));
+        parts.push(format!(
+            "{}: {}",
+            key,
+            serde_json::Value::String(val.trim().to_string())
+        ));
     }
     parts.join(", ")
 }
@@ -252,9 +263,8 @@ mod tests {
 
     #[test]
     fn strips_xml_prolog_doctype_comments() {
-        let out = svg_to_component(
-            "<?xml version=\"1.0\"?><!DOCTYPE svg><!-- c --><svg><path/></svg>",
-        );
+        let out =
+            svg_to_component("<?xml version=\"1.0\"?><!DOCTYPE svg><!-- c --><svg><path/></svg>");
         assert!(!out.contains("<?xml"), "{out}");
         assert!(!out.contains("DOCTYPE"), "{out}");
         assert!(!out.contains("<!--"), "{out}");

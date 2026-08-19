@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use oj_resolver::OjResolver;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -44,10 +44,15 @@ pub fn vite_config_file(root: &Path) -> Option<std::path::PathBuf> {
     if let Some(p) = VITE_CONFIG_OVERRIDE.get() {
         return p.is_file().then(|| p.clone());
     }
-    ["vite.config.ts", "vite.config.mts", "vite.config.mjs", "vite.config.js"]
-        .into_iter()
-        .map(|f| root.join(f))
-        .find(|p| p.is_file())
+    [
+        "vite.config.ts",
+        "vite.config.mts",
+        "vite.config.mjs",
+        "vite.config.js",
+    ]
+    .into_iter()
+    .map(|f| root.join(f))
+    .find(|p| p.is_file())
 }
 
 #[inline]
@@ -106,12 +111,23 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
 #[inline]
 fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
     ViteValues {
-        base: json.get("base").and_then(|v| v.as_str()).map(str::to_string),
-        public_dir: json.get("publicDir").and_then(|v| v.as_str()).map(str::to_string),
+        base: json
+            .get("base")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        public_dir: json
+            .get("publicDir")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
         port: json.get("port").and_then(|v| v.as_u64()).map(|p| p as u16),
-        host: json.get("host").and_then(|v| v.as_str()).map(str::to_string),
+        host: json
+            .get("host")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
         fs_allow: json.get("fsAllow").and_then(|v| v.as_array()).map(|a| {
-            a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
         }),
         define: json.get("define").and_then(|v| v.as_object()).cloned(),
         alias: json.get("alias").and_then(|v| v.as_object()).cloned(),
@@ -120,7 +136,9 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
         assets_inline_limit: json.get("assetsInlineLimit").and_then(|v| v.as_u64()),
         proxy: json.get("proxy").filter(|v| !v.is_null()).cloned(),
         dedupe: json.get("dedupe").and_then(|v| v.as_array()).map(|a| {
-            a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
         }),
         optimize_deps: json.get("optimizeDeps").filter(|v| !v.is_null()).cloned(),
     }
@@ -157,7 +175,11 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
         }
         if sc.fs.is_none() {
             if let Some(allow) = v.fs_allow {
-                sc.fs = Some(oj_config::FsConfig { allow: Some(allow), strict: None, deny: None });
+                sc.fs = Some(oj_config::FsConfig {
+                    allow: Some(allow),
+                    strict: None,
+                    deny: None,
+                });
             }
         }
         if sc.headers.is_none() {
@@ -246,7 +268,10 @@ async fn handle_ctx_rpc(
             let dir = if importer.is_empty() {
                 root.to_path_buf()
             } else {
-                Path::new(importer).parent().map(Path::to_path_buf).unwrap_or_else(|| root.to_path_buf())
+                Path::new(importer)
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| root.to_path_buf())
             };
             match resolver.resolve(&dir, source) {
                 Ok(p) => serde_json::json!({ "rpcReply": rpc, "result": p.display().to_string() }),
@@ -258,7 +283,10 @@ async fn handle_ctx_rpc(
             let path = Path::new(id);
             match std::fs::read_to_string(path) {
                 Ok(src) => {
-                    let dir = path.parent().map(Path::to_path_buf).unwrap_or_else(|| root.to_path_buf());
+                    let dir = path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| root.to_path_buf());
                     let (code, imports) = match oj_compiler::compile(
                         path,
                         &src,
@@ -284,7 +312,9 @@ async fn handle_ctx_rpc(
                 Err(_) => serde_json::json!({ "rpcReply": rpc, "result": null }),
             }
         }
-        other => serde_json::json!({ "rpcReply": rpc, "error": format!("unknown ctx method: {other}") }),
+        other => {
+            serde_json::json!({ "rpcReply": rpc, "error": format!("unknown ctx method: {other}") })
+        }
     };
     let mut stdin = stdin.lock().await;
     let _ = stdin.write_all(format!("{reply}\n").as_bytes()).await;
@@ -336,11 +366,14 @@ impl PluginHost {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+                let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
+                    continue;
+                };
                 if let Some(rpc) = msg["rpc"].as_u64() {
                     let method = msg["method"].as_str().unwrap_or("").to_string();
                     let args = msg["args"].as_array().cloned().unwrap_or_default();
-                    handle_ctx_rpc(rpc, &method, &args, &resolver, &root_buf, &reader_ref.stdin).await;
+                    handle_ctx_rpc(rpc, &method, &args, &resolver, &root_buf, &reader_ref.stdin)
+                        .await;
                     continue;
                 }
                 if let Some(ws) = msg.get("ojWs") {
@@ -353,7 +386,11 @@ impl PluginHost {
                                 "data": ws.get("data").cloned().unwrap_or(serde_json::Value::Null),
                             })
                             .to_string(),
-                            None => ws.get("data").filter(|d| d.is_object()).map(|d| d.to_string()).unwrap_or_default(),
+                            None => ws
+                                .get("data")
+                                .filter(|d| d.is_object())
+                                .map(|d| d.to_string())
+                                .unwrap_or_default(),
                         };
                         if !payload.is_empty() {
                             let _ = tx.send(payload);
@@ -361,11 +398,16 @@ impl PluginHost {
                     }
                     continue;
                 }
-                let Some(id) = msg["id"].as_u64() else { continue };
+                let Some(id) = msg["id"].as_u64() else {
+                    continue;
+                };
                 let result = if let Some(err) = msg.get("error").and_then(|e| e.as_str()) {
                     Err(err.to_string())
                 } else {
-                    Ok(msg.get("result").and_then(|r| r.as_str()).map(str::to_string))
+                    Ok(msg
+                        .get("result")
+                        .and_then(|r| r.as_str())
+                        .map(str::to_string))
                 };
                 if let Some(tx) = reader_ref.pending.lock().unwrap().remove(&id) {
                     let _ = tx.send(result);
@@ -382,7 +424,11 @@ impl PluginHost {
         let request = serde_json::json!({ "id": req_id, "hook": hook, "args": args });
         {
             let mut stdin = self.stdin.lock().await;
-            if stdin.write_all(format!("{request}\n").as_bytes()).await.is_err() {
+            if stdin
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .is_err()
+            {
                 self.pending.lock().unwrap().remove(&req_id);
                 return Err("plugin host died".into());
             }
@@ -399,11 +445,19 @@ impl PluginHost {
         };
         match serde_json::from_str::<serde_json::Value>(&raw) {
             Ok(v) => {
-                let out = v.get("code").and_then(|c| c.as_str()).unwrap_or(code).to_string();
+                let out = v
+                    .get("code")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or(code)
+                    .to_string();
                 let watch = v
                     .get("watchFiles")
                     .and_then(|w| w.as_array())
-                    .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 Ok((out, watch))
             }
@@ -432,13 +486,21 @@ impl PluginHost {
     }
 
     #[inline]
-    pub async fn handle_hot_update(&self, file: &str, timestamp: u64) -> Result<Option<String>, String> {
-        self.call("handleHotUpdate", &[file, &timestamp.to_string()]).await
+    pub async fn handle_hot_update(
+        &self,
+        file: &str,
+        timestamp: u64,
+    ) -> Result<Option<String>, String> {
+        self.call("handleHotUpdate", &[file, &timestamp.to_string()])
+            .await
     }
 
     #[inline]
     pub async fn transform_index_html(&self, html: &str) -> Result<String, String> {
-        Ok(self.call("transformIndexHtml", &[html]).await?.unwrap_or_else(|| html.to_string()))
+        Ok(self
+            .call("transformIndexHtml", &[html])
+            .await?
+            .unwrap_or_else(|| html.to_string()))
     }
 
     #[inline]
@@ -480,8 +542,16 @@ impl PluginHost {
     }
 
     #[inline]
-    pub async fn generate_bundle(&self, bundle_json: &str, is_write: bool) -> Result<Option<String>, String> {
-        self.call("generateBundle", &[bundle_json, if is_write { "true" } else { "false" }]).await
+    pub async fn generate_bundle(
+        &self,
+        bundle_json: &str,
+        is_write: bool,
+    ) -> Result<Option<String>, String> {
+        self.call(
+            "generateBundle",
+            &[bundle_json, if is_write { "true" } else { "false" }],
+        )
+        .await
     }
 
     #[inline]
@@ -489,7 +559,11 @@ impl PluginHost {
         matches!(self.call("hasRenderChunk", &[]).await, Ok(Some(s)) if s == "true")
     }
 
-    pub async fn render_chunk(&self, code: &str, chunk_json: &str) -> Result<Option<String>, String> {
+    pub async fn render_chunk(
+        &self,
+        code: &str,
+        chunk_json: &str,
+    ) -> Result<Option<String>, String> {
         self.call("renderChunk", &[code, chunk_json]).await
     }
 
@@ -500,25 +574,44 @@ impl PluginHost {
 
     #[inline]
     pub async fn write_bundle(&self, bundle_json: &str, is_write: bool) -> Result<(), String> {
-        self.call("writeBundle", &[bundle_json, if is_write { "true" } else { "false" }]).await.map(|_| ())
+        self.call(
+            "writeBundle",
+            &[bundle_json, if is_write { "true" } else { "false" }],
+        )
+        .await
+        .map(|_| ())
     }
 
     #[inline]
     pub async fn middleware_port(&self) -> Option<u16> {
-        self.call("getMiddlewarePort", &[]).await.ok().flatten().and_then(|s| s.parse().ok())
+        self.call("getMiddlewarePort", &[])
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok())
     }
 
     /// Number of plugins still active after oj filters out the ones it
     /// reimplements natively (the React family). Defaults to 1 on RPC failure so
     /// an uncertain host is kept, never dropped by mistake.
     pub async fn plugin_count(&self) -> usize {
-        self.call("getPluginCount", &[]).await.ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(1)
+        self.call("getPluginCount", &[])
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1)
     }
 
     /// Whether any active plugin has a `transform` hook. Defaults to true on RPC
     /// failure so the per-module transform pass is never skipped by mistake.
     pub async fn has_transform(&self) -> bool {
-        self.call("getHasTransform", &[]).await.ok().flatten().map(|s| s == "true").unwrap_or(true)
+        self.call("getHasTransform", &[])
+            .await
+            .ok()
+            .flatten()
+            .map(|s| s == "true")
+            .unwrap_or(true)
     }
 
     /// Which HMR hooks any active plugin defines: (watchChange, handleHotUpdate).
@@ -531,8 +624,12 @@ impl PluginHost {
         };
         match serde_json::from_str::<serde_json::Value>(&raw) {
             Ok(v) => (
-                v.get("watchChange").and_then(|b| b.as_bool()).unwrap_or(true),
-                v.get("handleHotUpdate").and_then(|b| b.as_bool()).unwrap_or(true),
+                v.get("watchChange")
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(true),
+                v.get("handleHotUpdate")
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(true),
             ),
             Err(_) => (true, true),
         }
@@ -676,11 +773,17 @@ mod vite_values_tests {
     fn merge_adopts_rollup_options() {
         let mut config = oj_config::OjConfig::default();
         let v = ViteValues {
-            rollup_options: Some(serde_json::json!({ "output": { "entryFileNames": "x/[name].js" } })),
+            rollup_options: Some(
+                serde_json::json!({ "output": { "entryFileNames": "x/[name].js" } }),
+            ),
             ..Default::default()
         };
         merge_vite_values(&mut config, v);
         let ro = oj_config::rolldown_options(&config).unwrap();
-        assert_eq!(ro.pointer("/output/entryFileNames").and_then(|v| v.as_str()), Some("x/[name].js"));
+        assert_eq!(
+            ro.pointer("/output/entryFileNames")
+                .and_then(|v| v.as_str()),
+            Some("x/[name].js")
+        );
     }
 }

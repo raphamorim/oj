@@ -2,7 +2,9 @@ use std::path::Path;
 use std::time::Instant;
 
 fn collect(dir: &Path, out: &mut Vec<Vec<u8>>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -47,8 +49,18 @@ fn main() {
 
     assert_eq!(ok_old, ok_new, "both must validate the same files");
     let mb = (total * iters) as f64 / (1024.0 * 1024.0);
-    println!("validate {} files ({} KB) x {iters} iters:", files.len(), total / 1024);
-    println!("  OLD (std::str::from_utf8):     {old:?}  = {:.2} GB/s", mb / 1024.0 / old.as_secs_f64());
-    println!("  NEW (simdutf8::basic):         {new:?}  = {:.2} GB/s", mb / 1024.0 / new.as_secs_f64());
+    println!(
+        "validate {} files ({} KB) x {iters} iters:",
+        files.len(),
+        total / 1024
+    );
+    println!(
+        "  OLD (std::str::from_utf8):     {old:?}  = {:.2} GB/s",
+        mb / 1024.0 / old.as_secs_f64()
+    );
+    println!(
+        "  NEW (simdutf8::basic):         {new:?}  = {:.2} GB/s",
+        mb / 1024.0 / new.as_secs_f64()
+    );
     println!("  speedup: {:.1}x", old.as_secs_f64() / new.as_secs_f64());
 }

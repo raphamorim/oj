@@ -8,31 +8,36 @@ use std::time::Instant;
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
+use oj_server::plugins::PluginHost;
 use rolldown::{
     BundlerBuilder, BundlerOptions, InputItem, OutputFormat, RawMinifyOptions, SourceMapType,
 };
+use rolldown_plugin::__inner::SharedPluginable;
 use rolldown_plugin::{
     HookLoadArgs, HookLoadOutput, HookLoadReturn, HookRenderChunkArgs, HookRenderChunkOutput,
     HookRenderChunkReturn, HookResolveIdArgs, HookResolveIdOutput, HookResolveIdReturn,
     HookTransformArgs, HookTransformOutput, HookTransformOutputMap, HookTransformReturn, Plugin,
     PluginContext, SharedLoadPluginContext, SharedTransformPluginContext,
 };
-use rolldown_plugin::__inner::SharedPluginable;
-use oj_server::plugins::PluginHost;
 
 fn ro_output_str(ro: Option<&serde_json::Value>, key: &str) -> Option<String> {
     let output = ro?.get("output")?;
-    let obj = if output.is_array() { output.get(0)? } else { output };
+    let obj = if output.is_array() {
+        output.get(0)?
+    } else {
+        output
+    };
     obj.get(key)?.as_str().map(String::from)
 }
 
 fn ro_external(ro: Option<&serde_json::Value>) -> Vec<String> {
     match ro.and_then(|v| v.get("external")) {
         Some(serde_json::Value::String(s)) => vec![s.clone()],
-        Some(serde_json::Value::Array(a)) => {
-            a.iter().filter_map(|x| x.as_str().map(String::from)).collect()
-        }
+        Some(serde_json::Value::Array(a)) => a
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -48,12 +53,20 @@ struct OjCssPlugin {
 }
 
 fn assets_inline_limit_of(config: &oj_config::OjConfig) -> u64 {
-    config.build.as_ref().and_then(|b| b.assets_inline_limit).unwrap_or(4096)
+    config
+        .build
+        .as_ref()
+        .and_then(|b| b.assets_inline_limit)
+        .unwrap_or(4096)
 }
 
 /// Vite's `build.cssCodeSplit` defaults to true: each chunk gets its own CSS.
 fn css_code_split_of(config: &oj_config::OjConfig) -> bool {
-    config.build.as_ref().and_then(|b| b.css_code_split).unwrap_or(true)
+    config
+        .build
+        .as_ref()
+        .and_then(|b| b.css_code_split)
+        .unwrap_or(true)
 }
 
 fn re_escape(s: &str) -> String {
@@ -73,19 +86,30 @@ fn re_escape(s: &str) -> String {
 
 fn manual_chunks(ro: Option<&serde_json::Value>) -> Option<rolldown_common::CodeSplittingMode> {
     let output = ro?.get("output")?;
-    let output = if output.is_array() { output.get(0)? } else { output };
+    let output = if output.is_array() {
+        output.get(0)?
+    } else {
+        output
+    };
     let map = output.get("manualChunks")?.as_object()?;
     let mut groups = Vec::new();
     let mut priority = map.len() as u32;
     for (name, tokens) in map {
-        let Some(arr) = tokens.as_array() else { continue };
-        let escaped: Vec<String> =
-            arr.iter().filter_map(|t| t.as_str()).map(re_escape).collect();
+        let Some(arr) = tokens.as_array() else {
+            continue;
+        };
+        let escaped: Vec<String> = arr
+            .iter()
+            .filter_map(|t| t.as_str())
+            .map(re_escape)
+            .collect();
         if escaped.is_empty() {
             continue;
         }
         let pattern = format!(r"[\\/]node_modules[\\/]({})([\\/]|$)", escaped.join("|"));
-        let Ok(test) = rolldown_utils::js_regex::HybridRegex::new(&pattern) else { continue };
+        let Ok(test) = rolldown_utils::js_regex::HybridRegex::new(&pattern) else {
+            continue;
+        };
         groups.push(rolldown_common::MatchGroup {
             name: rolldown_common::MatchGroupName::Static(name.clone()),
             test: Some(rolldown_common::MatchGroupTest::Regex(test)),
@@ -97,13 +121,17 @@ fn manual_chunks(ro: Option<&serde_json::Value>) -> Option<rolldown_common::Code
     if groups.is_empty() {
         return None;
     }
-    Some(rolldown_common::CodeSplittingMode::Advanced(rolldown_common::ManualCodeSplittingOptions {
-        groups: Some(groups),
-        ..Default::default()
-    }))
+    Some(rolldown_common::CodeSplittingMode::Advanced(
+        rolldown_common::ManualCodeSplittingOptions {
+            groups: Some(groups),
+            ..Default::default()
+        },
+    ))
 }
 
-fn target_transform(config: &oj_config::OjConfig) -> Option<rolldown_common::BundlerTransformOptions> {
+fn target_transform(
+    config: &oj_config::OjConfig,
+) -> Option<rolldown_common::BundlerTransformOptions> {
     let target = config.build.as_ref().and_then(|b| b.target.clone())?;
     Some(rolldown_common::BundlerTransformOptions {
         target: Some(rolldown_common::Either::Left(target)),
@@ -117,8 +145,26 @@ fn is_build_asset(id: &str) -> bool {
             .extension()
             .and_then(|e| e.to_str()),
         Some(
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "ico" | "bmp" | "svg" | "woff"
-                | "woff2" | "ttf" | "otf" | "eot" | "mp4" | "webm" | "mov" | "mp3" | "wav" | "ogg"
+            "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "webp"
+                | "avif"
+                | "ico"
+                | "bmp"
+                | "svg"
+                | "woff"
+                | "woff2"
+                | "ttf"
+                | "otf"
+                | "eot"
+                | "mp4"
+                | "webm"
+                | "mov"
+                | "mp3"
+                | "wav"
+                | "ogg"
         )
     )
 }
@@ -150,12 +196,24 @@ fn b64(bytes: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
         out.push(T[(n >> 18 & 63) as usize] as char);
         out.push(T[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -169,7 +227,11 @@ fn emit_or_inline(
     let path = std::path::Path::new(file);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if (bytes.len() as u64) <= inline_limit && ext != "svg" {
-        return Ok(format!("export default \"data:{};base64,{}\";", asset_mime(ext), b64(&bytes)));
+        return Ok(format!(
+            "export default \"data:{};base64,{}\";",
+            asset_mime(ext),
+            b64(&bytes)
+        ));
     }
     if (bytes.len() as u64) <= inline_limit && ext == "svg" {
         let text = String::from_utf8_lossy(&bytes);
@@ -182,7 +244,11 @@ fn emit_or_inline(
             .replace('\n', "");
         return Ok(format!("export default \"data:image/svg+xml,{encoded}\";"));
     }
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("asset").to_string();
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("asset")
+        .to_string();
     let reference = ctx
         .emit_file(
             rolldown_common::EmittedAsset {
@@ -194,7 +260,9 @@ fn emit_or_inline(
             None,
         )
         .map_err(|e| anyhow::anyhow!(e))?;
-    Ok(format!("export default import.meta.ROLLUP_FILE_URL_{reference};"))
+    Ok(format!(
+        "export default import.meta.ROLLUP_FILE_URL_{reference};"
+    ))
 }
 
 impl Plugin for OjCssPlugin {
@@ -214,14 +282,21 @@ impl Plugin for OjCssPlugin {
         args: &HookResolveIdArgs<'_>,
     ) -> impl std::future::Future<Output = HookResolveIdReturn> + Send {
         let is_routes = args.specifier == "virtual:oj-routes";
-        let routes_id = self.root.join("oj-routes.tsx").to_string_lossy().into_owned();
+        let routes_id = self
+            .root
+            .join("oj-routes.tsx")
+            .to_string_lossy()
+            .into_owned();
         let url_base = args.specifier.strip_suffix("?url").map(str::to_string);
         let init_base = args.specifier.strip_suffix("?init").map(str::to_string);
         let raw_base = args.specifier.strip_suffix("?raw").map(str::to_string);
         let inline_base = args.specifier.strip_suffix("?inline").map(str::to_string);
         let react_base = args.specifier.strip_suffix("?react").map(str::to_string);
         let worker_base = args.specifier.strip_suffix("?worker").map(str::to_string);
-        let shared_base = args.specifier.strip_suffix("?sharedworker").map(str::to_string);
+        let shared_base = args
+            .specifier
+            .strip_suffix("?sharedworker")
+            .map(str::to_string);
         let importer = args.importer.map(str::to_string);
         let ctx = ctx.clone();
         async move {
@@ -293,8 +368,8 @@ impl Plugin for OjCssPlugin {
         let inline_limit = self.inline_limit;
         async move {
             if let Some(file) = id.strip_suffix("?url") {
-                let bytes = std::fs::read(file)
-                    .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
+                let bytes =
+                    std::fs::read(file).map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
                 let code = emit_or_inline(&ctx, file, bytes, inline_limit)?;
                 return Ok(Some(rolldown_plugin::HookLoadOutput {
                     code: arcstr::ArcStr::from(code),
@@ -303,8 +378,8 @@ impl Plugin for OjCssPlugin {
                 }));
             }
             if !id.contains('?') && is_build_asset(&id) {
-                let bytes = std::fs::read(&id)
-                    .map_err(|e| anyhow::anyhow!("cannot read {id}: {e}"))?;
+                let bytes =
+                    std::fs::read(&id).map_err(|e| anyhow::anyhow!("cannot read {id}: {e}"))?;
                 let code = emit_or_inline(&ctx, &id, bytes, inline_limit)?;
                 return Ok(Some(rolldown_plugin::HookLoadOutput {
                     code: arcstr::ArcStr::from(code),
@@ -313,8 +388,8 @@ impl Plugin for OjCssPlugin {
                 }));
             }
             if let Some(file) = id.strip_suffix("?init") {
-                let bytes = std::fs::read(file)
-                    .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
+                let bytes =
+                    std::fs::read(file).map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
                 let name = std::path::Path::new(file)
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -352,8 +427,8 @@ impl Plugin for OjCssPlugin {
                 }));
             }
             if let Some(file) = id.strip_suffix("?inline") {
-                let bytes = std::fs::read(file)
-                    .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
+                let bytes =
+                    std::fs::read(file).map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
                 let ext = std::path::Path::new(file)
                     .extension()
                     .and_then(|e| e.to_str())
@@ -388,7 +463,10 @@ impl Plugin for OjCssPlugin {
             let worker = id
                 .strip_suffix("?worker")
                 .map(|f| (f, "Worker"))
-                .or_else(|| id.strip_suffix("?sharedworker").map(|f| (f, "SharedWorker")));
+                .or_else(|| {
+                    id.strip_suffix("?sharedworker")
+                        .map(|f| (f, "SharedWorker"))
+                });
             if let Some((file, ctor)) = worker {
                 let stem = std::path::Path::new(file)
                     .file_stem()
@@ -421,7 +499,10 @@ impl Plugin for OjCssPlugin {
                     Ok(rel) => format!("/{}", rel.display()),
                     Err(_) => path.to_string(),
                 };
-                let stub = server_fn_prod_stub(&oj_compiler::exports(&source, std::path::Path::new(path)), &url);
+                let stub = server_fn_prod_stub(
+                    &oj_compiler::exports(&source, std::path::Path::new(path)),
+                    &url,
+                );
                 return Ok(Some(rolldown_plugin::HookLoadOutput {
                     code: arcstr::ArcStr::from(stub),
                     module_type: Some(rolldown_common::ModuleType::Js),
@@ -457,8 +538,8 @@ impl Plugin for OjCssPlugin {
                 Ok(rel) => format!("/{}", rel.display()),
                 Err(_) => path.to_string(),
             };
-            let output = oj_css::compile_css(&css_id, &source, true)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let output =
+                oj_css::compile_css(&css_id, &source, true).map_err(|e| anyhow::anyhow!(e))?;
             let js = match &output.exports {
                 Some(exports) => {
                     let map: serde_json::Map<String, serde_json::Value> = exports
@@ -469,12 +550,16 @@ impl Plugin for OjCssPlugin {
                 }
                 None => "export default void 0;".to_string(),
             };
-            collected.lock().unwrap().push((path.to_string(), output.css));
+            collected
+                .lock()
+                .unwrap()
+                .push((path.to_string(), output.css));
             // When code-splitting CSS, keep the stub in its chunk so `module_ids`
             // maps each stylesheet to the chunk that imported it; without this the
             // unused-default stub is tree-shaken and the mapping is lost.
-            let side_effects =
-                self.css_code_split.then_some(rolldown_common::side_effects::HookSideEffects::NoTreeshake);
+            let side_effects = self
+                .css_code_split
+                .then_some(rolldown_common::side_effects::HookSideEffects::NoTreeshake);
             Ok(Some(rolldown_plugin::HookLoadOutput {
                 code: arcstr::ArcStr::from(js),
                 module_type: Some(rolldown_common::ModuleType::Js),
@@ -502,7 +587,11 @@ fn expand_css_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String
         .output()
         .context("node not found for tailwind/postcss build")?;
     if !out.status.success() {
-        bail!("css build failed for {}: {}", css_file.display(), String::from_utf8_lossy(&out.stderr));
+        bail!(
+            "css build failed for {}: {}",
+            css_file.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -531,7 +620,11 @@ fn svelte_via_sidecar(root: &Path, file: &Path) -> anyhow::Result<String> {
         .stderr(std::process::Stdio::inherit())
         .spawn()
         .context("node not found for svelte compile")?;
-    child.stdin.take().unwrap().write_all(format!("{req}\n").as_bytes())?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{req}\n").as_bytes())?;
     let out = child.wait_with_output()?;
     let line = String::from_utf8_lossy(&out.stdout);
     let line = line.trim().lines().next().unwrap_or("{}");
@@ -541,7 +634,9 @@ fn svelte_via_sidecar(root: &Path, file: &Path) -> anyhow::Result<String> {
         None => bail!(
             "svelte compile failed for {}: {}",
             file.display(),
-            v.get("error").and_then(|e| e.as_str()).unwrap_or("is `svelte` installed?")
+            v.get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("is `svelte` installed?")
         ),
     }
 }
@@ -569,7 +664,11 @@ fn preprocess_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String
         .stderr(std::process::Stdio::inherit())
         .spawn()
         .context("node not found for css preprocess build")?;
-    child.stdin.take().unwrap().write_all(format!("{req}\n").as_bytes())?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{req}\n").as_bytes())?;
     let out = child.wait_with_output()?;
     let line = String::from_utf8_lossy(&out.stdout);
     let line = line.trim().lines().next().unwrap_or("{}");
@@ -579,7 +678,9 @@ fn preprocess_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String
         None => bail!(
             "css preprocess failed for {}: {}",
             css_file.display(),
-            v.get("error").and_then(|e| e.as_str()).unwrap_or("is `less`/`stylus` installed?")
+            v.get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("is `less`/`stylus` installed?")
         ),
     }
 }
@@ -604,11 +705,16 @@ fn rolldown_resolve(
             (find, vec![Some(target)])
         })
         .collect();
-    Some(rolldown_common::ResolveOptions { alias: Some(alias), ..Default::default() })
+    Some(rolldown_common::ResolveOptions {
+        alias: Some(alias),
+        ..Default::default()
+    })
 }
 
 fn is_server_module_path(path: &str) -> bool {
-    [".server.ts", ".server.tsx", ".server.js", ".server.jsx"].iter().any(|s| path.ends_with(s))
+    [".server.ts", ".server.tsx", ".server.js", ".server.jsx"]
+        .iter()
+        .any(|s| path.ends_with(s))
 }
 
 fn server_fn_prod_stub(exports: &[String], url: &str) -> String {
@@ -620,9 +726,13 @@ fn server_fn_prod_stub(exports: &[String], url: &str) -> String {
     );
     for name in exports {
         if name == "default" {
-            out.push_str(&format!("export default (...a) => __ojCall({url:?}, \"default\", a);\n"));
+            out.push_str(&format!(
+                "export default (...a) => __ojCall({url:?}, \"default\", a);\n"
+            ));
         } else {
-            out.push_str(&format!("export const {name} = (...a) => __ojCall({url:?}, {name:?}, a);\n"));
+            out.push_str(&format!(
+                "export const {name} = (...a) => __ojCall({url:?}, {name:?}, a);\n"
+            ));
         }
     }
     out
@@ -657,7 +767,10 @@ struct OjUserPlugin {
 
 impl OjUserPlugin {
     fn new(host: Arc<PluginHost>) -> Self {
-        Self { host, render_chunk_enabled: Arc::new(tokio::sync::OnceCell::new()) }
+        Self {
+            host,
+            render_chunk_enabled: Arc::new(tokio::sync::OnceCell::new()),
+        }
     }
 }
 
@@ -703,11 +816,16 @@ impl Plugin for OjUserPlugin {
         let host = Arc::clone(&self.host);
         let id = args.id.to_string();
         async move {
-            Ok(host.load(&id).await.ok().flatten().map(|code| HookLoadOutput {
-                code: arcstr::ArcStr::from(code),
-                module_type: Some(rolldown_common::ModuleType::Js),
-                ..Default::default()
-            }))
+            Ok(host
+                .load(&id)
+                .await
+                .ok()
+                .flatten()
+                .map(|code| HookLoadOutput {
+                    code: arcstr::ArcStr::from(code),
+                    module_type: Some(rolldown_common::ModuleType::Js),
+                    ..Default::default()
+                }))
         }
     }
 
@@ -755,14 +873,17 @@ impl Plugin for OjUserPlugin {
         let code = Arc::clone(&args.code);
         let chunk_json = serialize_rendered_chunk(&args.chunk);
         async move {
-            let on = *enabled.get_or_init(|| async { host.has_render_chunk().await }).await;
+            let on = *enabled
+                .get_or_init(|| async { host.has_render_chunk().await })
+                .await;
             if !on {
                 return Ok(None);
             }
             match host.render_chunk(&code, &chunk_json).await {
-                Ok(Some(out)) if out != *code => {
-                    Ok(Some(HookRenderChunkOutput { code: out, map: HookTransformOutputMap::Null }))
-                }
+                Ok(Some(out)) if out != *code => Ok(Some(HookRenderChunkOutput {
+                    code: out,
+                    map: HookTransformOutputMap::Null,
+                })),
                 _ => Ok(None),
             }
         }
@@ -856,8 +977,10 @@ fn apply_bundle_mutations(bundle: &mut [rolldown_common::Output], json: &str) {
     for out in bundle.iter_mut() {
         match out {
             Output::Chunk(c) => {
-                if let Some(code) =
-                    map.get(c.filename.as_str()).and_then(|v| v.get("code")).and_then(|x| x.as_str())
+                if let Some(code) = map
+                    .get(c.filename.as_str())
+                    .and_then(|v| v.get("code"))
+                    .and_then(|x| x.as_str())
                 {
                     if c.code != code {
                         Arc::make_mut(c).code = code.to_string();
@@ -865,8 +988,10 @@ fn apply_bundle_mutations(bundle: &mut [rolldown_common::Output], json: &str) {
                 }
             }
             Output::Asset(a) => {
-                if let Some(src) =
-                    map.get(a.filename.as_str()).and_then(|v| v.get("source")).and_then(|x| x.as_str())
+                if let Some(src) = map
+                    .get(a.filename.as_str())
+                    .and_then(|v| v.get("source"))
+                    .and_then(|x| x.as_str())
                 {
                     if a.source.as_bytes() != src.as_bytes() {
                         Arc::make_mut(a).source = StrOrBytes::Str(src.to_string());
@@ -911,25 +1036,42 @@ async fn user_plugin_host(
     }
 }
 
-pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>, mode: &str) -> anyhow::Result<()> {
+pub async fn build(
+    root: PathBuf,
+    out: Option<PathBuf>,
+    ssr: Option<String>,
+    mode: &str,
+) -> anyhow::Result<()> {
     let root = root
         .canonicalize()
         .with_context(|| format!("app root not found: {}", root.display()))?;
 
-    let mut config = oj_config::load_with(&root, "build", mode).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut config =
+        oj_config::load_with(&root, "build", mode).map_err(|e| anyhow::anyhow!("{e}"))?;
     oj_server::plugins::adopt_vite_config_values(&mut config, &root);
     let build_cfg = config.build.clone().unwrap_or_default();
     let ro_opts = oj_config::rolldown_options(&config);
     let out = out
         .or_else(|| build_cfg.out_dir.as_ref().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("dist"));
-    let out_dir = if out.is_absolute() { out } else { root.join(&out) };
+    let out_dir = if out.is_absolute() {
+        out
+    } else {
+        root.join(&out)
+    };
     let minify = build_cfg.minify.unwrap_or(true);
     let sourcemap = build_cfg.sourcemap.unwrap_or(false);
 
     if let Some(entry) = ssr.or_else(|| build_cfg.ssr.clone()) {
-        return build_ssr_app(&root, &out_dir, &entry, minify, sourcemap, build_cfg.prerender.clone())
-            .await;
+        return build_ssr_app(
+            &root,
+            &out_dir,
+            &entry,
+            minify,
+            sourcemap,
+            build_cfg.prerender.clone(),
+        )
+        .await;
     }
 
     if let Some(lib) = build_cfg.lib.clone() {
@@ -987,46 +1129,55 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>, mod
         }
         oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host))));
     }
-    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(&root), inline_limit: assets_inline_limit_of(&config), client: true, css_code_split: css_split }));
+    oj_plugins.push(Arc::new(OjCssPlugin {
+        collected: Arc::clone(&collected_css),
+        root: root.to_path_buf(),
+        has_postcss: oj_server::has_postcss_config(&root),
+        inline_limit: assets_inline_limit_of(&config),
+        client: true,
+        css_code_split: css_split,
+    }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
         .with_options(BundlerOptions {
-        input: Some(inputs),
-        transform: target_transform(&config),
-        code_splitting: manual_chunks(ro_opts),
-        cwd: Some(root.clone()),
-        dir: Some(out_dir.display().to_string()),
-        resolve: rolldown_resolve(&root, &config, "client"),
-        entry_filenames: Some(
-            ro_output_str(ro_opts, "entryFileNames")
-                .unwrap_or_else(|| "assets/[name]-[hash].js".to_string())
-                .into(),
-        ),
-        chunk_filenames: Some(
-            ro_output_str(ro_opts, "chunkFileNames")
-                .unwrap_or_else(|| "assets/[name]-[hash].js".to_string())
-                .into(),
-        ),
-        asset_filenames: ro_output_str(ro_opts, "assetFileNames").map(Into::into),
-        external: {
-            let ext = ro_external(ro_opts);
-            (!ext.is_empty()).then(|| rolldown::IsExternal::from(ext))
-        },
-        minify: Some(RawMinifyOptions::Bool(
-            oj_config::environment_build_bool(&config, "client", "minify").unwrap_or(minify),
-        )),
-        sourcemap: oj_config::environment_build_bool(&config, "client", "sourcemap")
-            .unwrap_or(sourcemap)
-            .then_some(SourceMapType::File),
-        define: Some({
-            let env = oj_env::load(&root, mode);
-            let mut pairs: Vec<(String, String)> =
-                vec![("process.env.NODE_ENV".into(), "'production'".into())];
-            pairs.extend(oj_env::import_meta_env_defines(&env, mode, false, &base, "VITE_"));
-            pairs.extend(oj_config::config_defines(&config));
-            pairs.extend(oj_config::environment_defines(&config, "client"));
-            pairs.into_iter().collect()
-        }),
+            input: Some(inputs),
+            transform: target_transform(&config),
+            code_splitting: manual_chunks(ro_opts),
+            cwd: Some(root.clone()),
+            dir: Some(out_dir.display().to_string()),
+            resolve: rolldown_resolve(&root, &config, "client"),
+            entry_filenames: Some(
+                ro_output_str(ro_opts, "entryFileNames")
+                    .unwrap_or_else(|| "assets/[name]-[hash].js".to_string())
+                    .into(),
+            ),
+            chunk_filenames: Some(
+                ro_output_str(ro_opts, "chunkFileNames")
+                    .unwrap_or_else(|| "assets/[name]-[hash].js".to_string())
+                    .into(),
+            ),
+            asset_filenames: ro_output_str(ro_opts, "assetFileNames").map(Into::into),
+            external: {
+                let ext = ro_external(ro_opts);
+                (!ext.is_empty()).then(|| rolldown::IsExternal::from(ext))
+            },
+            minify: Some(RawMinifyOptions::Bool(
+                oj_config::environment_build_bool(&config, "client", "minify").unwrap_or(minify),
+            )),
+            sourcemap: oj_config::environment_build_bool(&config, "client", "sourcemap")
+                .unwrap_or(sourcemap)
+                .then_some(SourceMapType::File),
+            define: Some({
+                let env = oj_env::load(&root, mode);
+                let mut pairs: Vec<(String, String)> =
+                    vec![("process.env.NODE_ENV".into(), "'production'".into())];
+                pairs.extend(oj_env::import_meta_env_defines(
+                    &env, mode, false, &base, "VITE_",
+                ));
+                pairs.extend(oj_config::config_defines(&config));
+                pairs.extend(oj_config::environment_defines(&config, "client"));
+                pairs.into_iter().collect()
+            }),
             ..Default::default()
         })
         .build()
@@ -1036,7 +1187,10 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>, mod
         .write()
         .await
         .map_err(|errs| anyhow::anyhow!("build failed:\n{errs:?}"))?;
-    bundler.close().await.map_err(|errs| anyhow::anyhow!("close failed:\n{errs:?}"))?;
+    bundler
+        .close()
+        .await
+        .map_err(|errs| anyhow::anyhow!("close failed:\n{errs:?}"))?;
 
     if let Some(host) = &plugin_host {
         if let Err(e) = host.build_end().await {
@@ -1074,13 +1228,17 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>, mod
     let mut rewritten_html = oj_env::replace_html_env(&html, &html_env);
     let mut emitted: Vec<(String, usize)> = Vec::new();
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
-    let mut imports_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut imports_map: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     let mut entry_files: Vec<String> = Vec::new();
     for asset in &output.assets {
         if let rolldown_common::Output::Chunk(chunk) = asset {
             let filename = chunk.filename.to_string();
             emitted.push((filename.clone(), chunk.code.len()));
-            imports_map.insert(filename.clone(), chunk.imports.iter().map(|i| i.to_string()).collect());
+            imports_map.insert(
+                filename.clone(),
+                chunk.imports.iter().map(|i| i.to_string()).collect(),
+            );
             // Entry chunks are keyed by their source path; shared/non-entry
             // chunks by `_<filename>` (Vite's manifest shape).
             let src = if chunk.is_entry {
@@ -1094,7 +1252,13 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>, mod
                 None
             };
             let key = src.clone().unwrap_or_else(|| {
-                format!("_{}", Path::new(&filename).file_name().and_then(|n| n.to_str()).unwrap_or(&filename))
+                format!(
+                    "_{}",
+                    Path::new(&filename)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&filename)
+                )
             });
             manifest_entries.push(ManifestEntry {
                 key,
@@ -1104,18 +1268,23 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>, mod
                 is_entry: chunk.is_entry,
                 is_dynamic_entry: chunk.is_dynamic_entry,
                 imports: chunk.imports.iter().map(|i| i.to_string()).collect(),
-                dynamic_imports: chunk.dynamic_imports.iter().map(|i| i.to_string()).collect(),
+                dynamic_imports: chunk
+                    .dynamic_imports
+                    .iter()
+                    .map(|i| i.to_string())
+                    .collect(),
                 css: Vec::new(),
             });
             if chunk.is_entry {
                 entry_files.push(filename.clone());
                 if let Some(facade) = &chunk.facade_module_id {
                     for entry in &entries {
-                        let resolved = oj_server::html_entry_src(entry).unwrap_or_else(|| entry.clone());
+                        let resolved =
+                            oj_server::html_entry_src(entry).unwrap_or_else(|| entry.clone());
                         let entry_abs = root.join(resolved.trim_start_matches('/'));
                         if Path::new(facade.as_ref()) == entry_abs.as_path() {
-                            rewritten_html =
-                                rewritten_html.replace(entry.as_str(), &with_base(&filename, &base));
+                            rewritten_html = rewritten_html
+                                .replace(entry.as_str(), &with_base(&filename, &base));
                         }
                     }
                 }
@@ -1137,11 +1306,21 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>, mod
     if !preloads.is_empty() {
         let links = preloads
             .iter()
-            .map(|f| format!("<link rel=\"modulepreload\" href=\"{}\" />", with_base(f, &base)))
+            .map(|f| {
+                format!(
+                    "<link rel=\"modulepreload\" href=\"{}\" />",
+                    with_base(f, &base)
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
         rewritten_html = match rewritten_html.find("</head>") {
-            Some(i) => format!("{}{}\n{}", &rewritten_html[..i], links, &rewritten_html[i..]),
+            Some(i) => format!(
+                "{}{}\n{}",
+                &rewritten_html[..i],
+                links,
+                &rewritten_html[i..]
+            ),
             None => format!("{links}\n{rewritten_html}"),
         };
     }
@@ -1156,7 +1335,8 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>, mod
             let source = fs::read_to_string(&src)?;
             if oj_server::sidecar::is_tailwind_css(&source) {
                 let css = expand_css_via_sidecar(&root, &src)?;
-                let minified = oj_css::compile_css(href.as_str(), &css, true).map_err(|e| anyhow::anyhow!(e))?;
+                let minified = oj_css::compile_css(href.as_str(), &css, true)
+                    .map_err(|e| anyhow::anyhow!(e))?;
                 fs::write(&dest, minified.css)?;
                 continue;
             }
@@ -1169,11 +1349,15 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>, mod
         if !css_entries.is_empty() {
             css_entries.sort();
             fs::create_dir_all(out_dir.join("assets"))?;
-            let mut seen_assets: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
+            let mut seen_assets: std::collections::HashMap<PathBuf, String> =
+                std::collections::HashMap::new();
             let combined: String = css_entries
                 .into_iter()
                 .map(|(src, css)| {
-                    let dir = Path::new(&src).parent().map(Path::to_path_buf).unwrap_or_else(|| root.to_path_buf());
+                    let dir = Path::new(&src)
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| root.to_path_buf());
                     rebase_css_urls(&css, &dir, &out_dir, &base, &mut emitted, &mut seen_assets)
                 })
                 .collect::<Vec<_>>()
@@ -1182,9 +1366,17 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>, mod
             let css_name = format!("assets/style-{}.css", &hash[..8]);
             fs::write(out_dir.join(&css_name), &combined)?;
             emitted.push((css_name.clone(), combined.len()));
-            let link = format!("<link rel=\"stylesheet\" href=\"{}\" />", with_base(&css_name, &base));
+            let link = format!(
+                "<link rel=\"stylesheet\" href=\"{}\" />",
+                with_base(&css_name, &base)
+            );
             rewritten_html = match rewritten_html.find("</head>") {
-                Some(idx) => format!("{}{}\n{}", &rewritten_html[..idx], link, &rewritten_html[idx..]),
+                Some(idx) => format!(
+                    "{}{}\n{}",
+                    &rewritten_html[..idx],
+                    link,
+                    &rewritten_html[idx..]
+                ),
                 None => format!("{link}\n{rewritten_html}"),
             };
             for entry in &mut manifest_entries {
@@ -1221,10 +1413,19 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>, mod
     }
     fs::write(out_dir.join("index.html"), rewritten_html)?;
 
-    let public_dir = config.public_dir.as_ref().map(|p| root.join(p)).unwrap_or_else(|| root.join("public"));
+    let public_dir = config
+        .public_dir
+        .as_ref()
+        .map(|p| root.join(p))
+        .unwrap_or_else(|| root.join("public"));
     copy_public_dir(&public_dir, &out_dir)?;
 
-    println!("{} build: {} in {:?}", oj_server::oj_brand(), out_dir.display(), started.elapsed());
+    println!(
+        "{} build: {} in {:?}",
+        oj_server::oj_brand(),
+        out_dir.display(),
+        started.elapsed()
+    );
     emitted.sort_by(|a, b| b.1.cmp(&a.1));
     for (name, bytes) in emitted.iter().take(12) {
         println!("  {:>9}  {}", human_bytes(*bytes), name);
@@ -1262,7 +1463,9 @@ fn link_hrefs(html: &str) -> Vec<String> {
 fn scan_attrs(html: &str, tag_prefix: &str, attr_prefix: &str) -> Vec<String> {
     let mut values = Vec::new();
     for (start, _) in html.match_indices(tag_prefix) {
-        let Some(end) = html[start..].find('>') else { continue };
+        let Some(end) = html[start..].find('>') else {
+            continue;
+        };
         let tag = &html[start..start + end];
         if tag_prefix == "<script" && !tag.contains("type=\"module\"") {
             continue;
@@ -1285,15 +1488,23 @@ pub(crate) async fn build_ssr(
 ) -> anyhow::Result<()> {
     use rolldown::{IsExternal, Platform};
 
-    let entry_import = if entry.starts_with('.') { entry.to_string() } else { format!("./{entry}") };
-    let stem =
-        Path::new(entry).file_stem().and_then(|s| s.to_str()).unwrap_or("server").to_string();
+    let entry_import = if entry.starts_with('.') {
+        entry.to_string()
+    } else {
+        format!("./{entry}")
+    };
+    let stem = Path::new(entry)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("server")
+        .to_string();
 
     fs::create_dir_all(out_dir)?;
     let started = Instant::now();
     let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let mut config = oj_config::load_with(root, "build", "production").map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut config =
+        oj_config::load_with(root, "build", "production").map_err(|e| anyhow::anyhow!("{e}"))?;
     oj_server::plugins::adopt_vite_config_values(&mut config, root);
     let ssr_base = config.base.clone().unwrap_or_else(|| "/".into());
     let plugin_host = user_plugin_host(
@@ -1306,10 +1517,12 @@ pub(crate) async fn build_ssr(
     )
     .await;
 
-    let external = IsExternal::Fn(Some(Arc::new(|spec: &str, _importer, is_resolved: bool| {
-        let ext = is_resolved && spec.contains("node_modules");
-        Box::pin(async move { Ok(ext) })
-    })));
+    let external = IsExternal::Fn(Some(Arc::new(
+        |spec: &str, _importer, is_resolved: bool| {
+            let ext = is_resolved && spec.contains("node_modules");
+            Box::pin(async move { Ok(ext) })
+        },
+    )));
 
     let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
     if let Some(host) = &plugin_host {
@@ -1318,7 +1531,14 @@ pub(crate) async fn build_ssr(
         }
         oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host))));
     }
-    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root), inline_limit: assets_inline_limit_of(&config), client: false , css_code_split: false }));
+    oj_plugins.push(Arc::new(OjCssPlugin {
+        collected: Arc::clone(&collected_css),
+        root: root.to_path_buf(),
+        has_postcss: oj_server::has_postcss_config(root),
+        inline_limit: assets_inline_limit_of(&config),
+        client: false,
+        css_code_split: false,
+    }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
         .with_options(BundlerOptions {
@@ -1344,11 +1564,17 @@ pub(crate) async fn build_ssr(
                 .then_some(SourceMapType::File),
             define: Some({
                 let mut pairs = vec![
-                    ("process.env.NODE_ENV".to_string(), "'production'".to_string()),
+                    (
+                        "process.env.NODE_ENV".to_string(),
+                        "'production'".to_string(),
+                    ),
                     ("import.meta.env.SSR".to_string(), "true".to_string()),
                     ("import.meta.env.PROD".to_string(), "true".to_string()),
                     ("import.meta.env.DEV".to_string(), "false".to_string()),
-                    ("import.meta.env.MODE".to_string(), "\"production\"".to_string()),
+                    (
+                        "import.meta.env.MODE".to_string(),
+                        "\"production\"".to_string(),
+                    ),
                     ("import.meta.env.BASE_URL".to_string(), "\"/\"".to_string()),
                 ];
                 pairs.extend(oj_config::config_defines(&config));
@@ -1364,7 +1590,10 @@ pub(crate) async fn build_ssr(
         .write()
         .await
         .map_err(|errs| anyhow::anyhow!("ssr build failed:\n{errs:?}"))?;
-    bundler.close().await.map_err(|errs| anyhow::anyhow!("ssr close failed:\n{errs:?}"))?;
+    bundler
+        .close()
+        .await
+        .map_err(|errs| anyhow::anyhow!("ssr close failed:\n{errs:?}"))?;
 
     if let Some(host) = &plugin_host {
         if let Err(e) = host.build_end().await {
@@ -1378,7 +1607,11 @@ pub(crate) async fn build_ssr(
             emitted.push((c.filename.to_string(), c.code.len()));
         }
     }
-    println!("oj build (ssr): {} in {:?}", out_dir.display(), started.elapsed());
+    println!(
+        "oj build (ssr): {} in {:?}",
+        out_dir.display(),
+        started.elapsed()
+    );
     emitted.sort_by(|a, b| b.1.cmp(&a.1));
     for (name, bytes) in &emitted {
         println!("  {:>9}  {}", human_bytes(*bytes), name);
@@ -1401,7 +1634,9 @@ export async function dispatch(url, name, args) {
 
 fn has_server_modules(root: &Path) -> bool {
     fn walk(dir: &Path) -> bool {
-        let Ok(entries) = fs::read_dir(dir) else { return false };
+        let Ok(entries) = fs::read_dir(dir) else {
+            return false;
+        };
         for entry in entries.flatten() {
             let p = entry.path();
             if p.is_dir() {
@@ -1409,7 +1644,9 @@ fn has_server_modules(root: &Path) -> bool {
                     return true;
                 }
             } else if p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                [".server.ts", ".server.tsx", ".server.js", ".server.jsx"].iter().any(|s| n.ends_with(s))
+                [".server.ts", ".server.tsx", ".server.js", ".server.jsx"]
+                    .iter()
+                    .any(|s| n.ends_with(s))
             }) {
                 return true;
             }
@@ -1454,7 +1691,10 @@ async fn build_server_fns(root: &Path, out_dir: &Path) -> anyhow::Result<()> {
                 minify: Some(RawMinifyOptions::Bool(false)),
                 define: Some(
                     vec![
-                        ("process.env.NODE_ENV".to_string(), "'production'".to_string()),
+                        (
+                            "process.env.NODE_ENV".to_string(),
+                            "'production'".to_string(),
+                        ),
                         ("import.meta.env.SSR".to_string(), "true".to_string()),
                     ]
                     .into_iter()
@@ -1464,8 +1704,14 @@ async fn build_server_fns(root: &Path, out_dir: &Path) -> anyhow::Result<()> {
             })
             .build()
             .map_err(|errs| anyhow::anyhow!("server-fns init failed: {errs:?}"))?;
-        bundler.write().await.map_err(|errs| anyhow::anyhow!("server-fns build failed:\n{errs:?}"))?;
-        bundler.close().await.map_err(|errs| anyhow::anyhow!("server-fns close failed:\n{errs:?}"))?;
+        bundler
+            .write()
+            .await
+            .map_err(|errs| anyhow::anyhow!("server-fns build failed:\n{errs:?}"))?;
+        bundler
+            .close()
+            .await
+            .map_err(|errs| anyhow::anyhow!("server-fns close failed:\n{errs:?}"))?;
         Ok::<(), anyhow::Error>(())
     }
     .await;
@@ -1669,7 +1915,9 @@ pub(crate) fn derive_client_entry(root: &Path, server_entry: &str) -> Option<Str
     }
     let client_file = file.replace("server", "client");
     let client_rel = match Path::new(server_entry).parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => format!("{}/{}", dir.to_string_lossy(), client_file),
+        Some(dir) if !dir.as_os_str().is_empty() => {
+            format!("{}/{}", dir.to_string_lossy(), client_file)
+        }
         _ => client_file,
     };
     root.join(&client_rel).is_file().then_some(client_rel)
@@ -1696,7 +1944,10 @@ pub(crate) async fn build_ssr_app(
 
     build_server_fns(root, out_dir).await?;
     if has_server_modules(root) {
-        println!("  {:>9}  _oj_server_fns.mjs", human_bytes(OJ_SERVER_FNS_JS.len()));
+        println!(
+            "  {:>9}  _oj_server_fns.mjs",
+            human_bytes(OJ_SERVER_FNS_JS.len())
+        );
     }
 
     let server = SSR_PROD_SERVER
@@ -1709,7 +1960,10 @@ pub(crate) async fn build_ssr_app(
         .replace("__CLIENT_JS__", &js)
         .replace("__CLIENT_CSS__", css.as_deref().unwrap_or(""));
     fs::write(out_dir.join("worker.mjs"), worker)?;
-    println!("  {:>9}  worker.mjs (edge)", human_bytes(SSR_WORKER_ENTRY.len()));
+    println!(
+        "  {:>9}  worker.mjs (edge)",
+        human_bytes(SSR_WORKER_ENTRY.len())
+    );
 
     if let Some(paths) = prerender.filter(|p| !p.is_empty()) {
         let script = PRERENDER_JS
@@ -1742,11 +1996,20 @@ async fn build_client_entry(
     minify: bool,
     sourcemap: bool,
 ) -> anyhow::Result<(String, Option<String>)> {
-    let entry_import = if entry.starts_with('.') { entry.to_string() } else { format!("./{entry}") };
-    let stem = Path::new(entry).file_stem().and_then(|s| s.to_str()).unwrap_or("client").to_string();
+    let entry_import = if entry.starts_with('.') {
+        entry.to_string()
+    } else {
+        format!("./{entry}")
+    };
+    let stem = Path::new(entry)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("client")
+        .to_string();
     let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let mut config = oj_config::load_with(root, "build", "production").map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut config =
+        oj_config::load_with(root, "build", "production").map_err(|e| anyhow::anyhow!("{e}"))?;
     oj_server::plugins::adopt_vite_config_values(&mut config, root);
     let client_base = config.base.clone().unwrap_or_else(|| "/".into());
     let plugin_host = user_plugin_host(
@@ -1765,12 +2028,23 @@ async fn build_client_entry(
         }
         oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host))));
     }
-    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root), inline_limit: assets_inline_limit_of(&config), client: true, css_code_split: false }));
+    oj_plugins.push(Arc::new(OjCssPlugin {
+        collected: Arc::clone(&collected_css),
+        root: root.to_path_buf(),
+        has_postcss: oj_server::has_postcss_config(root),
+        inline_limit: assets_inline_limit_of(&config),
+        client: true,
+        css_code_split: false,
+    }));
 
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
         .with_options(BundlerOptions {
-            input: Some(vec![InputItem { name: Some(stem), import: entry_import, ..Default::default() }]),
+            input: Some(vec![InputItem {
+                name: Some(stem),
+                import: entry_import,
+                ..Default::default()
+            }]),
             cwd: Some(root.to_path_buf()),
             dir: Some(out_dir.display().to_string()),
             resolve: rolldown_resolve(root, &config, "client"),
@@ -1785,9 +2059,17 @@ async fn build_client_entry(
                 .then_some(SourceMapType::File),
             define: Some({
                 let env = oj_env::load(root, "production");
-                let mut pairs =
-                    vec![("process.env.NODE_ENV".to_string(), "'production'".to_string())];
-                pairs.extend(oj_env::import_meta_env_defines(&env, "production", false, "/", "VITE_"));
+                let mut pairs = vec![(
+                    "process.env.NODE_ENV".to_string(),
+                    "'production'".to_string(),
+                )];
+                pairs.extend(oj_env::import_meta_env_defines(
+                    &env,
+                    "production",
+                    false,
+                    "/",
+                    "VITE_",
+                ));
                 pairs.extend(oj_config::config_defines(&config));
                 pairs.extend(oj_config::environment_defines(&config, "client"));
                 pairs.into_iter().collect()
@@ -1801,7 +2083,10 @@ async fn build_client_entry(
         .write()
         .await
         .map_err(|errs| anyhow::anyhow!("client build failed:\n{errs:?}"))?;
-    bundler.close().await.map_err(|errs| anyhow::anyhow!("client close failed:\n{errs:?}"))?;
+    bundler
+        .close()
+        .await
+        .map_err(|errs| anyhow::anyhow!("client close failed:\n{errs:?}"))?;
 
     if let Some(host) = &plugin_host {
         if let Err(e) = host.build_end().await {
@@ -1824,8 +2109,11 @@ async fn build_client_entry(
         None
     } else {
         css_entries.sort();
-        let combined: String =
-            css_entries.into_iter().map(|(_, css)| css).collect::<Vec<_>>().join("\n");
+        let combined: String = css_entries
+            .into_iter()
+            .map(|(_, css)| css)
+            .collect::<Vec<_>>()
+            .join("\n");
         let hash = format!("{:016x}", {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1880,7 +2168,14 @@ async fn build_library(
         }
 
         let mut bundler = BundlerBuilder::default()
-            .with_plugins(vec![Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root), inline_limit: 4096, client: true, css_code_split: false })])
+            .with_plugins(vec![Arc::new(OjCssPlugin {
+                collected: Arc::clone(&collected_css),
+                root: root.to_path_buf(),
+                has_postcss: oj_server::has_postcss_config(root),
+                inline_limit: 4096,
+                client: true,
+                css_code_split: false,
+            })])
             .with_options(BundlerOptions {
                 input: Some(vec![InputItem {
                     name: Some(file_name.clone()),
@@ -1896,8 +2191,11 @@ async fn build_library(
                 minify: Some(RawMinifyOptions::Bool(minify)),
                 sourcemap: sourcemap.then_some(SourceMapType::File),
                 define: Some(
-                    std::iter::once(("process.env.NODE_ENV".to_string(), "'production'".to_string()))
-                        .collect(),
+                    std::iter::once((
+                        "process.env.NODE_ENV".to_string(),
+                        "'production'".to_string(),
+                    ))
+                    .collect(),
                 ),
                 ..Default::default()
             })
@@ -1917,14 +2215,21 @@ async fn build_library(
 
     let css_entries = collected_css.lock().unwrap().clone();
     if !css_entries.is_empty() {
-        let combined: String =
-            css_entries.into_iter().map(|(_, css)| css).collect::<Vec<_>>().join("\n");
+        let combined: String = css_entries
+            .into_iter()
+            .map(|(_, css)| css)
+            .collect::<Vec<_>>()
+            .join("\n");
         let css_name = format!("{file_name}.css");
         fs::write(out_dir.join(&css_name), &combined)?;
         emitted.push((css_name, combined.len()));
     }
 
-    println!("oj build (library): {} in {:?}", out_dir.display(), started.elapsed());
+    println!(
+        "oj build (library): {} in {:?}",
+        out_dir.display(),
+        started.elapsed()
+    );
     emitted.sort_by(|a, b| b.1.cmp(&a.1));
     emitted.dedup();
     for (name, bytes) in &emitted {
@@ -1980,7 +2285,13 @@ fn transitive_imports(
 
 fn sanitize_asset_name(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -2020,7 +2331,11 @@ fn emit_css_url(
     let data = std::fs::read(&abs).ok()?;
     let hash = content_hash(&data);
     let stem = abs.file_stem().and_then(|s| s.to_str()).unwrap_or("asset");
-    let ext = abs.extension().and_then(|s| s.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
+    let ext = abs
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
     let name = format!("assets/{}-{}{}", sanitize_asset_name(stem), &hash[..8], ext);
     let dest = out_dir.join(&name);
     if let Some(p) = dest.parent() {
@@ -2055,7 +2370,10 @@ fn rebase_css_urls(
             continue;
         };
         let inner_raw = &after[..close];
-        let inner = inner_raw.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+        let inner = inner_raw
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .trim();
         match emit_css_url(inner, css_dir, out_dir, base, emitted, seen) {
             Some(url) => {
                 out.push_str("url(\"");
@@ -2097,7 +2415,8 @@ fn emit_split_css(
         return Ok(());
     }
     fs::create_dir_all(out_dir.join("assets"))?;
-    let mut seen_assets: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
+    let mut seen_assets: std::collections::HashMap<PathBuf, String> =
+        std::collections::HashMap::new();
 
     // Chunks reachable from an HTML entry through static imports only: their CSS
     // is safe to link render-blocking. Anything else loads asynchronously.
@@ -2110,7 +2429,9 @@ fn emit_split_css(
     // chunk filename -> emitted css filename
     let mut chunk_css: Vec<(String, String)> = Vec::new();
     for asset in &output.assets {
-        let rolldown_common::Output::Chunk(chunk) = asset else { continue };
+        let rolldown_common::Output::Chunk(chunk) = asset else {
+            continue;
+        };
         let mut css = String::new();
         for module_id in &chunk.modules.keys {
             let mid = module_id.to_string();
@@ -2122,14 +2443,25 @@ fn emit_split_css(
                 if !css.is_empty() {
                     css.push('\n');
                 }
-                css.push_str(&rebase_css_urls(src, &dir, out_dir, base, emitted, &mut seen_assets));
+                css.push_str(&rebase_css_urls(
+                    src,
+                    &dir,
+                    out_dir,
+                    base,
+                    emitted,
+                    &mut seen_assets,
+                ));
             }
         }
         if css.is_empty() {
             continue;
         }
         let hash = content_hash(css.as_bytes());
-        let css_name = format!("assets/{}-{}.css", sanitize_asset_name(&chunk.name), &hash[..8]);
+        let css_name = format!(
+            "assets/{}-{}.css",
+            sanitize_asset_name(&chunk.name),
+            &hash[..8]
+        );
         fs::write(out_dir.join(&css_name), &css)?;
         emitted.push((css_name.clone(), css.len()));
         for entry in manifest_entries.iter_mut() {
@@ -2154,7 +2486,12 @@ fn emit_split_css(
     if !links.is_empty() {
         let links = links.trim_end();
         *rewritten_html = match rewritten_html.find("</head>") {
-            Some(idx) => format!("{}{}\n{}", &rewritten_html[..idx], links, &rewritten_html[idx..]),
+            Some(idx) => format!(
+                "{}{}\n{}",
+                &rewritten_html[..idx],
+                links,
+                &rewritten_html[idx..]
+            ),
             None => format!("{links}\n{rewritten_html}"),
         };
     }
@@ -2165,7 +2502,9 @@ fn emit_split_css(
             continue;
         }
         let path = out_dir.join(chunk_file);
-        let Ok(code) = fs::read_to_string(&path) else { continue };
+        let Ok(code) = fs::read_to_string(&path) else {
+            continue;
+        };
         let href = serde_json::Value::String(with_base(css_name, base));
         let inject = format!(
             "(function(){{var u={href};if(!document.querySelector('link[rel=\"stylesheet\"][href=\"'+u+'\"]')){{var l=document.createElement('link');l.rel='stylesheet';l.href=u;document.head.appendChild(l);}}}})();\n"
@@ -2192,12 +2531,18 @@ struct ManifestEntry {
 fn build_manifest(entries: &[ManifestEntry]) -> serde_json::Value {
     // Vite's manifest references imports/dynamicImports by manifest KEY, not by
     // output filename, so build a filename -> key map first.
-    let file_to_key: std::collections::HashMap<&str, &str> =
-        entries.iter().map(|e| (e.file.as_str(), e.key.as_str())).collect();
+    let file_to_key: std::collections::HashMap<&str, &str> = entries
+        .iter()
+        .map(|e| (e.file.as_str(), e.key.as_str()))
+        .collect();
     let remap = |files: &[String]| -> Vec<serde_json::Value> {
         files
             .iter()
-            .filter_map(|f| file_to_key.get(f.as_str()).map(|k| serde_json::Value::from(*k)))
+            .filter_map(|f| {
+                file_to_key
+                    .get(f.as_str())
+                    .map(|k| serde_json::Value::from(*k))
+            })
             .collect()
     };
     let mut map = serde_json::Map::new();
@@ -2236,8 +2581,15 @@ mod tests {
 
     #[test]
     fn manifest_matches_vite_shape() {
-        let mk = |key: &str, name: &str, file: &str, src: Option<&str>, is_entry: bool, is_dyn: bool,
-                  imports: Vec<&str>, dyn_imports: Vec<&str>, css: Vec<&str>| ManifestEntry {
+        let mk = |key: &str,
+                  name: &str,
+                  file: &str,
+                  src: Option<&str>,
+                  is_entry: bool,
+                  is_dyn: bool,
+                  imports: Vec<&str>,
+                  dyn_imports: Vec<&str>,
+                  css: Vec<&str>| ManifestEntry {
             key: key.into(),
             name: name.into(),
             file: file.into(),
@@ -2249,11 +2601,39 @@ mod tests {
             css: css.into_iter().map(str::to_string).collect(),
         };
         let m = build_manifest(&[
-            mk("src/main.tsx", "main", "assets/main-abc123.js", Some("src/main.tsx"), true, false,
-               vec!["assets/vendor-def456.js"], vec!["assets/lazy-xyz.js"], vec!["assets/style-99.css"]),
-            mk("_vendor-def456.js", "vendor", "assets/vendor-def456.js", None, false, false,
-               vec![], vec![], vec![]),
-            mk("_lazy-xyz.js", "lazy", "assets/lazy-xyz.js", None, false, true, vec![], vec![], vec![]),
+            mk(
+                "src/main.tsx",
+                "main",
+                "assets/main-abc123.js",
+                Some("src/main.tsx"),
+                true,
+                false,
+                vec!["assets/vendor-def456.js"],
+                vec!["assets/lazy-xyz.js"],
+                vec!["assets/style-99.css"],
+            ),
+            mk(
+                "_vendor-def456.js",
+                "vendor",
+                "assets/vendor-def456.js",
+                None,
+                false,
+                false,
+                vec![],
+                vec![],
+                vec![],
+            ),
+            mk(
+                "_lazy-xyz.js",
+                "lazy",
+                "assets/lazy-xyz.js",
+                None,
+                false,
+                true,
+                vec![],
+                vec![],
+                vec![],
+            ),
         ]);
         let row = &m["src/main.tsx"];
         assert_eq!(row["file"], "assets/main-abc123.js");
@@ -2334,20 +2714,42 @@ mod tests {
 
     #[test]
     fn is_server_module_path_matches_server_suffixes() {
-        for yes in ["api.server.ts", "a/b/auth.server.tsx", "x.server.js", "y.server.jsx"] {
-            assert!(is_server_module_path(yes), "{yes} should be a server module");
+        for yes in [
+            "api.server.ts",
+            "a/b/auth.server.tsx",
+            "x.server.js",
+            "y.server.jsx",
+        ] {
+            assert!(
+                is_server_module_path(yes),
+                "{yes} should be a server module"
+            );
         }
-        for no in ["api.ts", "server.ts", "api.server.css", "a.serverx.ts", "note.server.md"] {
-            assert!(!is_server_module_path(no), "{no} should not be a server module");
+        for no in [
+            "api.ts",
+            "server.ts",
+            "api.server.css",
+            "a.serverx.ts",
+            "note.server.md",
+        ] {
+            assert!(
+                !is_server_module_path(no),
+                "{no} should not be a server module"
+            );
         }
     }
 
     #[test]
     fn server_fn_prod_stub_emits_an_rpc_per_export() {
         let out = server_fn_prod_stub(&["getUser".into(), "default".into()], "/api.server.ts");
-        assert!(out.contains("const __ojCall ="), "the fetch helper is inlined: {out}");
         assert!(
-            out.contains(r#"export const getUser = (...a) => __ojCall("/api.server.ts", "getUser", a);"#),
+            out.contains("const __ojCall ="),
+            "the fetch helper is inlined: {out}"
+        );
+        assert!(
+            out.contains(
+                r#"export const getUser = (...a) => __ojCall("/api.server.ts", "getUser", a);"#
+            ),
             "named export stub: {out}"
         );
         assert!(
@@ -2356,7 +2758,10 @@ mod tests {
         );
         let empty = server_fn_prod_stub(&[], "/x.server.ts");
         assert!(empty.contains("__ojCall"));
-        assert!(!empty.contains("export "), "no exports means no stubs: {empty}");
+        assert!(
+            !empty.contains("export "),
+            "no exports means no stubs: {empty}"
+        );
     }
 
     #[test]
@@ -2381,6 +2786,9 @@ mod tests {
         let hrefs = link_hrefs(html);
         assert!(hrefs.contains(&"/assets/app.css".to_string()), "{hrefs:?}");
         assert!(hrefs.contains(&"/assets/chunk.js".to_string()), "{hrefs:?}");
-        assert!(!hrefs.iter().any(|h| h.contains("favicon")), "relative href filtered: {hrefs:?}");
+        assert!(
+            !hrefs.iter().any(|h| h.contains("favicon")),
+            "relative href filtered: {hrefs:?}"
+        );
     }
 }

@@ -4,7 +4,9 @@ use std::time::Instant;
 use memchr::memmem::Finder;
 
 fn collect(dir: &Path, out: &mut Vec<String>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -56,8 +58,18 @@ fn main() {
 
     assert_eq!(hits_old, hits_new, "both must report the same matches");
     let scans = (sources.len() * 3 * iters) as f64;
-    println!("prescan {} modules ({} KB) x {iters} iters, 3 scans each:", sources.len(), bytes / 1024);
-    println!("  OLD (str::contains):  {old:?}  = {:.1} ns/scan", old.as_nanos() as f64 / scans);
-    println!("  NEW (memmem::Finder): {new:?}  = {:.1} ns/scan", new.as_nanos() as f64 / scans);
+    println!(
+        "prescan {} modules ({} KB) x {iters} iters, 3 scans each:",
+        sources.len(),
+        bytes / 1024
+    );
+    println!(
+        "  OLD (str::contains):  {old:?}  = {:.1} ns/scan",
+        old.as_nanos() as f64 / scans
+    );
+    println!(
+        "  NEW (memmem::Finder): {new:?}  = {:.1} ns/scan",
+        new.as_nanos() as f64 / scans
+    );
     println!("  speedup: {:.1}x", old.as_secs_f64() / new.as_secs_f64());
 }

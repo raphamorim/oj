@@ -22,12 +22,14 @@ use oxc_transformer_plugins::{ReplaceGlobalDefines, ReplaceGlobalDefinesConfig};
 
 pub type ImportRewriter<'r> = dyn FnMut(&str) -> Option<String> + 'r;
 
-static F_IMPORT_META_ENV: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new("import.meta.env"));
-static F_IMPORT_META_GLOB: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new("import.meta.glob"));
+static F_IMPORT_META_ENV: LazyLock<Finder<'static>> =
+    LazyLock::new(|| Finder::new("import.meta.env"));
+static F_IMPORT_META_GLOB: LazyLock<Finder<'static>> =
+    LazyLock::new(|| Finder::new("import.meta.glob"));
 
 pub(crate) fn detect_refresh_registrations(program: &Program) -> bool {
     use oxc_ast::ast::{CallExpression, Expression};
-    use oxc_ast_visit::{Visit, walk};
+    use oxc_ast_visit::{walk, Visit};
 
     struct Detector {
         found: bool,
@@ -87,11 +89,19 @@ pub struct CompileOptions {
 
 impl CompileOptions {
     pub fn dev() -> Self {
-        Self { dev: true, refresh: true, sourcemap: true }
+        Self {
+            dev: true,
+            refresh: true,
+            sourcemap: true,
+        }
     }
 
     pub fn prod() -> Self {
-        Self { dev: false, refresh: false, sourcemap: true }
+        Self {
+            dev: false,
+            refresh: false,
+            sourcemap: true,
+        }
     }
 }
 
@@ -136,7 +146,9 @@ pub fn compile(
 }
 
 pub fn exports(source_text: &str, path: &Path) -> Vec<String> {
-    let Ok(source_type) = SourceType::from_path(path) else { return Vec::new() };
+    let Ok(source_type) = SourceType::from_path(path) else {
+        return Vec::new();
+    };
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source_text, source_type).parse();
     if parsed.panicked {
@@ -189,11 +201,16 @@ pub fn compile_module(
             .map(|d| format!("{:?}", d.with_source_code(source_text.to_string())))
             .collect::<Vec<_>>()
             .join("\n");
-        return Err(CompileError::Parse { path: path.to_path_buf(), message });
+        return Err(CompileError::Parse {
+            path: path.to_path_buf(),
+            message,
+        });
     }
     let mut program = parsed.program;
 
-    let semantic_ret = SemanticBuilder::new().with_excess_capacity(2.0).build(&program);
+    let semantic_ret = SemanticBuilder::new()
+        .with_excess_capacity(2.0)
+        .build(&program);
     let scoping = semantic_ret.semantic.into_scoping();
 
     let mut transform_options = TransformOptions::default();
@@ -215,7 +232,10 @@ pub fn compile_module(
             .map(|d| format!("{:?}", d.with_source_code(source_text.to_string())))
             .collect::<Vec<_>>()
             .join("\n");
-        return Err(CompileError::Transform { path: path.to_path_buf(), message });
+        return Err(CompileError::Transform {
+            path: path.to_path_buf(),
+            message,
+        });
     }
 
     let defines = import_meta_env_defines(opts.dev);
@@ -225,7 +245,8 @@ pub fn compile_module(
             .any(|(k, _)| !k.starts_with("import.meta") && source_text.contains(k.as_str()));
     if needs_defines {
         if let Ok(config) = ReplaceGlobalDefinesConfig::new(&defines) {
-            let _ = ReplaceGlobalDefines::new(&allocator, config).build(transform_ret.scoping, &mut program);
+            let _ = ReplaceGlobalDefines::new(&allocator, config)
+                .build(transform_ret.scoping, &mut program);
         }
     }
 
@@ -250,7 +271,8 @@ pub fn compile_module(
         synthesized |= glob::expand_new_url_asset(&allocator, &mut program);
     }
 
-    let (imports, dynamic_imports) = rewrite_module_specifiers(&allocator, &mut program, &mut rewriter);
+    let (imports, dynamic_imports) =
+        rewrite_module_specifiers(&allocator, &mut program, &mut rewriter);
 
     let is_refresh_boundary = opts.refresh && detect_refresh_registrations(&program);
 
@@ -307,7 +329,11 @@ fn rewrite_module_specifiers<'a>(
         imports.push(lit.value.to_string());
     }
     if let Some(rewriter) = rewriter.as_deref_mut() {
-        let mut dyn_rewriter = DynamicImportRewriter { allocator, rewriter, dynamic: &mut dynamic_imports };
+        let mut dyn_rewriter = DynamicImportRewriter {
+            allocator,
+            rewriter,
+            dynamic: &mut dynamic_imports,
+        };
         use oxc_ast_visit::VisitMut;
         dyn_rewriter.visit_program(program);
     }
@@ -349,7 +375,10 @@ export default function () {}
 "#;
         let mut names = exports(src, Path::new("api.server.ts"));
         names.sort();
-        assert_eq!(names, ["Thing", "default", "getUser", "listUsers", "x", "y"]);
+        assert_eq!(
+            names,
+            ["Thing", "default", "getUser", "listUsers", "x", "y"]
+        );
     }
 
     const APP_TSX: &str = r#"
@@ -365,8 +394,7 @@ import React from "react";
 
     #[test]
     fn strips_types_and_uses_automatic_runtime_in_prod() {
-        let out =
-            compile(Path::new("App.tsx"), APP_TSX, &CompileOptions::prod()).unwrap();
+        let out = compile(Path::new("App.tsx"), APP_TSX, &CompileOptions::prod()).unwrap();
         assert!(!out.code.contains("interface"), "types must be stripped");
         assert!(!out.code.contains("<button"), "JSX must be transformed");
         assert!(
@@ -409,7 +437,8 @@ export function Root() {
 }
 "#;
         let mut rewrite = |spec: &str| -> Option<String> {
-            spec.starts_with('.').then(|| format!("/resolved{}", spec.trim_start_matches('.')))
+            spec.starts_with('.')
+                .then(|| format!("/resolved{}", spec.trim_start_matches('.')))
         };
         let out = compile_module(
             Path::new("Root.tsx"),
@@ -419,17 +448,32 @@ export function Root() {
         )
         .unwrap();
         assert!(out.code.contains("\"/resolved/App\""), "{}", out.code);
-        assert!(out.code.contains("\"/resolved/lib/helper\""), "{}", out.code);
-        assert!(out.code.contains("\"react\""), "bare imports stay untouched");
+        assert!(
+            out.code.contains("\"/resolved/lib/helper\""),
+            "{}",
+            out.code
+        );
+        assert!(
+            out.code.contains("\"react\""),
+            "bare imports stay untouched"
+        );
         assert!(out.imports.contains(&"/resolved/App".to_string()));
         assert!(out.imports.contains(&"react".to_string()));
-        assert!(out.imports.iter().any(|i| i.contains("jsx-runtime")), "{:?}", out.imports);
+        assert!(
+            out.imports.iter().any(|i| i.contains("jsx-runtime")),
+            "{:?}",
+            out.imports
+        );
     }
 
     #[test]
     fn reports_parse_errors_instead_of_panicking() {
-        let err = compile(Path::new("Broken.tsx"), "const = <div>;", &CompileOptions::dev())
-            .unwrap_err();
+        let err = compile(
+            Path::new("Broken.tsx"),
+            "const = <div>;",
+            &CompileOptions::dev(),
+        )
+        .unwrap_err();
         assert!(matches!(err, CompileError::Parse { .. }));
     }
 
@@ -439,15 +483,43 @@ export function Root() {
                    export const dev = import.meta.env.DEV;\n\
                    export const prod = import.meta.env.PROD;";
         let prod = compile(Path::new("env.ts"), src, &CompileOptions::prod()).unwrap();
-        assert!(!prod.code.contains("import.meta.env"), "defines must be replaced:\n{}", prod.code);
-        assert!(prod.code.contains("\"production\""), "MODE is production:\n{}", prod.code);
-        assert!(prod.code.contains("prod = true"), "PROD is true in prod:\n{}", prod.code);
-        assert!(prod.code.contains("dev = false"), "DEV is false in prod:\n{}", prod.code);
+        assert!(
+            !prod.code.contains("import.meta.env"),
+            "defines must be replaced:\n{}",
+            prod.code
+        );
+        assert!(
+            prod.code.contains("\"production\""),
+            "MODE is production:\n{}",
+            prod.code
+        );
+        assert!(
+            prod.code.contains("prod = true"),
+            "PROD is true in prod:\n{}",
+            prod.code
+        );
+        assert!(
+            prod.code.contains("dev = false"),
+            "DEV is false in prod:\n{}",
+            prod.code
+        );
 
         let dev = compile(Path::new("env.ts"), src, &CompileOptions::dev()).unwrap();
-        assert!(dev.code.contains("\"development\""), "MODE is development:\n{}", dev.code);
-        assert!(dev.code.contains("dev = true"), "DEV is true in dev:\n{}", dev.code);
-        assert!(dev.code.contains("prod = false"), "PROD is false in dev:\n{}", dev.code);
+        assert!(
+            dev.code.contains("\"development\""),
+            "MODE is development:\n{}",
+            dev.code
+        );
+        assert!(
+            dev.code.contains("dev = true"),
+            "DEV is true in dev:\n{}",
+            dev.code
+        );
+        assert!(
+            dev.code.contains("prod = false"),
+            "PROD is false in dev:\n{}",
+            dev.code
+        );
     }
 
     #[test]
@@ -463,9 +535,17 @@ export function Root() {
         let src = "export const load = (l) => import(`./locales/${l}.json`);\n";
         let out = compile(&dir.join("main.js"), src, &CompileOptions::dev()).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(out.code.contains("./locales/en.json"), "dyn-import-var must expand in dev:\n{}", out.code);
+        assert!(
+            out.code.contains("./locales/en.json"),
+            "dyn-import-var must expand in dev:\n{}",
+            out.code
+        );
         assert!(out.code.contains("./locales/fr.json"), "{}", out.code);
-        assert!(out.code.contains("case "), "expanded to a switch over matches:\n{}", out.code);
+        assert!(
+            out.code.contains("case "),
+            "expanded to a switch over matches:\n{}",
+            out.code
+        );
     }
 
     #[test]
@@ -474,9 +554,21 @@ export function Root() {
         // the asset flows through oj's pipeline instead of 404-ing.
         let src = "export const w = new URL(\"./worker.js\", import.meta.url);\n";
         let out = compile(std::path::Path::new("m.js"), src, &CompileOptions::dev()).unwrap();
-        assert!(out.code.contains("__oj_url_0"), "rewritten to hoisted asset ref:\n{}", out.code);
-        assert!(out.code.contains("worker.js?url"), "hoisted ?url import:\n{}", out.code);
-        assert!(!out.code.contains("new URL(\"./worker.js\""), "original literal replaced:\n{}", out.code);
+        assert!(
+            out.code.contains("__oj_url_0"),
+            "rewritten to hoisted asset ref:\n{}",
+            out.code
+        );
+        assert!(
+            out.code.contains("worker.js?url"),
+            "hoisted ?url import:\n{}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("new URL(\"./worker.js\""),
+            "original literal replaced:\n{}",
+            out.code
+        );
     }
 
     #[test]
@@ -488,10 +580,26 @@ import { d } from "./real";
 export const used: A extends B ? number : number = c + d;
 "#;
         let out = compile(Path::new("m.ts"), src, &CompileOptions::prod()).unwrap();
-        assert!(!out.imports.iter().any(|i| i.contains("types")), "type-only import erased: {:?}", out.imports);
-        assert!(!out.code.contains("./types"), "type-only source gone:\n{}", out.code);
-        assert!(out.imports.iter().any(|i| i.contains("mixed")), "mixed import kept: {:?}", out.imports);
-        assert!(!out.code.contains("type B"), "inline type specifier erased:\n{}", out.code);
+        assert!(
+            !out.imports.iter().any(|i| i.contains("types")),
+            "type-only import erased: {:?}",
+            out.imports
+        );
+        assert!(
+            !out.code.contains("./types"),
+            "type-only source gone:\n{}",
+            out.code
+        );
+        assert!(
+            out.imports.iter().any(|i| i.contains("mixed")),
+            "mixed import kept: {:?}",
+            out.imports
+        );
+        assert!(
+            !out.code.contains("type B"),
+            "inline type specifier erased:\n{}",
+            out.code
+        );
         assert!(out.imports.iter().any(|i| i.contains("real")));
     }
 
@@ -499,17 +607,30 @@ export const used: A extends B ? number : number = c + d;
     fn rewrites_dynamic_import_specifiers() {
         let src = r#"export async function load() { return import("./chunk"); }"#;
         let mut rewrite = |s: &str| -> Option<String> {
-            s.starts_with('.').then(|| format!("/res{}", s.trim_start_matches('.')))
+            s.starts_with('.')
+                .then(|| format!("/res{}", s.trim_start_matches('.')))
         };
-        let out =
-            compile_module(Path::new("d.ts"), src, &CompileOptions::prod(), Some(&mut rewrite)).unwrap();
-        assert!(out.code.contains("import(\"/res/chunk\")"), "dynamic import rewritten:\n{}", out.code);
+        let out = compile_module(
+            Path::new("d.ts"),
+            src,
+            &CompileOptions::prod(),
+            Some(&mut rewrite),
+        )
+        .unwrap();
+        assert!(
+            out.code.contains("import(\"/res/chunk\")"),
+            "dynamic import rewritten:\n{}",
+            out.code
+        );
         assert!(
             out.dynamic_imports.contains(&"/res/chunk".to_string()),
             "dynamic spec collected: {:?}",
             out.dynamic_imports
         );
-        assert!(!out.imports.contains(&"/res/chunk".to_string()), "dynamic not in static imports");
+        assert!(
+            !out.imports.contains(&"/res/chunk".to_string()),
+            "dynamic not in static imports"
+        );
     }
 
     #[test]
@@ -519,18 +640,28 @@ export const used: A extends B ? number : number = c + d;
         let dev_no_refresh = compile_module(
             Path::new("C.tsx"),
             APP_TSX,
-            &CompileOptions { dev: true, refresh: false, sourcemap: false },
+            &CompileOptions {
+                dev: true,
+                refresh: false,
+                sourcemap: false,
+            },
             None,
         )
         .unwrap();
         assert!(!dev_no_refresh.has_refresh_registrations());
-        assert!(dev_no_refresh.code.contains("jsx-dev-runtime"), "dev runtime regardless of refresh");
+        assert!(
+            dev_no_refresh.code.contains("jsx-dev-runtime"),
+            "dev runtime regardless of refresh"
+        );
     }
 
     #[test]
     fn rejects_unsupported_file_types() {
         let err = compile(Path::new("styles.css"), "body{}", &CompileOptions::prod()).unwrap_err();
-        assert!(matches!(err, CompileError::UnsupportedFileType(_)), "got {err:?}");
+        assert!(
+            matches!(err, CompileError::UnsupportedFileType(_)),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -538,21 +669,35 @@ export const used: A extends B ? number : number = c + d;
         let no_map = compile_module(
             Path::new("a.ts"),
             "export const x = 1;",
-            &CompileOptions { dev: false, refresh: false, sourcemap: false },
+            &CompileOptions {
+                dev: false,
+                refresh: false,
+                sourcemap: false,
+            },
             None,
         )
         .unwrap();
         assert!(no_map.map_data_url.is_none());
         assert_eq!(no_map.code_with_inline_map(), no_map.code);
 
-        let with_map = compile(Path::new("a.ts"), "export const x = 1;", &CompileOptions::prod()).unwrap();
+        let with_map = compile(
+            Path::new("a.ts"),
+            "export const x = 1;",
+            &CompileOptions::prod(),
+        )
+        .unwrap();
         assert!(with_map.map_data_url.is_some());
-        assert!(with_map.code_with_inline_map().contains("sourceMappingURL="));
+        assert!(with_map
+            .code_with_inline_map()
+            .contains("sourceMappingURL="));
     }
 
     #[test]
     fn exports_handles_reexports_and_never_panics() {
-        let mut local = exports(r#"export const a = 1; export { a as b };"#, Path::new("m.ts"));
+        let mut local = exports(
+            r#"export const a = 1; export { a as b };"#,
+            Path::new("m.ts"),
+        );
         local.sort();
         assert_eq!(local, ["a", "b"]);
         assert!(exports("export { = ;", Path::new("bad.ts")).is_empty());
@@ -564,7 +709,10 @@ export const used: A extends B ? number : number = c + d;
         let mut names = exports(r#"export { a, b as c } from "./mod";"#, Path::new("m.ts"));
         names.sort();
         assert_eq!(names, ["a", "c"]);
-        assert_eq!(exports(r#"export * as ns from "./mod";"#, Path::new("m.ts")), ["ns"]);
+        assert_eq!(
+            exports(r#"export * as ns from "./mod";"#, Path::new("m.ts")),
+            ["ns"]
+        );
         assert!(exports(r#"export * from "./mod";"#, Path::new("m.ts")).is_empty());
         let mut mixed = exports(
             r#"export default function () {}
