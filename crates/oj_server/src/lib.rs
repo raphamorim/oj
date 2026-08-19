@@ -146,7 +146,7 @@ struct ServerState {
     resolver: Arc<OjResolver>,
     ssr_resolver: Arc<OjResolver>,
     cache: PersistentCache,
-    memory: Mutex<HashMap<String, (String, Arc<CachedModule>)>>,
+    memory: Mutex<MemoryCache>,
     compile_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     crawl_done: tokio::sync::watch::Receiver<bool>,
     fs_allow: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
@@ -376,7 +376,7 @@ impl DevServer {
                 root.join(".oj-cache"),
                 env!("CARGO_PKG_VERSION"),
             ),
-            memory: Mutex::new(HashMap::new()),
+            memory: Mutex::new(MemoryCache::new(memory_cache_budget())),
             compile_locks: Mutex::new(HashMap::new()),
             crawl_done: crawl_rx,
             tailwind: tokio::sync::OnceCell::new(),
@@ -1561,17 +1561,81 @@ async fn replay_module_parsed(
     }
 }
 
+struct MemoryEntry {
+    key: String,
+    module: Arc<CachedModule>,
+    bytes: usize,
+    seq: u64,
+}
+
+struct MemoryCache {
+    map: HashMap<String, MemoryEntry>,
+    total: usize,
+    budget: usize,
+    seq: u64,
+}
+
+impl MemoryCache {
+    fn new(budget: usize) -> Self {
+        MemoryCache { map: HashMap::new(), total: 0, budget, seq: 0 }
+    }
+
+    fn get(&mut self, url: &str, key: &str) -> Option<Arc<CachedModule>> {
+        self.seq += 1;
+        let seq = self.seq;
+        let entry = self.map.get_mut(url)?;
+        if entry.key != key {
+            return None;
+        }
+        entry.seq = seq;
+        Some(Arc::clone(&entry.module))
+    }
+
+    fn put(&mut self, url: &str, key: &str, module: &Arc<CachedModule>) {
+        let bytes = module_weight(module);
+        self.seq += 1;
+        let seq = self.seq;
+        let entry = MemoryEntry { key: key.to_string(), module: Arc::clone(module), bytes, seq };
+        if let Some(old) = self.map.insert(url.to_string(), entry) {
+            self.total -= old.bytes;
+        }
+        self.total += bytes;
+        self.evict();
+    }
+
+    fn evict(&mut self) {
+        while self.total > self.budget && self.map.len() > 1 {
+            let victim = self.map.iter().min_by_key(|(_, e)| e.seq).map(|(k, _)| k.clone());
+            match victim {
+                Some(url) => {
+                    if let Some(e) = self.map.remove(&url) {
+                        self.total -= e.bytes;
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+fn module_weight(module: &CachedModule) -> usize {
+    module.code.len() + module.map_data_url.as_ref().map(|s| s.len()).unwrap_or(0)
+}
+
+fn memory_cache_budget() -> usize {
+    match std::env::var("OJ_MEMORY_CACHE_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(0) => usize::MAX,
+        Some(mb) => mb.saturating_mul(1024 * 1024),
+        None => 256 * 1024 * 1024,
+    }
+}
+
 fn memory_get(state: &ServerState, url: &str, key: &str) -> Option<Arc<CachedModule>> {
-    let memory = state.memory.lock().unwrap();
-    memory.get(url).filter(|(k, _)| k == key).map(|(_, m)| Arc::clone(m))
+    state.memory.lock().unwrap().get(url, key)
 }
 
 fn memory_put(state: &ServerState, url: &str, key: &str, module: &Arc<CachedModule>) {
-    state
-        .memory
-        .lock()
-        .unwrap()
-        .insert(url.to_string(), (key.to_string(), Arc::clone(module)));
+    state.memory.lock().unwrap().put(url, key, module);
 }
 
 fn package_root(path: &Path) -> PathBuf {
