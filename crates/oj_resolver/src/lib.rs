@@ -67,6 +67,14 @@ impl OjResolver {
             extensions: [".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs", ".json"]
                 .map(String::from)
                 .to_vec(),
+            // Vite's default package entry resolution: exports still wins (via
+            // condition_names), these are the fallbacks so ESM-only-via-`module`
+            // / `browser` deps don't fall back to their CJS `main`. `browser`
+            // alias_fields honors the package.json `browser` object remap.
+            main_fields: ["browser", "module", "jsnext:main", "jsnext", "main"]
+                .map(String::from)
+                .to_vec(),
+            alias_fields: vec![vec!["browser".to_string()]],
             condition_names: conditions.to_vec(),
             alias,
             tsconfig: tsconfig.is_file().then(|| {
@@ -204,6 +212,25 @@ mod tests {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/dual");
         let resolver = OjResolver::with_conditions(&dir, &["default".to_string()]);
         assert!(resolver.resolve(&dir, "dual-pkg").unwrap().ends_with("default.js"));
+    }
+
+    #[test]
+    fn prefers_module_field_and_browser_object_remap() {
+        // Vite default mainFields: an ESM-only package (module field, no exports)
+        // must resolve to its module entry, not fall back to CJS main; and the
+        // package.json `browser` object must remap the resolved file.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/mainfields");
+        let r = OjResolver::new(&dir);
+        assert!(
+            r.resolve(&dir, "mf-pkg").unwrap().ends_with("esm.js"),
+            "module field must win over main: {:?}",
+            r.resolve(&dir, "mf-pkg")
+        );
+        assert!(
+            r.resolve(&dir, "br-pkg").unwrap().ends_with("browser.js"),
+            "browser object must remap main: {:?}",
+            r.resolve(&dir, "br-pkg")
+        );
     }
 
     #[test]
