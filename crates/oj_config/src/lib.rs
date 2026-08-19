@@ -265,6 +265,27 @@ mod tests {
     }
 
     #[test]
+    fn unknown_vite_keys_are_ignored_not_rejected() {
+        // Vite never validates config-file keys; a config carrying options oj
+        // doesn't model must load and keep its known fields, not hard-fail.
+        let json = r#"{
+            "base": "/app/",
+            "resolve": { "dedupe": ["react"], "mainFields": ["module","browser"], "preserveSymlinks": true },
+            "optimizeDeps": { "include": ["cjs-dep"], "esbuildOptions": { "target": "es2020" }, "needsInterop": ["x"] },
+            "build": { "outDir": "out", "cssCodeSplit": false },
+            "css": { "modules": {} },
+            "worker": { "format": "es" },
+            "logLevel": "silent"
+        }"#;
+        let cfg: OjConfig =
+            serde_json::from_str(json).expect("unknown Vite keys must not fail config load");
+        assert_eq!(cfg.base.as_deref(), Some("/app/"));
+        assert_eq!(resolve_dedupe(&cfg), vec!["react".to_string()]);
+        let (inc, _, _) = optimize_deps_lists(&cfg);
+        assert_eq!(inc, vec!["cjs-dep".to_string()]);
+    }
+
+    #[test]
     fn optimize_deps_absent_is_empty() {
         let cfg: OjConfig = serde_json::from_str("{}").unwrap();
         assert!(resolve_dedupe(&cfg).is_empty());

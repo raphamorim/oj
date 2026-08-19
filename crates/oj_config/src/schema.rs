@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 #[derive(Debug, Default, Clone, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+#[serde(default, rename_all = "camelCase")]
 pub struct OjConfig {
     pub root: Option<String>,
     pub base: Option<String>,
@@ -25,7 +25,7 @@ pub struct OjConfig {
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+#[serde(default, rename_all = "camelCase")]
 pub struct OptimizeDepsConfig {
     pub include: Option<Vec<String>>,
     pub exclude: Option<Vec<String>>,
@@ -33,7 +33,7 @@ pub struct OptimizeDepsConfig {
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+#[serde(default, rename_all = "camelCase")]
 pub struct PreviewConfig {
     pub port: Option<u16>,
     pub host: Option<String>,
@@ -41,7 +41,7 @@ pub struct PreviewConfig {
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+#[serde(default, rename_all = "camelCase")]
 pub struct ServerConfig {
     pub port: Option<u16>,
     pub host: Option<String>,
@@ -83,7 +83,7 @@ impl ProxyEntry {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ProxyOptions {
     pub target: String,
     pub change_origin: Option<bool>,
@@ -92,14 +92,13 @@ pub struct ProxyOptions {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProxyRewrite {
     pub from: String,
     pub to: String,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+#[serde(default, rename_all = "camelCase")]
 pub struct ResolveConfig {
     pub alias: Option<BTreeMap<String, String>>,
     pub dedupe: Option<Vec<String>>,
@@ -108,7 +107,7 @@ pub struct ResolveConfig {
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+#[serde(default, rename_all = "camelCase")]
 pub struct BuildConfig {
     pub out_dir: Option<String>,
     pub target: Option<String>,
@@ -123,7 +122,7 @@ pub struct BuildConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct LibConfig {
     pub entry: String,
     pub name: Option<String>,
