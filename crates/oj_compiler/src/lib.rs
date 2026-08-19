@@ -229,17 +229,31 @@ pub fn compile_module(
         }
     }
 
+    // Track synthesized expansions: they splice generated nodes with no faithful
+    // source origin, so their sourcemap must be skipped (see codegen below).
+    let mut synthesized = false;
     if F_IMPORT_META_GLOB.find(source_text.as_bytes()).is_some() {
         let dir = path.parent().unwrap_or(path);
         glob::expand(&allocator, dir, &mut program);
+        synthesized = true;
+    }
+
+    // Expand dynamic-import-vars (import(`./x/${v}.js`)) in dev too — the build
+    // path already does; without it these work in `oj build` but throw in dev.
+    if source_text.contains("import(") {
+        let dir = path.parent().unwrap_or(path);
+        synthesized |= glob::expand_dynamic_import_vars(&allocator, dir, &mut program, source_text);
     }
 
     let (imports, dynamic_imports) = rewrite_module_specifiers(&allocator, &mut program, &mut rewriter);
 
     let is_refresh_boundary = opts.refresh && detect_refresh_registrations(&program);
 
+    // Synthesized nodes (glob / dynamic-import-vars) carry generated-string spans
+    // with no origin in this module's source; sourcemapping them panics oxc's
+    // builder on out-of-range spans, so skip the map for those modules.
     let codegen_options = CodegenOptions {
-        source_map_path: opts.sourcemap.then(|| path.to_path_buf()),
+        source_map_path: (opts.sourcemap && !synthesized).then(|| path.to_path_buf()),
         ..CodegenOptions::default()
     };
     let CodegenReturn { code, map, .. } =
@@ -429,6 +443,24 @@ export function Root() {
         assert!(dev.code.contains("\"development\""), "MODE is development:\n{}", dev.code);
         assert!(dev.code.contains("dev = true"), "DEV is true in dev:\n{}", dev.code);
         assert!(dev.code.contains("prod = false"), "PROD is false in dev:\n{}", dev.code);
+    }
+
+    #[test]
+    fn dev_compile_expands_dynamic_import_vars() {
+        // import(`./x/${v}.js`) must expand in the DEV compile path too — the
+        // build path already does, so without this it works in `oj build` and
+        // throws at runtime under `oj dev`.
+        let dir = std::env::temp_dir().join(format!("oj-dynimport-{}", std::process::id()));
+        let loc = dir.join("locales");
+        std::fs::create_dir_all(&loc).unwrap();
+        std::fs::write(loc.join("en.json"), "{}").unwrap();
+        std::fs::write(loc.join("fr.json"), "{}").unwrap();
+        let src = "export const load = (l) => import(`./locales/${l}.json`);\n";
+        let out = compile(&dir.join("main.js"), src, &CompileOptions::dev()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.code.contains("./locales/en.json"), "dyn-import-var must expand in dev:\n{}", out.code);
+        assert!(out.code.contains("./locales/fr.json"), "{}", out.code);
+        assert!(out.code.contains("case "), "expanded to a switch over matches:\n{}", out.code);
     }
 
     #[test]
