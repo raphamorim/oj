@@ -1428,10 +1428,10 @@ async fn ensure_module(
     let ext = file.extension().and_then(|e| e.to_str());
     let is_css = ext.is_some_and(is_style_ext);
     let is_json = ext == Some("json");
-    let dep_map = if !bundle {
-        state.optimized.ready().await
-    } else {
+    let dep_map = if bundle || is_css || is_json {
         Arc::new(optimize::DepMap::new())
+    } else {
+        state.optimized.ready().await
     };
     let compiled = tokio::task::spawn_blocking(move || -> Result<CachedModule, String> {
         if is_json {
