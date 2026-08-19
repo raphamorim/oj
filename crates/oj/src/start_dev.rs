@@ -193,7 +193,16 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
-            if !paths.iter().any(|p| !p.ends_with("routeTree.gen.ts")) {
+            // Rebuild only on a real source-file change. Ignore the generated
+            // route tree and its atomic-write temp siblings, plus bare directory
+            // events (Linux inotify emits a parent-dir event alongside the file
+            // write, which would otherwise slip past a filename-only filter and
+            // retrigger the generator on every reload).
+            let relevant = paths.iter().any(|p| {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                !name.contains("routeTree.gen") && !p.is_dir()
+            });
+            if !relevant {
                 continue;
             }
             let routes_now = list_route_files(&root);
