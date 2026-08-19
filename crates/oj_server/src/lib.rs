@@ -240,6 +240,16 @@ impl DevServer {
         defines.extend(oj_config::config_defines(&config));
         defines.extend(oj_config::environment_defines(&config, "client"));
         defines.extend(oj_config::environment_defines(&config, "ssr"));
+        // Vite defines process.env.NODE_ENV in dev too (nodeEnv = NODE_ENV || mode);
+        // without it, library code that reads it throws a ReferenceError in dev.
+        let node_env =
+            std::env::var("NODE_ENV").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "development".into());
+        let node_env_json = serde_json::to_string(&node_env).unwrap_or_else(|_| "\"development\"".into());
+        for key in ["process.env.NODE_ENV", "global.process.env.NODE_ENV", "globalThis.process.env.NODE_ENV"] {
+            if !defines.iter().any(|(k, _)| k == key) {
+                defines.push((key.to_string(), node_env_json.clone()));
+            }
+        }
         oj_compiler::set_import_meta_env(defines);
 
         let server_cfg = config.server.clone().unwrap_or_default();
