@@ -3033,7 +3033,7 @@ impl HmrGate {
                         g.generation == generation && !g.pending.is_empty()
                     };
                     if expired {
-                        gate.flush(&state);
+                        gate.flush(&state).await;
                     }
                 }
             });
