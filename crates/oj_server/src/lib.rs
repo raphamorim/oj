@@ -175,6 +175,7 @@ struct ServerState {
     plugins_have_transform: bool,
     plugins_watch_change: bool,
     plugins_hot_update: bool,
+    html_env: std::collections::BTreeMap<String, String>,
     parsed_fired: Mutex<std::collections::HashSet<String>>,
     rt: tokio::runtime::Handle,
     base: Option<String>,
@@ -250,6 +251,7 @@ impl DevServer {
                 defines.push((key.to_string(), node_env_json.clone()));
             }
         }
+        let html_env = oj_env::html_env_map(&defines);
         oj_compiler::set_import_meta_env(defines);
 
         let server_cfg = config.server.clone().unwrap_or_default();
@@ -427,6 +429,7 @@ impl DevServer {
             plugins_have_transform,
             plugins_watch_change,
             plugins_hot_update,
+            html_env,
             parsed_fired: Mutex::new(std::collections::HashSet::new()),
             rt: tokio::runtime::Handle::current(),
             base: config.base.clone().filter(|b| b != "/"),
@@ -907,6 +910,9 @@ async fn proxy_middleware(
 
 async fn serve_html(state: &ServerState, bytes: Vec<u8>) -> Response {
     let mut raw = String::from_utf8_lossy(&bytes).into_owned();
+    // %VITE_*% / import.meta.env substitution (Vite's htmlEnvHook), a pre-hook
+    // before any plugin transformIndexHtml.
+    raw = oj_env::replace_html_env(&raw, &state.html_env);
     if let Some(host) = &state.plugins {
         if let Ok(out) = host.transform_index_html(&raw).await {
             raw = out;

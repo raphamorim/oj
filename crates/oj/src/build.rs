@@ -1046,7 +1046,15 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>, mod
         eprintln!("oj build warning: {warning:?}");
     }
 
-    let mut rewritten_html = html.clone();
+    // %VITE_*% / import.meta.env substitution in index.html (Vite's htmlEnvHook),
+    // before the plugin transformIndexHtml below.
+    let html_env = {
+        let env = oj_env::load(&root, mode);
+        let mut defines = oj_env::import_meta_env_defines(&env, mode, false, &base, "VITE_");
+        defines.extend(oj_config::config_defines(&config));
+        oj_env::html_env_map(&defines)
+    };
+    let mut rewritten_html = oj_env::replace_html_env(&html, &html_env);
     let mut emitted: Vec<(String, usize)> = Vec::new();
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
     let mut imports_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
