@@ -252,7 +252,8 @@ impl Plugin for OjCssPlugin {
         async move {
             let has_glob = code.contains("import.meta.glob");
             let has_dynamic = code.contains("import(");
-            if !has_glob && !has_dynamic {
+            let has_new_url = code.contains("import.meta.url");
+            if !has_glob && !has_dynamic && !has_new_url {
                 return Ok(None);
             }
             let path = std::path::Path::new(&id);
@@ -262,6 +263,9 @@ impl Plugin for OjCssPlugin {
             }
             if has_dynamic {
                 expanded = oj_compiler::glob::expand_dynamic_import_vars_source(&expanded, path);
+            }
+            if has_new_url {
+                expanded = oj_compiler::glob::expand_new_url_asset_source(&expanded, path);
             }
             Ok(Some(rolldown_plugin::HookTransformOutput {
                 code: Some(expanded),

@@ -5,8 +5,8 @@ use std::path::Path;
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, ArrayExpressionElement, Expression, ObjectPropertyKind, Program, PropertyKey,
-    Statement,
+    Argument, ArrayExpressionElement, Expression, NewExpression, ObjectPropertyKind, Program,
+    PropertyKey, Statement,
 };
 use oxc_ast_visit::{VisitMut, walk_mut};
 use oxc_parser::Parser;
@@ -130,6 +130,93 @@ pub fn expand_dynamic_import_vars<'a>(
     let mut v = DynImportVars { allocator, dir, source: source_text, changed: false };
     v.visit_program(program);
     v.changed
+}
+
+/// Rewrites `new URL("./asset", import.meta.url)` into a hoisted `?url` asset
+/// import referenced in place, so the asset flows through oj's normal asset
+/// pipeline (Vite's asset-import-meta-url). Returns whether anything changed.
+pub fn expand_new_url_asset<'a>(allocator: &'a Allocator, program: &mut Program<'a>) -> bool {
+    let mut v = NewUrlAsset { allocator, hoisted: Vec::new(), uid: 0 };
+    v.visit_program(program);
+    if v.hoisted.is_empty() {
+        return false;
+    }
+    let src: &'a str = allocator.alloc_str(&v.hoisted.join("\n"));
+    let parsed = Parser::new(allocator, src, SourceType::mjs()).parse();
+    let mut stmts: Vec<Statement> = parsed.program.body.into_iter().collect();
+    stmts.reverse();
+    for stmt in stmts {
+        program.body.insert(0, stmt);
+    }
+    true
+}
+
+struct NewUrlAsset<'a> {
+    allocator: &'a Allocator,
+    hoisted: Vec<String>,
+    uid: usize,
+}
+
+impl<'a> NewUrlAsset<'a> {
+    fn asset_spec(&self, n: &NewExpression<'a>) -> Option<String> {
+        let Expression::Identifier(id) = &n.callee else { return None };
+        if id.name != "URL" || n.arguments.len() != 2 {
+            return None;
+        }
+        let Expression::StringLiteral(spec) = n.arguments[0].as_expression()? else { return None };
+        let spec = spec.value.as_str();
+        if !(spec.starts_with("./") || spec.starts_with("../")) {
+            return None;
+        }
+        // second arg must be `import.meta.url`
+        let Expression::StaticMemberExpression(m) = n.arguments[1].as_expression()? else {
+            return None;
+        };
+        if m.property.name != "url" || !matches!(&m.object, Expression::ImportMeta(_)) {
+            return None;
+        }
+        Some(spec.to_string())
+    }
+}
+
+impl<'a> VisitMut<'a> for NewUrlAsset<'a> {
+    fn visit_expression(&mut self, expr: &mut Expression<'a>) {
+        if let Expression::NewExpression(n) = &*expr {
+            if let Some(spec) = self.asset_spec(n) {
+                let ident = format!("__oj_url_{}", self.uid);
+                self.uid += 1;
+                self.hoisted.push(format!("import {ident} from {:?};", format!("{spec}?url")));
+                let rep = format!("new URL({ident}, import.meta.url)");
+                let src: &'a str = self.allocator.alloc_str(&rep);
+                let parsed = Parser::new(self.allocator, src, SourceType::mjs()).parse();
+                if let Some(Statement::ExpressionStatement(es)) =
+                    parsed.program.body.into_iter().next()
+                {
+                    *expr = es.unbox().expression;
+                }
+                return;
+            }
+        }
+        walk_mut::walk_expression(self, expr);
+    }
+}
+
+pub fn expand_new_url_asset_source(source: &str, path: &Path) -> String {
+    if !source.contains("import.meta.url") {
+        return source.to_string();
+    }
+    let allocator = Allocator::default();
+    let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::mjs());
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+    if parsed.panicked {
+        return source.to_string();
+    }
+    let mut program = parsed.program;
+    if expand_new_url_asset(&allocator, &mut program) {
+        oxc_codegen::Codegen::new().build(&program).code
+    } else {
+        source.to_string()
+    }
 }
 
 pub fn expand_dynamic_import_vars_source(source: &str, path: &Path) -> String {

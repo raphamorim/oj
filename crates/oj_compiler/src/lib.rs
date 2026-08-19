@@ -245,6 +245,11 @@ pub fn compile_module(
         synthesized |= glob::expand_dynamic_import_vars(&allocator, dir, &mut program, source_text);
     }
 
+    // new URL("./asset", import.meta.url) -> a hoisted ?url asset import.
+    if source_text.contains("import.meta.url") {
+        synthesized |= glob::expand_new_url_asset(&allocator, &mut program);
+    }
+
     let (imports, dynamic_imports) = rewrite_module_specifiers(&allocator, &mut program, &mut rewriter);
 
     let is_refresh_boundary = opts.refresh && detect_refresh_registrations(&program);
@@ -461,6 +466,17 @@ export function Root() {
         assert!(out.code.contains("./locales/en.json"), "dyn-import-var must expand in dev:\n{}", out.code);
         assert!(out.code.contains("./locales/fr.json"), "{}", out.code);
         assert!(out.code.contains("case "), "expanded to a switch over matches:\n{}", out.code);
+    }
+
+    #[test]
+    fn dev_compile_rewrites_new_url_import_meta_url() {
+        // new URL("./x", import.meta.url) -> a hoisted ?url asset import ref, so
+        // the asset flows through oj's pipeline instead of 404-ing.
+        let src = "export const w = new URL(\"./worker.js\", import.meta.url);\n";
+        let out = compile(std::path::Path::new("m.js"), src, &CompileOptions::dev()).unwrap();
+        assert!(out.code.contains("__oj_url_0"), "rewritten to hoisted asset ref:\n{}", out.code);
+        assert!(out.code.contains("worker.js?url"), "hoisted ?url import:\n{}", out.code);
+        assert!(!out.code.contains("new URL(\"./worker.js\""), "original literal replaced:\n{}", out.code);
     }
 
     #[test]
