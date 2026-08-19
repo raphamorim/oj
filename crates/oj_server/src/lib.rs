@@ -409,7 +409,22 @@ impl DevServer {
             svelte: tokio::sync::OnceCell::new(),
             tailwind_urls: Mutex::new(std::collections::HashSet::new()),
             has_postcss: has_postcss_config(&root),
-            fs_allow: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            fs_allow: Arc::new(Mutex::new(
+                server_cfg
+                    .fs
+                    .as_ref()
+                    .and_then(|f| f.allow.as_ref())
+                    .map(|allow| {
+                        allow
+                            .iter()
+                            .map(|p| {
+                                let pb = PathBuf::from(p);
+                                if pb.is_absolute() { pb } else { root.join(&pb) }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )),
             dir_cache: Arc::new(Mutex::new(DirCache::new())),
             patch_seq: std::sync::atomic::AtomicU64::new(0),
             chunk_cache: Mutex::new(None),

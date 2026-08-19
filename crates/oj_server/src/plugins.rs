@@ -67,6 +67,7 @@ pub struct ViteValues {
     pub public_dir: Option<String>,
     pub port: Option<u16>,
     pub host: Option<String>,
+    pub fs_allow: Option<Vec<String>>,
     pub define: Option<serde_json::Map<String, serde_json::Value>>,
     pub alias: Option<serde_json::Map<String, serde_json::Value>>,
     pub headers: Option<serde_json::Map<String, serde_json::Value>>,
@@ -109,6 +110,9 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
         public_dir: json.get("publicDir").and_then(|v| v.as_str()).map(str::to_string),
         port: json.get("port").and_then(|v| v.as_u64()).map(|p| p as u16),
         host: json.get("host").and_then(|v| v.as_str()).map(str::to_string),
+        fs_allow: json.get("fsAllow").and_then(|v| v.as_array()).map(|a| {
+            a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()
+        }),
         define: json.get("define").and_then(|v| v.as_object()).cloned(),
         alias: json.get("alias").and_then(|v| v.as_object()).cloned(),
         headers: json.get("headers").and_then(|v| v.as_object()).cloned(),
@@ -143,13 +147,18 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
             def.entry(k).or_insert(val);
         }
     }
-    if v.port.is_some() || v.host.is_some() || v.headers.is_some() {
+    if v.port.is_some() || v.host.is_some() || v.headers.is_some() || v.fs_allow.is_some() {
         let sc = config.server.get_or_insert_with(Default::default);
         if sc.port.is_none() {
             sc.port = v.port;
         }
         if sc.host.is_none() {
             sc.host = v.host;
+        }
+        if sc.fs.is_none() {
+            if let Some(allow) = v.fs_allow {
+                sc.fs = Some(oj_config::FsConfig { allow: Some(allow), strict: None, deny: None });
+            }
         }
         if sc.headers.is_none() {
             if let Some(vheaders) = v.headers {

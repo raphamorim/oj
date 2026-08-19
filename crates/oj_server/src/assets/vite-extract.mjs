@@ -150,6 +150,9 @@ try {
       publicDir: typeof c.publicDir === "string" ? c.publicDir : null,
       port: typeof c.server?.port === "number" ? c.server.port : null,
       host: typeof c.server?.host === "string" ? c.server.host : null,
+      fsAllow: Array.isArray(c.server?.fs?.allow)
+        ? c.server.fs.allow.filter((x) => typeof x === "string")
+        : null,
       define: c.define && typeof c.define === "object" ? c.define : null,
       alias: extractAlias(c.resolve?.alias),
       headers: stringMap(c.server?.headers),

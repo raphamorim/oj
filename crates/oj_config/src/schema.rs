@@ -52,6 +52,15 @@ pub struct ServerConfig {
     pub allowed_hosts: Option<Vec<String>>,
     pub headers: Option<BTreeMap<String, String>>,
     pub proxy: Option<BTreeMap<String, ProxyEntry>>,
+    pub fs: Option<FsConfig>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct FsConfig {
+    pub allow: Option<Vec<String>>,
+    pub strict: Option<bool>,
+    pub deny: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
