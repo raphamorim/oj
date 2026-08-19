@@ -173,6 +173,8 @@ struct ServerState {
     plugin_watched: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
     plugins_use_module_parsed: bool,
     plugins_have_transform: bool,
+    plugins_watch_change: bool,
+    plugins_hot_update: bool,
     parsed_fired: Mutex<std::collections::HashSet<String>>,
     rt: tokio::runtime::Handle,
     base: Option<String>,
@@ -323,6 +325,12 @@ impl DevServer {
             Some(host) => host.has_transform().await,
             None => false,
         };
+        // Same idea for HMR: a host without watchChange/handleHotUpdate hooks (the
+        // tagger case) doesn't need those per-save stdio round-trips.
+        let (plugins_watch_change, plugins_hot_update) = match &plugin_host {
+            Some(host) => host.hmr_hooks().await,
+            None => (false, false),
+        };
 
         let jsx_overrides = match &plugin_host {
             Some(host) => resolve_jsx_overrides(host, &root).await,
@@ -404,6 +412,8 @@ impl DevServer {
             plugin_watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             plugins_use_module_parsed,
             plugins_have_transform,
+            plugins_watch_change,
+            plugins_hot_update,
             parsed_fired: Mutex::new(std::collections::HashSet::new()),
             rt: tokio::runtime::Handle::current(),
             base: config.base.clone().filter(|b| b != "/"),
@@ -3133,21 +3143,25 @@ fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
 
         if let Some(host) = &state.plugins {
             let file = path.display().to_string();
-            let ts = now_millis() as u64;
-            let _ = state.rt.block_on(host.watch_change(&file, "update"));
-            match state.rt.block_on(host.handle_hot_update(&file, ts)) {
-                Ok(Some(d)) if d == "skip" => {
-                    println!("oj: change {file} -> HMR suppressed by plugin");
-                    continue;
+            if state.plugins_watch_change {
+                let _ = state.rt.block_on(host.watch_change(&file, "update"));
+            }
+            if state.plugins_hot_update {
+                let ts = now_millis() as u64;
+                match state.rt.block_on(host.handle_hot_update(&file, ts)) {
+                    Ok(Some(d)) if d == "skip" => {
+                        println!("oj: change {file} -> HMR suppressed by plugin");
+                        continue;
+                    }
+                    Ok(Some(d)) if d == "full-reload" => {
+                        println!("oj: change {file} -> full-reload (plugin)");
+                        messages.push(
+                            serde_json::json!({ "type": "full-reload", "reason": "plugin" }).to_string(),
+                        );
+                        return messages;
+                    }
+                    _ => {}
                 }
-                Ok(Some(d)) if d == "full-reload" => {
-                    println!("oj: change {file} -> full-reload (plugin)");
-                    messages.push(
-                        serde_json::json!({ "type": "full-reload", "reason": "plugin" }).to_string(),
-                    );
-                    return messages;
-                }
-                _ => {}
             }
         }
 

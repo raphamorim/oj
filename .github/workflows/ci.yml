@@ -48,6 +48,12 @@ jobs:
       - name: ssr streaming prod build + hydration
         if: matrix.mode == 'unbundled'
         run: node e2e/ssr-prod.mjs
+      - name: server fast-paths (cache bound, mtime, hmr gating)
+        if: matrix.mode == 'unbundled'
+        run: |
+          node e2e/memory-cache.mjs
+          node e2e/mtime-fastpath.mjs
+          node e2e/hmr-hook-skip.mjs
 
   # i need to fix this or automate
   build:

@@ -512,6 +512,23 @@ impl PluginHost {
         self.call("getHasTransform", &[]).await.ok().flatten().map(|s| s == "true").unwrap_or(true)
     }
 
+    /// Which HMR hooks any active plugin defines: (watchChange, handleHotUpdate).
+    /// Defaults to (true, true) on RPC or parse failure so an HMR RPC is never
+    /// skipped by mistake.
+    pub async fn hmr_hooks(&self) -> (bool, bool) {
+        let raw = match self.call("getHmrHooks", &[]).await {
+            Ok(Some(s)) => s,
+            _ => return (true, true),
+        };
+        match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(v) => (
+                v.get("watchChange").and_then(|b| b.as_bool()).unwrap_or(true),
+                v.get("handleHotUpdate").and_then(|b| b.as_bool()).unwrap_or(true),
+            ),
+            Err(_) => (true, true),
+        }
+    }
+
     /// Kill the Node process now (used when the host has no active plugins).
     pub fn shutdown(&self) {
         if let Some(mut child) = self.child.lock().unwrap().take() {

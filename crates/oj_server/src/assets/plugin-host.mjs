@@ -549,6 +549,11 @@ async function run(hook, args) {
     });
     return String(has);
   }
+  if (hook === "getHmrHooks") {
+    const watchChangeHook = plugins.some((p) => typeof p.watchChange === "function");
+    const hotUpdateHook = plugins.some((p) => typeof p.handleHotUpdate === "function");
+    return JSON.stringify({ watchChange: watchChangeHook, handleHotUpdate: hotUpdateHook });
+  }
   if (hook === "getMiddlewarePort") return middlewarePort == null ? null : String(middlewarePort);
   if (hook === "wsMessage") {
     const event = args[0];
