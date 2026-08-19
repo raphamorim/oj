@@ -44,10 +44,16 @@ struct OjCssPlugin {
     has_postcss: bool,
     client: bool,
     inline_limit: u64,
+    css_code_split: bool,
 }
 
 fn assets_inline_limit_of(config: &oj_config::OjConfig) -> u64 {
     config.build.as_ref().and_then(|b| b.assets_inline_limit).unwrap_or(4096)
+}
+
+/// Vite's `build.cssCodeSplit` defaults to true: each chunk gets its own CSS.
+fn css_code_split_of(config: &oj_config::OjConfig) -> bool {
+    config.build.as_ref().and_then(|b| b.css_code_split).unwrap_or(true)
 }
 
 fn re_escape(s: &str) -> String {
@@ -464,9 +470,15 @@ impl Plugin for OjCssPlugin {
                 None => "export default void 0;".to_string(),
             };
             collected.lock().unwrap().push((path.to_string(), output.css));
+            // When code-splitting CSS, keep the stub in its chunk so `module_ids`
+            // maps each stylesheet to the chunk that imported it; without this the
+            // unused-default stub is tree-shaken and the mapping is lost.
+            let side_effects =
+                self.css_code_split.then_some(rolldown_common::side_effects::HookSideEffects::NoTreeshake);
             Ok(Some(rolldown_plugin::HookLoadOutput {
                 code: arcstr::ArcStr::from(js),
                 module_type: Some(rolldown_common::ModuleType::Js),
+                side_effects,
                 ..Default::default()
             }))
         }
@@ -958,6 +970,7 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>, mod
         .collect();
 
     let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let css_split = css_code_split_of(&config);
     let plugin_host = user_plugin_host(
         &root,
         &base,
@@ -974,7 +987,7 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>, mod
         }
         oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host))));
     }
-    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(&root), inline_limit: assets_inline_limit_of(&config), client: true }));
+    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(&root), inline_limit: assets_inline_limit_of(&config), client: true, css_code_split: css_split }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
         .with_options(BundlerOptions {
@@ -1151,39 +1164,48 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>, mod
         }
     }
 
-    let mut css_entries = collected_css.lock().unwrap().clone();
-    if !css_entries.is_empty() {
-        css_entries.sort();
-        fs::create_dir_all(out_dir.join("assets"))?;
-        let mut seen_assets: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
-        let combined: String = css_entries
-            .into_iter()
-            .map(|(src, css)| {
-                let dir = Path::new(&src).parent().map(Path::to_path_buf).unwrap_or_else(|| root.to_path_buf());
-                rebase_css_urls(&css, &dir, &out_dir, &base, &mut emitted, &mut seen_assets)
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let hash = format!("{:016x}", {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            combined.hash(&mut h);
-            h.finish()
-        });
-        let css_name = format!("assets/style-{}.css", &hash[..8]);
-        fs::create_dir_all(out_dir.join("assets"))?;
-        fs::write(out_dir.join(&css_name), &combined)?;
-        emitted.push((css_name.clone(), combined.len()));
-        let link = format!("<link rel=\"stylesheet\" href=\"{}\" />", with_base(&css_name, &base));
-        rewritten_html = match rewritten_html.find("</head>") {
-            Some(idx) => format!("{}{}\n{}", &rewritten_html[..idx], link, &rewritten_html[idx..]),
-            None => format!("{link}\n{rewritten_html}"),
-        };
-        for entry in &mut manifest_entries {
-            if entry.is_entry {
-                entry.css.push(css_name.clone());
+    if !css_split {
+        let mut css_entries = collected_css.lock().unwrap().clone();
+        if !css_entries.is_empty() {
+            css_entries.sort();
+            fs::create_dir_all(out_dir.join("assets"))?;
+            let mut seen_assets: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
+            let combined: String = css_entries
+                .into_iter()
+                .map(|(src, css)| {
+                    let dir = Path::new(&src).parent().map(Path::to_path_buf).unwrap_or_else(|| root.to_path_buf());
+                    rebase_css_urls(&css, &dir, &out_dir, &base, &mut emitted, &mut seen_assets)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let hash = content_hash(combined.as_bytes());
+            let css_name = format!("assets/style-{}.css", &hash[..8]);
+            fs::write(out_dir.join(&css_name), &combined)?;
+            emitted.push((css_name.clone(), combined.len()));
+            let link = format!("<link rel=\"stylesheet\" href=\"{}\" />", with_base(&css_name, &base));
+            rewritten_html = match rewritten_html.find("</head>") {
+                Some(idx) => format!("{}{}\n{}", &rewritten_html[..idx], link, &rewritten_html[idx..]),
+                None => format!("{link}\n{rewritten_html}"),
+            };
+            for entry in &mut manifest_entries {
+                if entry.is_entry {
+                    entry.css.push(css_name.clone());
+                }
             }
         }
+    } else {
+        emit_split_css(
+            &output,
+            &collected_css,
+            &entry_files,
+            &imports_map,
+            &out_dir,
+            &root,
+            &base,
+            &mut emitted,
+            &mut manifest_entries,
+            &mut rewritten_html,
+        )?;
     }
 
     fs::create_dir_all(out_dir.join(".vite"))?;
@@ -1296,7 +1318,7 @@ pub(crate) async fn build_ssr(
         }
         oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host))));
     }
-    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root), inline_limit: assets_inline_limit_of(&config), client: false }));
+    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root), inline_limit: assets_inline_limit_of(&config), client: false , css_code_split: false }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
         .with_options(BundlerOptions {
@@ -1414,6 +1436,7 @@ async fn build_server_fns(root: &Path, out_dir: &Path) -> anyhow::Result<()> {
                 has_postcss: oj_server::has_postcss_config(root),
                 inline_limit: 4096,
                 client: false,
+                css_code_split: false,
             })])
             .with_options(BundlerOptions {
                 input: Some(vec![InputItem {
@@ -1742,7 +1765,7 @@ async fn build_client_entry(
         }
         oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host))));
     }
-    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root), inline_limit: assets_inline_limit_of(&config), client: true }));
+    oj_plugins.push(Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root), inline_limit: assets_inline_limit_of(&config), client: true, css_code_split: false }));
 
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
@@ -1857,7 +1880,7 @@ async fn build_library(
         }
 
         let mut bundler = BundlerBuilder::default()
-            .with_plugins(vec![Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root), inline_limit: 4096, client: true })])
+            .with_plugins(vec![Arc::new(OjCssPlugin { collected: Arc::clone(&collected_css), root: root.to_path_buf(), has_postcss: oj_server::has_postcss_config(root), inline_limit: 4096, client: true, css_code_split: false })])
             .with_options(BundlerOptions {
                 input: Some(vec![InputItem {
                     name: Some(file_name.clone()),
@@ -2049,6 +2072,107 @@ fn rebase_css_urls(
     }
     out.push_str(rest);
     out
+}
+
+/// `build.cssCodeSplit`: emit one stylesheet per chunk that imports CSS. The
+/// entry chunk and every chunk reachable from it via static imports get their
+/// CSS linked render-blocking in the HTML (no FOUC); async-only chunks carry a
+/// tiny injector that appends their stylesheet `<link>` when the chunk runs.
+#[allow(clippy::too_many_arguments)]
+fn emit_split_css(
+    output: &rolldown::BundleOutput,
+    collected_css: &Arc<Mutex<Vec<(String, String)>>>,
+    entry_files: &[String],
+    imports_map: &std::collections::HashMap<String, Vec<String>>,
+    out_dir: &Path,
+    root: &Path,
+    base: &str,
+    emitted: &mut Vec<(String, usize)>,
+    manifest_entries: &mut [ManifestEntry],
+    rewritten_html: &mut String,
+) -> anyhow::Result<()> {
+    let css_map: std::collections::HashMap<String, String> =
+        collected_css.lock().unwrap().iter().cloned().collect();
+    if css_map.is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(out_dir.join("assets"))?;
+    let mut seen_assets: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
+
+    // Chunks reachable from an HTML entry through static imports only: their CSS
+    // is safe to link render-blocking. Anything else loads asynchronously.
+    let mut sync_chunks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for entry in entry_files {
+        sync_chunks.insert(entry.clone());
+        sync_chunks.extend(transitive_imports(entry, imports_map));
+    }
+
+    // chunk filename -> emitted css filename
+    let mut chunk_css: Vec<(String, String)> = Vec::new();
+    for asset in &output.assets {
+        let rolldown_common::Output::Chunk(chunk) = asset else { continue };
+        let mut css = String::new();
+        for module_id in &chunk.modules.keys {
+            let mid = module_id.to_string();
+            if let Some(src) = css_map.get(&mid) {
+                let dir = Path::new(&mid)
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| root.to_path_buf());
+                if !css.is_empty() {
+                    css.push('\n');
+                }
+                css.push_str(&rebase_css_urls(src, &dir, out_dir, base, emitted, &mut seen_assets));
+            }
+        }
+        if css.is_empty() {
+            continue;
+        }
+        let hash = content_hash(css.as_bytes());
+        let css_name = format!("assets/{}-{}.css", sanitize_asset_name(&chunk.name), &hash[..8]);
+        fs::write(out_dir.join(&css_name), &css)?;
+        emitted.push((css_name.clone(), css.len()));
+        for entry in manifest_entries.iter_mut() {
+            if entry.file == chunk.filename.as_str() {
+                entry.css.push(css_name.clone());
+            }
+        }
+        chunk_css.push((chunk.filename.to_string(), css_name));
+    }
+
+    // Render-blocking links for entry + statically-imported chunk CSS.
+    let mut linked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut links = String::new();
+    for (chunk_file, css_name) in &chunk_css {
+        if sync_chunks.contains(chunk_file) && linked.insert(css_name.clone()) {
+            links.push_str(&format!(
+                "<link rel=\"stylesheet\" href=\"{}\" />\n",
+                with_base(css_name, base)
+            ));
+        }
+    }
+    if !links.is_empty() {
+        let links = links.trim_end();
+        *rewritten_html = match rewritten_html.find("</head>") {
+            Some(idx) => format!("{}{}\n{}", &rewritten_html[..idx], links, &rewritten_html[idx..]),
+            None => format!("{links}\n{rewritten_html}"),
+        };
+    }
+
+    // Async-only chunks self-inject their stylesheet when evaluated.
+    for (chunk_file, css_name) in &chunk_css {
+        if sync_chunks.contains(chunk_file) {
+            continue;
+        }
+        let path = out_dir.join(chunk_file);
+        let Ok(code) = fs::read_to_string(&path) else { continue };
+        let href = serde_json::Value::String(with_base(css_name, base));
+        let inject = format!(
+            "(function(){{var u={href};if(!document.querySelector('link[rel=\"stylesheet\"][href=\"'+u+'\"]')){{var l=document.createElement('link');l.rel='stylesheet';l.href=u;document.head.appendChild(l);}}}})();\n"
+        );
+        fs::write(&path, format!("{inject}{code}"))?;
+    }
+    Ok(())
 }
 
 struct ManifestEntry {

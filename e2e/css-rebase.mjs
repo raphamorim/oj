@@ -33,8 +33,9 @@ try {
 
   const assetsDir = path.join(app, "dist", "assets");
   const files = fs.readdirSync(assetsDir);
-  const styleFile = files.find((f) => /^style-.*\.css$/.test(f));
-  if (!styleFile) throw new Error("no style-*.css emitted; got: " + files.join(", "));
+  // cssCodeSplit names the stylesheet after its chunk (e.g. main-*.css).
+  const styleFile = files.find((f) => /\.css$/.test(f));
+  if (!styleFile) throw new Error("no .css emitted; got: " + files.join(", "));
   const css = fs.readFileSync(path.join(assetsDir, styleFile), "utf8");
 
   const rebased = css.match(/url\("\/assets\/bg-[0-9a-f]+\.png"\)/);

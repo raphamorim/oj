@@ -128,6 +128,7 @@ pub struct BuildConfig {
     pub rollup_options: Option<serde_json::Value>,
     pub rolldown_options: Option<serde_json::Value>,
     pub assets_inline_limit: Option<u64>,
+    pub css_code_split: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
