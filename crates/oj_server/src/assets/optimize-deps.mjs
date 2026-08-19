@@ -3,7 +3,7 @@
 
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
-import { mkdirSync, rmSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
+import { mkdirSync, rmSync, readFileSync, writeFileSync, renameSync, existsSync, realpathSync } from "node:fs";
 import path from "node:path";
 import builtinModules from "node:module";
 
@@ -137,6 +137,18 @@ for (const dep of deps) {
     entry = req.resolve(dep);
   } catch {
     continue;
+  }
+  // Skip linked / workspace packages (symlinked into node_modules): pre-bundling
+  // freezes their source so edits to them stop HMR-ing. Vite excludes these too.
+  // An explicit optimizeDeps.include still forces optimization.
+  if (!include.includes(dep)) {
+    let real = entry;
+    try {
+      real = realpathSync(entry);
+    } catch {}
+    if (!real.split(path.sep).includes("node_modules")) {
+      continue;
+    }
   }
   const name = dep.replace(/^@/, "").replace(/[/@]/g, "_");
   entryPoints[name] = entry;
