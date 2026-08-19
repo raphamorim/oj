@@ -189,6 +189,9 @@ pub struct BuiltApp {
     pub plugin_mw_port: Option<u16>,
     pub root: PathBuf,
     pub started: Instant,
+    /// Sender for the `/__ws` broadcast — the channel the Lovable editor reads
+    /// HMR + narration frames from. The start path pushes narration here.
+    pub reload_tx: broadcast::Sender<String>,
 }
 
 impl DevServer {
@@ -367,7 +370,7 @@ impl DevServer {
             root: root.clone(),
             public_dir,
             bundle,
-            reload_tx,
+            reload_tx: reload_tx.clone(),
             graph: Mutex::new(ModuleGraph::new()),
             resolver: Arc::new(OjResolver::with_options(
                 &root,
@@ -491,7 +494,16 @@ impl DevServer {
             state.proxy.iter().map(|(p, _)| p.clone()).collect();
         let app = app.with_state(state);
 
-        Ok(BuiltApp { router: app, host, port, proxy_prefixes, plugin_mw_port, root, started })
+        Ok(BuiltApp {
+            router: app,
+            host,
+            port,
+            proxy_prefixes,
+            plugin_mw_port,
+            root,
+            started,
+            reload_tx,
+        })
     }
 }
 
@@ -719,6 +731,51 @@ async fn preview_serve(
     }
 }
 
+/// A `lovable:boot-progress` custom HMR frame (editor boot narration). Shape
+/// mirrors web/shared/lib/preview/bootProgress.ts; ssrModules + clientModules
+/// are required non-negative ints or the editor drops the frame.
+pub fn boot_progress_frame(ssr_modules: usize, client_modules: usize, client_idle_ms: Option<u64>) -> String {
+    serde_json::json!({
+        "type": "custom",
+        "event": "lovable:boot-progress",
+        "data": {
+            "ssrModules": ssr_modules,
+            "clientModules": client_modules,
+            "ssrIdleMs": serde_json::Value::Null,
+            "clientIdleMs": client_idle_ms,
+            "buildError": serde_json::Value::Null,
+        },
+    })
+    .to_string()
+}
+
+/// A `lovable:update-progress` custom HMR frame (editor prompt / steady-state
+/// narration). Shape mirrors web/shared/lib/preview/updateProgress.ts; batch is
+/// monotonic and trigger is one of "flush" | "watch" | "restart".
+pub fn update_progress_frame(
+    batch: u64,
+    trigger: &str,
+    ssr_modules: usize,
+    client_modules: usize,
+    idle_ms: Option<u64>,
+    done: bool,
+) -> String {
+    serde_json::json!({
+        "type": "custom",
+        "event": "lovable:update-progress",
+        "data": {
+            "batch": batch,
+            "trigger": trigger,
+            "ssrModules": ssr_modules,
+            "clientModules": client_modules,
+            "idleMs": idle_ms,
+            "done": done,
+            "buildError": serde_json::Value::Null,
+        },
+    })
+    .to_string()
+}
+
 async fn ws_upgrade(
     State(state): State<Arc<ServerState>>,
     upgrade: WebSocketUpgrade,
@@ -733,18 +790,7 @@ async fn ws_upgrade(
             })
             .to_string();
             let _ = socket.send(Message::Text(mode.into())).await;
-            let boot = serde_json::json!({
-                "type": "custom",
-                "event": "lovable:boot-progress",
-                "data": {
-                    "ssrModules": 0,
-                    "clientModules": state.preload_snapshot.len(),
-                    "ssrIdleMs": serde_json::Value::Null,
-                    "clientIdleMs": 0,
-                    "buildError": serde_json::Value::Null,
-                },
-            })
-            .to_string();
+            let boot = boot_progress_frame(0, state.preload_snapshot.len(), Some(0));
             let _ = socket.send(Message::Text(boot.into())).await;
         }
         loop {

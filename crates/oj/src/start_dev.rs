@@ -29,6 +29,10 @@ struct StartState {
     live_reload: PathBuf,
     workspace_root: PathBuf,
     reload_tx: broadcast::Sender<()>,
+    // The oj_server /__ws broadcast: the channel the Lovable editor reads boot +
+    // update narration frames from (the start path's own /@oj-start/hmr socket
+    // only drives the app iframe's live reload).
+    ws_tx: broadcast::Sender<String>,
     css_host: Option<Arc<tokio::sync::Mutex<Runner>>>,
 }
 
@@ -78,6 +82,7 @@ pub async fn start_dev(root: PathBuf, port: Option<u16>, host: Option<String>) -
         live_reload: cache.join("live-reload.js"),
         workspace_root: workspace_root(&root),
         reload_tx: reload_tx.clone(),
+        ws_tx: built.reload_tx.clone(),
         css_host,
     });
 
@@ -179,6 +184,7 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             return;
         }
         let mut prev_routes = list_route_files(&root);
+        let mut batch = 0u64;
         loop {
             let mut paths: std::collections::HashSet<PathBuf> = match rx.recv() {
                 Ok(Ok(ev)) => ev.paths.into_iter().collect(),
@@ -218,6 +224,10 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             if routes_changed || server_fn_changed {
                 let _ = run_node(&root, &cache.join("gen-resolver.mjs"), "server-fn resolver");
             }
+            // Narrate the compile batch to the editor: "Applying changes…" while
+            // it rebuilds, then done so the pill clears.
+            batch += 1;
+            let _ = state.ws_tx.send(oj_server::update_progress_frame(batch, "watch", 0, 0, None, false));
             rt.block_on(async {
                 let (r, c) = (root.clone(), cache.clone());
                 let client = tokio::task::spawn_blocking(move || {
@@ -226,6 +236,8 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
                 let (_, _) = tokio::join!(client, reload_runner(&state));
             });
             let _ = state.reload_tx.send(());
+            let modules = client_module_count(&cache);
+            let _ = state.ws_tx.send(oj_server::update_progress_frame(batch, "watch", 0, modules, Some(0), true));
             println!("  oj start: rebuilt, reloading");
         }
     });
@@ -267,6 +279,14 @@ fn generate_route_tree(root: &Path, cache: &Path) -> anyhow::Result<()> {
 
 fn bundle_client_entry(root: &Path, cache: &Path) -> anyhow::Result<()> {
     run_node(root, &cache.join("bundle-client.mjs"), "client entry bundling")
+}
+
+// Client module count written by bundle-client.mjs, for update/boot narration.
+fn client_module_count(cache: &Path) -> usize {
+    std::fs::read_to_string(cache.join("client-entry.modules"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 fn run_node(root: &Path, script: &Path, what: &str) -> anyhow::Result<()> {

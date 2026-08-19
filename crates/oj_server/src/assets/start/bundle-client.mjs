@@ -105,6 +105,8 @@ const result = await build({
 
 const chunk = result.output.find((o) => o.type === "chunk" && o.isEntry) ?? result.output[0];
 writeFileSync(join(HERE, "client-entry.js"), chunk.code);
+// Module count for the editor's update-progress narration ("(N modules)").
+writeFileSync(join(HERE, "client-entry.modules"), String(chunk.modules ? Object.keys(chunk.modules).length : 0));
 
 const devManifest = {
   routes: {
