@@ -10,7 +10,10 @@ export default defineConfig({
     prerender: ["/", "/about"],
   },
   environments: {
-    client: { define: { __OJ_DEFINE_CLIENT__: JSON.stringify("client-define") } },
+    client: {
+      define: { __OJ_DEFINE_CLIENT__: JSON.stringify("client-define") },
+      build: { sourcemap: true },
+    },
     ssr: {
       define: { __OJ_DEFINE_SSR__: JSON.stringify("ssr-define") },
       build: { sourcemap: false },

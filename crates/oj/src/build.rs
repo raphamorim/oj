@@ -909,7 +909,7 @@ pub async fn build(root: PathBuf, out: Option<PathBuf>, ssr: Option<String>, mod
         .unwrap_or_else(|| PathBuf::from("dist"));
     let out_dir = if out.is_absolute() { out } else { root.join(&out) };
     let minify = build_cfg.minify.unwrap_or(true);
-    let sourcemap = build_cfg.sourcemap.unwrap_or(true);
+    let sourcemap = build_cfg.sourcemap.unwrap_or(false);
 
     if let Some(entry) = ssr.or_else(|| build_cfg.ssr.clone()) {
         return build_ssr_app(&root, &out_dir, &entry, minify, sourcemap, build_cfg.prerender.clone())
