@@ -1596,6 +1596,10 @@ async fn replay_module_parsed(
     }
 }
 
+// Rough fixed cost of one cache entry beyond its module payload: the MemoryEntry
+// struct, the HashMap bucket, and the String headers for the url + key.
+const MEMORY_ENTRY_OVERHEAD: usize = 160;
+
 struct MemoryEntry {
     key: String,
     module: Arc<CachedModule>,
@@ -1627,7 +1631,7 @@ impl MemoryCache {
     }
 
     fn put(&mut self, url: &str, key: &str, module: &Arc<CachedModule>) {
-        let bytes = module_weight(module);
+        let bytes = module_weight(module) + url.len() + key.len() + MEMORY_ENTRY_OVERHEAD;
         self.seq += 1;
         let seq = self.seq;
         let entry = MemoryEntry { key: key.to_string(), module: Arc::clone(module), bytes, seq };
@@ -1638,31 +1642,78 @@ impl MemoryCache {
         self.evict();
     }
 
+    // Evict in one sorted pass down to a low-water mark (90% of budget) so the
+    // hot get()/put() paths stay cheap and eviction runs rarely, not per-put.
     fn evict(&mut self) {
-        while self.total > self.budget && self.map.len() > 1 {
-            let victim = self.map.iter().min_by_key(|(_, e)| e.seq).map(|(k, _)| k.clone());
-            match victim {
-                Some(url) => {
-                    if let Some(e) = self.map.remove(&url) {
-                        self.total -= e.bytes;
-                    }
-                }
-                None => break,
+        if self.total <= self.budget {
+            return;
+        }
+        let low = self.budget - self.budget / 10;
+        let mut order: Vec<(u64, String)> =
+            self.map.iter().map(|(url, e)| (e.seq, url.clone())).collect();
+        order.sort_unstable_by_key(|(seq, _)| *seq);
+        for (_, url) in order {
+            if self.total <= low || self.map.len() <= 1 {
+                break;
+            }
+            if let Some(e) = self.map.remove(&url) {
+                self.total -= e.bytes;
             }
         }
     }
 }
 
 fn module_weight(module: &CachedModule) -> usize {
-    module.code.len() + module.map_data_url.as_ref().map(|s| s.len()).unwrap_or(0)
+    fn strs(v: &[String]) -> usize {
+        v.iter().map(|s| s.len() + std::mem::size_of::<String>()).sum::<usize>()
+    }
+    fn pairs(v: &[(String, String)]) -> usize {
+        v.iter().map(|(a, b)| a.len() + b.len() + 2 * std::mem::size_of::<String>()).sum::<usize>()
+    }
+    module.code.len()
+        + module.map_data_url.as_ref().map_or(0, String::len)
+        + module.kind.len()
+        + strs(&module.imports)
+        + strs(&module.fs_allow)
+        + strs(&module.watch_files)
+        + pairs(&module.require_map)
+        + pairs(&module.css_exports)
 }
 
 fn memory_cache_budget() -> usize {
-    match std::env::var("OJ_MEMORY_CACHE_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
-        Some(0) => usize::MAX,
-        Some(mb) => mb.saturating_mul(1024 * 1024),
-        None => 256 * 1024 * 1024,
+    if let Some(mb) =
+        std::env::var("OJ_MEMORY_CACHE_MB").ok().and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        return if mb == 0 { usize::MAX } else { mb.saturating_mul(1024 * 1024) };
     }
+    // No explicit budget: scale to the container memory limit (density) if one is
+    // visible, else a sane fixed default for a dev machine.
+    let ceil = 256 * 1024 * 1024;
+    let floor = 32 * 1024 * 1024;
+    match detect_memory_limit() {
+        Some(limit) => (limit / 8).clamp(floor, ceil),
+        None => 128 * 1024 * 1024,
+    }
+}
+
+// The cgroup memory ceiling (v2 then v1); None off-container or when unlimited.
+fn detect_memory_limit() -> Option<usize> {
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        let t = s.trim();
+        if t != "max" {
+            if let Ok(v) = t.parse::<u64>() {
+                return Some(v as usize);
+            }
+        }
+    }
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
+        if let Ok(v) = s.trim().parse::<u64>() {
+            if v < (1u64 << 62) {
+                return Some(v as usize);
+            }
+        }
+    }
+    None
 }
 
 fn memory_get(state: &ServerState, url: &str, key: &str) -> Option<Arc<CachedModule>> {
