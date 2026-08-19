@@ -164,8 +164,19 @@ const watchedFiles = new Set();
 const transformWatchStore = new AsyncLocalStorage();
 const seenIds = new Set();
 
+// this.parse is synchronous in Rollup, so resolve Vite's parseAst (re-exported
+// from Rollup) once at startup; AST-aware plugins call it inside transform.
+let viteParseAst = null;
+try {
+  const _root = initial.config?.root ?? process.cwd();
+  const _vite = await import(createRequire(_root + "/package.json").resolve("vite"));
+  if (typeof _vite.parseAst === "function") viteParseAst = _vite.parseAst;
+} catch {}
+
 const ctx = {
   environment,
+  meta: { rollupVersion: "4.0.0", watchMode: true, framework: "oj" },
+  parse: (code, opts) => (viteParseAst ? viteParseAst(code, opts) : {}),
   warn: (m) => process.stderr.write(`oj plugin warn: ${m}\n`),
   error: (m) => {
     throw typeof m === "string" ? new Error(m) : m;
