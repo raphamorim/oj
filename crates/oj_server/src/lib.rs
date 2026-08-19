@@ -147,6 +147,7 @@ struct ServerState {
     ssr_resolver: Arc<OjResolver>,
     cache: PersistentCache,
     memory: Mutex<MemoryCache>,
+    mtime_keys: Mutex<HashMap<String, (std::time::SystemTime, u64, String)>>,
     compile_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     crawl_done: tokio::sync::watch::Receiver<bool>,
     fs_allow: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
@@ -377,6 +378,7 @@ impl DevServer {
                 env!("CARGO_PKG_VERSION"),
             ),
             memory: Mutex::new(MemoryCache::new(memory_cache_budget())),
+            mtime_keys: Mutex::new(HashMap::new()),
             compile_locks: Mutex::new(HashMap::new()),
             crawl_done: crawl_rx,
             tailwind: tokio::sync::OnceCell::new(),
@@ -1269,6 +1271,26 @@ async fn ensure_module(
         return Ok((String::new(), module));
     }
 
+    let stamp = match tokio::fs::metadata(file).await {
+        Ok(meta) => meta.modified().ok().map(|mtime| (mtime, meta.len())),
+        Err(_) => None,
+    };
+    if let Some((mtime, size)) = stamp {
+        let cached_key = state
+            .mtime_keys
+            .lock()
+            .unwrap()
+            .get(url)
+            .filter(|(t, s, _)| *t == mtime && *s == size)
+            .map(|(_, _, k)| k.clone());
+        if let Some(key) = cached_key {
+            if let Some(module) = memory_get(state, url, &key) {
+                register_in_graph(state, url, &module);
+                return Ok((key, module));
+            }
+        }
+    }
+
     let source = bytes_to_string(
         tokio::fs::read(file).await.map_err(|err| format!("read error for {url}: {err}"))?,
     )
@@ -1301,6 +1323,9 @@ async fn ensure_module(
         "dev"
     };
     let key = state.cache.key(source.as_bytes(), url, mode);
+    if let Some((mtime, size)) = stamp {
+        state.mtime_keys.lock().unwrap().insert(url.to_string(), (mtime, size, key.clone()));
+    }
 
     if let Some(module) = memory_get(state, url, &key) {
         register_in_graph(state, url, &module);
