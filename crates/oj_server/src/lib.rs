@@ -693,10 +693,23 @@ async fn preview_serve(
         return (StatusCode::NOT_FOUND, format!("oj: not found: {rel}")).into_response();
     };
 
+    // Build assets carry a content hash in their name, so they can be cached
+    // forever; HTML is unhashed and must revalidate.
+    let cache_control = if rel.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else if ctype.starts_with("text/html") {
+        "no-cache"
+    } else {
+        ""
+    };
+
     match tokio::fs::read(&target).await {
         Ok(bytes) => {
             let mut resp = ([(header::CONTENT_TYPE, ctype)], bytes).into_response();
             let h = resp.headers_mut();
+            if !cache_control.is_empty() {
+                h.insert(header::CACHE_CONTROL, header::HeaderValue::from_static(cache_control));
+            }
             for (name, value) in extra_headers {
                 h.insert(name.clone(), value.clone());
             }

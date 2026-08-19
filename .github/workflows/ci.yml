@@ -136,4 +136,8 @@ jobs:
           for i in $(seq 1 30); do curl -sf http://localhost:4173/ >/dev/null && break; sleep 1; done
           curl -sf http://localhost:4173/ | grep -q 'id="root"'
           test "$(curl -sf -o /dev/null -w '%{http_code}' http://localhost:4173/deep/route)" = 200
+          # hashed assets are immutable; html revalidates
+          asset=$(curl -sf http://localhost:4173/ | grep -o '/assets/[^"]*\.js' | head -1)
+          curl -sf -D - -o /dev/null "http://localhost:4173$asset" | grep -qi 'cache-control: public, max-age=31536000, immutable'
+          curl -sf -D - -o /dev/null http://localhost:4173/ | grep -qi 'cache-control: no-cache'
           lsof -ti:4173 -sTCP:LISTEN | xargs -r kill || true
