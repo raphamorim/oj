@@ -1,0 +1,5 @@
+# Seeds for failure cases proptest has generated in the past, replayed before
+# any novel case. Checked in on purpose: this one caught the graph walk failing
+# to reset a module from gray to black after visiting its importers, which turns
+# a diamond into a reported cycle.
+cc 3ced5e53de36a9d3b695d4867b83b944f7db897e923689b9e7fbffff8ff336f3 # shrinks to ops = [AddImport { importer: 3, imported: 0 }, Link { importer: 2, imports: [1] }, Link { importer: 1, imports: [3, 0] }, Accept { module: 2, accepting: true }]

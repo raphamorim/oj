@@ -176,38 +176,64 @@ impl ModuleGraph {
         Ok(boundaries)
     }
 
+    /// Depth-first climb towards accepting boundaries, with an explicit stack:
+    /// import chains are as deep as an app's barrel files make them, and a
+    /// recursive walk overflows the (2 MiB) stack of the runtime worker that
+    /// handles a file change somewhere past a few thousand levels.
     fn climb<'a>(
         &'a self,
-        current: &'a Path,
+        seed: &'a Path,
         colors: &mut HashMap<&'a Path, Color>,
         boundaries: &mut Vec<PathBuf>,
     ) -> Result<(), String> {
-        match colors.get(current) {
-            Some(Color::Black) => return Ok(()),
-            Some(Color::Gray) => {
-                return Err(format!("circular import involving {}", current.display()));
+        enum Step<'s> {
+            /// Visit the module, pushing its importers.
+            Enter(&'s Path),
+            /// Every importer of the module has been visited.
+            Blacken(&'s Path),
+        }
+
+        let mut stack = vec![Step::Enter(seed)];
+        while let Some(step) = stack.pop() {
+            let current = match step {
+                Step::Blacken(path) => {
+                    colors.insert(path, Color::Black);
+                    continue;
+                }
+                Step::Enter(path) => path,
+            };
+            match colors.get(current) {
+                Some(Color::Black) => continue,
+                Some(Color::Gray) => {
+                    return Err(format!("circular import involving {}", current.display()));
+                }
+                None => {}
             }
-            None => {}
+            // Importer sets only ever name modules the graph knows, but a full
+            // reload is the safe answer if that ever stops holding.
+            let Some(node) = self.modules.get(current) else {
+                return Err(format!("{} is not in the module graph", current.display()));
+            };
+            if node.is_self_accepting {
+                boundaries.push(current.to_path_buf());
+                colors.insert(current, Color::Black);
+                continue;
+            }
+            if node.importers.is_empty() {
+                return Err(format!(
+                    "update reached entry {} with no accepting boundary",
+                    current.display()
+                ));
+            }
+            colors.insert(current, Color::Gray);
+            stack.push(Step::Blacken(current));
+            let mut importers: Vec<&Path> = node.importers.iter().map(PathBuf::as_path).collect();
+            importers.sort_unstable();
+            // Reversed, so the sorted order is the visit order.
+            for importer in importers.into_iter().rev() {
+                stack.push(Step::Enter(importer));
+            }
         }
-        let node = &self.modules[current];
-        if node.is_self_accepting {
-            boundaries.push(current.to_path_buf());
-            colors.insert(current, Color::Black);
-            return Ok(());
-        }
-        if node.importers.is_empty() {
-            return Err(format!(
-                "update reached entry {} with no accepting boundary",
-                current.display()
-            ));
-        }
-        colors.insert(current, Color::Gray);
-        let mut importers: Vec<&Path> = node.importers.iter().map(PathBuf::as_path).collect();
-        importers.sort();
-        for importer in importers {
-            self.climb(importer, colors, boundaries)?;
-        }
-        colors.insert(current, Color::Black);
         Ok(())
     }
 }
