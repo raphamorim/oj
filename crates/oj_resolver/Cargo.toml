@@ -8,3 +8,6 @@ description = "Module resolution: thin policy layer over oxc_resolver (Node algo
 [dependencies]
 oxc_resolver.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
