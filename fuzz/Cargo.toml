@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Raphael Amorim
+[package]
+name = "oj-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+oj_compiler = { path = "../crates/oj_compiler" }
+oj_cache = { path = "../crates/oj_cache" }
+oj_env = { path = "../crates/oj_env" }
+
+[[bin]]
+name = "fuzz_compile"
+path = "fuzz_targets/fuzz_compile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_dotenv"
+path = "fuzz_targets/fuzz_dotenv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_json_module"
+path = "fuzz_targets/fuzz_json_module.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_html_env"
+path = "fuzz_targets/fuzz_html_env.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_cache_entry"
+path = "fuzz_targets/fuzz_cache_entry.rs"
+test = false
+doc = false
+bench = false
+
+# Detached from the workspace so fuzzing dependencies and profiles never leak
+# into the product build.
+[workspace]

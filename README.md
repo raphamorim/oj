@@ -127,7 +127,21 @@ node e2e/plugin-middleware.mjs                     # configureServer post body f
 node e2e/hmr-gate.mjs                              # hmr gate holds updates until POST /__hmr_flush
 node e2e/config-flag.mjs                           # oj dev --config <path> loads an override config
 node e2e/config-wrapper.mjs                        # vite.config that calls an external defineConfig wrapper
+node e2e/awkward-paths.mjs                         # percent-encoded filenames served, traversal contained
 node bench/generate.mjs 1000                      # generate a benchmark app (then npm i inside it)
 node bench/run.mjs 1000                           # p50/p95 benchmark vs vite
 node bench/card.mjs                               # render bench/card.html to oj-benchmarks.png
 ```
+
+## Testing
+
+```sh
+cargo test --workspace                            # unit + integration suites
+node e2e/run.mjs                                  # the end-to-end suite
+```
+
+The suite is organized by failure mode rather than by module -- adversarial
+input, boundary shapes, contention, injected faults, and properties that hold
+for every input -- and `docs/development/testing.md` describes the layers, the
+fuzz targets, and the behaviours that are deliberate boundaries rather than
+gaps.

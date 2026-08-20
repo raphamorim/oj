@@ -1,0 +1,14 @@
+# cargo-mutants configuration. Informational, run on demand rather than in CI:
+# it is a check on the suites, not a gate on a change.
+#
+# Scoped to the pure, correctness-critical crates. The dev server and the CLI
+# are covered end to end from `e2e/`, which cargo-mutants cannot drive.
+examine_globs = [
+    "crates/oj_env/src/**",
+    "crates/oj_graph/src/**",
+    "crates/oj_cache/src/**",
+    "crates/oj_css/src/**",
+    "crates/oj_compiler/src/json.rs",
+]
+timeout_multiplier = 4.0
+minimum_test_timeout = 60

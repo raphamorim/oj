@@ -9,3 +9,7 @@ dist*/
 bench/oj-benchmarks.png
 bench/card.html
 e2e/.ssr-stderr.log
+
+# cargo-mutants scratch output
+mutants.out/
+mutants.out.old/
