@@ -54,6 +54,10 @@ axum = { version = "0.8.9", features = ["ws"] }
 notify = "8.2.0"
 clap = { version = "4.6.6", features = ["derive"] }
 
+# test-only
+proptest = "1.9.0"
+tempfile = "3.24.0"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

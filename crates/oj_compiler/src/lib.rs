@@ -22,6 +22,8 @@ use oxc_transformer_plugins::{ReplaceGlobalDefines, ReplaceGlobalDefinesConfig};
 
 pub type ImportRewriter<'r> = dyn FnMut(&str) -> Option<String> + 'r;
 
+pub const COMPILE_STACK_SIZE: usize = 16 * 1024 * 1024;
+
 static F_IMPORT_META_ENV: LazyLock<Finder<'static>> =
     LazyLock::new(|| Finder::new("import.meta.env"));
 static F_IMPORT_META_GLOB: LazyLock<Finder<'static>> =
@@ -210,6 +212,7 @@ pub fn compile_module(
 
     let semantic_ret = SemanticBuilder::new()
         .with_excess_capacity(2.0)
+        .with_enum_eval(true)
         .build(&program);
     let scoping = semantic_ret.semantic.into_scoping();
 

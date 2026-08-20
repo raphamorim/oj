@@ -111,6 +111,7 @@ fn compile_esm_factory(
 
     let scoping = SemanticBuilder::new()
         .with_excess_capacity(2.0)
+        .with_enum_eval(true)
         .build(&program);
     let scoping = scoping.semantic.into_scoping();
     let mut transform_options = TransformOptions::default();

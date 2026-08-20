@@ -14,6 +14,9 @@ fn named_keys(value: &serde_json::Value) -> Vec<String> {
 }
 
 fn is_safe_export_name(name: &str) -> bool {
+    if name == "__proto__" {
+        return false;
+    }
     const RESERVED: &[&str] = &[
         "default", "class", "const", "let", "var", "function", "return", "import", "export", "new",
         "delete", "void", "typeof", "in", "of", "do", "if", "else", "switch", "case", "for",
@@ -35,9 +38,30 @@ fn parse(source: &str, url: &str) -> Result<serde_json::Value, CompileError> {
     })
 }
 
+fn has_proto_key(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.contains_key("__proto__") || map.values().any(has_proto_key)
+        }
+        serde_json::Value::Array(items) => items.iter().any(has_proto_key),
+        _ => false,
+    }
+}
+
+fn js_expression(source: &str, value: &serde_json::Value) -> String {
+    let raw = source.trim();
+    if has_proto_key(value) {
+        return format!(
+            "JSON.parse({})",
+            serde_json::Value::String(raw.to_string())
+        );
+    }
+    raw.to_string()
+}
+
 pub fn to_esm(source: &str, url: &str) -> Result<String, CompileError> {
     let value = parse(source, url)?;
-    let raw = source.trim();
+    let raw = js_expression(source, &value);
     let mut out = format!("const __oj_json = {raw};\nexport default __oj_json;\n");
     for key in named_keys(&value) {
         out.push_str(&format!("export const {key} = __oj_json[{key:?}];\n"));
@@ -47,7 +71,7 @@ pub fn to_esm(source: &str, url: &str) -> Result<String, CompileError> {
 
 pub fn to_factory_body(source: &str, url: &str) -> Result<String, CompileError> {
     let value = parse(source, url)?;
-    let raw = source.trim();
+    let raw = js_expression(source, &value);
     let mut getters = vec!["\"default\": () => __oj_json".to_string()];
     for key in named_keys(&value) {
         getters.push(format!("{key:?}: () => __oj_json[{key:?}]"));
