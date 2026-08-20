@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-import { createRequire } from "node:module";
-import { existsSync, readFileSync } from "node:fs";
+import module, { createRequire } from "node:module";
+import { existsSync, fstatSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import readline from "node:readline";
 
@@ -69,6 +69,19 @@ async function compile(path) {
 const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
 const OJ = _ojTTY ? "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m" : "oj";
 process.stderr.write(`${OJ} css host: ready\n`);
+// stdin EOF means oj died without tearing us down (SIGKILL skips
+// kill_on_drop): exit instead of idling as an orphan.
+const onParentGone = () => {
+  try { module.flushCompileCache?.(); } catch {}
+  process.exit(0);
+};
+try {
+  if (fstatSync(0).isFIFO()) {
+    process.stdin.once("end", onParentGone);
+    process.stdin.once("close", onParentGone);
+  }
+} catch {}
+
 const rl = readline.createInterface({ input: process.stdin });
 for await (const line of rl) {
   let msg;

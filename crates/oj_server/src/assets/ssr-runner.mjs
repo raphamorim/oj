@@ -3,7 +3,7 @@
 
 import vm from "node:vm";
 import readline from "node:readline";
-import { statSync } from "node:fs";
+import { fstatSync, statSync } from "node:fs";
 
 const [BASE, ENTRY] = process.argv.slice(2);
 
@@ -247,6 +247,15 @@ function connectHmr() {
   ws.addEventListener("error", () => {});
 }
 connectHmr();
+
+// stdin EOF means oj died without tearing us down (the HMR reconnect timer
+// would otherwise keep an orphaned runner alive forever): exit.
+try {
+  if (fstatSync(0).isFIFO()) {
+    process.stdin.once("end", () => process.exit(0));
+    process.stdin.once("close", () => process.exit(0));
+  }
+} catch {}
 
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
