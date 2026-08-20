@@ -41,6 +41,12 @@ function withResolvedDefaults(config) {
       optimizeDeps: {},
       ssr: {},
       env: {},
+      // Vite's resolved config always carries these; plugins read them in
+      // configResolved/configureServer (e.g. `config.plugins.findIndex`,
+      // `config.environments.client`). Absent, those hooks throw and get
+      // skipped though they only meant to inspect the shape.
+      plugins: [],
+      environments: { client: {}, ssr: {} },
     },
     c,
   );
@@ -54,6 +60,11 @@ const environment = {
     deepMerge(initial.config ?? {}, (initial.config?.environments ?? {})[envName] ?? {}),
   ),
 };
+// The resolved config (defaults + plugin `config` hooks). configureServer must
+// receive this, not the raw initial.config, so plugins reading resolved-only
+// fields (experimental, environments, plugins) don't throw. Seeded with the
+// resolved environment config until runConfigHooks recomputes it.
+let resolvedConfig = environment.config;
 
 async function loadViteConfig(configPath) {
   const appRoot = initial.config?.root ?? process.cwd();
@@ -244,11 +255,11 @@ async function runConfigHooks() {
       process.stderr.write(`${OJ} plugin host: config(${p.name ?? "?"}) skipped: ${(e && e.message) || e}\n`);
     }
   }
-  const resolved = withResolvedDefaults(config);
+  resolvedConfig = withResolvedDefaults(config);
   for (const p of plugins) {
     if (typeof p.configResolved !== "function") continue;
     try {
-      await p.configResolved.call(ctx, resolved);
+      await p.configResolved.call(ctx, resolvedConfig);
     } catch (e) {
       if (!ojStartMode) throw e;
       process.stderr.write(`${OJ} plugin host: configResolved(${p.name ?? "?"}) skipped: ${(e && e.message) || e}\n`);
@@ -288,7 +299,7 @@ async function setupConfigureServer() {
   };
   const noop = () => {};
   const server = {
-    config: initial.config ?? {},
+    config: resolvedConfig,
     middlewares,
     httpServer: null,
     ws: wsApi,
