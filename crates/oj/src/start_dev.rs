@@ -689,7 +689,15 @@ mod tests {
     use super::*;
 
     fn tmp(label: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("oj-startdev-{}-{label}", std::process::id()));
+        // A fresh directory per call: this wipes the path before creating it, so
+        // two tests that pass the same label would race -- one clearing the
+        // other's fixture out from under it, in whichever order they interleave.
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!(
+            "oj-startdev-{}-{label}-{seq}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
