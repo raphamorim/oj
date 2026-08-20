@@ -95,16 +95,19 @@ fn lockfile_hash(root: &Path, version: &str, input: &OptimizeInput) -> String {
         }
     }
     // Fold the optimizer config into the key so include/exclude/entries/dedupe/alias
-    // changes invalidate a stale prebundle.
-    for s in input
-        .include
-        .iter()
-        .chain(&input.exclude)
-        .chain(&input.entries)
-        .chain(&input.dedupe)
-    {
-        hasher.update(b"\0");
-        hasher.update(s.as_bytes());
+    // changes invalidate a stale prebundle. Each list gets its own tag: without
+    // one, moving a package from `include` to `exclude` would leave the key --
+    // and therefore the prebundle -- unchanged.
+    for (tag, list) in [
+        (b"\0i".as_slice(), &input.include),
+        (b"\0x".as_slice(), &input.exclude),
+        (b"\0e".as_slice(), &input.entries),
+        (b"\0d".as_slice(), &input.dedupe),
+    ] {
+        for entry in list {
+            hasher.update(tag);
+            hasher.update(entry.as_bytes());
+        }
     }
     for (find, replacement) in &input.alias {
         hasher.update(b"\0a");
@@ -199,4 +202,157 @@ async fn run_optimizer(
     let manifest = serde_json::json!({ "hash": hash, "metadata": metadata });
     let _ = std::fs::write(dir.join("manifest.json"), manifest.to_string());
     Some(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(include: &[&str], exclude: &[&str], entries: &[&str], dedupe: &[&str]) -> OptimizeInput {
+        OptimizeInput {
+            include: include.iter().map(|s| s.to_string()).collect(),
+            exclude: exclude.iter().map(|s| s.to_string()).collect(),
+            entries: entries.iter().map(|s| s.to_string()).collect(),
+            dedupe: dedupe.iter().map(|s| s.to_string()).collect(),
+            alias: Vec::new(),
+        }
+    }
+
+    fn project(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, contents) in files {
+            std::fs::write(dir.path().join(name), contents).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn every_optimizer_list_is_distinguishable_in_the_key() {
+        let dir = project(&[("package.json", r#"{"name":"app"}"#)]);
+        let root = dir.path();
+        let key = |i: &OptimizeInput| lockfile_hash(root, "0.0.1", i);
+
+        // The same package in a different list must not reuse a prebundle: an
+        // excluded dep is not a prebundled one.
+        let base = key(&input(&["react"], &[], &[], &[]));
+        assert_ne!(base, key(&input(&[], &["react"], &[], &[])), "include vs exclude");
+        assert_ne!(base, key(&input(&[], &[], &["react"], &[])), "include vs entries");
+        assert_ne!(base, key(&input(&[], &[], &[], &["react"])), "include vs dedupe");
+        // ...and neither may a list boundary that merely moves an item across it.
+        assert_ne!(
+            key(&input(&["a"], &["b"], &[], &[])),
+            key(&input(&["a", "b"], &[], &[], &[])),
+            "moving an entry across the include/exclude boundary"
+        );
+        assert_ne!(
+            key(&input(&[], &[], &["a", "b"], &[])),
+            key(&input(&[], &[], &["a"], &["b"])),
+            "moving an entry across the entries/dedupe boundary"
+        );
+    }
+
+    #[test]
+    fn the_key_covers_the_lockfiles_the_version_and_the_aliases() {
+        let dir = project(&[
+            ("package.json", r#"{"name":"app","dependencies":{"react":"18"}}"#),
+            ("package-lock.json", r#"{"lockfileVersion":3}"#),
+        ]);
+        let root = dir.path();
+        let empty = OptimizeInput::default();
+        let base = lockfile_hash(root, "0.0.1", &empty);
+
+        assert_eq!(base, lockfile_hash(root, "0.0.1", &empty), "deterministic");
+        assert_ne!(base, lockfile_hash(root, "0.0.2", &empty), "tool version");
+
+        std::fs::write(root.join("package-lock.json"), r#"{"lockfileVersion":4}"#).unwrap();
+        let after_lock = lockfile_hash(root, "0.0.1", &empty);
+        assert_ne!(base, after_lock, "a lockfile change must invalidate");
+
+        let aliased = OptimizeInput {
+            alias: vec![("~".into(), "./src".into())],
+            ..OptimizeInput::default()
+        };
+        assert_ne!(after_lock, lockfile_hash(root, "0.0.1", &aliased), "alias");
+        let swapped = OptimizeInput {
+            alias: vec![("./src".into(), "~".into())],
+            ..OptimizeInput::default()
+        };
+        assert_ne!(
+            lockfile_hash(root, "0.0.1", &aliased),
+            lockfile_hash(root, "0.0.1", &swapped),
+            "an alias is directional"
+        );
+    }
+
+    #[test]
+    fn a_manifest_is_only_reused_when_its_hash_and_its_files_are_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = dir.path().join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        std::fs::write(deps.join("react.js"), "export default 1;").unwrap();
+        std::fs::write(
+            deps.join("manifest.json"),
+            r#"{"hash":"abc","metadata":{"react":{"file":"react.js","needsInterop":false}}}"#,
+        )
+        .unwrap();
+
+        let map = load_manifest(&deps, "abc").expect("matching hash loads");
+        assert_eq!(map["react"].file, "react.js");
+        assert!(!map["react"].needs_interop);
+
+        assert!(load_manifest(&deps, "different").is_none(), "stale hash");
+
+        // A manifest whose prebundle is gone is not a warm cache.
+        std::fs::remove_file(deps.join("react.js")).unwrap();
+        assert!(load_manifest(&deps, "abc").is_none(), "missing dep file");
+    }
+
+    #[test]
+    fn a_malformed_manifest_is_a_miss_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = dir.path().join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        for contents in [
+            "",
+            "{",
+            "null",
+            "[]",
+            r#"{"metadata":{}}"#,
+            r#"{"hash":"abc"}"#,
+            r#"{"hash":123,"metadata":{}}"#,
+            r#"{"hash":"abc","metadata":[]}"#,
+            r#"{"hash":"abc","metadata":{"react":{}}}"#,
+            r#"{"hash":"abc","metadata":{"react":{"file":42}}}"#,
+        ] {
+            std::fs::write(deps.join("manifest.json"), contents).unwrap();
+            assert!(
+                load_manifest(&deps, "abc").is_none(),
+                "accepted {contents:?}"
+            );
+        }
+        // An empty metadata object is a legitimate warm cache with no deps.
+        std::fs::write(
+            deps.join("manifest.json"),
+            r#"{"hash":"abc","metadata":{}}"#,
+        )
+        .unwrap();
+        assert!(load_manifest(&deps, "abc").expect("empty is valid").is_empty());
+    }
+
+    #[test]
+    fn needs_interop_defaults_to_true_when_the_optimizer_does_not_say() {
+        // Interop is the safe default: assuming an ESM dep needs none would
+        // break `import x from "cjs-dep"` at runtime.
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"dep":{"file":"dep.js"}}"#).unwrap();
+        let map = parse_metadata(&v).unwrap();
+        assert!(map["dep"].needs_interop);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_optimizer_is_ready_immediately_and_empty() {
+        let deps = OptimizedDeps::disabled();
+        assert!(deps.ready().await.is_empty());
+        assert_eq!(deps.dir(), Path::new(""));
+    }
 }

@@ -795,18 +795,20 @@ pub async fn preview(
     Ok(())
 }
 
-fn preview_rel<'a>(path: &'a str, base: &str) -> Option<String> {
+fn preview_rel(path: &str, base: &str) -> Option<String> {
     let trimmed = path
         .strip_prefix(base.trim_end_matches('/'))
         .unwrap_or(path);
-    let rel = trimmed.trim_start_matches('/');
+    // Decode first, so `%2e%2e` is rejected by the same check as `..` and a file
+    // with a space in its name is still found.
+    let rel = urldecode(trimmed.trim_start_matches('/'));
     if rel.split('/').any(|seg| seg == "..") {
         return None;
     }
     Some(if rel.is_empty() {
         "index.html".to_string()
     } else {
-        rel.to_string()
+        rel
     })
 }
 
@@ -1206,8 +1208,16 @@ async fn serve_path(
         .as_deref()
         .and_then(|b| uri.path().strip_prefix(b.trim_end_matches('/')))
         .unwrap_or_else(|| uri.path());
-    let rel = path.trim_start_matches('/');
-    let rel = if rel.is_empty() { "index.html" } else { rel };
+    // A request path is percent-encoded: a file called `Cool Button.tsx` arrives
+    // as `Cool%20Button.tsx`. Decode before it is treated as a path -- and
+    // therefore before the traversal check in `locate`, so an encoded `..` is
+    // caught rather than smuggled through.
+    let decoded = urldecode(path.trim_start_matches('/'));
+    let rel = if decoded.is_empty() {
+        "index.html"
+    } else {
+        decoded.as_str()
+    };
 
     if let Some(name) = uri.path().strip_prefix("/@oj-deps/") {
         if name.contains('/') || name.contains("..") {
@@ -1261,7 +1271,7 @@ async fn serve_path(
     }
 
     let file = if let Some(abs) = uri.path().strip_prefix("/@fs") {
-        let candidate = PathBuf::from(abs);
+        let candidate = PathBuf::from(urldecode(abs));
         let allowed = {
             let allow = state.fs_allow.lock().unwrap();
             allow.iter().any(|root| candidate.starts_with(root))
@@ -4045,6 +4055,146 @@ mod adapter_tests {
         assert_eq!(locate(&root, &public, "img/missing.webp"), None);
         assert_eq!(locate(&root, &public, "../secret"), None);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- adverse: request paths are attacker-shaped strings ---
+
+    #[test]
+    fn urldecode_handles_every_malformed_escape() {
+        assert_eq!(urldecode("plain/path.tsx"), "plain/path.tsx");
+        assert_eq!(urldecode("a%20b"), "a b");
+        assert_eq!(urldecode("a%2Fb"), "a/b");
+        assert_eq!(urldecode("caf%C3%A9.css"), "café.css");
+        assert_eq!(urldecode("100%25.css"), "100%.css");
+        // Truncated and non-hex escapes are left alone rather than dropped.
+        assert_eq!(urldecode("a%"), "a%");
+        assert_eq!(urldecode("a%2"), "a%2");
+        assert_eq!(urldecode("a%zz"), "a%zz");
+        assert_eq!(urldecode("a%%20"), "a% ");
+        assert_eq!(urldecode(""), "");
+        // A single pass only: an encoded escape stays encoded once decoded.
+        assert_eq!(urldecode("a%2520b"), "a%20b");
+        // Invalid UTF-8 becomes replacement characters instead of panicking.
+        assert!(!urldecode("%ff%fe").is_empty());
+    }
+
+    #[test]
+    fn locate_rejects_traversal_in_every_spelling_after_decoding() {
+        let base = tmp("traversal");
+        let root = base.join("root");
+        let public = base.join("public");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(&public).unwrap();
+        std::fs::write(base.join("secret.txt"), "s3cret").unwrap();
+        std::fs::write(root.join("src").join("App.tsx"), "x").unwrap();
+
+        for hostile in [
+            "../secret.txt",
+            "src/../../secret.txt",
+            "./../secret.txt",
+            "src/../../../etc/passwd",
+        ] {
+            assert_eq!(locate(&root, &public, hostile), None, "{hostile}");
+            // ...and through the decoding the request handler applies first.
+            let encoded = hostile.replace("..", "%2e%2e");
+            assert_eq!(
+                locate(&root, &public, &urldecode(&encoded)),
+                None,
+                "{encoded}"
+            );
+        }
+        // A name that merely contains dots is not traversal.
+        std::fs::write(root.join("src").join("..dotted.tsx"), "x").unwrap();
+        assert!(locate(&root, &public, "src/..dotted.tsx").is_some());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn locate_finds_files_whose_names_need_encoding() {
+        let base = tmp("encoded-names");
+        let root = base.join("root");
+        let public = base.join("public");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(&public).unwrap();
+        for name in ["Cool Button.tsx", "café.css", "100%.css", "a+b.tsx"] {
+            std::fs::write(root.join("src").join(name), "x").unwrap();
+        }
+
+        // What a browser actually requests for each of those files.
+        for (requested, name) in [
+            ("src/Cool%20Button.tsx", "Cool Button.tsx"),
+            ("src/caf%C3%A9.css", "café.css"),
+            ("src/100%25.css", "100%.css"),
+            ("src/a+b.tsx", "a+b.tsx"),
+        ] {
+            let decoded = urldecode(requested);
+            assert_eq!(
+                locate(&root, &public, &decoded),
+                Some(root.join("src").join(name)),
+                "{requested}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn preview_rel_decodes_before_guarding_traversal() {
+        assert_eq!(
+            preview_rel("/assets/Cool%20Button.js", "/").as_deref(),
+            Some("assets/Cool Button.js")
+        );
+        assert_eq!(preview_rel("/%2e%2e/etc/passwd", "/"), None);
+        assert_eq!(preview_rel("/a/%2e%2e/%2e%2e/etc/passwd", "/"), None);
+        assert_eq!(preview_rel("/%2E%2E/etc/passwd", "/"), None);
+        // Not traversal: `..` inside a segment.
+        assert_eq!(
+            preview_rel("/a..b/x.js", "/").as_deref(),
+            Some("a..b/x.js")
+        );
+    }
+
+    #[test]
+    fn html_entry_src_rejects_everything_that_is_not_a_local_path() {
+        for external in [
+            "",
+            "   ",
+            "http://cdn.example/x.js",
+            "https://cdn.example/x.js",
+            "//cdn.example/x.js",
+            "data:text/javascript,alert(1)",
+        ] {
+            assert_eq!(html_entry_src(external), None, "{external:?}");
+        }
+        assert_eq!(html_entry_src("./src/main.tsx").as_deref(), Some("/src/main.tsx"));
+        assert_eq!(html_entry_src("src/main.tsx").as_deref(), Some("/src/main.tsx"));
+        assert_eq!(html_entry_src("/src/main.tsx").as_deref(), Some("/src/main.tsx"));
+        assert_eq!(html_entry_src("  src/main.tsx  ").as_deref(), Some("/src/main.tsx"));
+        // A traversal in an entry src stays a path; `locate` is what refuses it.
+        assert_eq!(
+            html_entry_src("../../etc/passwd").as_deref(),
+            Some("/../../etc/passwd")
+        );
+    }
+
+    #[test]
+    fn gate_relevance_ignores_generated_directories() {
+        assert!(gate_relevant(Path::new("/app/src/App.tsx")));
+        assert!(!gate_relevant(Path::new("/app/node_modules/react/index.js")));
+        assert!(!gate_relevant(Path::new("/app/.oj-cache/ab/cd.json")));
+        assert!(!gate_relevant(Path::new("/app/dist/assets/x.js")));
+        // Only a whole path component counts.
+        assert!(gate_relevant(Path::new("/app/src/dist-helper.ts")));
+        assert!(gate_relevant(Path::new("/app/src/my-node_modules-thing.ts")));
+    }
+
+    #[test]
+    fn query_classification_only_matches_whole_flags() {
+        assert!(is_worker_query("/w.ts?worker"));
+        assert!(is_worker_query("/w.ts?sharedworker"));
+        assert!(!is_worker_query("/w.ts?workerish"));
+        assert!(!is_worker_query("/w.ts?x=worker"));
+        assert!(!is_worker_query("/w.ts"));
+        assert!(!is_worker_query(""));
     }
 
     #[test]

@@ -10,6 +10,9 @@ use std::sync::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
 
+/// How long one sidecar request may take before it is abandoned.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 pub const SIDECAR_JS: &str = include_str!("assets/tailwind-sidecar.mjs");
 pub const PREPROCESS_JS: &str = include_str!("assets/css-preprocess.mjs");
 pub const SVELTE_COMPILE_JS: &str = include_str!("assets/svelte-compile.mjs");
@@ -30,12 +33,59 @@ pub fn is_stylus(url: &str) -> bool {
     f.ends_with(".styl") || f.ends_with(".stylus")
 }
 
-#[inline]
+/// Whether a stylesheet has to go through the Tailwind sidecar.
+///
+/// Both halves of this matter. A false negative silently drops every utility
+/// class from the page; a false positive runs Tailwind over a plain stylesheet
+/// and fails the build with "is tailwindcss installed?". So an import of
+/// `tailwindcss` counts whatever follows the package name (`tailwindcss/theme`,
+/// `... layer(base)`), and `@theme`/`@tailwind` count only where a directive can
+/// actually start -- not inside a comment, a string, or a longer word.
 pub fn is_tailwind_css(source: &str) -> bool {
-    source.contains("@import \"tailwindcss\"")
-        || source.contains("@import 'tailwindcss'")
-        || source.contains("@tailwind ")
-        || source.contains("@theme")
+    for (index, _) in source.match_indices('@') {
+        let rest = &source[index..];
+        if !at_directive_position(source, index) {
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("@import") {
+            let target = after.trim_start().trim_start_matches(['"', '\'']);
+            if let Some(tail) = target.strip_prefix("tailwindcss") {
+                // The package name has to end here: `tailwindcss-animate` is a
+                // different package, `tailwindcss/theme` is a subpath of this one.
+                if tail
+                    .chars()
+                    .next()
+                    .is_none_or(|c| matches!(c, '"' | '\'' | '/') || c.is_whitespace())
+                {
+                    return true;
+                }
+            }
+            continue;
+        }
+        for directive in ["@tailwind", "@theme", "@utility", "@apply", "@source"] {
+            if let Some(after) = rest.strip_prefix(directive) {
+                // `@themes` is not `@theme`.
+                if after
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '-' && c != '_')
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Whether the `@` at `index` can begin an at-rule: only whitespace, a block or
+/// statement boundary may precede it on its line.
+fn at_directive_position(source: &str, index: usize) -> bool {
+    source[..index]
+        .chars()
+        .rev()
+        .find(|c| !matches!(c, ' ' | '\t'))
+        .is_none_or(|c| matches!(c, '\n' | '\r' | '}' | '{' | ';'))
 }
 
 pub struct Sidecar {
@@ -43,26 +93,47 @@ pub struct Sidecar {
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<String, String>>>>,
     counter: AtomicU64,
     base: String,
+    /// What this sidecar is, for error messages: three kinds share this type,
+    /// and "is tailwindcss installed?" is unhelpful when Less failed to compile.
+    kind: &'static str,
+    /// What to suggest installing when it cannot be reached.
+    package: &'static str,
     _child: tokio::process::Child,
 }
 
 impl Sidecar {
     pub async fn spawn(root: &Path) -> anyhow::Result<std::sync::Arc<Sidecar>> {
-        Self::spawn_named(root, "tailwind-sidecar.mjs", SIDECAR_JS).await
+        Self::spawn_named(root, "tailwind-sidecar.mjs", SIDECAR_JS, "tailwind", "tailwindcss").await
     }
 
     pub async fn spawn_preprocess(root: &Path) -> anyhow::Result<std::sync::Arc<Sidecar>> {
-        Self::spawn_named(root, "css-preprocess.mjs", PREPROCESS_JS).await
+        Self::spawn_named(
+            root,
+            "css-preprocess.mjs",
+            PREPROCESS_JS,
+            "css preprocessor",
+            "less or stylus",
+        )
+        .await
     }
 
     pub async fn spawn_svelte(root: &Path) -> anyhow::Result<std::sync::Arc<Sidecar>> {
-        Self::spawn_named(root, "svelte-compile.mjs", SVELTE_COMPILE_JS).await
+        Self::spawn_named(
+            root,
+            "svelte-compile.mjs",
+            SVELTE_COMPILE_JS,
+            "svelte compiler",
+            "svelte",
+        )
+        .await
     }
 
     async fn spawn_named(
         root: &Path,
         name: &str,
         js: &str,
+        kind: &'static str,
+        package: &'static str,
     ) -> anyhow::Result<std::sync::Arc<Sidecar>> {
         let script = root.join(".oj-cache").join(name);
         if let Some(parent) = script.parent() {
@@ -77,7 +148,7 @@ impl Sidecar {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .map_err(|e| anyhow::anyhow!("cannot spawn node for css sidecar: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("cannot spawn node for the {kind} sidecar: {e}"))?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
 
@@ -86,6 +157,8 @@ impl Sidecar {
             pending: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(1),
             base: root.display().to_string(),
+            kind,
+            package,
             _child: child,
         });
 
@@ -123,12 +196,132 @@ impl Sidecar {
                 .await
                 .is_err()
             {
-                return Err("tailwind sidecar died (is tailwindcss installed?)".into());
+                self.pending.lock().unwrap().remove(&id);
+                return Err(format!(
+                    "{} sidecar died (is {} installed?)",
+                    self.kind, self.package
+                ));
             }
         }
-        match tokio::time::timeout(std::time::Duration::from_secs(20), rx).await {
+        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
             Ok(Ok(result)) => result,
-            _ => Err("tailwind sidecar timed out".into()),
+            other => {
+                // Nothing will answer this id: drop it, or a sidecar that stalls
+                // once leaks a waiter for the lifetime of the server.
+                self.pending.lock().unwrap().remove(&id);
+                Err(match other {
+                    Ok(Err(_)) => format!("{} sidecar closed the connection", self.kind),
+                    _ => format!(
+                        "{} sidecar timed out after {}s",
+                        self.kind,
+                        REQUEST_TIMEOUT.as_secs()
+                    ),
+                })
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tailwind_imports_are_detected_in_every_written_form() {
+        for source in [
+            "@import \"tailwindcss\";",
+            "@import 'tailwindcss';",
+            "@import \"tailwindcss\"",
+            "  @import \"tailwindcss\";",
+            "\n\n@import \"tailwindcss\";\n",
+            // v4 subpath and layer forms.
+            "@import \"tailwindcss/preflight\" layer(base);",
+            "@import \"tailwindcss/theme\" layer(theme);",
+            "@import \"tailwindcss/utilities\" layer(utilities);",
+            // Other statements around it.
+            "@charset \"utf-8\";\n@import \"tailwindcss\";",
+            ".a { color: red }\n@import \"tailwindcss\";",
+        ] {
+            assert!(is_tailwind_css(source), "missed: {source:?}");
+        }
+    }
+
+    #[test]
+    fn tailwind_directives_are_detected_only_where_a_directive_can_start() {
+        for source in [
+            "@tailwind base;",
+            "@tailwind utilities;",
+            "@theme { --color-brand: red }",
+            "@theme inline { --x: 1 }",
+            ".btn {\n  @apply underline;\n}",
+            "@utility tab-4 { tab-size: 4 }",
+            "@source \"./src/**/*.tsx\";",
+            "}\n@theme { --x: 1 }",
+        ] {
+            assert!(is_tailwind_css(source), "missed: {source:?}");
+        }
+    }
+
+    #[test]
+    fn a_plain_stylesheet_never_reaches_the_tailwind_sidecar() {
+        // A false positive here fails the build with "is tailwindcss installed?"
+        // on a stylesheet that has nothing to do with Tailwind.
+        for source in [
+            "",
+            ".a { color: red }",
+            "@media (min-width: 1px) { .a { color: red } }",
+            "@supports (display: grid) { .a { display: grid } }",
+            "@font-face { font-family: X; src: url(x.woff2) }",
+            "@keyframes spin { to { transform: rotate(1turn) } }",
+            "@layer base { .a { color: red } }",
+            "@import \"./other.css\";",
+            "@import \"@acme/design/tokens.css\";",
+            // The word appears, but not as a directive.
+            "/* @theme is not used here */",
+            "/* @tailwind base; */",
+            ".a { content: \"@theme\" }",
+            ".a { content: \"@import \\\"tailwindcss\\\"\" }",
+            "@themes { --x: 1 }",
+            "@theming { --x: 1 }",
+            ".a[data-x=\"@apply\"] { color: red }",
+            "/* see @source for details */",
+            "@import \"tailwindcss-is-not-this-package\";",
+        ] {
+            assert!(!is_tailwind_css(source), "false positive: {source:?}");
+        }
+    }
+
+    #[test]
+    fn an_import_of_a_package_named_after_tailwind_is_not_tailwind() {
+        // The prefix has to end at a boundary the package itself uses.
+        assert!(is_tailwind_css("@import \"tailwindcss\";"));
+        assert!(is_tailwind_css("@import \"tailwindcss/theme\";"));
+        assert!(!is_tailwind_css("@import \"tailwindcss-animate\";"));
+        assert!(!is_tailwind_css("@import \"my-tailwindcss\";"));
+    }
+
+    #[test]
+    fn style_dialects_are_classified_by_extension_not_by_query() {
+        assert!(is_less("/src/a.less"));
+        assert!(is_less("/src/a.less?inline"));
+        assert!(!is_less("/src/a.less/b.css"));
+        assert!(!is_less("/src/a.css?x=.less"));
+
+        assert!(is_stylus("/src/a.styl"));
+        assert!(is_stylus("/src/a.stylus"));
+        assert!(is_stylus("/src/a.styl?raw"));
+        assert!(!is_stylus("/src/a.style"));
+        assert!(!is_stylus("/src/a.css?x=.styl"));
+
+        assert!(is_svelte("/src/A.svelte"));
+        assert!(is_svelte("/src/A.svelte?raw"));
+        assert!(!is_svelte("/src/A.svelte.ts"));
+        assert!(!is_svelte("/src/a.ts?x=.svelte"));
+
+        for predicate in [is_less, is_stylus, is_svelte] {
+            assert!(!predicate(""));
+            assert!(!predicate("?"));
+            assert!(!predicate("/"));
         }
     }
 }
