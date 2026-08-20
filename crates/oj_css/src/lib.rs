@@ -15,7 +15,10 @@ pub struct CssOutput {
 }
 
 pub fn is_css_module(url: &str) -> bool {
-    url.rsplit('/')
+    // The query is not part of the filename: `styles.css?x=.module.` is a plain
+    // stylesheet, and `a.module.css?used` is still a module.
+    let path = url.split('?').next().unwrap_or(url);
+    path.rsplit('/')
         .next()
         .is_some_and(|f| f.contains(".module."))
 }
@@ -157,6 +160,65 @@ mod tests {
             "autoprefixed: {}",
             out.css
         );
+    }
+
+    #[test]
+    fn the_browser_matrix_keeps_modern_syntax_and_downlevels_the_rest() {
+        // The target matrix is the compatibility contract of every stylesheet oj
+        // emits. Asserted through behaviour: syntax the configured versions
+        // support has to survive, and syntax they do not has to be lowered. A
+        // matrix that decoded to version 0 would downlevel everything.
+        let out = compile_css(
+            "/p.css",
+            ".a { width: clamp(1px, 2vw, 3px); color: rgb(0 0 0 / 50%); aspect-ratio: 1/2 }",
+            true,
+        )
+        .unwrap()
+        .css;
+        assert!(out.contains("clamp("), "clamp is supported: {out}");
+        assert!(out.contains("#00000080"), "modern color syntax: {out}");
+        assert!(out.contains("aspect-ratio"), "aspect-ratio is supported: {out}");
+        assert!(!out.contains("max(1px"), "clamp must not be lowered: {out}");
+
+        // Nesting and logical properties are not supported by the oldest target,
+        // so they are lowered.
+        let nested = compile_css("/p.css", ".a { .b { color: red } }", true).unwrap().css;
+        assert_eq!(nested, ".a .b{color:red}");
+        let logical = compile_css("/p.css", ".a { inset-inline-start: 1px }", true)
+            .unwrap()
+            .css;
+        assert!(logical.contains("left:1px"), "logical props lowered: {logical}");
+    }
+
+    #[test]
+    fn scoped_class_names_follow_the_name_local_hash_pattern() {
+        // The scoped name shows up in devtools, in snapshots and in the exports
+        // map, so its shape is part of the contract.
+        let out = compile_css("/src/Counter.module.css", ".button { color: red }", false).unwrap();
+        let (local, scoped) = out.exports.expect("exports").into_iter().next().unwrap();
+        assert_eq!(local, "button");
+        // `[name]` is the file stem with its dots flattened.
+        let prefix = "Counter-module_button_";
+        assert!(
+            scoped.starts_with(prefix),
+            "expected [name]_[local]_[hash], got {scoped}"
+        );
+        let hash = &scoped[prefix.len()..];
+        assert!(!hash.is_empty(), "no hash in {scoped}");
+        assert!(
+            hash.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "hash is not a plain token: {scoped}"
+        );
+        // The hash is derived from the path, not the contents: editing a
+        // stylesheet must not rename its classes, or every edit would invalidate
+        // the markup that already references them.
+        let after_edit = compile_css("/src/Counter.module.css", ".button { color: blue }", false)
+            .unwrap()
+            .exports
+            .expect("exports")
+            .remove(0)
+            .1;
+        assert_eq!(scoped, after_edit, "an edit must not rename a class");
     }
 
     #[test]
