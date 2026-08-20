@@ -183,8 +183,10 @@ fn asset_mime(ext: &str) -> &'static str {
         "ttf" => "font/ttf",
         "otf" => "font/otf",
         "eot" => "application/vnd.ms-fontobject",
+        "bmp" => "image/bmp",
         "mp4" => "video/mp4",
         "webm" => "video/webm",
+        "mov" => "video/quicktime",
         "mp3" => "audio/mpeg",
         "wav" => "audio/wav",
         "ogg" => "audio/ogg",
@@ -218,6 +220,43 @@ fn b64(bytes: &[u8]) -> String {
     out
 }
 
+/// A module that default-exports `url`. The literal is JSON-encoded rather than
+/// interpolated: a url is derived from a file oj did not write, and a raw
+/// carriage return or quote in it would emit JavaScript that does not parse.
+fn export_default_url(url: &str) -> String {
+    format!(
+        "export default {};",
+        serde_json::Value::String(url.to_string())
+    )
+}
+
+/// An unencoded `data:image/svg+xml,` url, which keeps an inlined SVG readable
+/// and smaller than base64 would.
+///
+/// Percent-encodes what cannot appear unencoded in a data url, and drops the
+/// line terminators: a CRLF-formatted SVG -- what git hands a Windows checkout
+/// -- used to leave the CR in place, and a raw CR cannot appear in a JavaScript
+/// string literal at all.
+fn svg_data_url(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    for ch in text.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '#' => out.push_str("%23"),
+            '<' => out.push_str("%3C"),
+            '>' => out.push_str("%3E"),
+            '\\' => out.push_str("%5C"),
+            // A double quote would close the literal; SVG accepts either quote.
+            '"' => out.push('\''),
+            // Line terminators: not allowed in a string literal, and not
+            // meaningful in SVG markup.
+            '\n' | '\r' | '\u{2028}' | '\u{2029}' => {}
+            other => out.push(other),
+        }
+    }
+    format!("data:image/svg+xml,{out}")
+}
+
 fn emit_or_inline(
     ctx: &rolldown_plugin::SharedLoadPluginContext,
     file: &str,
@@ -227,22 +266,15 @@ fn emit_or_inline(
     let path = std::path::Path::new(file);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if (bytes.len() as u64) <= inline_limit && ext != "svg" {
-        return Ok(format!(
-            "export default \"data:{};base64,{}\";",
+        return Ok(export_default_url(&format!(
+            "data:{};base64,{}",
             asset_mime(ext),
             b64(&bytes)
-        ));
+        )));
     }
     if (bytes.len() as u64) <= inline_limit && ext == "svg" {
         let text = String::from_utf8_lossy(&bytes);
-        let encoded = text
-            .replace('%', "%25")
-            .replace('#', "%23")
-            .replace('<', "%3C")
-            .replace('>', "%3E")
-            .replace('"', "'")
-            .replace('\n', "");
-        return Ok(format!("export default \"data:image/svg+xml,{encoded}\";"));
+        return Ok(export_default_url(&svg_data_url(&text)));
     }
     let name = path
         .file_name()
@@ -2295,11 +2327,14 @@ fn sanitize_asset_name(s: &str) -> String {
         .collect()
 }
 
+/// The hash in a content-addressed filename.
+///
+/// blake3 rather than `DefaultHasher`: the standard library makes no promise
+/// about that hasher's output across releases, so asset filenames could change
+/// -- invalidating every caching header a deploy relies on -- purely because oj
+/// was rebuilt with a newer Rust.
 fn content_hash(bytes: &[u8]) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut h);
-    format!("{:016x}", h.finish())
+    blake3::hash(bytes).to_hex()[..16].to_string()
 }
 
 /// Emit a CSS-referenced asset (font/image) under a content hash and return its
@@ -2762,6 +2797,163 @@ mod tests {
             !empty.contains("export "),
             "no exports means no stubs: {empty}"
         );
+    }
+
+    /// Whatever an inlined asset's bytes are, the module oj emits for it has to
+    /// parse. The url is derived from a file oj did not write.
+    fn parses(code: &str) -> bool {
+        oj_compiler::compile(
+            std::path::Path::new("/verify.mjs"),
+            code,
+            &oj_compiler::CompileOptions::prod(),
+        )
+        .is_ok()
+    }
+
+    #[test]
+    fn an_inlined_svg_with_crlf_endings_emits_parseable_javascript() {
+        // git hands a Windows checkout CRLF, and a raw carriage return cannot
+        // appear in a JavaScript string literal.
+        let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\">\r\n  <rect/>\r\n</svg>\r\n";
+        let url = svg_data_url(svg);
+        assert!(!url.contains('\r'), "carriage return survived: {url}");
+        assert!(!url.contains('\n'), "line feed survived: {url}");
+        assert!(url.starts_with("data:image/svg+xml,"), "{url}");
+        assert!(url.contains("%3Crect/%3E"), "content lost: {url}");
+        assert!(parses(&export_default_url(&url)), "{url}");
+    }
+
+    #[test]
+    fn svg_data_urls_encode_everything_that_would_break_the_url_or_the_literal() {
+        let cases = [
+            ("<svg/>", "%3Csvg/%3E"),
+            ("<svg a=\"b\"/>", "%3Csvg a='b'/%3E"),
+            ("<svg>100%</svg>", "%3Csvg%3E100%25%3C/svg%3E"),
+            ("<svg fill=\"#fff\"/>", "%3Csvg fill='%23fff'/%3E"),
+            ("<svg>a\\b</svg>", "%3Csvg%3Ea%5Cb%3C/svg%3E"),
+        ];
+        for (svg, expected_tail) in cases {
+            let url = svg_data_url(svg);
+            assert_eq!(url, format!("data:image/svg+xml,{expected_tail}"));
+            assert!(parses(&export_default_url(&url)), "{url}");
+        }
+        // Line and paragraph separators are string-literal terminators too.
+        for terminator in ["\u{2028}", "\u{2029}", "\r", "\n", "\r\n"] {
+            let url = svg_data_url(&format!("<svg>{terminator}</svg>"));
+            assert_eq!(url, "data:image/svg+xml,%3Csvg%3E%3C/svg%3E");
+            assert!(parses(&export_default_url(&url)));
+        }
+    }
+
+    #[test]
+    fn a_default_export_of_a_url_is_always_a_valid_module() {
+        for url in [
+            "data:image/png;base64,AAAA",
+            "/assets/a-0123.png",
+            "",
+            "a\"b",
+            "a\\b",
+            "a\nb",
+            "a\rb",
+            "a\u{2028}b",
+            "a\0b",
+            "café/🚀.png",
+        ] {
+            let module = export_default_url(url);
+            assert!(parses(&module), "{url:?} -> {module}");
+        }
+    }
+
+    #[test]
+    fn every_asset_extension_has_a_real_mime_type() {
+        // `is_build_asset` decides what gets inlined; `asset_mime` decides what
+        // the browser is told it is. A gap between them inlines a file the page
+        // then refuses to render.
+        for ext in [
+            "png", "jpg", "jpeg", "gif", "webp", "avif", "ico", "bmp", "svg", "woff", "woff2",
+            "ttf", "otf", "eot", "mp4", "webm", "mov", "mp3", "wav", "ogg",
+        ] {
+            assert!(is_build_asset(&format!("/src/a.{ext}")), "{ext} not an asset");
+            assert_ne!(
+                asset_mime(ext),
+                "application/octet-stream",
+                "{ext} has no mime type"
+            );
+        }
+        // A query does not change the classification.
+        assert!(is_build_asset("/src/a.png?url"));
+        assert!(!is_build_asset("/src/a.tsx"));
+        assert!(!is_build_asset("/src/a.png.tsx"));
+        assert!(!is_build_asset(""));
+        // An unknown extension falls back rather than guessing.
+        assert_eq!(asset_mime("xyz"), "application/octet-stream");
+    }
+
+    #[test]
+    fn base64_matches_the_reference_vectors() {
+        // RFC 4648 section 10, plus the padding boundaries.
+        assert_eq!(b64(b""), "");
+        assert_eq!(b64(b"f"), "Zg==");
+        assert_eq!(b64(b"fo"), "Zm8=");
+        assert_eq!(b64(b"foo"), "Zm9v");
+        assert_eq!(b64(b"foob"), "Zm9vYg==");
+        assert_eq!(b64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(b64(b"foobar"), "Zm9vYmFy");
+        // High bytes must not sign-extend.
+        assert_eq!(b64(&[0xff, 0xff, 0xff]), "////");
+        assert_eq!(b64(&[0x00, 0x00, 0x00]), "AAAA");
+        assert_eq!(b64(&[0xfb, 0xff, 0xbf]), "+/+/");
+        // Length is always a multiple of four.
+        for len in 0..64 {
+            let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            assert_eq!(b64(&bytes).len() % 4, 0, "len {len}");
+        }
+    }
+
+    #[test]
+    fn content_hashes_are_stable_and_content_addressed() {
+        // Pinned: filenames derived from this end up in caching headers, so the
+        // value must not drift with the toolchain that built oj.
+        assert_eq!(content_hash(b""), "af1349b9f5f9a1a6");
+        assert_eq!(content_hash(b"oj"), "b74f11b8dbbdd6b4");
+        assert_eq!(content_hash(b"oj").len(), 16);
+        assert!(content_hash(b"oj").chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(content_hash(b"a"), content_hash(b"b"));
+        // A one-bit difference is a different name.
+        assert_ne!(content_hash(&[0x00]), content_hash(&[0x01]));
+    }
+
+    #[test]
+    fn transitive_imports_terminates_on_a_cycle() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("a".to_string(), vec!["b".to_string()]);
+        map.insert("b".to_string(), vec!["c".to_string(), "a".to_string()]);
+        map.insert("c".to_string(), vec!["b".to_string()]);
+        let reachable = transitive_imports("a", &map);
+        assert_eq!(
+            reachable.into_iter().collect::<Vec<_>>(),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        // An unknown entry reaches nothing.
+        assert!(transitive_imports("missing", &map).is_empty());
+        // A self-import terminates.
+        let mut selfish = std::collections::HashMap::new();
+        selfish.insert("a".to_string(), vec!["a".to_string()]);
+        assert_eq!(
+            transitive_imports("a", &selfish).into_iter().collect::<Vec<_>>(),
+            vec!["a".to_string()]
+        );
+    }
+
+    #[test]
+    fn asset_names_are_sanitized_without_collapsing_to_nothing() {
+        assert_eq!(sanitize_asset_name("logo.png"), "logo.png");
+        assert_eq!(sanitize_asset_name("my logo.png"), "my_logo.png");
+        assert_eq!(sanitize_asset_name("a/b.png"), "a_b.png");
+        assert_eq!(sanitize_asset_name("../../etc/passwd"), ".._.._etc_passwd");
+        assert_eq!(sanitize_asset_name("a\0b.png"), "a_b.png");
+        assert!(!sanitize_asset_name("café.png").contains('é'));
+        assert!(sanitize_asset_name("").is_empty());
     }
 
     #[test]
