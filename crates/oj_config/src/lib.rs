@@ -239,6 +239,9 @@ fn strip_types(path: &Path, source: &str) -> Result<String, ConfigError> {
     }
     let mut program = parsed.program;
     let scoping = SemanticBuilder::new()
+        // The TypeScript transform needs this to lower `enum` instead of
+        // panicking; a config file is allowed to declare one.
+        .with_enum_eval(true)
         .build(&program)
         .semantic
         .into_scoping();
@@ -278,6 +281,30 @@ fn to_script(js: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A config may declare a TypeScript `enum`, and lowering one needs scoping
+    /// built with `with_enum_eval`: without it the transform aborts the process
+    /// instead of loading the config.
+    #[test]
+    fn a_config_that_declares_an_enum_loads() {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "oj-config-enum-{}-{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("oj.config.ts"),
+            "enum Port { Dev = 5199 }\nexport default { server: { port: Port.Dev as number } };",
+        )
+        .unwrap();
+
+        let config = super::load(&dir).expect("a config with an enum must load");
+        assert_eq!(config.server.unwrap().port, Some(5199));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     fn eval_config_in(label: &str, src: &str) -> OjConfig {

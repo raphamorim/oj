@@ -40,6 +40,7 @@ pub fn has_module_syntax_pub(path: &Path, source_text: &str) -> bool {
     has_module_syntax(path, source_text)
 }
 
+#[derive(Debug)]
 pub struct CjsFactoryAnalysis {
     pub body: String,
     pub requires: Vec<String>,

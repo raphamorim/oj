@@ -61,8 +61,18 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Compilation happens on runtime threads, and it recurses once per level of
+    // bracket nesting; the default 2 MiB is not enough for generated code, and
+    // a stack overflow aborts the process instead of failing one module.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(oj_compiler::COMPILE_STACK_SIZE)
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Dev {
             root,

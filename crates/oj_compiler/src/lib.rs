@@ -22,6 +22,16 @@ use oxc_transformer_plugins::{ReplaceGlobalDefines, ReplaceGlobalDefinesConfig};
 
 pub type ImportRewriter<'r> = dyn FnMut(&str) -> Option<String> + 'r;
 
+/// Stack size for any thread that compiles a module.
+///
+/// Parsing, transforming and printing are all recursive descent: one frame per
+/// level of bracket nesting. The 2 MiB a runtime thread gets by default runs
+/// out somewhere under a thousand levels, and an overflow aborts the process
+/// rather than failing the one file -- a generated or minified module can take
+/// the whole dev server down with it. Hand-written source stays two orders of
+/// magnitude below this; generated code does not.
+pub const COMPILE_STACK_SIZE: usize = 16 * 1024 * 1024;
+
 static F_IMPORT_META_ENV: LazyLock<Finder<'static>> =
     LazyLock::new(|| Finder::new("import.meta.env"));
 static F_IMPORT_META_GLOB: LazyLock<Finder<'static>> =
@@ -210,6 +220,9 @@ pub fn compile_module(
 
     let semantic_ret = SemanticBuilder::new()
         .with_excess_capacity(2.0)
+        // Required by the TypeScript transform to lower `enum`: without it the
+        // transformer panics rather than reporting a diagnostic.
+        .with_enum_eval(true)
         .build(&program);
     let scoping = semantic_ret.semantic.into_scoping();
 
