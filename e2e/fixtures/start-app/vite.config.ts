@@ -33,6 +33,9 @@ function freshModulePlugin(): Plugin {
     name: "fixture-fresh-module",
     enforce: "pre",
     buildStart() {
+      // Set OJ_TEST_BUILDSTART_THROW to assert oj fails loud (not silently
+      // serving half-compiled output) when a plugin's buildStart throws.
+      if (process.env.OJ_TEST_BUILDSTART_THROW) throw new Error("boom-from-buildStart");
       compiled = "FRESH_via_buildStart";
     },
     load(id) {

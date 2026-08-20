@@ -19,8 +19,13 @@ const container = await loadPluginContainer(APP, { command: "serve", environment
 // Vite runs buildStart before serving any module; plugins that compile sources
 // (e.g. i18n message compilers) populate the state their load() hook serves.
 if (container) {
+  // Let a buildStart failure abort startup (Vite semantics) with a clear,
+  // attributed message rather than surfacing later as a runtime error.
   try { await container.buildStart(); }
-  catch (e) { process.stderr.write(`oj: buildStart failed: ${(e && e.stack) || e}\n`); }
+  catch (e) {
+    process.stderr.write(`oj: SSR buildStart failed: ${(e && (e.stack || e.message)) || e}\n`);
+    throw e;
+  }
 }
 const VIRTUAL_SCHEME = "ojvirtual:///";
 
@@ -225,10 +230,11 @@ export async function load(url, context, next) {
       return { format: "module", source: out.code, shortCircuit: true };
     }
   }
-  // A user plugin's load() may override a real on-disk .js/.mjs/.cjs file
-  // (Vite: load hooks run before the fs read). Consult it for user files; fall
-  // through to Node's default loader when no plugin claims the module.
-  if (container && (clean.endsWith(".js") || clean.endsWith(".mjs") || clean.endsWith(".cjs"))) {
+  // A user plugin's load() may override a real on-disk .js/.mjs file (Vite:
+  // load hooks run before the fs read). Consult it for user files; fall through
+  // to Node's default loader when no plugin claims the module. (.cjs is excluded
+  // — plugin content is served as an ES module.)
+  if (container && (clean.endsWith(".js") || clean.endsWith(".mjs"))) {
     const path = fileURLToPath(clean);
     if (!path.includes("/node_modules/")) {
       const loaded = await container.load(path);

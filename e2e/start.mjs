@@ -101,6 +101,35 @@ async function devPhase() {
   } finally {
     srv.kill("SIGKILL");
   }
+  await assertBuildStartAbort();
+}
+
+// A plugin whose buildStart throws must abort startup with an attributed error,
+// not silently serve half-compiled output (which would resurface as a runtime
+// "not a function"). The fixture plugin throws under OJ_TEST_BUILDSTART_THROW.
+async function assertBuildStartAbort() {
+  rm(path.join(app, ".oj-cache"));
+  const port = 3098;
+  let stderr = "";
+  const srv = spawn(oj, ["dev", app, "--port", String(port)], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: { ...process.env, OJ_TEST_BUILDSTART_THROW: "1" },
+  });
+  srv.stderr.on("data", (d) => (stderr += d));
+  try {
+    for (let i = 0; i < 60 && !/failed in buildStart/.test(stderr); i++) {
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    let served = false;
+    try { served = (await fetch(`http://localhost:${port}/`)).ok; } catch {}
+    if (served) throw new Error("start-dev: server served 200 despite a throwing buildStart (silent swallow)");
+    if (!/plugin "fixture-fresh-module" failed in buildStart/.test(stderr)) {
+      throw new Error("start-dev: buildStart throw not surfaced with attribution; stderr tail:\n" + stderr.slice(-600));
+    }
+    console.log("start-dev: throwing buildStart aborts startup with plugin attribution");
+  } finally {
+    srv.kill("SIGKILL");
+  }
 }
 
 async function prodPhase() {

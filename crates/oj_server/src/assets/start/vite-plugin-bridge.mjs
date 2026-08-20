@@ -185,8 +185,15 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
       if (ojReimplemented(p.name) || !envAllows(p, environment)) continue;
       const h = hookHandler(p.buildStart);
       if (!h) continue;
+      // Fail loud like Vite: a swallowed buildStart throw would let the plugin's
+      // load() serve half-compiled output, resurfacing as a confusing runtime
+      // "not a function" instead of a clear startup error.
       try { await h.call(ctx, {}); }
-      catch (e) { process.stderr.write(`oj: plugin ${p.name || "?"} buildStart failed: ${(e && e.stack) || e}\n`); }
+      catch (e) {
+        const err = new Error(`plugin "${p.name || "?"}" failed in buildStart: ${(e && e.message) || e}`);
+        err.cause = e;
+        throw err;
+      }
     }
   }
 

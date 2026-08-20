@@ -125,7 +125,7 @@ export function makeVitePlugins({ container, fallback, appRoot, mode = "dev", fs
       // too, so compile-on-startup plugins produce the same output as dev.
       if (container && !id.startsWith("\0") && !id.includes("/node_modules/")) {
         const cleanId = id.replace(/\?.*$/, "");
-        if (/\.(jsx?|mjs|cjs|tsx?)$/.test(cleanId)) {
+        if (/\.(jsx?|mjs|tsx?)$/.test(cleanId)) {
           let code = await container.load(cleanId);
           if (code == null && fallback) code = await fallback.load(cleanId);
           if (code != null) {
