@@ -37,9 +37,11 @@ function freshModulePlugin(): Plugin {
     },
     load(id) {
       if (!id.replace(/\\/g, "/").endsWith("/src/generated/stale.js")) return;
-      if (compiled == null) return `export const LABEL = "BUILDSTART_SKIPPED";`;
       const env = (this as { environment?: { name?: string } }).environment?.name ?? "noenv";
-      return `export const LABEL = ${JSON.stringify(`${compiled}_${env}`)};`;
+      const val = JSON.stringify(compiled == null ? "BUILDSTART_SKIPPED" : `${compiled}_${env}`);
+      // Emit the arbitrary-string export form (as a compiled i18n barrel does),
+      // reached by the caller as `m.freshMsg_cta()` — the exact failure shape.
+      return `export const LABEL = ${val};\nconst fn = () => ${val};\nexport { fn as "freshMsg_cta" };`;
     },
   };
 }
