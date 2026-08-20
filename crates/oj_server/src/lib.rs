@@ -653,6 +653,46 @@ fn js_response_json(v: serde_json::Value) -> Response {
     ([(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response()
 }
 
+/// Whether the SSR runner may load `path`, given what the server allows.
+///
+/// The runner asks for modules by absolute path, and `id` arrives on a request,
+/// so the set has to be bounded by something other than the caller's honesty.
+/// Anything that is not a real file is not a filesystem read at all -- a virtual
+/// id can only be resolved by the plugin host, and only to what a plugin
+/// generated -- so those pass through. A real file has to be the project's, a
+/// dependency's, or something `server.fs.allow` named. That leaves out what this
+/// endpoint has no business reading: `~/.ssh`, `~/.aws`, `/etc`.
+fn module_read_allowed(
+    root: &Path,
+    allow: &std::collections::HashSet<PathBuf>,
+    path: &Path,
+) -> bool {
+    let Ok(candidate) = std::fs::canonicalize(path) else {
+        return true;
+    };
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if candidate.starts_with(real(root)) {
+        return true;
+    }
+    // A dependency, wherever it is installed (a pnpm store, a workspace root, a
+    // linked package): dependencies are not secrets, and this is the path every
+    // real SSR import takes.
+    if candidate
+        .components()
+        .any(|c| c.as_os_str() == "node_modules")
+    {
+        return true;
+    }
+    allow
+        .iter()
+        .any(|allowed| candidate.starts_with(real(allowed)))
+}
+
+fn ssr_module_allowed(state: &ServerState, path: &Path) -> bool {
+    let allow = state.fs_allow.lock().unwrap().clone();
+    module_read_allowed(&state.root, &allow, path)
+}
+
 async fn ssr_module(
     State(state): State<Arc<ServerState>>,
     Query(q): Query<HashMap<String, String>>,
@@ -661,6 +701,11 @@ async fn ssr_module(
         return (StatusCode::BAD_REQUEST, "id required").into_response();
     };
     let path = PathBuf::from(id);
+    // `id` arrives on a request, so it is attacker-controlled: without this the
+    // endpoint hands back the contents of any compilable file on the machine.
+    if !ssr_module_allowed(&state, &path) {
+        return (StatusCode::FORBIDDEN, "oj: module not allow-listed").into_response();
+    }
     let (source, from_plugin) = match std::fs::read(&path).and_then(bytes_to_string) {
         Ok(s) => (s, false),
         Err(read_err) => match ssr_plugin_host(&state).await {
@@ -4021,6 +4066,73 @@ mod adapter_tests {
         )
         .unwrap();
         assert!(!is_tanstack_start_app(&app2));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_ssr_module_endpoint_only_reads_the_project_and_its_dependencies() {
+        let base = tmp("ssr-allow");
+        let root = base.join("app");
+        let outside = base.join("elsewhere");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/react")).unwrap();
+        std::fs::create_dir_all(outside.join("secrets")).unwrap();
+        std::fs::create_dir_all(base.join("linked/node_modules/dep")).unwrap();
+        std::fs::create_dir_all(base.join("allowed")).unwrap();
+        std::fs::write(root.join("src/App.tsx"), "x").unwrap();
+        std::fs::write(root.join("node_modules/react/index.js"), "x").unwrap();
+        std::fs::write(outside.join("secrets/id_rsa"), "x").unwrap();
+        std::fs::write(base.join("linked/node_modules/dep/index.js"), "x").unwrap();
+        std::fs::write(base.join("allowed/shared.ts"), "x").unwrap();
+
+        let mut allow = std::collections::HashSet::new();
+        allow.insert(base.join("allowed"));
+
+        // The project, its dependencies, and what `server.fs.allow` named.
+        for ok in [
+            root.join("src/App.tsx"),
+            root.join("node_modules/react/index.js"),
+            base.join("linked/node_modules/dep/index.js"),
+            base.join("allowed/shared.ts"),
+        ] {
+            assert!(module_read_allowed(&root, &allow, &ok), "{ok:?} denied");
+        }
+
+        // Everything else, however it is spelled.
+        for denied in [
+            outside.join("secrets/id_rsa"),
+            root.join("../elsewhere/secrets/id_rsa"),
+            root.join("src/../../elsewhere/secrets/id_rsa"),
+        ] {
+            assert!(
+                !module_read_allowed(&root, &allow, &denied),
+                "{denied:?} allowed"
+            );
+        }
+
+        // A virtual id is not a filesystem read: the plugin host is the only
+        // thing that can resolve it, so it passes through.
+        for virtual_id in ["virtual:oj-routes", "\0virtual:x", "plugin:generated"] {
+            assert!(module_read_allowed(&root, &allow, Path::new(virtual_id)));
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_the_project_does_not_widen_what_can_be_read() {
+        let base = tmp("ssr-symlink");
+        let root = base.join("app");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(base.join("secrets")).unwrap();
+        std::fs::write(base.join("secrets/id_rsa"), "x").unwrap();
+        let link = root.join("src/escape.ts");
+        if std::os::unix::fs::symlink(base.join("secrets/id_rsa"), &link).is_ok() {
+            assert!(
+                !module_read_allowed(&root, &std::collections::HashSet::new(), &link),
+                "a symlink inside the project must not expose its target"
+            );
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

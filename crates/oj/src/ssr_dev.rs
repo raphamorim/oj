@@ -80,6 +80,65 @@ pub async fn ssr_dev(
     Ok(())
 }
 
+/// Resolve the `module` field of a server-function call to a file oj is willing
+/// to import.
+///
+/// The field comes off the request body, so it is attacker-controlled -- and a
+/// browser can POST here cross-origin without a preflight, since a JSON body
+/// with `content-type: text/plain` is a simple request. Unchecked, that is
+/// "import and run any module on the developer's machine" from any page they
+/// have open. Two conditions, matching what the production dispatch table
+/// allows: inside the project, and named like a server module.
+fn server_fn_module(root: &Path, module_url: &str) -> Option<PathBuf> {
+    const SERVER_SUFFIXES: [&str; 8] = [
+        ".server.ts",
+        ".server.tsx",
+        ".server.js",
+        ".server.jsx",
+        ".server.mts",
+        ".server.mjs",
+        ".server.cts",
+        ".server.cjs",
+    ];
+
+    let rel = module_url.split('?').next().unwrap_or(module_url);
+    let rel = rel.trim_start_matches('/');
+    if rel.is_empty() {
+        return None;
+    }
+    let candidate = normalize_path(&root.join(rel));
+    if !candidate.starts_with(normalize_path(root)) {
+        return None;
+    }
+    let name = candidate.file_name().and_then(|n| n.to_str())?;
+    if !SERVER_SUFFIXES.iter().any(|s| name.ends_with(s)) {
+        return None;
+    }
+    // Every server module is a real file in the project (production dispatches
+    // through a table globbed from them), so a name that is not one is refused
+    // here rather than sent to the runner to fail with a stack trace.
+    if !candidate.is_file() {
+        return None;
+    }
+    Some(candidate)
+}
+
+/// Resolve `.` and `..` without touching the filesystem, so a path that does not
+/// exist yet is still confined.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 async fn spawn_runner(root: &Path, base: &str, entry_abs: &Path) -> anyhow::Result<Runner> {
     let dir = root.join(".oj-cache").join("ssr");
     std::fs::create_dir_all(&dir)?;
@@ -123,7 +182,13 @@ async fn ssr_route(State(state): State<Arc<SsrState>>, req: Request, next: Next)
             .unwrap_or_default();
         let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
         let module_url = payload.get("module").and_then(|m| m.as_str()).unwrap_or("");
-        let abs = state.root.join(module_url.trim_start_matches('/'));
+        let Some(abs) = server_fn_module(&state.root, module_url) else {
+            return (
+                StatusCode::FORBIDDEN,
+                format!("oj: not a server module: {module_url}"),
+            )
+                .into_response();
+        };
         let cmd = serde_json::json!({
             "cmd": "call",
             "module": abs.to_string_lossy(),
@@ -337,4 +402,137 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A project with one server module and one ordinary module, plus a sibling
+    /// directory outside it.
+    fn fixture() -> (PathBuf, PathBuf) {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("oj-serverfn-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("app");
+        std::fs::create_dir_all(root.join("src/api")).unwrap();
+        std::fs::create_dir_all(base.join("outside")).unwrap();
+        for name in [
+            "src/greeting.server.ts",
+            "src/greeting.server.tsx",
+            "src/api/user.server.js",
+            "src/api/user.server.mjs",
+            "src/App.tsx",
+            "src/main.tsx",
+            "src/server.ts",
+            "src/serverish.ts",
+            "src/greeting.server",
+            "src/greeting.server.css",
+            "package.json",
+        ] {
+            std::fs::write(root.join(name), "x").unwrap();
+        }
+        std::fs::write(base.join("outside/secrets.server.ts"), "x").unwrap();
+        (base, root)
+    }
+
+    #[test]
+    fn a_server_function_call_names_a_server_module_inside_the_project() {
+        let (base, root) = fixture();
+        for ok in [
+            "src/greeting.server.ts",
+            "/src/greeting.server.ts",
+            "src/greeting.server.tsx",
+            "src/api/user.server.js",
+            "src/api/user.server.mjs",
+            "src/greeting.server.ts?t=123",
+            // `..` that lands back inside is still inside.
+            "src/../src/greeting.server.ts",
+        ] {
+            let resolved = server_fn_module(&root, ok).unwrap_or_else(|| panic!("{ok} rejected"));
+            assert!(resolved.starts_with(&root), "{ok} -> {resolved:?}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_server_function_call_cannot_name_a_module_outside_the_project() {
+        let (base, root) = fixture();
+        // The `module` field comes off the request body, and a browser can POST
+        // here cross-origin without a preflight. Unchecked, this is "import and
+        // run any module on the machine" from any page the developer has open.
+        for hostile in [
+            "../outside/secrets.server.ts",
+            "../../../../etc/evil.server.js",
+            "src/../../outside/secrets.server.ts",
+            "/etc/passwd",
+            "/Users/someone/.ssh/id_rsa",
+            "..",
+            "/",
+            "",
+            " ",
+        ] {
+            assert!(
+                server_fn_module(&root, hostile).is_none(),
+                "{hostile:?} accepted"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_server_function_call_cannot_name_an_ordinary_module() {
+        let (base, root) = fixture();
+        // Production dispatches through a table built from `**/*.server.*`; dev
+        // must not be able to reach further than that.
+        for not_a_server_module in [
+            "src/App.tsx",
+            "src/main.tsx",
+            "package.json",
+            "src/server.ts",
+            "src/greeting.server",
+            "src/greeting.server.css",
+            "src/serverish.ts",
+            "node_modules/react/index.js",
+        ] {
+            assert!(
+                server_fn_module(&root, not_a_server_module).is_none(),
+                "{not_a_server_module:?} accepted"
+            );
+        }
+        // A server module that does not exist is refused too.
+        assert!(server_fn_module(&root, "src/missing.server.ts").is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn path_normalization_does_not_touch_the_filesystem() {
+        assert_eq!(
+            normalize_path(Path::new("/a/b/../c/./d.ts")),
+            PathBuf::from("/a/c/d.ts")
+        );
+        assert_eq!(normalize_path(Path::new("/a/../..")), PathBuf::from("/"));
+        assert_eq!(normalize_path(Path::new("a/b/../b")), PathBuf::from("a/b"));
+    }
+
+    #[test]
+    fn requests_for_assets_and_internals_are_passed_through() {
+        let prefixes: Vec<String> = vec!["/api".to_string()];
+        let route = |method: &str, path: &str| {
+            let req = axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            matches!(classify(&req, &prefixes), Route::Pass)
+        };
+        assert!(route("GET", "/@oj/client.js"), "internal urls pass through");
+        assert!(route("GET", "/__oj_fn"), "double-underscore urls pass through");
+        assert!(route("GET", "/src/App.tsx"), "a file url passes through");
+        assert!(route("GET", "/api/users"), "a proxied prefix passes through");
+        assert!(route("PUT", "/dashboard"), "an unhandled method passes through");
+        assert!(!route("GET", "/dashboard"), "a route is a document");
+        assert!(!route("POST", "/dashboard"), "a post is an action");
+    }
 }
