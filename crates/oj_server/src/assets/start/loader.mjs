@@ -19,13 +19,11 @@ const container = await loadPluginContainer(APP, { command: "serve", environment
 // Vite runs buildStart before serving any module; plugins that compile sources
 // (e.g. i18n message compilers) populate the state their load() hook serves.
 if (container) {
-  // Let a buildStart failure abort startup (Vite semantics) with a clear,
-  // attributed message rather than surfacing later as a runtime error.
+  // buildStart degrades per-plugin inside the container (a plugin oj can't
+  // fully support is logged and skipped); this guards against a container-level
+  // failure without taking the SSR runner down.
   try { await container.buildStart(); }
-  catch (e) {
-    process.stderr.write(`oj: SSR buildStart failed: ${(e && (e.stack || e.message)) || e}\n`);
-    throw e;
-  }
+  catch (e) { process.stderr.write(`oj: SSR buildStart failed: ${(e && (e.stack || e.message)) || e}\n`); }
 }
 const VIRTUAL_SCHEME = "ojvirtual:///";
 

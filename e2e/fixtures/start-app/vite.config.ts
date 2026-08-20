@@ -40,7 +40,11 @@ function freshModulePlugin(): Plugin {
     },
     load(id) {
       if (!id.replace(/\\/g, "/").endsWith("/src/generated/stale.js")) return;
-      const env = (this as { environment?: { name?: string } }).environment?.name ?? "noenv";
+      // Read both this.environment.name and this.environment.config.consumer —
+      // oj must expose both (Vite shape) or a plugin reading config.consumer
+      // throws and its module degrades to an export-less stub.
+      const e = (this as { environment?: { name?: string; config?: { consumer?: string } } }).environment;
+      const env = `${e?.name ?? "noenv"}-${e?.config?.consumer ?? "noconsumer"}`;
       const val = JSON.stringify(compiled == null ? "BUILDSTART_SKIPPED" : `${compiled}_${env}`);
       // Emit the arbitrary-string export form (as a compiled i18n barrel does),
       // reached by the caller as `m.freshMsg_cta()` — the exact failure shape.

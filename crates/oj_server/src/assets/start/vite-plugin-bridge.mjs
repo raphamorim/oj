@@ -90,8 +90,19 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
     ? (code, opts) => vite.parseAst(code, opts)
     : () => ({});
 
+  // Vite exposes this.environment.config with `consumer` ("client" | "server")
+  // and `command` on every hook context; plugins branch on them (e.g. return an
+  // empty dev manifest when consumer !== "server"). Without config, a plugin
+  // reading `this.environment.config.consumer` throws, the hook is swallowed,
+  // and oj serves an export-less stub — surfacing downstream as an undefined
+  // import. Mirror Vite's shape so those plugins take their intended branch.
+  const consumer = environment === "client" ? "client" : "server";
   const ctx = {
-    environment: { name: environment, mode: command === "build" ? "build" : "dev" },
+    environment: {
+      name: environment,
+      mode: command === "build" ? "build" : "dev",
+      config: { command, consumer, mode: command === "build" ? "production" : "development" },
+    },
     meta: { rollupVersion: "4.0.0", watchMode: command !== "build", framework: "oj" },
     warn() {}, info() {}, debug() {},
     error(m) { throw new Error(typeof m === "string" ? m : m?.message ?? String(m)); },
@@ -185,14 +196,15 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
       if (ojReimplemented(p.name) || !envAllows(p, environment)) continue;
       const h = hookHandler(p.buildStart);
       if (!h) continue;
-      // Fail loud like Vite: a swallowed buildStart throw would let the plugin's
-      // load() serve half-compiled output, resurfacing as a confusing runtime
-      // "not a function" instead of a clear startup error.
+      // Degrade gracefully: oj's plugin context is minimal (e.g. a stubbed
+      // this.resolve), so some plugins' buildStart throw here though they'd
+      // succeed under full Vite. Log and continue rather than abort the whole
+      // dev server — a plugin that genuinely needed buildStart will surface as
+      // its own load() output being wrong, which is strictly better than one
+      // unsupported plugin taking down every other plugin's startup.
       try { await h.call(ctx, {}); }
       catch (e) {
-        const err = new Error(`plugin "${p.name || "?"}" failed in buildStart: ${(e && e.message) || e}`);
-        err.cause = e;
-        throw err;
+        process.stderr.write(`oj: plugin "${p.name || "?"}" buildStart failed (skipped): ${(e && e.message) || e}\n`);
       }
     }
   }
