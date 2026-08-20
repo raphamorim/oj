@@ -51,6 +51,7 @@ async function assertApp(port, label) {
     ["commonjs dep facade", "[INTEROP]"],
     ["commonjs subpath (extensionless)", "[deep:ok]"],
     ["plugin virtual module", "fixture-virtual-ok"],
+    ["plugin load overrides on-disk .js (buildStart ran)", "FRESH_via_buildStart_"],
     ["import.meta.glob", "Alpha Widget, Beta Widget"],
     ["?raw import", "raw-notes-marker"],
     ["svgr bare .svg component", "<rect"],
@@ -59,6 +60,14 @@ async function assertApp(port, label) {
   ];
   for (const [what, marker] of want) {
     if (!h.includes(marker)) throw new Error(`${label}: missing ${what} ("${marker}")`);
+  }
+  // The plugin's load() must override the real on-disk stale.js; buildStart must
+  // have run before it. Either failure leaves a tell-tale marker in the render.
+  if (h.includes("STALE_ON_DISK")) {
+    throw new Error(`${label}: plugin load() did not override on-disk stale.js (fs read won)`);
+  }
+  if (h.includes("BUILDSTART_SKIPPED")) {
+    throw new Error(`${label}: plugin load() ran before buildStart (compiled state missing)`);
   }
   if (!/src="[^"]*hero[^"]*\.png"/.test(h)) {
     throw new Error(`${label}: missing ?url import (hero png src)`);

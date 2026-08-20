@@ -16,6 +16,12 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
 const { transformSync } = await importPkg(APP, "rolldown/experimental", ["vite", "@tanstack/react-start"]);
 const container = await loadPluginContainer(APP, { command: "serve", environment: "ssr" });
+// Vite runs buildStart before serving any module; plugins that compile sources
+// (e.g. i18n message compilers) populate the state their load() hook serves.
+if (container) {
+  try { await container.buildStart(); }
+  catch (e) { process.stderr.write(`oj: buildStart failed: ${(e && e.stack) || e}\n`); }
+}
 const VIRTUAL_SCHEME = "ojvirtual:///";
 
 let V = 0;
@@ -182,8 +188,11 @@ export async function load(url, context, next) {
   }
   if (clean.endsWith(".tsx") || clean.endsWith(".ts")) {
     const path = fileURLToPath(clean);
-    let raw = readFileSync(path, "utf8");
-    if (container && !path.includes("/node_modules/")) {
+    const userFile = container && !path.includes("/node_modules/");
+    // A plugin load() overrides the on-disk file (Vite: load runs before fs read).
+    let raw = userFile ? await container.load(path) : null;
+    if (raw == null) raw = readFileSync(path, "utf8");
+    if (userFile) {
       const t = await container.transformUserCode(raw, path);
       if (t != null) raw = t;
     }
@@ -214,6 +223,18 @@ export async function load(url, context, next) {
         define: viteEnvDefine({ ssr: true }),
       });
       return { format: "module", source: out.code, shortCircuit: true };
+    }
+  }
+  // A user plugin's load() may override a real on-disk .js/.mjs/.cjs file
+  // (Vite: load hooks run before the fs read). Consult it for user files; fall
+  // through to Node's default loader when no plugin claims the module.
+  if (container && (clean.endsWith(".js") || clean.endsWith(".mjs") || clean.endsWith(".cjs"))) {
+    const path = fileURLToPath(clean);
+    if (!path.includes("/node_modules/")) {
+      const loaded = await container.load(path);
+      if (loaded != null) {
+        return { format: "module", source: transformGlob(loaded, path), shortCircuit: true };
+      }
     }
   }
   if (clean.startsWith("file:") && clean.includes("/node_modules/")) {

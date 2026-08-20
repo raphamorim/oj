@@ -18,6 +18,11 @@ import deep from "legacy-cjs/deep";
 // A plugin-owned virtual module (resolved via oj's plugin-container bridge).
 import { buildTag } from "virtual:build-info";
 
+// A REAL on-disk .js file whose content a plugin's load() overrides (compiled
+// in buildStart). Exercises: buildStart ran, load overrode the fs read for a
+// real path, and this.environment.name was visible to the hook.
+import { LABEL as freshLabel } from "../generated/stale.js";
+
 // svgr: a bare .svg import yields a React component (exportType "default")...
 import Logo from "../logo.svg";
 // ...and the explicit `?react` query yields one regardless of exportType.
@@ -57,6 +62,7 @@ function Index() {
       <p data-testid="cjs">{badge("interop")}</p>
       <p data-testid="cjs-subpath">{deep("ok")}</p>
       <p data-testid="virtual">{buildTag}</p>
+      <p data-testid="fresh-module">{freshLabel}</p>
       <p data-testid="glob">{titles}</p>
       <p data-testid="raw">{notes.trim()}</p>
       <img data-testid="url" src={heroUrl} alt="hero" />

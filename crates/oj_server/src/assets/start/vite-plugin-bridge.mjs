@@ -171,8 +171,27 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
     }
   }
 
+  // Vite runs buildStart once before any module loads; plugins that compile
+  // sources (e.g. i18n message compilers) populate their state here and serve
+  // it from load(). oj's SSR loader is a separate process with its own plugin
+  // instances, so it must run buildStart itself. Scoped to non-reimplemented
+  // (user) plugins, like transformUserCode, so framework plugins oj already
+  // handles don't newly execute a hook they never ran under oj before.
+  let buildStarted = false;
+  async function buildStart() {
+    if (buildStarted) return;
+    buildStarted = true;
+    for (const p of plugins) {
+      if (ojReimplemented(p.name) || !envAllows(p, environment)) continue;
+      const h = hookHandler(p.buildStart);
+      if (!h) continue;
+      try { await h.call(ctx, {}); }
+      catch (e) { process.stderr.write(`oj: plugin ${p.name || "?"} buildStart failed: ${(e && e.stack) || e}\n`); }
+    }
+  }
+
   const publicDir = typeof loaded?.config?.publicDir === "string" ? loaded.config.publicDir : null;
-  return { resolveId, load, transform, transformUserCode, generateBundle, publicDir, pluginCount: plugins.length };
+  return { resolveId, load, transform, transformUserCode, buildStart, generateBundle, publicDir, pluginCount: plugins.length };
 }
 
 export const __test = { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows };

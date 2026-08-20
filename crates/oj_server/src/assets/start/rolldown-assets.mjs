@@ -78,6 +78,12 @@ export function makeVitePlugins({ container, fallback, appRoot, mode = "dev", fs
   };
   return {
     name: "oj-vite-plugins",
+    async buildStart() {
+      // Run user plugins' buildStart before any module loads, so compile-on-
+      // startup plugins (e.g. i18n) have populated the state their load() serves.
+      if (container?.buildStart) await container.buildStart();
+      if (fallback?.buildStart && fallback !== container) await fallback.buildStart();
+    },
     async resolveId(source, importer, options) {
       if (options?.custom?.ojSvg) return null;
       if (/\.svg\?react$/.test(source)) {
@@ -114,6 +120,26 @@ export function makeVitePlugins({ container, fallback, appRoot, mode = "dev", fs
         return { code, moduleType: "jsx" };
       }
       if (/\.svg$/.test(id) && !id.startsWith("\0")) return svgModule(id, id);
+      // A user plugin's load() may override a real on-disk source file (Vite:
+      // load runs before the fs read). Consult it for user files in the build
+      // too, so compile-on-startup plugins produce the same output as dev.
+      if (container && !id.startsWith("\0") && !id.includes("/node_modules/")) {
+        const cleanId = id.replace(/\?.*$/, "");
+        if (/\.(jsx?|mjs|cjs|tsx?)$/.test(cleanId)) {
+          let code = await container.load(cleanId);
+          if (code == null && fallback) code = await fallback.load(cleanId);
+          if (code != null) {
+            const moduleType = cleanId.endsWith(".tsx")
+              ? "tsx"
+              : cleanId.endsWith(".ts")
+                ? "ts"
+                : cleanId.endsWith(".jsx")
+                  ? "jsx"
+                  : "js";
+            return { code, moduleType };
+          }
+        }
+      }
       return null;
     },
     async transform(code, id) {
