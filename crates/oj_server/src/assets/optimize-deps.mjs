@@ -7,7 +7,7 @@ import { mkdirSync, rmSync, readFileSync, writeFileSync, renameSync, existsSync,
 import path from "node:path";
 import builtinModules from "node:module";
 
-const { root, outDir, entries, include = [], exclude = [], dedupe = [], alias = [] } = JSON.parse(process.argv[2]);
+const { root, outDir, entries, include = [], exclude = [], dedupe = [], alias = [], autoDiscover = false } = JSON.parse(process.argv[2]);
 
 const DEDUPE = new Set([
   "react",
@@ -166,7 +166,13 @@ async function scan() {
           return { path: r.path, external: r.external };
         }
         if (isBare(args.path) && !excludeSet.has(args.path)) {
-          found.add(args.path);
+          // A specifier with a query (`x?worker`, `x?url`, `x?raw`) is a special
+          // import handled by oj's worker/asset pipeline, not a plain dep — never
+          // pre-bundle it (the optimized-dep URL would 404). Externalize it so it
+          // is served directly. Vite excludes queried imports from the optimizer.
+          if (!args.path.includes("?")) {
+            found.add(args.path);
+          }
           return { path: args.path, external: true };
         }
         if (!args.path.startsWith(".") && !path.isAbsolute(args.path)) return { path: args.path, external: true };
@@ -190,7 +196,13 @@ async function scan() {
   return found;
 }
 
-const scanned = await scan();
+// Only pre-bundle the explicit optimizeDeps.include list by default (a small,
+// author-vetted, well-behaved set). Full-graph auto-discovery via the esbuild
+// scan is opt-in: converting an entire app's CommonJS/UMD dependency tree to ESM
+// with esbuild has a real interop tail (UMD `this`->void 0, cross-dep shape) that
+// can break an app, so oj's robust per-module wrap_cjs serves undiscovered deps
+// instead. See oj-native partial bundling for the eventual request-count fix.
+const scanned = autoDiscover ? await scan() : new Set();
 for (const inc of include) scanned.add(inc);
 const deps = [...scanned].filter((d) => !excludeSet.has(d));
 
@@ -230,7 +242,12 @@ for (const dep of deps) {
     continue;
   }
   const name = dep.replace(/^@/, "").replace(/[/@]/g, "_");
-  entryPoints[name] = entry;
+  // Hand esbuild the BARE specifier, not the Node-resolved path: `req.resolve`
+  // picks the `require`/`node` condition (uuid's ./dist/cjs, which `require`s
+  // node crypto), and bundling that fixed file skips browser resolution. A bare
+  // entry lets esbuild's platform:"browser" pick the browser build. Vite does
+  // the same via its browser-aware resolver in esbuildDepPlugin.
+  entryPoints[name] = dep;
   nameOf[dep] = name;
 }
 
@@ -241,6 +258,7 @@ const metadata = {};
 if (Object.keys(entryPoints).length) {
   const result = await esbuild.build({
     entryPoints,
+    absWorkingDir: root,
     bundle: true,
     splitting: true,
     format: "esm",

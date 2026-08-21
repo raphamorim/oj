@@ -174,6 +174,12 @@ async fn run_optimizer(
         .iter()
         .map(|(f, r)| [f.as_str(), r.as_str()])
         .collect();
+    // Full-graph auto-discovery (esbuild-scan the whole dep tree and pre-bundle
+    // it) is opt-in via OJ_OPTIMIZE_SCAN=1: it can break apps with UMD/CommonJS
+    // interop quirks, so by default oj pre-bundles only the explicit
+    // optimizeDeps.include list and serves the rest through wrap_cjs.
+    let auto_discover = std::env::var("OJ_OPTIMIZE_SCAN")
+        .is_ok_and(|v| !v.is_empty() && v != "0");
     let cfg = serde_json::json!({
         "root": root,
         "outDir": dir,
@@ -182,6 +188,7 @@ async fn run_optimizer(
         "exclude": input.exclude,
         "dedupe": input.dedupe,
         "alias": alias,
+        "autoDiscover": auto_discover,
     })
     .to_string();
     let out = tokio::process::Command::new("node")

@@ -68,7 +68,7 @@ function fixture() {
 it("optimize-deps: scans + pre-bundles CJS deps with correct interop", async () => {
   const root = fixture();
   const outDir = path.join(root, ".oj-cache", "deps");
-  const cfg = JSON.stringify({ root, outDir, entries: [path.join(root, "entry.js")] });
+  const cfg = JSON.stringify({ root, outDir, entries: [path.join(root, "entry.js")], autoDiscover: true });
   const stdout = execFileSync("node", [sidecar, cfg], { encoding: "utf8" });
   const { metadata } = JSON.parse(stdout);
 
@@ -130,7 +130,7 @@ it("optimize-deps: resolves tsconfig `paths` with /* and externalizes a dep's CS
   );
 
   const outDir = path.join(root, ".oj-cache", "deps");
-  const cfg = JSON.stringify({ root, outDir, entries: [path.join(root, "entry.js")] });
+  const cfg = JSON.stringify({ root, outDir, entries: [path.join(root, "entry.js")], autoDiscover: true });
   const stdout = execFileSync("node", [sidecar, cfg], { encoding: "utf8" });
   const { metadata } = JSON.parse(stdout);
   const names = Object.keys(metadata).sort();
@@ -146,6 +146,74 @@ it("optimize-deps: resolves tsconfig `paths` with /* and externalizes a dep's CS
   for (const m of Object.values(metadata)) {
     assert.ok(fs.existsSync(path.join(outDir, m.file)), `missing ${m.file}`);
   }
+
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+it("optimize-deps: never pre-bundles a queried specifier (?worker/?url)", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "oj-optdeps3-"));
+  fs.mkdirSync(path.join(root, "node_modules"), { recursive: true });
+  fs.symlinkSync(esbuildSrc, path.join(root, "node_modules", "esbuild"));
+  const esbuildScoped = path.join(repo, "e2e/fixtures/start-app/node_modules/@esbuild");
+  if (fs.existsSync(esbuildScoped)) fs.symlinkSync(esbuildScoped, path.join(root, "node_modules", "@esbuild"));
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "fx3" }));
+
+  pkg("plaincjs", root, "index.js", { "index.js": `exports.a = 1;\n` });
+  pkg("wk", root, "index.js", { "index.js": `export default 1;\n`, "worker.js": `self.onmessage = () => {};\n` });
+
+  // A `?worker` import must be externalized, not recorded as a dep (Vite's
+  // SPECIAL_QUERY_RE does the same). If it were pre-bundled, the browser would
+  // request /@oj-deps/wk_worker.js and 404, breaking the app (the twenty
+  // monaco-graphql worker regression).
+  fs.writeFileSync(
+    path.join(root, "entry.js"),
+    `import { a } from "plaincjs";\nimport Worker from "wk/worker.js?worker";\nexport const out = a + typeof Worker;\n`,
+  );
+
+  const outDir = path.join(root, ".oj-cache", "deps");
+  const cfg = JSON.stringify({ root, outDir, entries: [path.join(root, "entry.js")], autoDiscover: true });
+  const stdout = execFileSync("node", [sidecar, cfg], { encoding: "utf8" });
+  const { metadata } = JSON.parse(stdout);
+  const names = Object.keys(metadata);
+
+  assert.ok(names.includes("plaincjs"), `plain dep still pre-bundled; got ${names.join(", ")}`);
+  assert.ok(
+    !names.some((n) => n.includes("?") || n.includes("worker")),
+    `queried/worker specifier must NOT be pre-bundled; got ${names.join(", ")}`,
+  );
+
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+it("optimize-deps: does NOT auto-discover by default; only the include list is pre-bundled", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "oj-optdeps4-"));
+  fs.mkdirSync(path.join(root, "node_modules"), { recursive: true });
+  fs.symlinkSync(esbuildSrc, path.join(root, "node_modules", "esbuild"));
+  const esbuildScoped = path.join(repo, "e2e/fixtures/start-app/node_modules/@esbuild");
+  if (fs.existsSync(esbuildScoped)) fs.symlinkSync(esbuildScoped, path.join(root, "node_modules", "@esbuild"));
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "fx4" }));
+
+  pkg("plaincjs", root, "index.js", { "index.js": `exports.a = 1;\n` });
+  pkg("other", root, "index.js", { "index.js": `exports.b = 2;\n` });
+  fs.writeFileSync(
+    path.join(root, "entry.js"),
+    `import { a } from "plaincjs";\nimport { b } from "other";\nexport const out = a + b;\n`,
+  );
+  const outDir = path.join(root, ".oj-cache", "deps");
+
+  // Default (no autoDiscover): the esbuild scan does not run, so a dep reached
+  // only from the entry graph is NOT pre-bundled — it is served individually via
+  // wrap_cjs. This gate keeps a dep's CJS/UMD interop quirks from breaking an app.
+  const gated = JSON.parse(
+    execFileSync("node", [sidecar, JSON.stringify({ root, outDir, entries: [path.join(root, "entry.js")] })], { encoding: "utf8" }),
+  ).metadata;
+  assert.equal(Object.keys(gated).length, 0, `default must not auto-discover; got ${Object.keys(gated).join(", ")}`);
+
+  // The explicit include list is always pre-bundled, even without autoDiscover.
+  const included = JSON.parse(
+    execFileSync("node", [sidecar, JSON.stringify({ root, outDir, entries: [path.join(root, "entry.js")], include: ["plaincjs"] })], { encoding: "utf8" }),
+  ).metadata;
+  assert.deepEqual(Object.keys(included), ["plaincjs"], "explicit include is pre-bundled");
 
   fs.rmSync(root, { recursive: true, force: true });
 });
