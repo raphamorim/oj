@@ -602,6 +602,7 @@ fn expand_css_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String
             css_file.to_str().unwrap(),
             root.to_str().unwrap(),
         ])
+        .env("NODE_COMPILE_CACHE", oj_server::node_compile_cache(root))
         .current_dir(root)
         .output()
         .context("node not found for tailwind/postcss build")?;
@@ -633,6 +634,7 @@ fn svelte_via_sidecar(root: &Path, file: &Path) -> anyhow::Result<String> {
     .to_string();
     let mut child = std::process::Command::new("node")
         .arg(&script)
+        .env("NODE_COMPILE_CACHE", oj_server::node_compile_cache(root))
         .current_dir(root)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -677,6 +679,7 @@ fn preprocess_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String
     .to_string();
     let mut child = std::process::Command::new("node")
         .arg(&script)
+        .env("NODE_COMPILE_CACHE", oj_server::node_compile_cache(root))
         .current_dir(root)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -1993,6 +1996,7 @@ pub(crate) async fn build_ssr_app(
         let out = std::process::Command::new("node")
             .arg(&script_path)
             .arg(serde_json::to_string(&paths)?)
+            .env("NODE_COMPILE_CACHE", oj_server::node_compile_cache(root))
             .current_dir(out_dir)
             .output()
             .context("node not found for prerender")?;

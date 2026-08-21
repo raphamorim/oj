@@ -150,6 +150,19 @@ const START_ASSETS: &[(&str, &str)] = &[
     ("manifest.ts", include_str!("assets/start/manifest.ts")),
 ];
 
+pub fn node_compile_cache(root: &Path) -> std::ffi::OsString {
+    std::env::var_os("NODE_COMPILE_CACHE")
+        .unwrap_or_else(|| root.join(".oj-cache").join("v8").into_os_string())
+}
+
+pub fn node_compile_cache_opt_in(root: &Path) -> Option<std::ffi::OsString> {
+    let v = std::env::var_os("OJ_V8_COMPILE_CACHE")?;
+    if v.is_empty() || v == "0" {
+        return None;
+    }
+    Some(node_compile_cache(root))
+}
+
 pub fn write_start_assets(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     for (name, content) in START_ASSETS {

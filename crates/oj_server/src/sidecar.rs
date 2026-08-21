@@ -126,6 +126,7 @@ impl Sidecar {
 
         let mut child = tokio::process::Command::new("node")
             .arg(&script)
+            .env("NODE_COMPILE_CACHE", crate::node_compile_cache(root))
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

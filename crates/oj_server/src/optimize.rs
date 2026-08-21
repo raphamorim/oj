@@ -187,6 +187,7 @@ async fn run_optimizer(
     let out = tokio::process::Command::new("node")
         .arg(&script)
         .arg(&cfg)
+        .env("NODE_COMPILE_CACHE", crate::node_compile_cache(root))
         .current_dir(root)
         .output()
         .await

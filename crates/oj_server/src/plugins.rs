@@ -98,6 +98,7 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
         .arg(root)
         .arg("serve")
         .arg("development")
+        .env("NODE_COMPILE_CACHE", crate::node_compile_cache(root))
         .current_dir(root)
         .output()
         .ok()?;
@@ -342,6 +343,7 @@ impl PluginHost {
             .arg(&script)
             .arg(plugins_file)
             .arg(config_json)
+            .env("NODE_COMPILE_CACHE", crate::node_compile_cache(root))
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

@@ -1816,6 +1816,7 @@ dependencies = [
  "blake3",
  "clap",
  "notify",
+ "oj_cache",
  "oj_compiler",
  "oj_config",
  "oj_css",

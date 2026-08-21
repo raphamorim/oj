@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+pub mod start_codegen;
+
 pub const CACHE_FORMAT: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
