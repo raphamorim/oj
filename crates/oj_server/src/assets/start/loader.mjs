@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { readFileSync, unlinkSync } from "node:fs";
+import { readFileSync, unlinkSync, statSync } from "node:fs";
 import { writeFile, appendFile, rename, mkdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { resolve as pathResolve, dirname } from "node:path";
@@ -22,7 +22,103 @@ const { transformSync } = await importPkg(APP, "rolldown/experimental", ["vite",
 // it off-thread keeps its bootstrap out of the module-loading critical path.
 const container = loadPluginContainerSync(APP, { command: "serve", environment: "ssr" });
 const VIRTUAL_SCHEME = "ojvirtual:///";
-const DEFINE = viteEnvDefine({ ssr: true });
+const CACHE_DIR = pathResolve(APP, ".oj-cache");
+
+const BASE_FILES = [
+  "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "package.json",
+  "vite.config.ts", "vite.config.js", "vite.config.mjs", "vite.config.mts",
+  "oj.config.ts", "oj.config.js", "oj.config.mjs",
+];
+const LOADER_FILES = ["loader.mjs", "loader-util.mjs", "glob-transform.mjs", "vite-plugin-bridge.mjs", "resolve-pkg.mjs"];
+const hashAdd = (h, label, bytes) => { h.update(label); h.update("\0"); h.update(bytes); h.update("\0"); };
+function hashBaseInputs(h) {
+  hashAdd(h, "node", process.version);
+  for (const name of BASE_FILES) {
+    try { hashAdd(h, name, readFileSync(pathResolve(APP, name))); } catch {}
+  }
+  for (const name of LOADER_FILES) {
+    try { hashAdd(h, name, readFileSync(pathResolve(HERE, name))); } catch {}
+  }
+}
+
+// Config evaluation mutates process.env (e.g. VITE_* vars derived from git
+// state or .env files) and those values feed the import.meta.env inlining
+// below — but the eval now happens in the container worker's env copy. The
+// worker reports the delta; to keep warm boots from blocking on config eval,
+// the delta is persisted keyed by everything that can change it (config,
+// lockfile, loader assets, .env files, git HEAD). A key change means a boot
+// that recompiles anyway, so blocking on the worker there costs little.
+// Compromise vs the in-worker design: env side effects that are
+// nondeterministic for identical inputs are replayed, not recomputed.
+function gitStateBytes() {
+  try {
+    let dir = APP;
+    for (let i = 0; i < 12; i++) {
+      const dotGit = pathResolve(dir, ".git");
+      let gitDir = null;
+      try {
+        if (statSync(dotGit).isDirectory()) gitDir = dotGit;
+        else {
+          const m = readFileSync(dotGit, "utf8").match(/^gitdir:\s*(.+)$/m);
+          if (m) gitDir = pathResolve(dir, m[1].trim());
+        }
+      } catch {}
+      if (gitDir) {
+        const head = readFileSync(pathResolve(gitDir, "HEAD"), "utf8");
+        const ref = head.match(/^ref:\s*(.+)$/m);
+        let tip = "";
+        if (ref) {
+          const refPath = ref[1].trim();
+          for (const base of [gitDir, (() => { try { return pathResolve(gitDir, readFileSync(pathResolve(gitDir, "commondir"), "utf8").trim()); } catch { return null; } })()]) {
+            if (!base) continue;
+            try { tip = readFileSync(pathResolve(base, refPath), "utf8"); break; } catch {}
+            try { tip = readFileSync(pathResolve(base, "packed-refs"), "utf8"); break; } catch {}
+          }
+        }
+        return head + "\0" + tip;
+      }
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  } catch {}
+  return "";
+}
+const ENV_DELTA_FILE = pathResolve(CACHE_DIR, "ssr-env.json");
+const envDelta = (() => {
+  if (!container) return {};
+  let deltaKey = null;
+  if (process.env.OJ_SSR_LOADER_CACHE !== "off") {
+    try {
+      const h = createHash("sha256");
+      hashAdd(h, "v", "oj-ssr-env-delta-v1");
+      hashBaseInputs(h);
+      for (const name of [".env", ".env.local", ".env.development", ".env.development.local"]) {
+        try { hashAdd(h, name, readFileSync(pathResolve(APP, name))); } catch {}
+      }
+      hashAdd(h, "git", gitStateBytes());
+      deltaKey = h.digest("hex");
+    } catch {}
+  }
+  if (deltaKey) {
+    try {
+      const j = JSON.parse(readFileSync(ENV_DELTA_FILE, "utf8"));
+      if (j.key === deltaKey && j.delta && typeof j.delta === "object") return j.delta;
+    } catch {}
+  }
+  let fresh = {};
+  try { fresh = container.env() ?? {}; } catch {}
+  if (deltaKey) {
+    (async () => {
+      try {
+        await mkdir(CACHE_DIR, { recursive: true });
+        await writeFile(ENV_DELTA_FILE, JSON.stringify({ key: deltaKey, delta: fresh }));
+      } catch {}
+    })();
+  }
+  return fresh;
+})();
+const DEFINE = viteEnvDefine({ ssr: true, env: { ...process.env, ...envDelta } });
 
 // Persistent per-module result cache. Same on-disk layout as oj_cache's
 // PersistentCache (.oj-cache/<2hex>/<key>.json, corrupt entries self-delete)
@@ -30,27 +126,15 @@ const DEFINE = viteEnvDefine({ ssr: true });
 // non-content that can change a transform result: lockfile, vite/oj config,
 // the loader assets themselves (which change with the oj version), and the
 // define/env inputs fed to transformSync. Any error degrades to a miss.
-const CACHE_DIR = pathResolve(APP, ".oj-cache");
 const cacheStats = { hits: 0, misses: 0, uncached: 0, rhits: 0, rmisses: 0 };
 const EPOCH = (() => {
   if (process.env.OJ_SSR_LOADER_CACHE === "off") return null;
   try {
     const h = createHash("sha256");
-    const add = (label, bytes) => { h.update(label); h.update("\0"); h.update(bytes); h.update("\0"); };
-    add("v", "oj-ssr-loader-cache-v1");
-    add("node", process.version);
-    for (const name of [
-      "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "package.json",
-      "vite.config.ts", "vite.config.js", "vite.config.mjs", "vite.config.mts",
-      "oj.config.ts", "oj.config.js", "oj.config.mjs",
-    ]) {
-      try { add(name, readFileSync(pathResolve(APP, name))); } catch {}
-    }
-    for (const name of ["loader.mjs", "loader-util.mjs", "glob-transform.mjs", "vite-plugin-bridge.mjs", "resolve-pkg.mjs"]) {
-      try { add(name, readFileSync(pathResolve(HERE, name))); } catch {}
-    }
-    add("define", JSON.stringify(DEFINE));
-    add("fnbase", process.env.TSS_SERVER_FN_BASE ?? "");
+    hashAdd(h, "v", "oj-ssr-loader-cache-v1");
+    hashBaseInputs(h);
+    hashAdd(h, "define", JSON.stringify(DEFINE));
+    hashAdd(h, "fnbase", process.env.TSS_SERVER_FN_BASE ?? "");
     return h.digest("hex");
   } catch {
     return null;

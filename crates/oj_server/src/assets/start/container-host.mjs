@@ -9,7 +9,7 @@
 import { workerData } from "node:worker_threads";
 import { loadPluginContainer } from "./vite-plugin-bridge.mjs";
 
-const { app, opts, port, sab } = workerData;
+const { app, opts, port, sab, envBase } = workerData;
 const flag = new Int32Array(sab);
 
 function respond(msg) {
@@ -29,7 +29,16 @@ if (container) {
   catch (e) { process.stderr.write(`oj: SSR buildStart failed: ${(e && (e.stack || e.message)) || e}\n`); }
 }
 
+// Evaluating the config (and buildStart) mutates this worker's process.env
+// copy — e.g. configs that derive VITE_* vars from git state. The loader
+// fetches this delta to feed the same values into its define/env inlining.
+const envDelta = {};
+for (const [k, v] of Object.entries(process.env)) {
+  if (envBase[k] !== v) envDelta[k] = v;
+}
+
 port.on("message", async ({ id, method, args }) => {
+  if (method === "__env") return respond({ id, value: envDelta });
   if (!container) return respond({ id, value: null });
   try {
     respond({ id, value: await container[method](...args) });

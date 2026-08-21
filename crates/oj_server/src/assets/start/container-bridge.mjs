@@ -21,7 +21,7 @@ export function loadPluginContainerSync(app, opts) {
   const sab = new SharedArrayBuffer(4);
   const flag = new Int32Array(sab);
   const worker = new Worker(join(HERE, "container-host.mjs"), {
-    workerData: { app, opts, port: port2, sab },
+    workerData: { app, opts, port: port2, sab, envBase: { ...process.env } },
     transferList: [port2],
   });
   // Neither the worker nor the port may keep the runner alive after stdin
@@ -52,5 +52,6 @@ export function loadPluginContainerSync(app, opts) {
     load: (id) => call("load", [id]),
     transform: (code, id) => call("transform", [code, id]),
     transformUserCode: (code, id) => call("transformUserCode", [code, id]),
+    env: () => call("__env", []),
   };
 }
