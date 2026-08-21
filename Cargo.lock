@@ -1874,9 +1874,11 @@ dependencies = [
  "oxc_semantic",
  "oxc_span",
  "oxc_transformer",
+ "proptest",
  "rquickjs",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 

@@ -18,3 +18,7 @@ rquickjs = { version = "0.12.2", features = ["loader"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true

@@ -16,6 +16,9 @@ pub enum ConfigError {
     Schema(PathBuf, String),
 }
 
+const EVAL_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+const EVAL_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+
 const CANDIDATES: &[&str] = &[
     "oj.config.ts",
     "oj.config.mjs",
@@ -161,7 +164,33 @@ pub fn load_with(root: &Path, command: &str, mode: &str) -> Result<OjConfig, Con
     } else {
         evaluate(&path, &source, command, mode)?
     };
-    serde_json::from_str(&json).map_err(|e| ConfigError::Schema(path, e.to_string()))
+
+    let value: serde_json::Value =
+        serde_json::from_str(&json).map_err(|e| ConfigError::Schema(path.clone(), e.to_string()))?;
+    match &value {
+        serde_json::Value::Object(_) => {
+            serde_json::from_value(value).map_err(|e| ConfigError::Schema(path, e.to_string()))
+        }
+        serde_json::Value::Null => Err(ConfigError::Eval(
+            path,
+            "no config was exported; a config file must `export default` an object".into(),
+        )),
+        other => Err(ConfigError::Schema(
+            path,
+            format!("expected an object, found {}", json_type_name(other)),
+        )),
+    }
+}
+
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
 }
 
 fn evaluate(path: &Path, source: &str, command: &str, mode: &str) -> Result<String, ConfigError> {
@@ -170,6 +199,9 @@ fn evaluate(path: &Path, source: &str, command: &str, mode: &str) -> Result<Stri
 
     let rt = rquickjs::Runtime::new()
         .map_err(|e| ConfigError::Eval(path.to_path_buf(), e.to_string()))?;
+    rt.set_memory_limit(EVAL_MEMORY_LIMIT);
+    let deadline = std::time::Instant::now() + EVAL_TIME_LIMIT;
+    rt.set_interrupt_handler(Some(Box::new(move || std::time::Instant::now() >= deadline)));
     let ctx = rquickjs::Context::full(&rt)
         .map_err(|e| ConfigError::Eval(path.to_path_buf(), e.to_string()))?;
 
@@ -206,6 +238,13 @@ fn evaluate(path: &Path, source: &str, command: &str, mode: &str) -> Result<Stri
                 .as_exception()
                 .map(|ex| ex.to_string())
                 .unwrap_or_else(|| format!("{e}"));
+            if std::time::Instant::now() >= deadline {
+                detail = format!(
+                    "evaluation exceeded the {}s limit; a config file must not \
+                     block (no infinite loops, no blocking work)",
+                    EVAL_TIME_LIMIT.as_secs()
+                );
+            }
             if detail.contains("is not defined") {
                 detail.push_str(
                     "\nnote: oj.config is evaluated in a sandbox without module imports; \
