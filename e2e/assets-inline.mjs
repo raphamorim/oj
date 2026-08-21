@@ -26,10 +26,22 @@ fs.writeFileSync(
   path.join(app, "src", "dot.png"),
   Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64"),
 );
+// A CRLF-formatted SVG: what git hands a Windows checkout. Inlining used to
+// leave the CR in the emitted string literal, which does not parse.
+fs.writeFileSync(
+  path.join(app, "src", "crlf.svg"),
+  `<svg xmlns="http://www.w3.org/2000/svg">\r\n  <rect width="1" height="1"/>\r\n</svg>\r\n`,
+);
+fs.writeFileSync(
+  path.join(app, "src", "dot.bmp"),
+  Buffer.from("Qk06AAAAAAAAADYAAAAoAAAAAQAAAAEAAAABABgAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAD/AA==", "base64"),
+);
 fs.writeFileSync(
   path.join(app, "src", "main.js"),
   `import small from "./small.svg";\nimport big from "./big.svg";\nimport png from "./dot.png";\n` +
-    `window.__S = small; window.__B = big; window.__PNG = png; window.__READY = true;\n`,
+    `import crlf from "./crlf.svg";\nimport bmp from "./dot.bmp";\n` +
+    `window.__S = small; window.__B = big; window.__PNG = png; window.__CRLF = crlf; window.__BMP = bmp;\n` +
+    `window.__READY = true;\n`,
 );
 fs.writeFileSync(
   path.join(app, "index.html"),
@@ -60,10 +72,20 @@ try {
   try {
     await page.goto("http://localhost:5351/", { timeout: 30000 });
     await page.waitForFunction(() => window.__READY, { timeout: 10000 });
-    const r = await page.evaluate(() => ({ s: window.__S, b: window.__B, png: window.__PNG }));
+    const r = await page.evaluate(() => ({
+      s: window.__S,
+      b: window.__B,
+      png: window.__PNG,
+      crlf: window.__CRLF,
+      bmp: window.__BMP,
+    }));
     assert.match(r.s, /^data:image\/svg\+xml,/, "small svg is an inline data uri");
     assert.match(r.png, /^data:image\/png;base64,/, "png is an inline base64 data uri");
     assert.match(r.b, /\/assets\/big-.*\.svg$/, "big svg is an emitted file url");
+    assert.match(r.crlf, /^data:image\/svg\+xml,/, "a CRLF svg inlines too");
+    assert.ok(!/[\r\n]/.test(r.crlf), "no line terminator survives in the data uri");
+    assert.match(r.crlf, /%3Crect/, "the CRLF svg kept its content");
+    assert.match(r.bmp, /^data:image\/bmp;base64,/, "bmp inlines with its own mime type");
     assert.equal(errors.length, 0, `page errors: ${errors.join("|")}`);
   } finally {
     await browser.close();
@@ -75,6 +97,7 @@ try {
   build();
   files = assets();
   assert.ok(files.some((f) => f.startsWith("small-")) && files.some((f) => f.endsWith(".png")), "limit 0 emits every asset");
+  assert.ok(files.some((f) => f.endsWith(".bmp")), "limit 0 emits the bmp too");
 
   console.log("ASSETS-INLINE E2E PASSED");
 } catch (err) {

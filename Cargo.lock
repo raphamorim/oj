@@ -1813,6 +1813,7 @@ dependencies = [
  "anyhow",
  "arcstr",
  "axum",
+ "blake3",
  "clap",
  "notify",
  "oj_compiler",
