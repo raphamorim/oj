@@ -68,9 +68,9 @@ export async function importPkg(root, spec, preferred = []) {
   return m.default ?? m;
 }
 
-export function viteEnvDefine({ ssr = false, mode = "development" } = {}) {
+export function viteEnvDefine({ ssr = false, mode = "development", env: envSource = process.env } = {}) {
   const env = { MODE: mode, DEV: mode !== "production", PROD: mode === "production", SSR: !!ssr, BASE_URL: "/" };
-  for (const [k, v] of Object.entries(process.env)) if (k.startsWith("VITE_")) env[k] = v;
+  for (const [k, v] of Object.entries(envSource)) if (k.startsWith("VITE_")) env[k] = v;
   return { "import.meta.env": JSON.stringify(env) };
 }
 

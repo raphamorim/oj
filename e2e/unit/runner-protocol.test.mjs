@@ -12,7 +12,14 @@ import readline from "node:readline";
 const here = dirname(fileURLToPath(import.meta.url));
 const RUNNER = join(here, "..", "..", "crates", "oj_server", "src", "assets", "start", "runner.mjs");
 
-const STUB_LOADER = "export async function initialize() {}\n";
+const STUB_LOADER = [
+  "export function resolve(spec, ctx, next) { return next(spec, ctx); }",
+  "export function load(url, ctx, next) { return next(url, ctx); }",
+  "export function flushCaches() {}",
+  "export function setVersion() {}",
+  "export function reportCacheStats() {}",
+  "",
+].join("\n");
 
 const STUB_ENTRY = `
 export default {
