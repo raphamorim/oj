@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Raphael Amorim
 
 import http from "node:http";
-import { writeFileSync } from "node:fs";
+import { fstatSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { dirname } from "node:path";
@@ -595,6 +595,13 @@ async function run(hook, args) {
   }
   return null;
 }
+
+try {
+  if (fstatSync(0).isFIFO()) {
+    process.stdin.once("end", () => process.exit(0));
+    process.stdin.once("close", () => process.exit(0));
+  }
+} catch {}
 
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", async (line) => {

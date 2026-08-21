@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Raphael Amorim
 
 import { createRequire } from "node:module";
+import { fstatSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
 import readline from "node:readline";
@@ -28,6 +29,12 @@ async function stylus(base, css, from) {
 }
 
 const rl = readline.createInterface({ input: process.stdin });
+let inflight = 0;
+let stdinClosed = false;
+const maybeExit = () => { if (stdinClosed && inflight === 0) process.exit(0); };
+try {
+  if (fstatSync(0).isFIFO()) rl.once("close", () => { stdinClosed = true; maybeExit(); });
+} catch {}
 rl.on("line", async (line) => {
   let msg;
   try {
@@ -37,6 +44,7 @@ rl.on("line", async (line) => {
   }
   const { id, base, css, from } = msg;
   const ext = String(from || "").split("?")[0].split(".").pop().toLowerCase();
+  inflight += 1;
   try {
     let out = css;
     if (ext === "less") out = await less(base, css, from);
@@ -44,5 +52,8 @@ rl.on("line", async (line) => {
     process.stdout.write(JSON.stringify({ id, css: out }) + "\n");
   } catch (e) {
     process.stdout.write(JSON.stringify({ id, error: String((e && e.message) || e) }) + "\n");
+  } finally {
+    inflight -= 1;
+    maybeExit();
   }
 });

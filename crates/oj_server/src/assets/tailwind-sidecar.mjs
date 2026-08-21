@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Raphael Amorim
 
 import { createRequire } from "node:module";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, fstatSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import readline from "node:readline";
 
@@ -69,14 +69,24 @@ if (process.argv[2] === "--once") {
     .catch((err) => { console.error(String(err)); process.exit(1); });
 } else {
   const rl = readline.createInterface({ input: process.stdin });
+  let inflight = 0;
+  let stdinClosed = false;
+  const maybeExit = () => { if (stdinClosed && inflight === 0) process.exit(0); };
+  try {
+    if (fstatSync(0).isFIFO()) rl.once("close", () => { stdinClosed = true; maybeExit(); });
+  } catch {}
   rl.on("line", async (line) => {
     let msg;
     try { msg = JSON.parse(line); } catch { return; }
+    inflight += 1;
     try {
       const css = await compileCss(msg.base, msg.css, msg.from);
       process.stdout.write(JSON.stringify({ id: msg.id, css }) + "\n");
     } catch (err) {
       process.stdout.write(JSON.stringify({ id: msg.id, error: String(err) }) + "\n");
+    } finally {
+      inflight -= 1;
+      maybeExit();
     }
   });
 }
