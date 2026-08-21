@@ -91,3 +91,61 @@ it("optimize-deps: scans + pre-bundles CJS deps with correct interop", async () 
 
   fs.rmSync(root, { recursive: true, force: true });
 });
+
+it("optimize-deps: resolves tsconfig `paths` with /* and externalizes a dep's CSS/font", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "oj-optdeps2-"));
+  fs.mkdirSync(path.join(root, "node_modules"), { recursive: true });
+  fs.symlinkSync(esbuildSrc, path.join(root, "node_modules", "esbuild"));
+  const esbuildScoped = path.join(repo, "e2e/fixtures/start-app/node_modules/@esbuild");
+  if (fs.existsSync(esbuildScoped)) fs.symlinkSync(esbuildScoped, path.join(root, "node_modules", "@esbuild"));
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "fx2" }));
+
+  // A tsconfig `paths` value contains `/*` — the exact shape a naive JSONC
+  // comment stripper corrupts. If stripJsonc mishandles it, the alias never
+  // loads, `@/aliased` is treated as an external bare dep, and `defprop`
+  // (reachable ONLY through the alias) is never discovered.
+  fs.writeFileSync(
+    path.join(root, "tsconfig.json"),
+    JSON.stringify({ compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/*"] } } }),
+  );
+  pkg("defprop", root, "index.js", {
+    "index.js":
+      `"use strict";\nObject.defineProperty(exports, "__esModule", { value: true });\n` +
+      `Object.defineProperty(exports, "greet", { enumerable: true, get: function () { return greet; } });\n` +
+      `function greet(n) { return "hi " + n; }\n`,
+  });
+  // A JS dep whose (relative) CSS pulls a (relative) .woff2. If those are not
+  // externalized, esbuild fails the whole pre-bundle with "No loader is
+  // configured for .woff2" and nothing gets optimized.
+  pkg("uikit", root, "index.js", {
+    "index.js": `import "./style.css";\nexport const ok = 1;\n`,
+    "style.css": `@font-face { font-family: x; src: url(./f.woff2) format("woff2"); }\n`,
+    "f.woff2": "not-a-real-font",
+  });
+  fs.mkdirSync(path.join(root, "src"), { recursive: true });
+  fs.writeFileSync(path.join(root, "src", "aliased.js"), `import { greet } from "defprop";\nexport const v = greet("z");\n`);
+  fs.writeFileSync(
+    path.join(root, "entry.js"),
+    `import { v } from "@/aliased";\nimport { ok } from "uikit";\nexport const out = v + ok;\n`,
+  );
+
+  const outDir = path.join(root, ".oj-cache", "deps");
+  const cfg = JSON.stringify({ root, outDir, entries: [path.join(root, "entry.js")] });
+  const stdout = execFileSync("node", [sidecar, cfg], { encoding: "utf8" });
+  const { metadata } = JSON.parse(stdout);
+  const names = Object.keys(metadata).sort();
+
+  assert.ok(
+    names.includes("defprop"),
+    `dep reached only through the tsconfig \`@/\` alias must be discovered (stripJsonc + alias traversal); got ${names.join(", ")}`,
+  );
+  assert.ok(
+    names.includes("uikit"),
+    `JS dep with a CSS/font import must still pre-bundle (assets externalized); got ${names.join(", ")}`,
+  );
+  for (const m of Object.values(metadata)) {
+    assert.ok(fs.existsSync(path.join(outDir, m.file)), `missing ${m.file}`);
+  }
+
+  fs.rmSync(root, { recursive: true, force: true });
+});

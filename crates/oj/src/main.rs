@@ -38,11 +38,12 @@ enum Command {
         /// Disable the on-disk module cache (always recompile; also OJ_NO_CACHE=1).
         #[arg(long)]
         no_cache: bool,
-        /// Eagerly crawl and compile the whole module graph on boot. Off by
-        /// default: oj compiles on demand (Vite's model), which paints the first
-        /// route faster, especially on very large apps. Rarely needed.
+        /// Compile modules on demand instead of eagerly crawling the whole graph
+        /// on boot. Opt-in: the eager crawl pre-compiles in parallel and warms
+        /// HMR, which is usually the faster default; --lazy suits apps that
+        /// code-split so the first route needs only a fraction of the graph.
         #[arg(long)]
-        eager: bool,
+        lazy: bool,
     },
     Compile {
         file: PathBuf,
@@ -87,7 +88,7 @@ async fn run() -> anyhow::Result<()> {
             host,
             config,
             no_cache,
-            eager,
+            lazy,
         } => {
             let root = root.unwrap_or_else(|| {
                 let playground = PathBuf::from("playground");
@@ -109,7 +110,7 @@ async fn run() -> anyhow::Result<()> {
                     host,
                     config,
                     no_cache,
-                    lazy: !eager,
+                    lazy,
                 }
                 .run()
                 .await

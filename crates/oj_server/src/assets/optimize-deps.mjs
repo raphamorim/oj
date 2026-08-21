@@ -42,8 +42,46 @@ const NODE_BUILTINS = new Set([...builtinModules.builtinModules, ...builtinModul
 const isBare = (id) => id && !id.startsWith(".") && !id.startsWith("/") && !id.startsWith("\0") && !NODE_BUILTINS.has(id);
 const excludeSet = new Set(exclude);
 
+// Strip // and /* */ comments from JSONC, but only outside string literals. A
+// regex stripper is wrong here: a path pattern like "./src/modules/*" contains
+// `/*`, which a naive block-comment regex treats as a comment start and eats
+// through the next `*/`, corrupting the file (this silently broke tsconfig
+// `paths` loading, so aliased imports were never resolved during the dep scan).
 function stripJsonc(s) {
-  return s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+  let out = "";
+  let inStr = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    const c2 = s[i + 1];
+    if (inStr) {
+      out += c;
+      if (c === "\\") {
+        out += c2 ?? "";
+        i++;
+      } else if (c === '"') {
+        inStr = false;
+      }
+      continue;
+    }
+    if (c === '"') {
+      inStr = true;
+      out += c;
+      continue;
+    }
+    if (c === "/" && c2 === "/") {
+      while (i < s.length && s[i] !== "\n") i++;
+      out += "\n";
+      continue;
+    }
+    if (c === "/" && c2 === "*") {
+      i += 2;
+      while (i < s.length && !(s[i] === "*" && s[i + 1] === "/")) i++;
+      i++;
+      continue;
+    }
+    out += c;
+  }
+  return out;
 }
 
 function loadTsconfigAliases(dir) {
@@ -87,6 +125,33 @@ function aliasResolve(id) {
   return null;
 }
 
+// Match Vite's esbuildDepPlugin: never let esbuild bundle a non-JS type into a
+// dep. Styles, preprocessors, wasm, single-file-component types, and known asset
+// types (fonts, images, media) are externalized — a relative one resolved to an
+// absolute path so its URL is correct, a bare/absolute one kept as-is — and left
+// for oj's own asset/CSS pipeline to serve. Without this a dep whose CSS pulls
+// in a `.woff2` fails the entire pre-bundle ("No loader is configured").
+const EXTERNAL_TYPES = [
+  "css", "scss", "sass", "less", "styl", "stylus", "pcss", "postcss",
+  "wasm",
+  "vue", "svelte", "astro", "imba", "marko",
+  "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "avif", "bmp", "cur",
+  "woff", "woff2", "ttf", "otf", "eot",
+  "mp4", "webm", "ogg", "mp3", "wav", "flac", "aac", "mov", "m4a",
+];
+const EXTERNAL_RE = new RegExp(`\\.(${EXTERNAL_TYPES.join("|")})(\\?.*)?$`, "i");
+const externalizeNonJs = {
+  name: "oj-externalize-non-js",
+  setup(build) {
+    build.onResolve({ filter: EXTERNAL_RE }, (args) => {
+      if (args.path.startsWith(".")) {
+        return { path: path.resolve(args.resolveDir, args.path), external: true };
+      }
+      return { path: args.path, external: true };
+    });
+  },
+};
+
 async function scan() {
   const found = new Set();
   const collector = {
@@ -118,7 +183,7 @@ async function scan() {
       platform: "browser",
       loader: { ".js": "jsx", ".ts": "ts", ".tsx": "tsx", ".jsx": "jsx" },
       jsx: "automatic",
-      plugins: [collector],
+      plugins: [externalizeNonJs, collector],
       metafile: false,
     });
   } catch {}
@@ -150,6 +215,20 @@ for (const dep of deps) {
       continue;
     }
   }
+  // The lingui macro entrypoints are served by oj's runtime shim, never bundled:
+  // pre-bundling them would drag in the whole babel macro toolchain (which
+  // imports node builtins) and, worse, route the specifier to the optimized dep
+  // instead of the shim. oj externalizes these at serve time too.
+  if (/^@lingui\/(macro|core\/macro|react\/macro)$/.test(dep)) {
+    continue;
+  }
+  // Only pre-bundle JavaScript deps. A CSS-only dep (e.g. `@fontsource/*`) is
+  // not a JS module: esbuild would emit a stray .css and choke on the fonts its
+  // @font-face rules pull in, failing the *whole* build. Vite excludes these
+  // from the dep optimizer too; oj serves them directly through its CSS pipeline.
+  if (/\.(css|scss|sass|less|styl|woff2?|ttf|otf|eot|svg|png|jpe?g|gif|webp|avif|mp4|webm|wasm)$/i.test(entry)) {
+    continue;
+  }
   const name = dep.replace(/^@/, "").replace(/[/@]/g, "_");
   entryPoints[name] = entry;
   nameOf[dep] = name;
@@ -172,6 +251,12 @@ if (Object.keys(entryPoints).length) {
     mainFields: ["browser", "module", "main"],
     conditions: ["browser", "module", "import", "development"],
     target: "esnext",
+    // A node-oriented dep (e.g. @react-pdf/renderer, cosmiconfig) may import a
+    // node builtin; externalize them so one such dep can't fail the whole
+    // pre-bundle. The import stays in the output and oj serves a browser stub,
+    // matching Vite's esbuildDepPlugin, which also externalizes builtins.
+    external: [...NODE_BUILTINS],
+    plugins: [externalizeNonJs],
     logLevel: "silent",
     metafile: true,
     write: true,

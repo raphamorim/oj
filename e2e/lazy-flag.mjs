@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 //
-// `oj dev` compiles modules on demand by default (Vite's model): no eager graph
-// crawl on boot, the first route only pays for the modules it imports. `--eager`
-// opts back into crawling the whole graph up front. This asserts both: the
-// default serves without ever logging "eager graph ready", and --eager does.
+// `oj dev` eagerly crawls the module graph by default (parallel pre-compile,
+// warm HMR); `--lazy` opts into compiling on demand (Vite's model), which suits
+// apps that code-split. This asserts both: the default logs "eager graph ready",
+// and --lazy serves the same modules without ever running the crawl.
 
 import { spawn, execSync } from "node:child_process";
 import fs from "node:fs";
@@ -41,10 +41,10 @@ async function waitUp() {
 
 // Run oj, collect stdout, request the entry + main, and report whether the eager
 // crawl ran (it prints "eager graph ready").
-async function run({ eager }) {
+async function run({ lazy }) {
   fs.rmSync(path.join(app, ".oj-cache"), { recursive: true, force: true });
   const args = ["dev", app, "--port", String(port)];
-  if (eager) args.push("--eager");
+  if (lazy) args.push("--lazy");
   const proc = spawn(oj, args, { stdio: ["ignore", "pipe", "ignore"] });
   let out = "";
   proc.stdout.on("data", (d) => (out += d.toString()));
@@ -68,19 +68,19 @@ async function run({ eager }) {
 
 let failed = false;
 try {
-  const lazyOut = await run({ eager: false });
+  const defaultOut = await run({ lazy: false });
+  assert.match(defaultOut, /eager graph ready/, "default must run the eager crawl");
+
+  const lazyOut = await run({ lazy: true });
   assert.ok(
     !/eager graph ready/.test(lazyOut),
-    `default must NOT run the eager crawl:\n${lazyOut}`,
+    `--lazy must NOT run the eager crawl:\n${lazyOut}`,
   );
 
-  const eagerOut = await run({ eager: true });
-  assert.match(eagerOut, /eager graph ready/, "--eager must run the eager crawl");
-
-  console.log("PASS lazy-default");
+  console.log("PASS lazy-flag");
 } catch (e) {
   failed = true;
-  console.error("FAIL lazy-default:", e.message);
+  console.error("FAIL lazy-flag:", e.message);
 } finally {
   fs.rmSync(app, { recursive: true, force: true });
 }
