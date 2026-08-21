@@ -2542,7 +2542,11 @@ fn rewrite_specifier(
             Some(url_of(root, &resolved))
         }
         Err(err) => {
-            if !(spec.starts_with("./") || spec.starts_with("../")) {
+            // Plugin-provided ids (virtual: modules, \0-prefixed) are expected
+            // to miss the on-disk resolver; the caller's plugin fallback serves
+            // them, so a "cannot resolve" line here is just misleading noise.
+            let plugin_virtual = spec.starts_with("virtual:") || spec.starts_with('\0');
+            if !(spec.starts_with("./") || spec.starts_with("../") || plugin_virtual) {
                 eprintln!("oj: cannot resolve '{spec}': {err}");
             }
             None
@@ -3999,6 +4003,20 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_specifier_classification_routes_plugin_virtuals_to_the_fallback() {
+        // Plugin virtuals (`virtual:pwa-register`, \0-prefixed ids) count as
+        // bare, so the plugin-host fallback (/@id/) resolves them; relative and
+        // absolute-URL specifiers do not.
+        assert!(is_bare_specifier("react"));
+        assert!(is_bare_specifier("virtual:pwa-register"));
+        assert!(is_bare_specifier("\0oj-virtual"));
+        assert!(!is_bare_specifier("./local"));
+        assert!(!is_bare_specifier("../up"));
+        assert!(!is_bare_specifier("/abs"));
+        assert!(!is_bare_specifier("https://cdn/x.js"));
+    }
 
     #[test]
     fn ts_source_outside_root_is_not_treated_as_a_dep() {
