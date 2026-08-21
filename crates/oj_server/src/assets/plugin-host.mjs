@@ -215,7 +215,15 @@ try {
   plugins = (Array.isArray(list) ? list : [list]).filter(Boolean);
   allPlugins = plugins;
   plugins = plugins.filter((p) => !OJ_NATIVE_PLUGIN_NAMES.has(p && p.name));
-  plugins = plugins.filter((p) => !OJ_UNSUPPORTED_PLUGIN_NAMES.has(p && p.name));
+  plugins = plugins.filter((p) => {
+    if (OJ_UNSUPPORTED_PLUGIN_NAMES.has(p && p.name)) {
+      process.stderr.write(
+        `${OJ} plugin host: skipping unsupported plugin "${p.name}" (dev-only tooling oj does not host; your app's output is unaffected)\n`,
+      );
+      return false;
+    }
+    return true;
+  });
   plugins = plugins.filter((p) => {
     if (p.apply == null) return true;
     try {
