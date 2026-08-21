@@ -109,10 +109,6 @@ const START_ASSETS: &[(&str, &str)] = &[
         include_str!("assets/start/container-bridge.mjs"),
     ),
     (
-        "container-host.mjs",
-        include_str!("assets/start/container-host.mjs"),
-    ),
-    (
         "glob-transform.mjs",
         include_str!("assets/start/glob-transform.mjs"),
     ),
@@ -181,6 +177,17 @@ pub fn node_compile_cache_opt_in(root: &Path) -> Option<std::ffi::OsString> {
         return None;
     }
     Some(node_compile_cache(root))
+}
+
+pub fn ensure_cache_gitignore(root: &Path) {
+    let dir = root.join(".oj-cache");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let gitignore = dir.join(".gitignore");
+    if !gitignore.exists() {
+        let _ = std::fs::write(gitignore, "*\n");
+    }
 }
 
 pub fn write_start_assets(dir: &Path) -> std::io::Result<()> {
@@ -299,6 +306,7 @@ impl DevServer {
         }
 
         boot_phase("build_app begin");
+        ensure_cache_gitignore(&root);
         let mut config = oj_config::load(&root).map_err(|e| anyhow::anyhow!("{e}"))?;
         plugins::adopt_vite_config_values(&mut config, &root);
         boot_phase("vite config values adopted");
@@ -367,6 +375,14 @@ impl DevServer {
             None => (None, "oj", String::new()),
         };
 
+        let ssr_bridge_dir = if is_start && plugins_path.is_some() {
+            plugins::ensure_ssr_bridge(&root)
+        } else {
+            None
+        };
+        if is_start && ssr_bridge_dir.is_none() {
+            plugins::disable_ssr_bridge(&root);
+        }
         let mut plugin_cfg = serde_json::json!({
             "config": {
                 "root": root.display().to_string(),
@@ -382,8 +398,12 @@ impl DevServer {
             "pluginsFormat": plugins_format,
             "ojStartMode": is_start,
         });
+        if let Some(dir) = &ssr_bridge_dir {
+            plugin_cfg["ssrBridge"] = serde_json::json!({ "dir": dir.display().to_string() });
+        }
         let plugin_config = plugin_cfg.to_string();
         plugin_cfg["environment"]["name"] = serde_json::json!("ssr");
+        plugin_cfg.as_object_mut().unwrap().remove("ssrBridge");
         let ssr_plugin_config = plugin_cfg.to_string();
         boot_phase("plugin host spawning");
         let plugin_host = match plugins_path {
@@ -396,6 +416,9 @@ impl DevServer {
                     // and serve natively. Dropping the Arc kills the process.
                     if host.plugin_count().await == 0 {
                         host.shutdown();
+                        if ssr_bridge_dir.is_some() {
+                            plugins::disable_ssr_bridge(&root);
+                        }
                         println!("  plugins: {plugins_label} (none active after native filtering; served natively)");
                         None
                     } else {
@@ -410,6 +433,9 @@ impl DevServer {
                 }
                 Err(e) => {
                     eprintln!("oj: plugin host failed to start: {e}");
+                    if ssr_bridge_dir.is_some() {
+                        plugins::disable_ssr_bridge(&root);
+                    }
                     None
                 }
             },
