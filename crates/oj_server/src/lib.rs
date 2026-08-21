@@ -148,6 +148,7 @@ const START_ASSETS: &[(&str, &str)] = &[
         include_str!("assets/start/plugin-adapters.ts"),
     ),
     ("manifest.ts", include_str!("assets/start/manifest.ts")),
+    ("manifest-dev.ts", include_str!("assets/start/manifest-dev.ts")),
 ];
 
 pub fn node_compile_cache(root: &Path) -> std::ffi::OsString {

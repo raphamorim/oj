@@ -8,6 +8,8 @@ import { MessageChannel } from "node:worker_threads";
 import readline from "node:readline";
 
 process.env.TSS_SERVER_FN_BASE ??= "/_serverFn/";
+process.env.TSS_DEV_SERVER ??= "true";
+process.env.TSS_DEV_SSR_STYLES_ENABLED ??= "false";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();

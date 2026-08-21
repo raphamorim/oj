@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 
 import { importPkg } from "./resolve-pkg.mjs";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 process.env.VITE_CONFIG_NATIVE_IGNORE_WARNING ??= "true";
 
@@ -57,6 +58,28 @@ function ordered(plugins) {
     else normal.push(p);
   }
   return [...pre, ...normal, ...post];
+}
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+async function withBuildStartLock(fn) {
+  const lock = join(HERE, "buildstart.lock");
+  for (;;) {
+    try { mkdirSync(lock); break; }
+    catch {
+      let pid = 0;
+      try { pid = Number(readFileSync(join(lock, "holder"), "utf8")); } catch {}
+      let alive = false;
+      if (pid) { try { process.kill(pid, 0); alive = true; } catch {} }
+      let expired = false;
+      try { expired = Date.now() - statSync(lock).mtimeMs > 300_000; } catch {}
+      if ((pid && !alive) || expired) { try { rmSync(lock, { recursive: true, force: true }); } catch {} }
+      else await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+  try { writeFileSync(join(lock, "holder"), String(process.pid)); } catch {}
+  try { return await fn(); }
+  finally { try { rmSync(lock, { recursive: true, force: true }); } catch {} }
 }
 
 function findConfig(app) {
@@ -193,21 +216,23 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
   async function buildStart() {
     if (buildStarted) return;
     buildStarted = true;
-    for (const p of plugins) {
-      if (ojReimplemented(p.name) || !envAllows(p, environment)) continue;
-      const h = hookHandler(p.buildStart);
-      if (!h) continue;
-      // Degrade gracefully: oj's plugin context is minimal (e.g. a stubbed
-      // this.resolve), so some plugins' buildStart throw here though they'd
-      // succeed under full Vite. Log and continue rather than abort the whole
-      // dev server — a plugin that genuinely needed buildStart will surface as
-      // its own load() output being wrong, which is strictly better than one
-      // unsupported plugin taking down every other plugin's startup.
-      try { await h.call(ctx, {}); }
-      catch (e) {
-        process.stderr.write(`oj: plugin "${p.name || "?"}" buildStart failed (skipped): ${(e && e.message) || e}\n`);
+    await withBuildStartLock(async () => {
+      for (const p of plugins) {
+        if (ojReimplemented(p.name) || !envAllows(p, environment)) continue;
+        const h = hookHandler(p.buildStart);
+        if (!h) continue;
+        // Degrade gracefully: oj's plugin context is minimal (e.g. a stubbed
+        // this.resolve), so some plugins' buildStart throw here though they'd
+        // succeed under full Vite. Log and continue rather than abort the whole
+        // dev server — a plugin that genuinely needed buildStart will surface as
+        // its own load() output being wrong, which is strictly better than one
+        // unsupported plugin taking down every other plugin's startup.
+        try { await h.call(ctx, {}); }
+        catch (e) {
+          process.stderr.write(`oj: plugin "${p.name || "?"}" buildStart failed (skipped): ${(e && e.message) || e}\n`);
+        }
       }
-    }
+    });
   }
 
   const publicDir = typeof loaded?.config?.publicDir === "string" ? loaded.config.publicDir : null;
