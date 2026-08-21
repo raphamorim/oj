@@ -54,6 +54,9 @@ jobs:
           node e2e/memory-cache.mjs
           node e2e/mtime-fastpath.mjs
           node e2e/hmr-hook-skip.mjs
+      - name: request paths (encoded filenames, traversal containment)
+        if: matrix.mode == 'unbundled'
+        run: node e2e/awkward-paths.mjs
 
   # i need to fix this or automate
   build:
