@@ -52,6 +52,20 @@ pub async fn start_dev(
     oj_server::write_start_assets(&cache)?;
     oj_server::boot_phase("start_dev begin");
 
+    // build_app (vite.config extract + plugin host boot) needs only the root;
+    // starting it first overlaps the plugin host's own config evaluation with
+    // route/resolver codegen, the runner spawn, and the client bundle.
+    let built_task = tokio::spawn(
+        oj_server::DevServer {
+            root: root.clone(),
+            port,
+            bundle: false,
+            host,
+            config: None,
+        }
+        .build_app(),
+    );
+
     let route_tree = {
         let (root, cache) = (root.clone(), cache.clone());
         tokio::task::spawn_blocking(move || generate_route_tree(&root, &cache))
@@ -65,14 +79,6 @@ pub async fn start_dev(
         let (root, cache) = (root.clone(), cache.clone());
         tokio::task::spawn_blocking(move || bundle_client_entry_cached(&root, &cache))
     };
-    let built_fut = oj_server::DevServer {
-        root: root.clone(),
-        port,
-        bundle: false,
-        host,
-        config: None,
-    }
-    .build_app();
     resolver.await??;
     // The runner's SSR module-graph walk dominates boot time; start it now so
     // it overlaps the client bundle (the manifest reads CSS lazily, so the
@@ -88,9 +94,9 @@ pub async fn start_dev(
             let _ = forward(&runner, "GET".into(), "/".into(), vec![], None).await;
         });
     }
-    let (bundle_res, built_res) = tokio::join!(bundle, built_fut);
+    let (bundle_res, built_res) = tokio::join!(bundle, built_task);
     let pinned = bundle_res??;
-    let built = built_res?;
+    let built = built_res??;
     let css_host = if app_uses_tailwind(&root) {
         spawn_node_service(&root, &cache.join("css-host.mjs"))
             .await
