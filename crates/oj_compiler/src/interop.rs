@@ -32,39 +32,46 @@ pub fn rewrite_cjs_interop(
                 let Some(url) = interop(decl.source.value.as_str()) else {
                     continue;
                 };
-                let ns = format!("__ojcjs{idx}");
+                let ns = format!("__ojns{idx}");
+                let cjs = format!("__ojcjs{idx}");
                 idx += 1;
 
-                let mut out = format!("import {ns} from {};", json_str(&url));
-                match &decl.specifiers {
-                    None => {
-                        out = format!("import {};", json_str(&url));
+                // Namespace import + the robust CommonJS value (what `require()`
+                // returns): oj-wrapped CJS exposes it as `__cjs_exports`,
+                // esbuild-prebundled and ESM-with-default expose `default`, a plain
+                // ESM namespace is itself. Named imports read off this value, so a
+                // barrel like @sniptt/guards (sets __esModule, so `default` is
+                // undefined, but carries its names on module.exports) still resolves.
+                let cjs_value = format!(
+                    "{ns} && {ns}.__cjs_exports !== undefined ? {ns}.__cjs_exports : ({ns} && {ns}.default !== undefined ? {ns}.default : {ns})",
+                );
+                let mut out = match &decl.specifiers {
+                    None => format!("import {};", json_str(&url)),
+                    Some(_) => {
+                        format!("import * as {ns} from {};const {cjs} = {cjs_value};", json_str(&url))
                     }
-                    Some(specs) => {
-                        let mut names: Vec<String> = Vec::new();
-                        for spec in specs {
-                            match spec {
-                                ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
-                                    out.push_str(&format!(
-                                        "const {} = {ns} && {ns}.__esModule ? {ns}.default : {ns};",
-                                        s.local.name
-                                    ));
-                                }
-                                ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
-                                    out.push_str(&format!("const {} = {ns};", s.local.name));
-                                }
-                                ImportDeclarationSpecifier::ImportSpecifier(s) => {
-                                    names.push(format!(
-                                        "{}: {}",
-                                        json_key(&export_name(&s.imported)),
-                                        s.local.name
-                                    ));
-                                }
+                };
+                if let Some(specs) = &decl.specifiers {
+                    let mut names: Vec<String> = Vec::new();
+                    for spec in specs {
+                        match spec {
+                            ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
+                                out.push_str(&format!("const {} = {cjs};", s.local.name));
+                            }
+                            ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
+                                out.push_str(&format!("const {} = {ns};", s.local.name));
+                            }
+                            ImportDeclarationSpecifier::ImportSpecifier(s) => {
+                                names.push(format!(
+                                    "{}: {}",
+                                    json_key(&export_name(&s.imported)),
+                                    s.local.name
+                                ));
                             }
                         }
-                        if !names.is_empty() {
-                            out.push_str(&format!("const {{ {} }} = {ns};", names.join(", ")));
-                        }
+                    }
+                    if !names.is_empty() {
+                        out.push_str(&format!("const {{ {} }} = {cjs};", names.join(", ")));
                     }
                 }
                 edits.push((decl.span.start as usize, decl.span.end as usize, out));
@@ -80,10 +87,17 @@ pub fn rewrite_cjs_interop(
                     continue;
                 };
                 let n = idx;
-                let ns = format!("__ojcjs{n}");
+                let ns = format!("__ojns{n}");
+                let cjs = format!("__ojcjs{n}");
                 idx += 1;
 
-                let mut out = format!("import {ns} from {};", json_str(&url));
+                let cjs_value = format!(
+                    "{ns} && {ns}.__cjs_exports !== undefined ? {ns}.__cjs_exports : ({ns} && {ns}.default !== undefined ? {ns}.default : {ns})",
+                );
+                let mut out = format!(
+                    "import * as {ns} from {};const {cjs} = {cjs_value};",
+                    json_str(&url)
+                );
                 let mut tmp = 0usize;
                 for spec in &decl.specifiers {
                     if spec.export_kind.is_type() {
@@ -92,9 +106,9 @@ pub fn rewrite_cjs_interop(
                     let local = export_name(&spec.local);
                     let exported = export_name(&spec.exported);
                     let value = if local == "default" {
-                        format!("{ns} && {ns}.__esModule ? {ns}.default : {ns}")
+                        cjs.clone()
                     } else {
-                        format!("{ns}[{}]", json_str(&local))
+                        format!("{cjs}[{}]", json_str(&local))
                     };
                     let t = format!("__ojex{n}_{tmp}");
                     tmp += 1;
@@ -176,15 +190,14 @@ mod tests {
     fn default_import_unwraps_esmodule() {
         let out = run(r#"import Foo from "cjs-dep";"#);
         assert!(
-            out.contains(r#"import __ojcjs0 from "/@oj-deps/cjs-dep.mjs";"#),
+            out.contains(r#"import * as __ojns0 from "/@oj-deps/cjs-dep.mjs";"#),
             "{out}"
         );
         assert!(
-            out.contains(
-                "const Foo = __ojcjs0 && __ojcjs0.__esModule ? __ojcjs0.default : __ojcjs0;"
-            ),
-            "{out}"
+            out.contains("__ojns0.__cjs_exports !== undefined ? __ojns0.__cjs_exports"),
+            "cjs value prefers __cjs_exports: {out}"
         );
+        assert!(out.contains("const Foo = __ojcjs0;"), "{out}");
     }
 
     #[test]
@@ -196,19 +209,14 @@ mod tests {
     #[test]
     fn mixed_default_and_named() {
         let out = run(r#"import D, { x } from "cjs-dep";"#);
-        assert!(
-            out.contains(
-                "const D = __ojcjs0 && __ojcjs0.__esModule ? __ojcjs0.default : __ojcjs0;"
-            ),
-            "{out}"
-        );
+        assert!(out.contains("const D = __ojcjs0;"), "{out}");
         assert!(out.contains("const { x: x } = __ojcjs0;"), "{out}");
     }
 
     #[test]
     fn namespace_import_binds_module_exports() {
         let out = run(r#"import * as ns from "cjs-dep";"#);
-        assert!(out.contains("const ns = __ojcjs0;"), "{out}");
+        assert!(out.contains("const ns = __ojns0;"), "{out}");
     }
 
     #[test]
@@ -246,7 +254,7 @@ mod tests {
     fn reexport_named_from_cjs() {
         let out = run(r#"export { a, b as c } from "cjs-dep";"#);
         assert!(
-            out.contains(r#"import __ojcjs0 from "/@oj-deps/cjs-dep.mjs";"#),
+            out.contains(r#"import * as __ojns0 from "/@oj-deps/cjs-dep.mjs";"#),
             "{out}"
         );
         assert!(
@@ -262,12 +270,7 @@ mod tests {
     #[test]
     fn reexport_default_from_cjs_unwraps() {
         let out = run(r#"export { default as X } from "cjs-dep";"#);
-        assert!(
-            out.contains(
-                "const __ojex0_0 = __ojcjs0 && __ojcjs0.__esModule ? __ojcjs0.default : __ojcjs0;"
-            ),
-            "{out}",
-        );
+        assert!(out.contains("const __ojex0_0 = __ojcjs0;"), "{out}");
         assert!(out.contains("export { __ojex0_0 as X };"), "{out}");
     }
 

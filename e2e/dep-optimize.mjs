@@ -57,8 +57,8 @@ try {
 
   const main = await get("/main.js");
   assert.equal(main.status, 200);
-  assert.match(main.body, /import __ojcjs0 from "\/@oj-deps\/cjs-lib\.mjs"/, "consumer redirected to optimized dep");
-  assert.match(main.body, /const \{ greet[^}]*\} = __ojcjs0/, "named import destructured from module.exports");
+  assert.match(main.body, /import \* as __ojns0 from "\/@oj-deps\/cjs-lib\.mjs"/, "consumer redirected to optimized dep");
+  assert.match(main.body, /const \{ greet[^}]*\} = __ojcjs0/, "named import destructured from the cjs value");
 
   const dep = await get("/@oj-deps/cjs-lib.mjs");
   assert.equal(dep.status, 200);

@@ -1801,7 +1801,10 @@ async fn ensure_module(
                     plugin_watch_files = watches;
                     code
                 }
-                Err(_) => source,
+                Err(e) => {
+                    eprintln!("oj: plugin transform failed for {}: {e}", file.display());
+                    source
+                }
             }
         }
         _ => source,
@@ -1958,10 +1961,32 @@ async fn ensure_module(
             } else {
                 let interopped =
                     oj_compiler::interop::rewrite_cjs_interop(&source, &file_owned, &|spec| {
-                        dep_map
-                            .get(spec)
-                            .filter(|m| m.needs_interop)
-                            .map(|m| format!("/@oj-deps/{}", m.file))
+                        // lingui macro entrypoints go to the shim (which has real
+                        // named exports), never through default-access interop.
+                        if is_lingui_macro_specifier(spec) {
+                            return None;
+                        }
+                        if let Some(m) = dep_map.get(spec).filter(|m| m.needs_interop) {
+                            return Some(format!("/@oj-deps/{}", m.file));
+                        }
+                        // A directly-served bare CJS dep (not pre-bundled): rewrite
+                        // `import { x } from "dep"` to read x off the default export,
+                        // so runtime-assigned CJS exports resolve. Vite pre-bundles
+                        // these; oj interops at the importer instead. Restricted to
+                        // node_modules so aliased app source (`~/x`, `@/x`, which
+                        // is_bare_specifier also matches) is never treated as a dep.
+                        if is_bare_specifier(spec) && dep_map.get(spec).is_none() {
+                            if let Ok(resolved) = resolver.resolve(&dir, spec) {
+                                let in_node_modules = resolved
+                                    .components()
+                                    .any(|c| c.as_os_str() == "node_modules");
+                                if in_node_modules && is_cjs_dep_file(&resolved) {
+                                    fs_allow.lock().unwrap().insert(package_root(&resolved));
+                                    return Some(url_of(&root, &resolved));
+                                }
+                            }
+                        }
+                        None
                     });
                 let opts = if is_svelte {
                     oj_compiler::CompileOptions {
@@ -3092,6 +3117,26 @@ fn is_lingui_macro_specifier(spec: &str) -> bool {
         spec,
         "@lingui/macro" | "@lingui/core/macro" | "@lingui/react/macro"
     )
+}
+
+// Whether a resolved dependency file is CommonJS (no ESM syntax), i.e. it will
+// be served through wrap_cjs with `default` = module.exports. Used to decide
+// whether a bare `import { x } from "cjs-dep"` needs importer-side interop
+// (rewriting the named import to a property read off the default), since a CJS
+// dep whose named exports are assigned at runtime (e.g. file-saver's `saveAs`)
+// exposes no static ESM named bindings. Cached: a file's module kind is stable.
+fn is_cjs_dep_file(path: &Path) -> bool {
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<PathBuf, bool>>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&v) = cache.lock().unwrap().get(path) {
+        return v;
+    }
+    let v = match std::fs::read_to_string(path) {
+        Ok(src) => !oj_compiler::cjs::has_module_syntax_pub(path, &src),
+        Err(_) => false,
+    };
+    cache.lock().unwrap().insert(path.to_path_buf(), v);
+    v
 }
 
 fn warn_lingui_macro_shim_once() {

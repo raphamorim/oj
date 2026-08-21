@@ -17,6 +17,12 @@ const ssrEnvBase = { ...process.env };
 process.env.VITE_CONFIG_NATIVE_IGNORE_WARNING ??= "true";
 const env = initial.env ?? { command: "serve", mode: "development" };
 
+// resolve.alias from the app's own vite config (loaded below for its plugins).
+// oj applies aliases in its Rust resolver and does not forward them in the
+// config it hands the host, so createResolver — which plugins like wyw-in-js use
+// to resolve modules during CSS evaluation — would otherwise see no aliases.
+let userResolveAlias = null;
+
 // This process hosts untrusted third-party plugin code. A plugin that spawns a
 // worker or a floating promise which throws asynchronously would otherwise take
 // the whole host down, and with it every other plugin. The host's own request
@@ -123,9 +129,18 @@ function applyAlias(id, entries) {
     if (typeof replacement !== "string") continue;
     if (find instanceof RegExp) {
       if (find.test(id)) return id.replace(find, replacement);
-    } else if (typeof find === "string") {
-      if (id === find) return replacement;
-      if (id.startsWith(find + "/")) return replacement + id.slice(find.length);
+      continue;
+    }
+    if (typeof find !== "string") continue;
+    // oj's config extractor emits directory aliases with a trailing slash
+    // (`"@/"` -> "<abs>/src/modules/"); normalize so both `"@"` and `"@/"`
+    // forms match `@/foo` and join cleanly.
+    const f = find.endsWith("/") ? find.slice(0, -1) : find;
+    if (id === f) return replacement;
+    if (id.startsWith(f + "/")) {
+      const rest = id.slice(f.length + 1);
+      const rep = replacement.endsWith("/") ? replacement : replacement + "/";
+      return rep + rest;
     }
   }
   return id;
@@ -148,7 +163,8 @@ function probeFile(p, exts) {
 }
 
 function makeCreateResolver(config) {
-  const entries = aliasEntries(config.resolve?.alias);
+  let entries = aliasEntries(config.resolve?.alias);
+  if (entries.length === 0) entries = aliasEntries(userResolveAlias);
   const exts =
     Array.isArray(config.resolve?.extensions) && config.resolve.extensions.length
       ? config.resolve.extensions
@@ -285,6 +301,7 @@ try {
   let list;
   if (initial.pluginsFormat === "vite") {
     const cfg = await loadViteConfig(pluginsPath);
+    userResolveAlias = cfg?.resolve?.alias ?? null;
     list = await Promise.all((cfg?.plugins ?? []).flat(Infinity));
   } else {
     const mod = await import(pathToFileURL(pluginsPath).href);
