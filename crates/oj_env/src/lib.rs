@@ -62,11 +62,11 @@ fn expand(input: &str, vars: &BTreeMap<String, String>) -> String {
             continue;
         }
         if c == b'$' {
-            let (name, next) = if bytes.get(i + 1) == Some(&b'{') {
-                match input[i + 2..].find('}') {
-                    Some(rel) => (&input[i + 2..i + 2 + rel], i + 2 + rel + 1),
-                    None => (&input[i + 1..i + 1], i + 1),
-                }
+            let reference: Option<(&str, usize)> = if bytes.get(i + 1) == Some(&b'{') {
+                input[i + 2..]
+                    .find('}')
+                    .map(|rel| (&input[i + 2..i + 2 + rel], i + 2 + rel + 1))
+                    .filter(|(name, _)| !name.is_empty())
             } else {
                 let start = i + 1;
                 let mut end = start;
@@ -75,16 +75,20 @@ fn expand(input: &str, vars: &BTreeMap<String, String>) -> String {
                 {
                     end += 1;
                 }
-                (&input[start..end], end)
+                (end > start).then(|| (&input[start..end], end))
             };
-            if !name.is_empty() {
+            if let Some((name, next)) = reference {
                 out.push_str(vars.get(name).map(String::as_str).unwrap_or(""));
                 i = next;
                 continue;
             }
         }
-        out.push(c as char);
-        i += 1;
+        let ch = input[i..]
+            .chars()
+            .next()
+            .expect("loop only advances to char boundaries");
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }

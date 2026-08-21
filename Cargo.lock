@@ -1890,7 +1890,9 @@ dependencies = [
 name = "oj_env"
 version = "0.0.45"
 dependencies = [
+ "proptest",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
