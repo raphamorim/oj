@@ -1690,7 +1690,7 @@ async fn ensure_module(
         return Ok((String::new(), module));
     }
 
-    let is_dep_early = url.contains("/node_modules/") || url.starts_with("/@fs/");
+    let is_dep_early = is_dep_module(url, file);
     let is_server = is_server_module(file) && !is_dep_early && !state.bundle;
 
     let mode = if state.bundle {
@@ -1753,7 +1753,7 @@ async fn ensure_module(
         return Ok((key, module));
     }
 
-    let is_dep = url.contains("/node_modules/") || url.starts_with("/@fs/");
+    let is_dep = is_dep_module(url, file);
     let mut plugin_watch_files: Vec<String> = Vec::new();
     let source = match &state.plugins {
         Some(host) if !is_dep && state.plugins_have_transform => {
@@ -2253,6 +2253,18 @@ async fn run_css_sidecar(
 
 fn is_preprocessor(url: &str) -> bool {
     sidecar::is_less(url) || sidecar::is_stylus(url)
+}
+
+// Whether a module served from node_modules or /@fs/ is a dependency (routed to
+// the dep/CJS-interop path) rather than app/workspace source. A TS/JSX-extension
+// file is always source and must be transpiled, even outside the root: monorepo
+// packages reached through a resolve.alias are served via /@fs/ but are source.
+fn is_dep_module(url: &str, file: &Path) -> bool {
+    let src_ext = matches!(
+        file.extension().and_then(|e| e.to_str()),
+        Some("ts" | "tsx" | "jsx" | "mts" | "cts")
+    );
+    !src_ext && (url.contains("/node_modules/") || url.starts_with("/@fs/"))
 }
 
 fn is_style_ext(ext: &str) -> bool {
@@ -3987,6 +3999,25 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ts_source_outside_root_is_not_treated_as_a_dep() {
+        // A monorepo package reached through a resolve.alias is served via /@fs/
+        // but is TS/JSX source that must be transpiled, not dep/CJS-interop'd.
+        let fs = Path::new("/repo/packages/ui/src/Button.tsx");
+        assert!(!is_dep_module("/@fs/repo/packages/ui/src/Button.tsx", fs));
+        let ts = Path::new("/repo/packages/ui/src/index.ts");
+        assert!(!is_dep_module("/@fs/repo/packages/ui/src/index.ts", ts));
+        // A real dependency (.js/.mjs, or anything under node_modules that is not
+        // TS/JSX source) stays on the dep path.
+        let dep = Path::new("/app/node_modules/react/index.js");
+        assert!(is_dep_module("/node_modules/react/index.js", dep));
+        let fs_js = Path::new("/repo/packages/ui/dist/index.mjs");
+        assert!(is_dep_module("/@fs/repo/packages/ui/dist/index.mjs", fs_js));
+        // App-local source (not node_modules, not /@fs/) is never a dep.
+        let local = Path::new("/app/src/App.tsx");
+        assert!(!is_dep_module("/src/App.tsx", local));
+    }
 
     #[test]
     fn html_injection_puts_preamble_first_in_head() {
