@@ -33,35 +33,41 @@ export function assetsPlugin({ mode = "dev", server = false, fsBase = "/@oj-star
   const urlFor = makeUrlFor({ mode, fsBase, emit });
   return {
     name: "oj-assets",
-    async resolveId(source, importer, options) {
-      if (options?.custom?.ojAsset) return null;
-      let tag = null;
-      if (/\?raw$/.test(source)) tag = "raw";
-      else if (/\?url$/.test(source)) tag = "url";
-      else if (/\?inline$/.test(source)) tag = "inline";
-      else if (ASSET_EXT.test(source)) tag = "url";
-      else if (/\.css(\?|$)/.test(source)) tag = "css";
-      if (!tag) return null;
-      const clean = source.replace(SUFFIX, "").replace(/\?.*$/, "");
-      const r = await this.resolve(clean, importer, { skipSelf: true, custom: { ojAsset: true } });
-      if (!r) return null;
-      return V(tag, r.id);
+    resolveId: {
+      filter: { id: { include: [SUFFIX, ASSET_EXT, /\.css(\?|$)/] } },
+      async handler(source, importer, options) {
+        if (options?.custom?.ojAsset) return null;
+        let tag = null;
+        if (/\?raw$/.test(source)) tag = "raw";
+        else if (/\?url$/.test(source)) tag = "url";
+        else if (/\?inline$/.test(source)) tag = "inline";
+        else if (ASSET_EXT.test(source)) tag = "url";
+        else if (/\.css(\?|$)/.test(source)) tag = "css";
+        if (!tag) return null;
+        const clean = source.replace(SUFFIX, "").replace(/\?.*$/, "");
+        const r = await this.resolve(clean, importer, { skipSelf: true, custom: { ojAsset: true } });
+        if (!r) return null;
+        return V(tag, r.id);
+      },
     },
-    async load(id) {
-      const v = parseV(id);
-      if (!v) return null;
-      const js = (code) => ({ code, moduleType: "js" });
-      if (v.tag === "raw") return js(`export default ${JSON.stringify(readFileSync(v.path, "utf8"))};`);
-      if (v.tag === "url") return js(`export default ${JSON.stringify(await urlFor(v.path))};`);
-      if (v.tag === "inline") return js(`export default ${JSON.stringify(dataUri(v.path))};`);
-      if (v.tag === "css") {
-        if (!server) {
-          const href = await urlFor(v.path);
-          if (cssUrls && !cssUrls.includes(href)) cssUrls.push(href);
+    load: {
+      filter: { id: /^\0oj-(raw|url|inline|css):/ },
+      async handler(id) {
+        const v = parseV(id);
+        if (!v) return null;
+        const js = (code) => ({ code, moduleType: "js" });
+        if (v.tag === "raw") return js(`export default ${JSON.stringify(readFileSync(v.path, "utf8"))};`);
+        if (v.tag === "url") return js(`export default ${JSON.stringify(await urlFor(v.path))};`);
+        if (v.tag === "inline") return js(`export default ${JSON.stringify(dataUri(v.path))};`);
+        if (v.tag === "css") {
+          if (!server) {
+            const href = await urlFor(v.path);
+            if (cssUrls && !cssUrls.includes(href)) cssUrls.push(href);
+          }
+          return js("export default {};");
         }
-        return js("export default {};");
-      }
-      return null;
+        return null;
+      },
     },
   };
 }
@@ -84,71 +90,80 @@ export function makeVitePlugins({ container, fallback, appRoot, mode = "dev", fs
       if (container?.buildStart) await container.buildStart();
       if (fallback?.buildStart && fallback !== container) await fallback.buildStart();
     },
-    async resolveId(source, importer, options) {
-      if (options?.custom?.ojSvg) return null;
-      if (/\.svg\?react$/.test(source)) {
-        const r = await this.resolve(source.slice(0, -"?react".length), importer, {
-          skipSelf: true,
-          custom: { ojSvg: true },
-        });
-        return r ? V("svg-react", r.id) : null;
-      }
-      if (!container) return null;
-      if (/^virtual:/.test(source) || source.startsWith("\0")) {
-        if (parseV(source)) return null;
-        const rid = await container.resolveId(source, importer);
-        return rid ? V("vite-virtual", rid) : null;
-      }
-      return null;
-    },
-    async load(id) {
-      const v = parseV(id);
-      if (v && v.tag === "svg-react") return svgModule(v.path, v.path + "?react");
-      if (v && v.tag === "vite-virtual") {
-        let code = await container.load(v.path);
-        if (code == null && fallback) code = await fallback.load(v.path);
-        if (code == null) {
-          if (!warnedVirtual.has(v.path)) {
-            warnedVirtual.add(v.path);
-            process.stderr.write(
-              `oj: plugin virtual "${v.path}" produced no content in the dev client bundle; ` +
-                `emitting an empty module. This virtual likely needs the full build graph oj does not run in dev.\n`,
-            );
-          }
-          return { code: emptyVirtualStub(appRoot, v.path), moduleType: "js" };
+    resolveId: {
+      filter: { id: { include: [/\.svg\?react$/, /^virtual:/, /^\0/] } },
+      async handler(source, importer, options) {
+        if (options?.custom?.ojSvg) return null;
+        if (/\.svg\?react$/.test(source)) {
+          const r = await this.resolve(source.slice(0, -"?react".length), importer, {
+            skipSelf: true,
+            custom: { ojSvg: true },
+          });
+          return r ? V("svg-react", r.id) : null;
         }
-        return { code, moduleType: "jsx" };
-      }
-      if (/\.svg$/.test(id) && !id.startsWith("\0")) return svgModule(id, id);
-      // A user plugin's load() may override a real on-disk source file (Vite:
-      // load runs before the fs read). Consult it for user files in the build
-      // too, so compile-on-startup plugins produce the same output as dev.
-      if (container && !id.startsWith("\0") && !id.includes("/node_modules/")) {
-        const cleanId = id.replace(/\?.*$/, "");
-        if (/\.(jsx?|mjs|tsx?)$/.test(cleanId)) {
-          let code = await container.load(cleanId);
-          if (code == null && fallback) code = await fallback.load(cleanId);
-          if (code != null) {
-            const moduleType = cleanId.endsWith(".tsx")
-              ? "tsx"
-              : cleanId.endsWith(".ts")
-                ? "ts"
-                : cleanId.endsWith(".jsx")
-                  ? "jsx"
-                  : "js";
-            return { code, moduleType };
+        if (!container) return null;
+        if (/^virtual:/.test(source) || source.startsWith("\0")) {
+          if (parseV(source)) return null;
+          const rid = await container.resolveId(source, importer);
+          return rid ? V("vite-virtual", rid) : null;
+        }
+        return null;
+      },
+    },
+    load: {
+      filter: { id: { include: [/^\0oj-/, /\.svg$/, /^(?!.*\/node_modules\/).*\.(jsx?|mjs|tsx?)(\?|$)/] } },
+      async handler(id) {
+        const v = parseV(id);
+        if (v && v.tag === "svg-react") return svgModule(v.path, v.path + "?react");
+        if (v && v.tag === "vite-virtual") {
+          let code = await container.load(v.path);
+          if (code == null && fallback) code = await fallback.load(v.path);
+          if (code == null) {
+            if (!warnedVirtual.has(v.path)) {
+              warnedVirtual.add(v.path);
+              process.stderr.write(
+                `oj: plugin virtual "${v.path}" produced no content in the dev client bundle; ` +
+                  `emitting an empty module. This virtual likely needs the full build graph oj does not run in dev.\n`,
+              );
+            }
+            return { code: emptyVirtualStub(appRoot, v.path), moduleType: "js" };
+          }
+          return { code, moduleType: "jsx" };
+        }
+        if (/\.svg$/.test(id) && !id.startsWith("\0")) return svgModule(id, id);
+        // A user plugin's load() may override a real on-disk source file (Vite:
+        // load runs before the fs read). Consult it for user files in the build
+        // too, so compile-on-startup plugins produce the same output as dev.
+        if (container && !id.startsWith("\0") && !id.includes("/node_modules/")) {
+          const cleanId = id.replace(/\?.*$/, "");
+          if (/\.(jsx?|mjs|tsx?)$/.test(cleanId)) {
+            let code = await container.load(cleanId);
+            if (code == null && fallback) code = await fallback.load(cleanId);
+            if (code != null) {
+              const moduleType = cleanId.endsWith(".tsx")
+                ? "tsx"
+                : cleanId.endsWith(".ts")
+                  ? "ts"
+                  : cleanId.endsWith(".jsx")
+                    ? "jsx"
+                    : "js";
+              return { code, moduleType };
+            }
           }
         }
-      }
-      return null;
+        return null;
+      },
     },
-    async transform(code, id) {
-      if (!container) return null;
-      if (/\.mdx?$/.test(id)) {
-        const out = await container.transform(code, id);
-        return out == null ? null : out;
-      }
-      return null;
+    transform: {
+      filter: { id: /\.mdx?$/ },
+      async handler(code, id) {
+        if (!container) return null;
+        if (/\.mdx?$/.test(id)) {
+          const out = await container.transform(code, id);
+          return out == null ? null : out;
+        }
+        return null;
+      },
     },
   };
 }
@@ -184,13 +199,19 @@ function shimSource(spec) {
 }
 export const nodeBuiltinShims = {
   name: "node-builtin-shims",
-  resolveId(source) {
-    if (/^node:/.test(source) || BARE_BUILTINS.test(source)) return V("node-shim", source);
-    return null;
+  resolveId: {
+    filter: { id: { include: [/^node:/, BARE_BUILTINS] } },
+    handler(source) {
+      if (/^node:/.test(source) || BARE_BUILTINS.test(source)) return V("node-shim", source);
+      return null;
+    },
   },
-  load(id) {
-    const v = parseV(id);
-    return v && v.tag === "node-shim" ? { code: shimSource(v.path), moduleType: "js" } : null;
+  load: {
+    filter: { id: /^\0oj-node-shim:/ },
+    handler(id) {
+      const v = parseV(id);
+      return v && v.tag === "node-shim" ? { code: shimSource(v.path), moduleType: "js" } : null;
+    },
   },
 };
 
