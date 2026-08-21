@@ -25,7 +25,7 @@ struct StartState {
     proxy_prefixes: Vec<String>,
     plugin_mw_port: Option<u16>,
     runner: Arc<tokio::sync::Mutex<Runner>>,
-    client_bundle: PathBuf,
+    bundle: std::sync::RwLock<Arc<PinnedBundle>>,
     live_reload: PathBuf,
     workspace_root: PathBuf,
     reload_tx: broadcast::Sender<()>,
@@ -60,7 +60,12 @@ pub async fn start_dev(
     route_tree.await??;
     let bundle = {
         let (root, cache) = (root.clone(), cache.clone());
-        tokio::task::spawn_blocking(move || bundle_client_entry(&root, &cache))
+        tokio::task::spawn_blocking(move || -> anyhow::Result<PinnedBundle> {
+            bundle_client_entry(&root, &cache)?;
+            PinnedBundle::from_build_dir(&cache).ok_or_else(|| {
+                anyhow::anyhow!("client chunk index missing after successful bundle")
+            })
+        })
     };
     let built_fut = oj_server::DevServer {
         root: root.clone(),
@@ -71,7 +76,7 @@ pub async fn start_dev(
     }
     .build_app();
     let (bundle_res, built_res) = tokio::join!(bundle, built_fut);
-    bundle_res??;
+    let pinned = bundle_res??;
     resolver.await??;
     let built = built_res?;
     let runner = spawn_start_runner(&root, &cache).await?;
@@ -88,7 +93,7 @@ pub async fn start_dev(
         proxy_prefixes: built.proxy_prefixes.clone(),
         plugin_mw_port: built.plugin_mw_port,
         runner: Arc::new(tokio::sync::Mutex::new(runner)),
-        client_bundle: cache.join("client-entry.js"),
+        bundle: std::sync::RwLock::new(Arc::new(pinned)),
         live_reload: cache.join("live-reload.js"),
         workspace_root: workspace_root(&root),
         reload_tx: reload_tx.clone(),
@@ -253,9 +258,15 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             rt.block_on(async {
                 let (r, c) = (root.clone(), cache.clone());
                 let client = tokio::task::spawn_blocking(move || {
-                    let _ = bundle_client_entry(&r, &c);
+                    if bundle_client_entry(&r, &c).is_err() {
+                        return None;
+                    }
+                    PinnedBundle::from_build_dir(&c)
                 });
-                let (_, _) = tokio::join!(client, reload_runner(&state));
+                let (pinned, _) = tokio::join!(client, reload_runner(&state));
+                if let Ok(Some(pinned)) = pinned {
+                    *state.bundle.write().unwrap() = Arc::new(pinned);
+                }
             });
             let _ = state.reload_tx.send(());
             let modules = client_module_count(&cache);
@@ -316,6 +327,40 @@ fn bundle_client_entry(root: &Path, cache: &Path) -> anyhow::Result<()> {
         &cache.join("bundle-client.mjs"),
         "client entry bundling",
     )
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PinnedBundle {
+    entry: String,
+    chunks: std::collections::HashMap<String, PinnedChunk>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PinnedChunk {
+    path: PathBuf,
+}
+
+impl PinnedBundle {
+    fn chunk(&self, name: &str) -> Option<&PinnedChunk> {
+        self.chunks
+            .get(name)
+            .or_else(|| (name == "client-entry.js").then(|| self.chunks.get(&self.entry))?)
+    }
+
+    fn from_build_dir(start_dir: &Path) -> Option<Self> {
+        let raw = std::fs::read_to_string(start_dir.join("client-chunks.json")).ok()?;
+        let index: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        let entry = index.get("entry")?.as_str()?.to_string();
+        let chunk_dir = start_dir.join("client-chunks");
+        let files = index.get("files")?.as_array()?;
+        let mut chunks = std::collections::HashMap::with_capacity(files.len());
+        for f in files {
+            let name = f.get("name")?.as_str()?.to_string();
+            let path = chunk_dir.join(&name);
+            chunks.insert(name, PinnedChunk { path });
+        }
+        Some(Self { entry, chunks })
+    }
 }
 
 // Client module count written by bundle-client.mjs, for update/boot narration.
@@ -451,14 +496,14 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
             Err(e) => e.into_response(),
         };
     }
-    if req.uri().path() == "/@oj-start/client-entry.js" {
-        return serve_js(&state.client_bundle, "client entry").await;
-    }
     if req.uri().path() == "/@oj-start/live-reload.js" {
         return serve_js(&state.live_reload, "live-reload client").await;
     }
-    if let Some(abs) = req.uri().path().strip_prefix("/@oj-start/fs") {
-        return serve_fs_asset(&state, abs).await;
+    if let Some(rest) = req.uri().path().strip_prefix("/@oj-start/fs/") {
+        return serve_fs_asset(&state, &format!("/{rest}")).await;
+    }
+    if let Some(name) = req.uri().path().strip_prefix("/@oj-start/") {
+        return serve_client_chunk(&state, name).await;
     }
     if req.uri().path().starts_with("/_serverFn/") {
         let method = req.method().to_string();
@@ -497,6 +542,40 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
             forward(&state, "GET".into(), document_url(&raw), vec![], None).await
         }
         Route::Pass => next.run(req).await,
+    }
+}
+
+async fn serve_client_chunk(state: &StartState, name: &str) -> Response {
+    let name = percent_decode(name);
+    let bundle = state
+        .bundle
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let Some(chunk) = bundle.chunk(&name) else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("oj start: {name} is not in the client bundle manifest"),
+        )
+            .into_response();
+    };
+    match tokio::fs::read(&chunk.path).await {
+        Ok(bytes) => {
+            let ext = name.rsplit('.').next().unwrap_or("");
+            (
+                [
+                    (header::CONTENT_TYPE, asset_mime(ext)),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("oj start: chunk {name}: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -689,15 +768,7 @@ mod tests {
     use super::*;
 
     fn tmp(label: &str) -> PathBuf {
-        // A fresh directory per call: this wipes the path before creating it, so
-        // two tests that pass the same label would race -- one clearing the
-        // other's fixture out from under it, in whichever order they interleave.
-        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let d = std::env::temp_dir().join(format!(
-            "oj-startdev-{}-{label}-{seq}",
-            std::process::id()
-        ));
+        let d = std::env::temp_dir().join(format!("oj-startdev-{}-{label}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

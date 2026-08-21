@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { importPkg, viteEnvDefine } from "./resolve-pkg.mjs";
@@ -106,10 +106,25 @@ const result = await build({
   write: false,
 });
 
-const chunk = result.output.find((o) => o.type === "chunk" && o.isEntry) ?? result.output[0];
-writeFileSync(join(HERE, "client-entry.js"), chunk.code);
+const entryChunk = result.output.find((o) => o.type === "chunk" && o.isEntry) ?? result.output[0];
+const chunksDir = join(HERE, "client-chunks");
+rmSync(chunksDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+mkdirSync(chunksDir, { recursive: true });
+const chunkIndex = [];
+let moduleCount = 0;
+for (const o of result.output) {
+  const dest = join(chunksDir, o.fileName);
+  mkdirSync(dirname(dest), { recursive: true });
+  writeFileSync(dest, o.type === "chunk" ? o.code : o.source);
+  chunkIndex.push({ name: o.fileName, size: statSync(dest).size });
+  if (o.type === "chunk") moduleCount += Object.keys(o.modules ?? {}).length;
+}
+writeFileSync(
+  join(HERE, "client-chunks.json"),
+  JSON.stringify({ entry: entryChunk.fileName, files: chunkIndex }),
+);
 // Module count for the editor's update-progress narration ("(N modules)").
-writeFileSync(join(HERE, "client-entry.modules"), String(chunk.modules ? Object.keys(chunk.modules).length : 0));
+writeFileSync(join(HERE, "client-entry.modules"), String(moduleCount));
 
 const devManifest = {
   routes: {
@@ -126,4 +141,4 @@ writeFileSync(
 );
 const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
 const OJ = _ojTTY ? "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m" : "oj";
-process.stderr.write(`${OJ}${_ojTTY ? "" : ":"} client entry bundled\n`);
+process.stderr.write(`${OJ}${_ojTTY ? "" : ":"} client bundled (${result.output.length} files)\n`);
