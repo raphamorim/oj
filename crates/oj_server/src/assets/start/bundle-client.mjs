@@ -53,17 +53,20 @@ const cssUrls = [];
 
 const serverFnClient = {
   name: "server-fn-client",
-  async transform(code, id) {
-    if (id.includes("/node_modules/") || id.startsWith("\0") || !/\.(ts|tsx)$/.test(id)) return null;
-    let out = code;
-    if (container) {
-      const t = await container.transformUserCode(out, id);
-      if (t != null) out = t;
-    }
-    out = transformGlob(out, id);
-    const rpc = rewriteServerFns(out, id);
-    if (rpc != null) return rpc;
-    return out === code ? null : out;
+  transform: {
+    filter: { id: { include: /\.(ts|tsx)$/, exclude: [/\/node_modules\//, /^\0/] } },
+    async handler(code, id) {
+      if (id.includes("/node_modules/") || id.startsWith("\0") || !/\.(ts|tsx)$/.test(id)) return null;
+      let out = code;
+      if (container) {
+        const t = await container.transformUserCode(out, id);
+        if (t != null) out = t;
+      }
+      out = transformGlob(out, id);
+      const rpc = rewriteServerFns(out, id);
+      if (rpc != null) return rpc;
+      return out === code ? null : out;
+    },
   },
 };
 
