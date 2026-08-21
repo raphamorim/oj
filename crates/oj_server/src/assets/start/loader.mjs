@@ -67,14 +67,65 @@ function cacheKey(mode, path, source) {
   }
 }
 const cachePath = (key) => pathResolve(CACHE_DIR, key.slice(0, 2), `${key}.json`);
+
+// Load pack: an in-memory index over the per-entry load cache, persisted as
+// one JSONL file (header line carries the epoch) and read once at init. A
+// warm boot serves its ~6k load hits from this Map instead of ~6k per-file
+// open/read/parse round trips. The per-entry cache stays authoritative: a key
+// missing here falls back to the per-file path below, and such hits are
+// re-appended so the pack converges opportunistically.
+const LOAD_PACK_FILE = pathResolve(CACHE_DIR, "ssr-load-pack.jsonl");
+const loadPack = new Map();
+let loadPackFileReady = false;
+if (EPOCH) {
+  try {
+    const lines = readFileSync(LOAD_PACK_FILE, "utf8").split("\n");
+    if (JSON.parse(lines[0]).epoch === EPOCH) {
+      loadPackFileReady = true;
+      for (let i = 1; i < lines.length; i++) {
+        if (!lines[i]) continue;
+        try { const e = JSON.parse(lines[i]); loadPack.set(e.k, e.c); } catch {}
+      }
+    }
+  } catch {}
+}
+let packPending = [];
+let packFlushChain = Promise.resolve();
+function flushLoadPack() {
+  const batch = packPending;
+  packPending = [];
+  if (batch.length === 0) return;
+  const body = batch.map((e) => JSON.stringify(e)).join("\n") + "\n";
+  const first = !loadPackFileReady;
+  loadPackFileReady = true;
+  packFlushChain = packFlushChain.then(async () => {
+    try {
+      await mkdir(CACHE_DIR, { recursive: true });
+      if (first) await writeFile(LOAD_PACK_FILE, JSON.stringify({ epoch: EPOCH }) + "\n" + body);
+      else await appendFile(LOAD_PACK_FILE, body);
+    } catch {}
+  });
+}
+function rememberPack(key, code) {
+  if (!EPOCH || loadPack.has(key)) return;
+  loadPack.set(key, code);
+  packPending.push({ k: key, c: code });
+}
+
 function cacheGet(key) {
   if (!key) return null;
+  const packed = loadPack.get(key);
+  if (packed !== undefined) { cacheStats.hits += 1; return packed; }
   const file = cachePath(key);
   let bytes;
   try { bytes = readFileSync(file, "utf8"); } catch { return null; }
   try {
     const entry = JSON.parse(bytes);
-    if (typeof entry.code === "string") { cacheStats.hits += 1; return entry.code; }
+    if (typeof entry.code === "string") {
+      cacheStats.hits += 1;
+      rememberPack(key, entry.code);
+      return entry.code;
+    }
   } catch {}
   try { unlinkSync(file); } catch {}
   return null;
@@ -103,6 +154,7 @@ function cachePut(key, code) {
   if (!key) { cacheStats.uncached += 1; return; }
   cacheStats.misses += 1;
   try {
+    rememberPack(key, code);
     writeQueue.push({
       file: cachePath(key),
       body: JSON.stringify({ code, map_data_url: null, imports: [], is_boundary: false, kind: "ssr-loader" }),
@@ -165,6 +217,7 @@ function rememberResolve(key, entry) {
 // almost nothing. The runner calls this at ready and after each response.
 export function flushCaches() {
   if (writeQueue.length > 0) drainWrites();
+  if (packPending.length > 0) flushLoadPack();
   if (resolvePending.length > 0) flushResolveCache();
 }
 
