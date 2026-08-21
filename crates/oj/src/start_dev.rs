@@ -72,11 +72,24 @@ pub async fn start_dev(
         config: None,
     }
     .build_app();
+    resolver.await??;
+    // The runner's SSR module-graph walk dominates boot time; start it now so
+    // it overlaps the client bundle (the manifest reads CSS lazily, so the
+    // runner no longer needs the bundle's output).
+    let runner = Arc::new(tokio::sync::Mutex::new(
+        spawn_start_runner(&root, &cache).await?,
+    ));
+    {
+        // Prewarm: queue one synthetic render so first-request module
+        // evaluation also happens before the listener binds.
+        let runner = Arc::clone(&runner);
+        tokio::spawn(async move {
+            let _ = forward(&runner, "GET".into(), "/".into(), vec![], None).await;
+        });
+    }
     let (bundle_res, built_res) = tokio::join!(bundle, built_fut);
     let pinned = bundle_res??;
-    resolver.await??;
     let built = built_res?;
-    let runner = spawn_start_runner(&root, &cache).await?;
     let css_host = if app_uses_tailwind(&root) {
         spawn_node_service(&root, &cache.join("css-host.mjs"))
             .await
@@ -89,7 +102,7 @@ pub async fn start_dev(
     let state = Arc::new(StartState {
         proxy_prefixes: built.proxy_prefixes.clone(),
         plugin_mw_port: built.plugin_mw_port,
-        runner: Arc::new(tokio::sync::Mutex::new(runner)),
+        runner,
         bundle: std::sync::RwLock::new(Arc::new(pinned)),
         verify: oj_cache::integrity::VerifyMode::from_env(),
         live_reload: cache.join("live-reload.js"),
@@ -649,7 +662,7 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
             .await
             .ok()
             .map(|b| String::from_utf8_lossy(&b).into_owned());
-        return forward(&state, method, url, headers, body).await;
+        return forward(&state.runner, method, url, headers, body).await;
     }
     match classify(&req, &state.proxy_prefixes) {
         Route::Document => {
@@ -670,7 +683,7 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
                     return resp;
                 }
             }
-            forward(&state, "GET".into(), document_url(&raw), vec![], None).await
+            forward(&state.runner, "GET".into(), document_url(&raw), vec![], None).await
         }
         Route::Pass => next.run(req).await,
     }
@@ -838,13 +851,13 @@ fn collect_headers(headers: &header::HeaderMap) -> Vec<(String, String)> {
 }
 
 async fn forward(
-    state: &StartState,
+    runner: &Arc<tokio::sync::Mutex<Runner>>,
     method: String,
     url: String,
     req_headers: Vec<(String, String)>,
     body: Option<String>,
 ) -> Response {
-    let runner = Arc::clone(&state.runner);
+    let runner = Arc::clone(runner);
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let mut guard = runner.lock_owned().await;

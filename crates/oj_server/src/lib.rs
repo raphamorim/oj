@@ -148,6 +148,7 @@ const START_ASSETS: &[(&str, &str)] = &[
         include_str!("assets/start/plugin-adapters.ts"),
     ),
     ("manifest.ts", include_str!("assets/start/manifest.ts")),
+    ("manifest-dev.ts", include_str!("assets/start/manifest-dev.ts")),
 ];
 
 // V8 bytecode cache for every node child oj spawns; a user-set value wins.

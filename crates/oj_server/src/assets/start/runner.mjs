@@ -8,6 +8,11 @@ import { MessageChannel } from "node:worker_threads";
 import readline from "node:readline";
 
 process.env.TSS_SERVER_FN_BASE ??= "/_serverFn/";
+// Vite dev sets this too: start-server-core then resolves the manifest per
+// request instead of caching the first render's (possibly CSS-less) result.
+process.env.TSS_DEV_SERVER ??= "true";
+// oj serves no dev-styles endpoint, so keep that <link> injection off.
+process.env.TSS_DEV_SSR_STYLES_ENABLED ??= "false";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();

@@ -184,8 +184,8 @@ writeFileSync(
   join(HERE, "manifest.ts"),
   `export const tsrStartManifest = () => (${JSON.stringify(devManifest)});\n`,
 );
-// Raw stylesheet-URL list for the store's generation manifest; write-then-
-// rename so a concurrent read never sees a partial JSON.
+// The SSR runner (manifest-dev.ts) polls this file per render; write-then-rename
+// so a concurrent read never sees a partial JSON.
 writeFileSync(join(HERE, "css-urls.json.tmp"), JSON.stringify(cssUrls));
 renameSync(join(HERE, "css-urls.json.tmp"), join(HERE, "css-urls.json"));
 const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
