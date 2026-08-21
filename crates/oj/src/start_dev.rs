@@ -45,8 +45,8 @@ pub async fn start_dev(
     let root = root
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("app root not found: {}: {e}", root.display()))?;
-    let cache = root.join(".oj-cache").join("start");
-    oj_server::ensure_cache_gitignore(&root);
+    let cache = oj_cache::cache_root(&root).join("start");
+    oj_server::prepare_cache_root(&root);
     oj_server::write_start_assets(&cache)?;
     oj_server::plugins::prepare_ssr_bridge(&root);
     oj_server::boot_phase("start_dev begin");
@@ -364,8 +364,8 @@ pub async fn start_build(root: PathBuf) -> anyhow::Result<()> {
     let root = root
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("app root not found: {}: {e}", root.display()))?;
-    let cache = root.join(".oj-cache").join("start");
-    oj_server::ensure_cache_gitignore(&root);
+    let cache = oj_cache::cache_root(&root).join("start");
+    oj_server::prepare_cache_root(&root);
     oj_server::write_start_assets(&cache)?;
     generate_route_tree(&root, &cache)?;
     generate_server_fn_resolver(&root, &cache)?;
@@ -378,6 +378,7 @@ pub async fn start_build(root: PathBuf) -> anyhow::Result<()> {
     let status = std::process::Command::new("node")
         .arg(cache.join("build.mjs"))
         .env("OJ_APP_ROOT", &root)
+        .env("OJ_CACHE_ROOT", oj_cache::cache_root(&root))
         .env("NODE_ENV", "production")
         .env("OJ_PRERENDER", &prerender)
         .env("NODE_COMPILE_CACHE", oj_server::node_compile_cache(&root))
@@ -563,6 +564,7 @@ fn run_node(root: &Path, script: &Path, what: &str) -> anyhow::Result<()> {
     let status = std::process::Command::new("node")
         .arg(script)
         .env("OJ_APP_ROOT", root)
+        .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
         .env("NODE_ENV", "development")
         .env("NODE_COMPILE_CACHE", oj_server::node_compile_cache(root))
         .current_dir(root)
@@ -582,6 +584,7 @@ async fn spawn_node_service(root: &Path, script: &Path) -> anyhow::Result<Runner
     let mut cmd = tokio::process::Command::new("node");
     cmd.arg(script)
         .env("OJ_APP_ROOT", root)
+        .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
         .env("NODE_ENV", "development")
         .env(
             "OJ_SSR_BRIDGE_DIR",

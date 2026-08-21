@@ -20,7 +20,7 @@ const APP = process.env.OJ_APP_ROOT ?? process.cwd();
 const { transformSync } = await importPkg(APP, "rolldown/experimental", ["vite", "@tanstack/react-start"]);
 const rawContainer = loadPluginContainerSync(APP, { command: "serve", environment: "ssr" });
 const VIRTUAL_SCHEME = "ojvirtual:///";
-const CACHE_DIR = pathResolve(APP, ".oj-cache");
+const CACHE_DIR = process.env.OJ_CACHE_ROOT ?? pathResolve(HERE, "..");
 
 const BASE_FILES = [
   "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "package.json",

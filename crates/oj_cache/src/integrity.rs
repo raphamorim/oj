@@ -109,6 +109,31 @@ pub fn verified_read(
     Ok(bytes)
 }
 
+pub fn write_self_verified(path: &Path, payload: &[u8]) -> io::Result<()> {
+    let mut bytes = Vec::with_capacity(payload.len() + 65);
+    bytes.extend_from_slice(blake3::hash(payload).to_hex().as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(payload);
+    atomic_write(path, &bytes)
+}
+
+pub fn read_self_verified(path: &Path) -> Result<Vec<u8>, VerifyError> {
+    let bytes = fs::read(path).map_err(VerifyError::Io)?;
+    let Some((header, payload)) = bytes.split_at_checked(65).filter(|(h, _)| h[64] == b'\n')
+    else {
+        return Err(VerifyError::WrongSize {
+            expected: 65,
+            actual: bytes.len() as u64,
+        });
+    };
+    let expected = String::from_utf8_lossy(&header[..64]).into_owned();
+    let actual = blake3::hash(payload).to_hex().to_string();
+    if actual != expected {
+        return Err(VerifyError::WrongHash { expected, actual });
+    }
+    Ok(payload.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +213,27 @@ mod tests {
             verify_file(&d.join("nope"), &exp, VerifyMode::Standard),
             Err(VerifyError::Io(_))
         ));
+    }
+
+    #[test]
+    fn self_verified_roundtrip_and_flip_detection() {
+        let d = tmp("selfv");
+        let p = d.join("entry.json");
+        write_self_verified(&p, b"{\"a\":1}").unwrap();
+        assert_eq!(read_self_verified(&p).unwrap(), b"{\"a\":1}");
+
+        // Same-size, single-byte flip in the payload must be caught.
+        let mut bytes = fs::read(&p).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        fs::write(&p, &bytes).unwrap();
+        assert!(matches!(
+            read_self_verified(&p),
+            Err(VerifyError::WrongHash { .. })
+        ));
+
+        // Truncation below the header is a framing failure, not a panic.
+        fs::write(&p, b"short").unwrap();
+        assert!(read_self_verified(&p).is_err());
     }
 }

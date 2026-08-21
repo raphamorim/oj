@@ -47,7 +47,7 @@ impl OptimizedDeps {
     }
 
     pub fn prepare(root: &Path, version: &str, input: OptimizeInput) -> Self {
-        let dir = root.join(".oj-cache").join("deps");
+        let dir = oj_cache::cache_root(&root).join("deps");
         let hash = lockfile_hash(root, version, &input);
         let (tx, rx) = watch::channel(None);
 
@@ -157,7 +157,7 @@ async fn run_optimizer(
     hash: &str,
     input: &OptimizeInput,
 ) -> Option<DepMap> {
-    let cache = root.join(".oj-cache");
+    let cache = oj_cache::cache_root(&root);
     std::fs::create_dir_all(&cache).ok()?;
     let script = cache.join("optimize-deps.mjs");
     std::fs::write(&script, OPTIMIZE_JS).ok()?;

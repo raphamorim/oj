@@ -590,7 +590,7 @@ impl Plugin for OjCssPlugin {
 }
 
 fn expand_css_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String> {
-    let script = root.join(".oj-cache").join("css-sidecar.mjs");
+    let script = oj_cache::cache_root(&root).join("css-sidecar.mjs");
     if let Some(parent) = script.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -618,7 +618,7 @@ fn expand_css_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String
 
 fn svelte_via_sidecar(root: &Path, file: &Path) -> anyhow::Result<String> {
     use std::io::Write;
-    let script = root.join(".oj-cache").join("svelte-compile.mjs");
+    let script = oj_cache::cache_root(&root).join("svelte-compile.mjs");
     if let Some(parent) = script.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -664,7 +664,7 @@ fn svelte_via_sidecar(root: &Path, file: &Path) -> anyhow::Result<String> {
 
 fn preprocess_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String> {
     use std::io::Write;
-    let script = root.join(".oj-cache").join("css-preprocess.mjs");
+    let script = oj_cache::cache_root(&root).join("css-preprocess.mjs");
     if let Some(parent) = script.parent() {
         fs::create_dir_all(parent)?;
     }

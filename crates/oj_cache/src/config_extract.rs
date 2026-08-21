@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::integrity;
+
 pub struct ConfigExtractStore {
     dir: PathBuf,
     root: PathBuf,
@@ -36,7 +38,7 @@ const ABSENT: &str = "-";
 impl ConfigExtractStore {
     pub fn new(root: &Path, salt: &str) -> Self {
         Self {
-            dir: root.join(".oj-cache").join("config-extract"),
+            dir: crate::cache_root(root).join("config-extract"),
             root: root.to_path_buf(),
             salt: salt.to_string(),
         }
@@ -44,8 +46,22 @@ impl ConfigExtractStore {
 
     pub fn lookup(&self, config: &Path, command: &str, mode: &str) -> Option<CachedExtract> {
         let path = self.entry_path(config, command, mode);
-        let bytes = fs::read(&path).ok()?;
-        let entry: Entry = match serde_json::from_slice(&bytes) {
+        if !path.exists() {
+            return None;
+        }
+        let payload = match integrity::read_self_verified(&path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "oj: cache integrity: {{\"store\":\"config-extract\",\"entry\":{:?},\"error\":{:?}}}",
+                    path.file_name().unwrap_or_default(),
+                    e.to_string()
+                );
+                let _ = fs::remove_file(&path);
+                return None;
+            }
+        };
+        let entry: Entry = match serde_json::from_slice(&payload) {
             Ok(e) => e,
             Err(_) => {
                 let _ = fs::remove_file(&path);
@@ -97,10 +113,7 @@ impl ConfigExtractStore {
             stderr: stderr.to_string(),
         };
         let path = self.entry_path(config, command, mode);
-        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-        if fs::write(&tmp, serde_json::to_vec(&entry).unwrap_or_default()).is_ok() {
-            let _ = fs::rename(&tmp, &path);
-        }
+        let _ = integrity::write_self_verified(&path, &serde_json::to_vec(&entry).unwrap_or_default());
     }
 
     fn entry_path(&self, config: &Path, command: &str, mode: &str) -> PathBuf {
@@ -266,5 +279,31 @@ mod tests {
             .is_none());
         assert!(store.lookup(&config, "build", "development").is_none());
         assert!(store.lookup(&config, "serve", "production").is_none());
+    }
+
+    #[test]
+    fn flipped_byte_is_a_miss_and_recomputes() {
+        let root = temp_root("flip");
+        let config = root.join("vite.config.ts");
+        fs::write(&config, "a").unwrap();
+        let store = ConfigExtractStore::new(&root, "s1");
+        store.store(&config, "serve", "development", &[], r#"{"base":"/x"}"#, "");
+        let path = store.entry_path(&config, "serve", "development");
+
+        // Same-size, single-byte flip inside the payload.
+        let mut bytes = fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        fs::write(&path, &bytes).unwrap();
+
+        assert!(
+            store.lookup(&config, "serve", "development").is_none(),
+            "flipped byte must be a miss, never wrong output"
+        );
+        assert!(!path.exists(), "corrupt entry must be removed");
+
+        store.store(&config, "serve", "development", &[], r#"{"base":"/x"}"#, "");
+        let hit = store.lookup(&config, "serve", "development").unwrap();
+        assert_eq!(hit.output, r#"{"base":"/x"}"#);
     }
 }

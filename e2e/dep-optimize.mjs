@@ -64,11 +64,11 @@ try {
   assert.equal(dep.status, 200);
   assert.match(dep.body, /export default require_cjs_lib\(\)/, "optimized dep exposes module.exports as default");
 
-  const mod = await import(pathToFileURL(path.join(app, ".oj-cache", "deps", "cjs-lib.mjs")).href);
+  const mod = await import(pathToFileURL(path.join(app, ".oj-cache", "v1", "deps", "cjs-lib.mjs")).href);
   const { greet } = mod.default;
   assert.equal(greet("world"), "hi world", "defineProperty export resolves at runtime through interop");
 
-  const manifest = JSON.parse(fs.readFileSync(path.join(app, ".oj-cache", "deps", "manifest.json"), "utf8"));
+  const manifest = JSON.parse(fs.readFileSync(path.join(app, ".oj-cache", "v1", "deps", "manifest.json"), "utf8"));
   assert.equal(manifest.metadata["cjs-lib"].needsInterop, true);
 
   console.log("dep-optimize e2e PASSED");

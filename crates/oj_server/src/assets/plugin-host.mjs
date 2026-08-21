@@ -167,7 +167,7 @@ async function loadViteConfig(configPath) {
         __filename: JSON.stringify(configPath),
       },
     });
-    const out = `${appRoot}/.oj-cache/oj-vite-config.mjs`;
+    const out = join(dirname(fileURLToPath(import.meta.url)), "oj-vite-config.mjs");
     writeFileSync(out, result.outputFiles[0].text);
     mod = await import(pathToFileURL(out).href);
   } else {

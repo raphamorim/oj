@@ -193,7 +193,7 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
             return Some(parse_vite_values(&json));
         }
     }
-    let cache = root.join(".oj-cache");
+    let cache = oj_cache::cache_root(root);
     let _ = std::fs::create_dir_all(&cache);
     let script = cache.join("oj-vite-extract.mjs");
     std::fs::write(&script, VITE_EXTRACT_JS).ok()?;
@@ -203,6 +203,7 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
         .arg(root)
         .arg("serve")
         .arg("development")
+        .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
         .env("NODE_COMPILE_CACHE", crate::node_compile_cache(root))
         .current_dir(root)
         .output()
@@ -459,7 +460,7 @@ impl PluginHost {
         plugins_file: &Path,
         config_json: &str,
     ) -> anyhow::Result<std::sync::Arc<PluginHost>> {
-        let script = root.join(".oj-cache").join("plugin-host.mjs");
+        let script = oj_cache::cache_root(root).join("plugin-host.mjs");
         if let Some(parent) = script.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -469,7 +470,8 @@ impl PluginHost {
             .arg(&script)
             .arg(plugins_file)
             .arg(config_json)
-            .env("NODE_COMPILE_CACHE", crate::node_compile_cache(root))
+            .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
+        .env("NODE_COMPILE_CACHE", crate::node_compile_cache(root))
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

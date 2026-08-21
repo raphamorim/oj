@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Raphael Amorim
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod config_extract;
@@ -14,6 +14,62 @@ use serde::{Deserialize, Serialize};
 pub mod start_codegen;
 
 pub const CACHE_FORMAT: u32 = 5;
+
+pub const CACHE_ROOT_VERSION: u32 = 1;
+
+pub fn cache_root(app_root: &Path) -> PathBuf {
+    app_root
+        .join(".oj-cache")
+        .join(format!("v{CACHE_ROOT_VERSION}"))
+}
+
+const LEGACY_TOP_LEVEL: &[&str] = &[
+    "start",
+    "start-codegen",
+    "start-bundle",
+    "config-extract",
+    "ssr",
+    "deps",
+    "v8",
+    "graph-snapshot.json",
+    "css-sidecar.mjs",
+    "svelte-compile.mjs",
+    "css-preprocess.mjs",
+    "tailwind-sidecar.mjs",
+    "oj-vite-config.mjs",
+    "oj-vite-extract.mjs",
+    "plugin-host.mjs",
+    "optimize-deps.mjs",
+    "ssr-env.json",
+    "ssr-load-pack.jsonl",
+    "ssr-resolve.jsonl",
+    "ssr-bridge-pack.jsonl",
+];
+
+pub fn heal_legacy_layout(app_root: &Path) {
+    let root = app_root.join(".oj-cache");
+    for name in LEGACY_TOP_LEVEL {
+        let path = root.join(name);
+        if path.is_dir() {
+            let _ = fs::remove_dir_all(&path);
+        } else {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    let Ok(entries) = fs::read_dir(&root) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.len() == 2
+            && name.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            && e.path().is_dir()
+        {
+            let _ = fs::remove_dir_all(e.path());
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CachedModule {
@@ -197,5 +253,49 @@ mod tests {
         let a = cache.key(b"bc", "a", "dev");
         let b = cache.key(b"c", "ab", "dev");
         assert_ne!(a, b, "url/source boundary must be unambiguous");
+    }
+
+    #[test]
+    fn cache_root_is_versioned() {
+        let root = cache_root(Path::new("/app"));
+        assert_eq!(
+            root,
+            Path::new("/app")
+                .join(".oj-cache")
+                .join(format!("v{CACHE_ROOT_VERSION}"))
+        );
+    }
+
+    #[test]
+    fn heal_removes_legacy_layout_and_keeps_the_rest() {
+        let app = std::env::temp_dir().join(format!("oj-heal-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&app);
+        let cache = app.join(".oj-cache");
+        for dir in ["start/ssr-bridge", "start-bundle", "deps", "ab", "3f"] {
+            fs::create_dir_all(cache.join(dir)).unwrap();
+        }
+        for file in ["ssr-resolve.jsonl", "graph-snapshot.json"] {
+            fs::write(cache.join(file), b"x").unwrap();
+        }
+        fs::write(cache.join(".gitignore"), b"*\n").unwrap();
+        fs::create_dir_all(cache_root(&app).join("start")).unwrap();
+        fs::create_dir_all(cache.join("user-stuff")).unwrap();
+
+        heal_legacy_layout(&app);
+
+        for legacy in [
+            "start",
+            "start-bundle",
+            "deps",
+            "ab",
+            "3f",
+            "ssr-resolve.jsonl",
+            "graph-snapshot.json",
+        ] {
+            assert!(!cache.join(legacy).exists(), "{legacy} must be removed");
+        }
+        assert!(cache.join(".gitignore").exists());
+        assert!(cache_root(&app).join("start").exists());
+        assert!(cache.join("user-stuff").exists(), "unknown dirs are left alone");
     }
 }

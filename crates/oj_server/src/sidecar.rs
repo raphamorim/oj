@@ -118,7 +118,7 @@ impl Sidecar {
         kind: &'static str,
         package: &'static str,
     ) -> anyhow::Result<std::sync::Arc<Sidecar>> {
-        let script = root.join(".oj-cache").join(name);
+        let script = oj_cache::cache_root(&root).join(name);
         if let Some(parent) = script.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -126,6 +126,7 @@ impl Sidecar {
 
         let mut child = tokio::process::Command::new("node")
             .arg(&script)
+            .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
             .env("NODE_COMPILE_CACHE", crate::node_compile_cache(root))
             .current_dir(root)
             .stdin(Stdio::piped())
