@@ -50,6 +50,7 @@ pub async fn start_dev(
         .map_err(|e| anyhow::anyhow!("app root not found: {}: {e}", root.display()))?;
     let cache = root.join(".oj-cache").join("start");
     oj_server::write_start_assets(&cache)?;
+    oj_server::boot_phase("start_dev begin");
 
     let route_tree = {
         let (root, cache) = (root.clone(), cache.clone());
@@ -129,6 +130,7 @@ pub async fn start_dev(
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| anyhow::anyhow!("cannot bind {addr}: {e}"))?;
+    oj_server::boot_phase("listening");
     println!("  {} dev (tanstack start)", oj_server::oj_brand());
     let url = format!("http://localhost:{}/", built.port);
     println!("  {}", oj_server::link(&url, &oj_server::cell(&url)));
