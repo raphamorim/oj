@@ -1808,7 +1808,7 @@ dependencies = [
 
 [[package]]
 name = "oj"
-version = "0.0.45"
+version = "0.0.46"
 dependencies = [
  "anyhow",
  "arcstr",
@@ -1832,7 +1832,7 @@ dependencies = [
 
 [[package]]
 name = "oj_cache"
-version = "0.0.45"
+version = "0.0.46"
 dependencies = [
  "blake3",
  "proptest",
@@ -1843,7 +1843,7 @@ dependencies = [
 
 [[package]]
 name = "oj_compiler"
-version = "0.0.45"
+version = "0.0.46"
 dependencies = [
  "glob",
  "memchr",
@@ -1867,7 +1867,7 @@ dependencies = [
 
 [[package]]
 name = "oj_config"
-version = "0.0.45"
+version = "0.0.46"
 dependencies = [
  "oxc_allocator",
  "oxc_codegen",
@@ -1885,7 +1885,7 @@ dependencies = [
 
 [[package]]
 name = "oj_css"
-version = "0.0.45"
+version = "0.0.46"
 dependencies = [
  "grass",
  "lightningcss",
@@ -1895,7 +1895,7 @@ dependencies = [
 
 [[package]]
 name = "oj_env"
-version = "0.0.45"
+version = "0.0.46"
 dependencies = [
  "proptest",
  "serde_json",
@@ -1904,14 +1904,14 @@ dependencies = [
 
 [[package]]
 name = "oj_graph"
-version = "0.0.45"
+version = "0.0.46"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "oj_resolver"
-version = "0.0.45"
+version = "0.0.46"
 dependencies = [
  "oxc_resolver",
  "tempfile",
@@ -1920,7 +1920,7 @@ dependencies = [
 
 [[package]]
 name = "oj_server"
-version = "0.0.45"
+version = "0.0.46"
 dependencies = [
  "anyhow",
  "axum",
