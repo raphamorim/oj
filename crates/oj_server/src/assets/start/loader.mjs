@@ -476,7 +476,12 @@ function resolveUncached(spec, context, next) {
       ? fileURLToPath(context.parentURL)
       : undefined;
     const rid = container.resolveId(spec, importer);
-    if (rid != null) return { url: VIRTUAL_SCHEME + encodeURIComponent(rid), shortCircuit: true };
+    // Version virtual URLs like file URLs: without the suffix, a reload's
+    // re-import would get the old module instance back from Node's registry.
+    if (rid != null) {
+      const u = VIRTUAL_SCHEME + encodeURIComponent(rid);
+      return { url: V ? `${u}?ojv=${V}` : u, shortCircuit: true };
+    }
   }
   const suffix = spec.match(ASSET_SUFFIX);
   const isCss = !spec.includes("?") && /\.css$/.test(spec);
@@ -553,7 +558,7 @@ function transformServerFns(code, path) {
 export function load(url, context, next) {
   if (isRequire(context)) return next(url, context);
   if (url.startsWith(VIRTUAL_SCHEME)) {
-    const rid = decodeURIComponent(url.slice(VIRTUAL_SCHEME.length));
+    const rid = decodeURIComponent(stripQ(url).slice(VIRTUAL_SCHEME.length));
     const code = container ? container.load(rid) : null;
     return { format: "module", source: code ?? emptyVirtualStub(APP, rid), shortCircuit: true };
   }
