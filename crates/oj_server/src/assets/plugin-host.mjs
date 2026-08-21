@@ -710,12 +710,16 @@ async function run(hook, args) {
 }
 
 // stdin EOF means oj died without tearing us down (SIGKILL skips
-// kill_on_drop): exit instead of idling as an orphan.
+// kill_on_drop): exit instead of idling as an orphan. process.exit would
+// join the uv threadpool, where the ssr bridge parks a read on req.fifo
+// that never returns (this process holds its write end r+) — die by
+// signal instead of teardown.
+const hardExit = () => process.kill(process.pid, "SIGKILL");
 try {
   // bigint keeps the FIFO mode out of the shared stat buffer fs.realpathSync reads mid-walk
   if (fstatSync(0, { bigint: true }).isFIFO()) {
-    process.stdin.once("end", () => process.exit(0));
-    process.stdin.once("close", () => process.exit(0));
+    process.stdin.once("end", hardExit);
+    process.stdin.once("close", hardExit);
   }
 } catch {}
 
