@@ -9,6 +9,7 @@ const send = process.stdout.write.bind(process.stdout);
 process.stdout.write = process.stderr.write.bind(process.stderr);
 
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
+if (process.env.OJ_V8_COMPILE_CACHE === "on") { try { module.enableCompileCache?.(APP + "/.oj-cache/v8"); } catch {} }
 const req = createRequire(APP + "/package.json");
 
 let postcssProcessor;
@@ -89,6 +90,7 @@ for await (const line of rl) {
   try { msg = JSON.parse(line); } catch { continue; }
   try {
     send(JSON.stringify({ id: msg.id, css: await compile(msg.path) }) + "\n");
+    try { module.flushCompileCache?.(); } catch {}
   } catch (e) {
     send(JSON.stringify({ id: msg.id, error: String((e && e.stack) || e) }) + "\n");
   }
