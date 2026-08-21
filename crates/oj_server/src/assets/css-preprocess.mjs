@@ -35,7 +35,8 @@ let inflight = 0;
 let stdinClosed = false;
 const maybeExit = () => { if (stdinClosed && inflight === 0) process.exit(0); };
 try {
-  if (fstatSync(0).isFIFO()) rl.once("close", () => { stdinClosed = true; maybeExit(); });
+  // bigint keeps the FIFO mode out of the shared stat buffer fs.realpathSync reads mid-walk
+  if (fstatSync(0, { bigint: true }).isFIFO()) rl.once("close", () => { stdinClosed = true; maybeExit(); });
 } catch {}
 rl.on("line", async (line) => {
   let msg;

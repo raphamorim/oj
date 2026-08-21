@@ -600,7 +600,8 @@ async function run(hook, args) {
 // stdin EOF means oj died without tearing us down (SIGKILL skips
 // kill_on_drop): exit instead of idling as an orphan.
 try {
-  if (fstatSync(0).isFIFO()) {
+  // bigint keeps the FIFO mode out of the shared stat buffer fs.realpathSync reads mid-walk
+  if (fstatSync(0, { bigint: true }).isFIFO()) {
     process.stdin.once("end", () => process.exit(0));
     process.stdin.once("close", () => process.exit(0));
   }

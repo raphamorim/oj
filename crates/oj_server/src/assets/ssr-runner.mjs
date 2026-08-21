@@ -251,7 +251,8 @@ connectHmr();
 // stdin EOF means oj died without tearing us down (the HMR reconnect timer
 // would otherwise keep an orphaned runner alive forever): exit.
 try {
-  if (fstatSync(0).isFIFO()) {
+  // bigint keeps the FIFO mode out of the shared stat buffer fs.realpathSync reads mid-walk
+  if (fstatSync(0, { bigint: true }).isFIFO()) {
     process.stdin.once("end", () => process.exit(0));
     process.stdin.once("close", () => process.exit(0));
   }

@@ -35,7 +35,8 @@ const onParentGone = () => {
   process.exit(0);
 };
 try {
-  if (fstatSync(0).isFIFO()) {
+  // bigint keeps the FIFO mode out of the shared stat buffer fs.realpathSync reads mid-walk
+  if (fstatSync(0, { bigint: true }).isFIFO()) {
     process.stdin.once("end", onParentGone);
     process.stdin.once("close", onParentGone);
   }
