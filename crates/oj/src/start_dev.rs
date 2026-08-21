@@ -25,7 +25,8 @@ struct StartState {
     proxy_prefixes: Vec<String>,
     plugin_mw_port: Option<u16>,
     runner: Arc<tokio::sync::Mutex<Runner>>,
-    bundle: std::sync::RwLock<Arc<PinnedBundle>>,
+    bundle: std::sync::RwLock<Arc<oj_cache::start_bundle::PinnedBundle>>,
+    verify: oj_cache::integrity::VerifyMode,
     live_reload: PathBuf,
     workspace_root: PathBuf,
     reload_tx: broadcast::Sender<()>,
@@ -58,12 +59,7 @@ pub async fn start_dev(
     route_tree.await??;
     let bundle = {
         let (root, cache) = (root.clone(), cache.clone());
-        tokio::task::spawn_blocking(move || -> anyhow::Result<PinnedBundle> {
-            bundle_client_entry(&root, &cache)?;
-            PinnedBundle::from_build_dir(&cache).ok_or_else(|| {
-                anyhow::anyhow!("client chunk index missing after successful bundle")
-            })
-        })
+        tokio::task::spawn_blocking(move || bundle_client_entry_cached(&root, &cache))
     };
     let built_fut = oj_server::DevServer {
         root: root.clone(),
@@ -92,6 +88,7 @@ pub async fn start_dev(
         plugin_mw_port: built.plugin_mw_port,
         runner: Arc::new(tokio::sync::Mutex::new(runner)),
         bundle: std::sync::RwLock::new(Arc::new(pinned)),
+        verify: oj_cache::integrity::VerifyMode::from_env(),
         live_reload: cache.join("live-reload.js"),
         workspace_root: workspace_root(&root),
         reload_tx: reload_tx.clone(),
@@ -100,6 +97,12 @@ pub async fn start_dev(
     });
 
     spawn_start_watcher(root.clone(), cache.clone(), Arc::clone(&state));
+    {
+        let root = root.clone();
+        tokio::task::spawn_blocking(move || {
+            start_bundle_store(&root).prune(oj_cache::start_bundle::DEFAULT_PRUNE_BUDGET_BYTES);
+        });
+    }
 
     let app = built.router.layer(axum::middleware::from_fn_with_state(
         Arc::clone(&state),
@@ -259,7 +262,10 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
                     if bundle_client_entry(&r, &c).is_err() {
                         return None;
                     }
-                    PinnedBundle::from_build_dir(&c)
+                    match start_bundle_store(&r).persist(&c) {
+                        Some((_, pinned)) => Some(pinned),
+                        None => oj_cache::start_bundle::PinnedBundle::from_build_dir(&c),
+                    }
                 });
                 let (pinned, _) = tokio::join!(client, reload_runner(&state));
                 if let Ok(Some(pinned)) = pinned {
@@ -428,38 +434,47 @@ fn bundle_client_entry(root: &Path, cache: &Path) -> anyhow::Result<()> {
     )
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct PinnedBundle {
-    entry: String,
-    chunks: std::collections::HashMap<String, PinnedChunk>,
+fn start_bundle_store(root: &Path) -> oj_cache::start_bundle::StartBundleStore {
+    oj_cache::start_bundle::StartBundleStore::new(
+        root,
+        env!("CARGO_PKG_VERSION"),
+        oj_cache::integrity::VerifyMode::from_env(),
+    )
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct PinnedChunk {
-    path: PathBuf,
-}
-
-impl PinnedBundle {
-    fn chunk(&self, name: &str) -> Option<&PinnedChunk> {
-        self.chunks
-            .get(name)
-            .or_else(|| (name == "client-entry.js").then(|| self.chunks.get(&self.entry))?)
-    }
-
-    fn from_build_dir(start_dir: &Path) -> Option<Self> {
-        let raw = std::fs::read_to_string(start_dir.join("client-chunks.json")).ok()?;
-        let index: serde_json::Value = serde_json::from_str(&raw).ok()?;
-        let entry = index.get("entry")?.as_str()?.to_string();
-        let chunk_dir = start_dir.join("client-chunks");
-        let files = index.get("files")?.as_array()?;
-        let mut chunks = std::collections::HashMap::with_capacity(files.len());
-        for f in files {
-            let name = f.get("name")?.as_str()?.to_string();
-            let path = chunk_dir.join(&name);
-            chunks.insert(name, PinnedChunk { path });
+fn bundle_client_entry_cached(
+    root: &Path,
+    cache: &Path,
+) -> anyhow::Result<oj_cache::start_bundle::PinnedBundle> {
+    let store = start_bundle_store(root);
+    match store.restore(cache) {
+        Ok((stats, pinned)) => {
+            let rehashed = match stats.rehashed {
+                0 => String::new(),
+                n => format!(", {n} re-hashed"),
+            };
+            println!(
+                "  oj start: client bundle restored from cache (key {}…, {} chunks, {} files verified in {}ms{rehashed})",
+                stats.key.get(..8).unwrap_or(&stats.key),
+                stats.chunks,
+                stats.files,
+                stats.elapsed_ms
+            );
+            return Ok(pinned);
         }
-        Some(Self { entry, chunks })
+        Err(miss) => println!("  oj start: client bundle cache miss ({miss})"),
     }
+    bundle_client_entry(root, cache)?;
+    if let Some((key, pinned)) = store.persist(cache) {
+        println!(
+            "  oj start: client bundle cached (key {}…, {} chunks)",
+            key.get(..8).unwrap_or(&key),
+            pinned.len()
+        );
+        return Ok(pinned);
+    }
+    oj_cache::start_bundle::PinnedBundle::from_build_dir(cache)
+        .ok_or_else(|| anyhow::anyhow!("client chunk index missing after successful bundle"))
 }
 
 // Client module count written by bundle-client.mjs, for update/boot narration.
@@ -663,8 +678,21 @@ async fn serve_client_chunk(state: &StartState, name: &str) -> Response {
         )
             .into_response();
     };
-    match tokio::fs::read(&chunk.path).await {
-        Ok(bytes) => {
+    let mode = match &chunk.hash {
+        Some(_) => state.verify,
+        None => oj_cache::integrity::VerifyMode::Standard,
+    };
+    let expected = oj_cache::integrity::ExpectedFile {
+        size: chunk.size,
+        hash: chunk.hash.clone().unwrap_or_default(),
+    };
+    let path = chunk.path.clone();
+    let read = tokio::task::spawn_blocking(move || {
+        oj_cache::integrity::verified_read(&path, &expected, mode)
+    })
+    .await;
+    match read {
+        Ok(Ok(bytes)) => {
             let ext = name.rsplit('.').next().unwrap_or("");
             (
                 [
@@ -675,9 +703,17 @@ async fn serve_client_chunk(state: &StartState, name: &str) -> Response {
             )
                 .into_response()
         }
-        Err(e) => (
+        Ok(Err(e)) => {
+            eprintln!("oj start: chunk {name} failed verification ({e}); refusing to serve");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("oj start: chunk {name}: {e}"),
+            )
+                .into_response()
+        }
+        Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("oj start: chunk {name}: {e}"),
+            "oj start: chunk read task failed".to_string(),
         )
             .into_response(),
     }
@@ -888,7 +924,7 @@ mod tests {
 
     #[test]
     fn app_uses_tailwind_detects_postcss_vite_and_bare() {
-        let base = tmp("tw");
+        let base = tmp("tw-pkg");
         let cases = [
             (r#"{"devDependencies":{"@tailwindcss/postcss":"4"}}"#, true),
             (r#"{"devDependencies":{"@tailwindcss/vite":"4"}}"#, true),

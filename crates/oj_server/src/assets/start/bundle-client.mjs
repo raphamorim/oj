@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve, relative } from "node:path";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, resolve, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { importPkg, viteEnvDefine } from "./resolve-pkg.mjs";
 import { assetsPlugin, makeVitePlugins, nodeBuiltinShims, workspaceRoot } from "./rolldown-assets.mjs";
@@ -51,6 +51,15 @@ const container = await loadPluginContainer(APP, { command: "serve", environment
 
 const cssUrls = [];
 
+const visitedIds = new Set();
+const closureRecorder = {
+  name: "oj-closure-recorder",
+  transform(code, id) {
+    visitedIds.add(id);
+    return null;
+  },
+};
+
 const serverFnClient = {
   name: "server-fn-client",
   transform: {
@@ -92,6 +101,7 @@ const result = await build({
     },
   },
   plugins: [
+    closureRecorder,
     makeVitePlugins({ container, appRoot: APP, mode: "dev" }),
     assetsPlugin({ mode: "dev", cssUrls }),
     serverFnClient,
@@ -126,6 +136,22 @@ writeFileSync(
 // Module count for the editor's update-progress narration ("(N modules)").
 writeFileSync(join(HERE, "client-entry.modules"), String(moduleCount));
 
+const closure = new Set([routerEntry(), ...visitedIds, ...(container?.configDependencies ?? []), ...(container?.watchFiles ?? [])]);
+for (const o of result.output) {
+  if (o.type !== "chunk") continue;
+  for (const id of Object.keys(o.modules ?? {})) closure.add(id);
+}
+const closureFiles = [...closure]
+  .map((id) => String(id).split("?")[0])
+  .filter((p) => !p.startsWith("\0"))
+  .map((p) => (isAbsolute(p) ? p : resolve(APP, p)))
+  .filter((p) => !p.startsWith(HERE) && !/(^|\/)routeTree\.gen\.[jt]sx?$/.test(p))
+  .filter((p) => {
+    try { return statSync(p).isFile(); } catch { return false; }
+  })
+  .sort();
+writeFileSync(join(HERE, "closure.json"), JSON.stringify(closureFiles));
+
 const devManifest = {
   routes: {
     __root__: {
@@ -139,6 +165,8 @@ writeFileSync(
   join(HERE, "manifest.ts"),
   `export const tsrStartManifest = () => (${JSON.stringify(devManifest)});\n`,
 );
+writeFileSync(join(HERE, "css-urls.json.tmp"), JSON.stringify(cssUrls));
+renameSync(join(HERE, "css-urls.json.tmp"), join(HERE, "css-urls.json"));
 const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
 const OJ = _ojTTY ? "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m" : "oj";
 process.stderr.write(`${OJ}${_ojTTY ? "" : ":"} client bundled (${result.output.length} files)\n`);

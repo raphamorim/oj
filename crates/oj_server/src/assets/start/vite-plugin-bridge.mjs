@@ -97,6 +97,7 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
   // and oj serves an export-less stub — surfacing downstream as an undefined
   // import. Mirror Vite's shape so those plugins take their intended branch.
   const consumer = environment === "client" ? "client" : "server";
+  const watchFiles = new Set();
   const ctx = {
     environment: {
       name: environment,
@@ -108,7 +109,7 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
     error(m) { throw new Error(typeof m === "string" ? m : m?.message ?? String(m)); },
     emitFile() { return "oj-emit-ref"; },
     setAssetSource() {}, getFileName() { return ""; },
-    addWatchFile() {}, getWatchFiles() { return []; },
+    addWatchFile(id) { watchFiles.add(String(id)); }, getWatchFiles() { return [...watchFiles]; },
     getModuleInfo() { return null; }, getModuleIds() { return [][Symbol.iterator](); },
     async resolve() { return null; }, async load() { return null; },
     parse,
@@ -210,7 +211,8 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
   }
 
   const publicDir = typeof loaded?.config?.publicDir === "string" ? loaded.config.publicDir : null;
-  return { resolveId, load, transform, transformUserCode, buildStart, generateBundle, publicDir, pluginCount: plugins.length };
+  const configDependencies = [configFile, ...(loaded?.dependencies ?? [])];
+  return { resolveId, load, transform, transformUserCode, buildStart, generateBundle, publicDir, pluginCount: plugins.length, watchFiles, configDependencies };
 }
 
 export const __test = { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows };
