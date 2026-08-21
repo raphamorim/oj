@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { readFileSync, unlinkSync, statSync, openSync, readSync } from "node:fs";
+import { readFileSync, unlinkSync, statSync, openSync, readSync, realpathSync } from "node:fs";
 import { writeFile, appendFile, rename, mkdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { resolve as pathResolve, dirname } from "node:path";
@@ -479,6 +479,31 @@ function resolveTsPaths(spec) {
   return null;
 }
 
+// Resolve a directory whose own package.json names the entry (module/main),
+// the legacy subpath-entry pattern Node ESM rejects; prefer the ESM `module`.
+function resolveDirEntry(dir) {
+  // realpath the entry so its own bare imports resolve against the real store
+  // location (under pnpm the dir is a symlink, and a transitive dep like immer
+  // lives beside the real package, not beside the symlink).
+  const real = (p) => {
+    try { return realpathSync(p); } catch { return p; }
+  };
+  try {
+    const pj = JSON.parse(readFileSync(pathResolve(dir, "package.json"), "utf8"));
+    for (const key of ["module", "main"]) {
+      if (typeof pj[key] === "string") {
+        const p = pathResolve(dir, pj[key]);
+        if (isFile(p)) return real(p);
+      }
+    }
+  } catch {}
+  for (const idx of ["index.mjs", "index.js", "index.cjs"]) {
+    const p = pathResolve(dir, idx);
+    if (isFile(p)) return real(p);
+  }
+  return null;
+}
+
 const isRequire = (context) => context.conditions && context.conditions.includes("require");
 
 export function resolve(spec, context, next) {
@@ -578,6 +603,17 @@ function resolveUncached(spec, context, next) {
         ? fileURLToPath(err.url)
         : (err.message.match(/Cannot find module '([^']+)'/) || [])[1];
       const hit = tried ? probe(tried) : null;
+      if (hit) return { url: pathToFileURL(hit).href, shortCircuit: true };
+    }
+    // A dep subpath that is a directory with its own package.json (the legacy
+    // `pkg/query/react/package.json` entry pattern, e.g. @reduxjs/toolkit): Node
+    // ESM refuses the directory import, but CJS resolvers and bundlers read its
+    // module/main. Resolve it to that entry so oj serves the same file Vite does.
+    if (err && err.code === "ERR_UNSUPPORTED_DIR_IMPORT") {
+      const dir = err.url && err.url.startsWith("file:")
+        ? fileURLToPath(err.url)
+        : (err.message.match(/Directory import '([^']+)'/) || [])[1];
+      const hit = dir ? resolveDirEntry(dir) : null;
       if (hit) return { url: pathToFileURL(hit).href, shortCircuit: true };
     }
     throw err;
