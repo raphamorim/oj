@@ -139,6 +139,11 @@ const environment = {
     deepMerge(initial.config ?? {}, (initial.config?.environments ?? {})[envName] ?? {}),
   ),
 };
+// Vite tags each environment's resolved config with a `consumer` ("client" or
+// "server"); plugins like @vitejs/plugin-react read `env.config.consumer`
+// directly in applyToEnvironment, so it must be present or they throw.
+environment.config.consumer =
+  environment.config.consumer ?? (envName === "client" ? "client" : "server");
 // The resolved config (defaults + plugin `config` hooks). configureServer must
 // receive this, not the raw initial.config, so plugins reading resolved-only
 // fields (experimental, environments, plugins) don't throw. Seeded with the

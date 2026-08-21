@@ -81,6 +81,22 @@ test("envAllows: applyToEnvironment gates per environment (the ssr-stub-scopes r
   assert.ok(envAllows({ applyToEnvironment: () => { throw new Error("x"); } }, "client"));
 });
 
+test("envAllows: passes env.config.consumer (@vitejs/plugin-react reads it)", () => {
+  // The env handed to applyToEnvironment must carry config.consumer
+  // ("client"/"server"); plugin-react reads it directly, so a bare {name}
+  // env threw and killed the client bundle. consumer must match the env.
+  const consumerOf = (env) => env.config.consumer;
+  assert.equal(envAllows({ applyToEnvironment: consumerOf }, "client"), true);
+  // a plugin-react-style gate: only the client consumer
+  const clientConsumer = { applyToEnvironment: (env) => env.config.consumer === "client" };
+  assert.ok(envAllows(clientConsumer, "client"));
+  assert.ok(!envAllows(clientConsumer, "ssr"));
+  // an async applyToEnvironment cannot be awaited in the sync filter, so a
+  // thenable is treated as allowed rather than throwing on `!== false`.
+  const asyncGate = { applyToEnvironment: async (env) => env.config.consumer === "client" };
+  assert.ok(envAllows(asyncGate, "ssr"));
+});
+
 test("hookHandler / hookFilter: function form and object form", () => {
   const fn = () => 1;
   assert.equal(hookHandler(fn), fn);

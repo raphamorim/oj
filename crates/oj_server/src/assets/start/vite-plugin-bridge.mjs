@@ -18,10 +18,25 @@ const hookFilter = (h) => (typeof h === "object" && h ? h.filter : undefined);
 const ojReimplemented = (name = "") =>
   name.startsWith("vite:") || /^tanstack[-:]/.test(name) || name.startsWith("@tanstack/");
 
+// Vite's Environment passed to applyToEnvironment carries `config.consumer`
+// ("client"/"server"); @vitejs/plugin-react reads it directly, so the bare
+// `{ name }` oj used to pass threw and (in the client-bundle process, which has
+// no rejection guard) killed the build. An async applyToEnvironment can't be
+// awaited here, so a thenable is treated as "allowed".
+function envConsumer(environment) {
+  return environment === "client" ? "client" : "server";
+}
 function envAllows(plugin, environment) {
   const f = plugin.applyToEnvironment;
   if (typeof f !== "function") return true;
-  try { return f({ name: environment }) !== false; } catch { return true; }
+  const env = { name: environment, config: { consumer: envConsumer(environment) } };
+  try {
+    const r = f(env);
+    if (r && typeof r.then === "function") return true;
+    return r !== false;
+  } catch {
+    return true;
+  }
 }
 
 function matchOne(pat, id) {
