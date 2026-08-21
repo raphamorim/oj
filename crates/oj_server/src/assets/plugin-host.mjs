@@ -338,19 +338,20 @@ async function setupConfigureServer() {
   const srv = http.createServer((req, res) => {
     let i = 0;
     const next = (err) => {
-      if (err) {
-        res.statusCode = 500;
-        res.end(String((err && err.stack) || err));
-        return;
-      }
       while (i < stack.length) {
         const { path, fn } = stack[i++];
         if (path && !req.url.startsWith(path)) continue;
+        if ((fn.length >= 4) !== (err != null)) continue;
         try {
-          return fn(req, res, next);
+          return err != null ? fn(err, req, res, next) : fn(req, res, next);
         } catch (e) {
           return next(e);
         }
+      }
+      if (err != null) {
+        res.statusCode = 500;
+        res.end(String((err && err.stack) || err));
+        return;
       }
       res.setHeader("x-oj-fallthrough", "1");
       res.statusCode = 404;
