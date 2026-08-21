@@ -1898,6 +1898,9 @@ dependencies = [
 [[package]]
 name = "oj_graph"
 version = "0.0.45"
+dependencies = [
+ "proptest",
+]
 
 [[package]]
 name = "oj_resolver"

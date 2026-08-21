@@ -4,3 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Module graph and HMR boundary propagation"
+
+[dev-dependencies]
+proptest.workspace = true
