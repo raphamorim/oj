@@ -1,0 +1,50 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_compile
+          - fuzz_dotenv
+          - fuzz_json_module
+          - fuzz_html_env
+          - fuzz_cache_entry
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      - name: fuzz for 10 minutes
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=600
+      - name: upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts
+
+  ignored:
+    name: process-aborting tier
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # These are `#[ignore]`d because they abort the test binary on purpose
+      # (see docs/development/testing.md). Nightly runs them so a change
+      # upstream that fixes -- or worsens -- one of them is noticed.
+      - name: run the ignored tier, reporting rather than failing
+        run: cargo test --workspace -- --ignored || echo "the ignored tier still aborts, as documented"
