@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -52,33 +53,47 @@ impl PersistentCache {
     }
 
     pub fn get(&self, key: &str) -> Option<CachedModule> {
-        let bytes = fs::read(self.path_for(key)).ok()?;
+        let path = self.path_for(key)?;
+        let bytes = fs::read(&path).ok()?;
         match serde_json::from_slice(&bytes) {
             Ok(module) => Some(module),
             Err(_) => {
-                let _ = fs::remove_file(self.path_for(key));
+                let _ = fs::remove_file(&path);
                 None
             }
         }
     }
 
     pub fn put(&self, key: &str, module: &CachedModule) {
-        let path = self.path_for(key);
+        let Some(path) = self.path_for(key) else { return };
         let Some(parent) = path.parent() else { return };
         if fs::create_dir_all(parent).is_err() {
             return;
         }
-        let tmp = path.with_extension("tmp");
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp-{}-{seq}", std::process::id()));
         if fs::write(&tmp, serde_json::to_vec(module).unwrap_or_default()).is_ok() {
-            let _ = fs::rename(&tmp, &path);
+            if fs::rename(&tmp, &path).is_err() {
+                let _ = fs::remove_file(&tmp);
+            }
+        } else {
+            let _ = fs::remove_file(&tmp);
         }
     }
 
-    fn path_for(&self, key: &str) -> PathBuf {
-        let shard = key.get(..2).unwrap_or("00");
-        self.dir.join(shard).join(format!("{key}.json"))
+    fn path_for(&self, key: &str) -> Option<PathBuf> {
+        let is_digest = key.len() == 64
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !is_digest {
+            return None;
+        }
+        Some(self.dir.join(&key[..2]).join(format!("{key}.json")))
     }
 }
+
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 mod tests {
@@ -138,7 +153,7 @@ mod tests {
         let cache = temp_cache("corrupt");
         let key = cache.key(b"s", "/u", "dev");
         cache.put(&key, &sample());
-        let path = cache.path_for(&key);
+        let path = cache.path_for(&key).unwrap();
         std::fs::write(&path, b"{ not json").unwrap();
         assert_eq!(cache.get(&key), None);
         assert!(!path.exists(), "corrupt entry must be removed");
@@ -149,7 +164,7 @@ mod tests {
         let cache = temp_cache("shard");
         let key = cache.key(b"s", "/u", "dev");
         cache.put(&key, &sample());
-        let path = cache.path_for(&key);
+        let path = cache.path_for(&key).unwrap();
         assert_eq!(
             path.parent()
                 .unwrap()
@@ -160,10 +175,14 @@ mod tests {
             &key[..2]
         );
         assert!(path.exists());
-        assert!(
-            !path.with_extension("tmp").exists(),
-            "temp file must be renamed away"
-        );
+        let shard = path.parent().unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(shard)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files must be renamed away: {leftovers:?}");
     }
 
     #[test]
