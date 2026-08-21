@@ -214,12 +214,15 @@ pub struct DevServer {
     pub bundle: bool,
     pub host: Option<String>,
     pub config: Option<PathBuf>,
+    /// Disable the on-disk module cache (always recompile).
+    pub no_cache: bool,
 }
 
 struct ServerState {
     root: PathBuf,
     public_dir: PathBuf,
     bundle: bool,
+    persistent_cache: bool,
     reload_tx: broadcast::Sender<String>,
     graph: Mutex<ModuleGraph>,
     resolver: Arc<OjResolver>,
@@ -354,6 +357,10 @@ impl DevServer {
         let server_cfg = config.server.clone().unwrap_or_default();
         let port = self.port.or(server_cfg.port).unwrap_or(5199);
         let bundle = self.bundle || config.bundle.unwrap_or(false);
+        // The on-disk module cache is on by default; `oj dev --no-cache` (or
+        // OJ_NO_CACHE=1) turns it off so every module recompiles each start.
+        let persistent_cache = !self.no_cache
+            && !std::env::var("OJ_NO_CACHE").is_ok_and(|v| !v.is_empty() && v != "0");
         let host = resolve_host(self.host.as_deref().or(server_cfg.host.as_deref()));
         let proxy: Vec<(String, oj_config::ProxyEntry)> = server_cfg
             .proxy
@@ -510,6 +517,7 @@ impl DevServer {
             .map(|p| root.join(p))
             .unwrap_or_else(|| root.join("public"));
         let state = Arc::new(ServerState {
+            persistent_cache,
             root: root.clone(),
             public_dir,
             bundle,
@@ -1774,7 +1782,7 @@ async fn ensure_module(
     // those. Modules whose imports are all real files (svgr on disk, plain
     // source, deps) keep the fast persistent cache (Vite has no cross-restart
     // transform cache at all; this preserves oj's where it is sound).
-    if let Some(module) = state.cache.get(&key) {
+    if let Some(module) = state.persistent_cache.then(|| state.cache.get(&key)).flatten() {
         let module = Arc::new(module);
         let needs_retransform = state.plugins_have_transform
             && !is_dep_early
@@ -1800,9 +1808,11 @@ async fn ensure_module(
             fs_allow: Vec::new(),
             watch_files: Vec::new(),
         });
-        let _ = state
-            .cache_writes
-            .try_send((key.clone(), Arc::clone(&module)));
+        if state.persistent_cache {
+            let _ = state
+                .cache_writes
+                .try_send((key.clone(), Arc::clone(&module)));
+        }
         memory_put(state, url, &key, &module);
         register_in_graph(state, url, &module);
         return Ok((key, module));
@@ -2048,9 +2058,11 @@ async fn ensure_module(
         Ok(Err(err)) => return Err(err),
         Err(join_err) => return Err(format!("compiler task failed: {join_err}")),
     };
-    let _ = state
-        .cache_writes
-        .try_send((key.clone(), Arc::clone(&module)));
+    if state.persistent_cache {
+        let _ = state
+            .cache_writes
+            .try_send((key.clone(), Arc::clone(&module)));
+    }
     memory_put(state, url, &key, &module);
     register_in_graph(state, url, &module);
     if state.plugins_use_module_parsed && !is_dep && !is_server {
