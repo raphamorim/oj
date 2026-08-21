@@ -1886,6 +1886,8 @@ version = "0.0.45"
 dependencies = [
  "grass",
  "lightningcss",
+ "proptest",
+ "tempfile",
 ]
 
 [[package]]

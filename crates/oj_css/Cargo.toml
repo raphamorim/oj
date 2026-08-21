@@ -8,3 +8,7 @@ description = "CSS pipeline: Lightning CSS transforms, CSS Modules scoping"
 [dependencies]
 lightningcss = "1.0.0-alpha.72"
 grass = "0.13.4"
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
