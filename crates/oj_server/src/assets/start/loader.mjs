@@ -17,10 +17,11 @@ import {
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
 const { transformSync } = await importPkg(APP, "rolldown/experimental", ["vite", "@tanstack/react-start"]);
-// The plugin container (config eval + buildStart + plugin hooks) lives in a
-// worker behind a sync bridge: registerHooks hooks cannot await, and hosting
-// it off-thread keeps its bootstrap out of the module-loading critical path.
-const container = loadPluginContainerSync(APP, { command: "serve", environment: "ssr" });
+// The plugin container (config eval + buildStart + plugin hooks) lives in the
+// plugin-host process behind a sync FIFO bridge: registerHooks hooks cannot
+// await, and hosting it out-of-process keeps its bootstrap off the
+// module-loading critical path.
+const rawContainer = loadPluginContainerSync(APP, { command: "serve", environment: "ssr" });
 const VIRTUAL_SCHEME = "ojvirtual:///";
 const CACHE_DIR = pathResolve(APP, ".oj-cache");
 
@@ -86,7 +87,7 @@ function gitStateBytes() {
 }
 const ENV_DELTA_FILE = pathResolve(CACHE_DIR, "ssr-env.json");
 const envDelta = (() => {
-  if (!container) return {};
+  if (!rawContainer) return {};
   let deltaKey = null;
   if (process.env.OJ_SSR_LOADER_CACHE !== "off") {
     try {
@@ -107,7 +108,7 @@ const envDelta = (() => {
     } catch {}
   }
   let fresh = {};
-  try { fresh = container.env() ?? {}; } catch {}
+  try { fresh = rawContainer.env() ?? {}; } catch {}
   if (deltaKey) {
     (async () => {
       try {
@@ -151,6 +152,109 @@ function cacheKey(mode, path, source) {
   }
 }
 const cachePath = (key) => pathResolve(CACHE_DIR, key.slice(0, 2), `${key}.json`);
+
+// Speculative bridge answers. Bridge resolveId/load/transformUserCode round
+// trips (and, worse, any call issued before the plugin host's container
+// finishes bootstrap)
+// put config eval + buildStart + per-call FIFO latency on the module walk's
+// critical path, so until the first post-prewarm revalidation, answers
+// recorded on a previous boot are served instead. Keys include the on-disk
+// bytes when the id is a readable file (an edited file misses and goes
+// live — correct); virtual ids have no content to key on, so every
+// speculated answer is replayed against the live container afterwards
+// (revalidateSpeculation, driven by the server's revalidate command) and
+// any mismatch triggers a runner reload.
+const SPEC_FILE = pathResolve(CACHE_DIR, "ssr-bridge-pack.jsonl");
+const specPack = new Map();
+let specFileReady = false;
+if (EPOCH && rawContainer) {
+  try {
+    const lines = readFileSync(SPEC_FILE, "utf8").split("\n");
+    if (JSON.parse(lines[0]).epoch === EPOCH) {
+      specFileReady = true;
+      for (let i = 1; i < lines.length; i++) {
+        if (!lines[i]) continue;
+        try { const e = JSON.parse(lines[i]); specPack.set(e.k, e.v); } catch {}
+      }
+    }
+  } catch {}
+}
+let specPending = [];
+let specDirty = false;
+function flushSpecPack() {
+  if (specDirty) {
+    specDirty = false;
+    specPending = [];
+    const body = [JSON.stringify({ epoch: EPOCH })];
+    for (const [k, v] of specPack) body.push(JSON.stringify({ k, v }));
+    specFileReady = true;
+    writeFile(SPEC_FILE, body.join("\n") + "\n").catch(() => {});
+    return;
+  }
+  const batch = specPending;
+  specPending = [];
+  if (batch.length === 0) return;
+  const body = batch.map((e) => JSON.stringify(e)).join("\n") + "\n";
+  const first = !specFileReady;
+  specFileReady = true;
+  (first
+    ? writeFile(SPEC_FILE, JSON.stringify({ epoch: EPOCH }) + "\n" + body)
+    : appendFile(SPEC_FILE, body)
+  ).catch(() => {});
+}
+function specKey(method, args) {
+  try {
+    const h = createHash("sha256");
+    h.update(method);
+    for (const a of args) { h.update("\0"); h.update(String(a ?? "")); }
+    if (method === "load") {
+      const p = String(args[0] ?? "").split("?")[0];
+      if (p.startsWith("/") && isFile(p)) { h.update("\0src\0"); h.update(readFileSync(p)); }
+    }
+    return h.digest("hex");
+  } catch { return null; }
+}
+const speculatedCalls = new Map();
+let specWindowOpen = true;
+function speculativeContainer(raw) {
+  const wrap = (method) => (...args) => {
+    const key = EPOCH ? specKey(method, args) : null;
+    if (key && specWindowOpen && specPack.has(key)) {
+      if (!speculatedCalls.has(key)) speculatedCalls.set(key, { method, args });
+      return specPack.get(key);
+    }
+    const v = raw[method](...args) ?? null;
+    if (key && !specPack.has(key)) {
+      specPack.set(key, v);
+      specPending.push({ k: key, v });
+    }
+    return v;
+  };
+  return {
+    ...raw,
+    resolveId: wrap("resolveId"),
+    load: wrap("load"),
+    transformUserCode: wrap("transformUserCode"),
+  };
+}
+const container = rawContainer ? speculativeContainer(rawContainer) : null;
+
+export function revalidateSpeculation() {
+  specWindowOpen = false;
+  let stale = false;
+  for (const [key, { method, args }] of speculatedCalls) {
+    let live;
+    try { live = rawContainer[method](...args) ?? null; } catch { continue; }
+    if (JSON.stringify(live) !== JSON.stringify(specPack.get(key) ?? null)) {
+      specPack.set(key, live);
+      specDirty = true;
+      stale = true;
+    }
+  }
+  speculatedCalls.clear();
+  if (specDirty) flushSpecPack();
+  return stale;
+}
 
 // Load pack: an index over the per-entry load cache, persisted as one JSONL
 // file (header line carries the epoch). At init only byte offsets are indexed;
@@ -345,6 +449,7 @@ export function flushCaches() {
   if (writeQueue.length > 0) drainWrites();
   if (packPending.length > 0) flushLoadPack();
   if (resolvePending.length > 0) flushResolveCache();
+  if (specPending.length > 0 || specDirty) flushSpecPack();
 }
 
 function reportCacheStats() {
@@ -602,8 +707,20 @@ export function load(url, context, next) {
       if (hit != null) return { format: "module", source: hit, shortCircuit: true };
     }
     if (userFile) {
-      const t = container.transformUserCode(raw, path);
-      if (t != null) raw = t;
+      // The pipeline already treats transformUserCode as pure in (path, raw)
+      // — its output is persisted under content keys — so the step itself is
+      // cached the same way. This unblocks import.meta.glob files, whose final
+      // output is never persisted (directory-dependent) and would otherwise
+      // consult the container on every boot.
+      const tucKey = cacheKey("ssr-tuc", path, raw);
+      const tucHit = cacheGet(tucKey);
+      if (tucHit != null) {
+        if (tucHit !== "\0none") raw = tucHit;
+      } else {
+        const t = container.transformUserCode(raw, path);
+        cachePut(tucKey, t ?? "\0none");
+        if (t != null) raw = t;
+      }
     }
     const src = transformServerFns(transformGlob(raw, path), path);
     const out = transformSync(path, src, {
@@ -649,10 +766,17 @@ export function load(url, context, next) {
   if (container && (clean.endsWith(".js") || clean.endsWith(".mjs"))) {
     const path = fileURLToPath(clean);
     if (!path.includes("/node_modules/")) {
+      // Unclaimed files are remembered under a disk-content key: the container
+      // round trip otherwise blocks the whole walk on container bootstrap.
+      let diskRaw = null;
+      try { diskRaw = readFileSync(path, "utf8"); } catch {}
+      const key = diskRaw != null ? cacheKey("ssr-loader-unclaimed", path, diskRaw) : null;
+      if (key && cacheGet(key) != null) return next(url, context);
       const loaded = container.load(path);
       if (loaded != null) {
         return { format: "module", source: transformGlob(loaded, path), shortCircuit: true };
       }
+      cachePut(key, "1");
     }
   }
   if (clean.startsWith("file:") && clean.includes("/node_modules/")) {

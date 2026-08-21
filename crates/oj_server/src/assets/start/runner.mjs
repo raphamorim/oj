@@ -25,6 +25,10 @@ if (process.env.OJ_V8_COMPILE_CACHE === "on") {
     module.enableCompileCache?.(v8Dir);
   } catch {}
 }
+const phase = (label) => {
+  if (process.env.OJ_BOOT_PHASES) process.stderr.write(`[oj-phase] ${Date.now()} runner: ${label}\n`);
+};
+phase("main begin");
 const ENTRY = pathToFileURL(process.env.OJ_RUNNER_ENTRY || join(HERE, "server-entry.tsx")).href;
 const LOADER = pathToFileURL(process.env.OJ_RUNNER_LOADER || join(HERE, "loader.mjs")).href;
 // In-thread synchronous hooks (registerHooks, Node 22.15+/23.5+): no hooks
@@ -32,6 +36,7 @@ const LOADER = pathToFileURL(process.env.OJ_RUNNER_LOADER || join(HERE, "loader.
 // imported before registration, so its own dependency graph loads unhooked.
 const loaderApi = await import(LOADER);
 if (loaderApi.resolve || loaderApi.load) module.registerHooks({ resolve: loaderApi.resolve, load: loaderApi.load });
+phase("loader registered");
 
 const send = process.stdout.write.bind(process.stdout);
 process.stdout.write = process.stderr.write.bind(process.stderr);
@@ -40,6 +45,7 @@ const flushV8 = () => { try { module.flushCompileCache?.(); } catch {} };
 let version = 0;
 let statsSent = false;
 let handler = (await import(ENTRY)).default;
+phase("entry evaluated");
 flushV8();
 loaderApi.flushCaches?.();
 const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
@@ -47,10 +53,13 @@ const OJ = _ojTTY ? "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m" : 
 process.stderr.write(`${OJ} start runner: ready\n`);
 
 // stdin EOF means oj died without tearing us down (SIGKILL skips
-// kill_on_drop): exit instead of idling as an orphan.
+// kill_on_drop): flush caches and exit instead of idling as an orphan.
+let parentGone = false;
 const onParentGone = () => {
-  try { module.flushCompileCache?.(); } catch {}
-  process.exit(0);
+  if (parentGone) return;
+  parentGone = true;
+  try { flushV8(); loaderApi.flushCaches(); } catch {}
+  setTimeout(() => process.exit(0), 500);
 };
 try {
   // bigint keeps the FIFO mode out of the shared stat buffer fs.realpathSync reads mid-walk
@@ -64,6 +73,24 @@ const rl = readline.createInterface({ input: process.stdin });
 for await (const line of rl) {
   let msg;
   try { msg = JSON.parse(line); } catch { continue; }
+  if (msg.cmd === "revalidate") {
+    // Replays speculated bridge answers against the live container; on any
+    // mismatch the entry is re-imported so later requests see fresh modules.
+    let reloaded = false;
+    try {
+      if (loaderApi.revalidateSpeculation?.()) {
+        version += 1;
+        loaderApi.setVersion?.(version);
+        handler = (await import(`${ENTRY}?ojv=${version}`)).default;
+        flushV8();
+        reloaded = true;
+      }
+    } catch {}
+    loaderApi.flushCaches?.();
+    phase(`revalidated (reloaded=${reloaded})`);
+    send(JSON.stringify({ revalidated: true, reloaded }) + "\n");
+    continue;
+  }
   if (msg.cmd === "reload") {
     try {
       version += 1;
