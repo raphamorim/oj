@@ -22,7 +22,7 @@ if (process.env.OJ_V8_COMPILE_CACHE === "on") {
 const ENTRY = pathToFileURL(process.env.OJ_RUNNER_ENTRY || join(HERE, "server-entry.tsx")).href;
 const LOADER = pathToFileURL(process.env.OJ_RUNNER_LOADER || join(HERE, "loader.mjs")).href;
 const loaderApi = await import(LOADER);
-module.registerHooks({ resolve: loaderApi.resolve, load: loaderApi.load });
+if (loaderApi.resolve || loaderApi.load) module.registerHooks({ resolve: loaderApi.resolve, load: loaderApi.load });
 
 const send = process.stdout.write.bind(process.stdout);
 process.stdout.write = process.stderr.write.bind(process.stderr);
@@ -32,7 +32,7 @@ let version = 0;
 let statsSent = false;
 let handler = (await import(ENTRY)).default;
 flushV8();
-loaderApi.flushCaches();
+loaderApi.flushCaches?.();
 const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
 const OJ = _ojTTY ? "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m" : "oj";
 process.stderr.write(`${OJ} start runner: ready\n`);
@@ -55,10 +55,10 @@ for await (const line of rl) {
   if (msg.cmd === "reload") {
     try {
       version += 1;
-      loaderApi.setVersion(version);
+      loaderApi.setVersion?.(version);
       handler = (await import(`${ENTRY}?ojv=${version}`)).default;
       flushV8();
-      loaderApi.flushCaches();
+      loaderApi.flushCaches?.();
       send(JSON.stringify({ reloaded: true }) + "\n");
     } catch (e) {
       send(JSON.stringify({ reloaded: false, error: String((e && e.stack) || e) }) + "\n");
@@ -74,8 +74,21 @@ for await (const line of rl) {
     const headers = {};
     res.headers.forEach((v, k) => { headers[k] = v; });
     send(JSON.stringify({ id: msg.id, status: res.status, headers, body }) + "\n");
-    loaderApi.flushCaches();
-    if (!statsSent) { statsSent = true; loaderApi.reportCacheStats(); flushV8(); }
+    loaderApi.flushCaches?.();
+    if (!statsSent) {
+      statsSent = true;
+      loaderApi.reportCacheStats?.();
+      flushV8();
+      if (process.env.OJ_SSR_MEM_STATS === "1") {
+        const v8 = await import("node:v8");
+        const stats = {
+          rss: process.memoryUsage.rss(),
+          heap: v8.default.getHeapStatistics(),
+          loader: loaderApi.memStats?.() ?? null,
+        };
+        process.stderr.write(`oj ssr memstats: ${JSON.stringify(stats)}\n`);
+      }
+    }
   } catch (e) {
     send(JSON.stringify({ id: msg.id, status: 500, headers: {}, body: String((e && e.stack) || e) }) + "\n");
   }
