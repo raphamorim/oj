@@ -95,26 +95,16 @@ export function findConfig(app) {
   return null;
 }
 
-export async function loadPluginContainer(app, { command = "serve", mode = "development", environment = "client" } = {}) {
-  const configFile = findConfig(app);
-  if (!configFile) return null;
-  let vite;
-  try { vite = await importPkg(app, "vite", ["@tanstack/react-start"]); } catch { return null; }
-  if (typeof vite?.loadConfigFromFile !== "function") return null;
-  let loaded;
-  try {
-    loaded = await vite.loadConfigFromFile({ command, mode }, configFile, app);
-  } catch {
-    return null;
-  }
-  const all = (loaded?.config?.plugins ?? []).flat(Infinity).filter(Boolean);
+// Builds an environment-scoped container over an already-evaluated plugin
+// list, so one config eval can serve several environments' containers.
+export function createPluginContainer(vite, allPlugins, { command = "serve", mode = "development", environment = "client" } = {}) {
   const plugins = ordered(
-    all.filter(
+    allPlugins.filter(
       (p) => (p.resolveId || p.load || p.transform || p.generateBundle) && applyMatches(p, command, mode),
     ),
   );
 
-  const parse = typeof vite.parseAst === "function"
+  const parse = typeof vite?.parseAst === "function"
     ? (code, opts) => vite.parseAst(code, opts)
     : () => ({});
 
@@ -240,9 +230,27 @@ export async function loadPluginContainer(app, { command = "serve", mode = "deve
     });
   }
 
+  return { resolveId, load, transform, transformUserCode, buildStart, generateBundle, pluginCount: plugins.length, watchFiles };
+}
+
+export async function loadPluginContainer(app, opts = {}) {
+  const { command = "serve", mode = "development" } = opts;
+  const configFile = findConfig(app);
+  if (!configFile) return null;
+  let vite;
+  try { vite = await importPkg(app, "vite", ["@tanstack/react-start"]); } catch { return null; }
+  if (typeof vite?.loadConfigFromFile !== "function") return null;
+  let loaded;
+  try {
+    loaded = await vite.loadConfigFromFile({ command, mode }, configFile, app);
+  } catch {
+    return null;
+  }
+  const all = (loaded?.config?.plugins ?? []).flat(Infinity).filter(Boolean);
+  const container = createPluginContainer(vite, all, opts);
   const publicDir = typeof loaded?.config?.publicDir === "string" ? loaded.config.publicDir : null;
   const configDependencies = [configFile, ...(loaded?.dependencies ?? [])];
-  return { resolveId, load, transform, transformUserCode, buildStart, generateBundle, publicDir, pluginCount: plugins.length, watchFiles, configDependencies };
+  return { ...container, publicDir, configDependencies };
 }
 
 export const __test = { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows };

@@ -1,58 +1,114 @@
 // SPDX-License-Identifier: MIT
 
-// Synchronous facade over the async Vite plugin container, for use inside
+// Synchronous facade over the Vite plugin container, for use inside
 // module.registerHooks() hooks (which must return values, not promises).
-// The container itself runs in a worker (container-host.mjs); each call here
-// posts a request and blocks on Atomics.wait until the worker replies. The
-// main thread never waits for worker bootstrap itself — only a call issued
-// before the container is ready blocks until bootstrap (incl. buildStart)
-// completes, so cache-hit boots pay nothing for config eval.
+// The container lives in the oj plugin-host process (plugin-host.mjs), which
+// evaluates the vite config once for all environments. Each call writes a
+// length-prefixed JSON frame to a FIFO and blocks in fs.readSync for the
+// framed reply. Connection is lazy: a full-cache-hit boot never touches the
+// FIFOs; only the first plugin-served miss blocks until the host is up.
 
-import { Worker, MessageChannel, receiveMessageOnPort } from "node:worker_threads";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { closeSync, constants, existsSync, openSync, readSync, writeSync } from "node:fs";
+import { join } from "node:path";
 import { findConfig } from "./vite-plugin-bridge.mjs";
 
-const HERE = dirname(fileURLToPath(import.meta.url));
+const sleeper = new Int32Array(new SharedArrayBuffer(4));
+const sleep = (ms) => { Atomics.wait(sleeper, 0, 0, ms); };
 
-export function loadPluginContainerSync(app, opts) {
+export function loadPluginContainerSync(app, _opts) {
   if (!findConfig(app)) return null;
-  const { port1, port2 } = new MessageChannel();
-  const sab = new SharedArrayBuffer(4);
-  const flag = new Int32Array(sab);
-  const worker = new Worker(join(HERE, "container-host.mjs"), {
-    workerData: { app, opts, port: port2, sab, envBase: { ...process.env } },
-    transferList: [port2],
-  });
-  // Neither the worker nor the port may keep the runner alive after stdin
-  // closes; requests are driven synchronously so no listener is needed.
-  worker.unref();
-  port1.unref();
+  // Decided in Rust (ssr_bridge_dir: OS temp dir, or the OJ_SSR_BRIDGE_DIR
+  // override) and passed down when the runner spawns. Never a path inside the
+  // app tree: source scanners that walk it block forever opening a FIFO.
+  const dir = process.env.OJ_SSR_BRIDGE_DIR;
+  if (!dir) return null;
+  const reqPath = join(dir, "req.fifo");
+  const repPath = join(dir, "rep.fifo");
+  let state = "idle"; // idle -> up | down
+  let reqFd = -1;
+  let repFd = -1;
   let seq = 0;
-  function call(method, args) {
-    const id = ++seq;
-    port1.postMessage({ id, method, args });
-    // buildStart can legitimately block on the cross-process lock in
-    // vite-plugin-bridge.mjs (stolen after 300s), so match that horizon.
+
+  function connect() {
+    // Config eval + buildStart can legitimately take this long on a cold
+    // cache (same horizon the worker-based bridge used).
     const deadline = Date.now() + 300_000;
     for (;;) {
-      Atomics.wait(flag, 0, 0, 200);
-      Atomics.store(flag, 0, 0);
-      const m = receiveMessageOnPort(port1);
-      if (m) {
-        if (m.message.id !== id) continue;
-        if (m.message.error != null) throw new Error(m.message.error);
-        return m.message.value;
+      if (existsSync(join(dir, "disabled"))) {
+        state = "down";
+        return false;
       }
-      if (Date.now() > deadline) throw new Error(`oj: SSR plugin container timed out (${method})`);
+      // A nonblocking write-open succeeds only once the host holds the read
+      // end, so this doubles as the host-liveness probe; the real descriptors
+      // are then opened blocking (writes must not short-read large frames).
+      try {
+        closeSync(openSync(reqPath, constants.O_WRONLY | constants.O_NONBLOCK));
+        break;
+      } catch {}
+      if (Date.now() > deadline) {
+        state = "down";
+        throw new Error("oj: SSR plugin bridge: plugin host not ready after 300s");
+      }
+      sleep(25);
+    }
+    reqFd = openSync(reqPath, "w");
+    repFd = openSync(repPath, "r");
+    state = "up";
+    return true;
+  }
+
+  function readExact(len) {
+    const buf = Buffer.allocUnsafe(len);
+    let off = 0;
+    while (off < len) {
+      let n = 0;
+      try {
+        n = readSync(repFd, buf, off, len - off, null);
+      } catch (e) {
+        if (e.code === "EAGAIN" || e.code === "EINTR") { sleep(1); continue; }
+        state = "down";
+        throw e;
+      }
+      if (n === 0) {
+        state = "down";
+        throw new Error("oj: SSR plugin bridge closed (plugin host exited)");
+      }
+      off += n;
+    }
+    return buf;
+  }
+
+  function call(method, args) {
+    if (state === "down") return null;
+    if (state === "idle" && !connect()) return null;
+    const id = ++seq;
+    const json = Buffer.from(JSON.stringify({ id, method, args }));
+    const frame = Buffer.allocUnsafe(4 + json.length);
+    frame.writeUInt32LE(json.length, 0);
+    json.copy(frame, 4);
+    let off = 0;
+    while (off < frame.length) off += writeSync(reqFd, frame, off, frame.length - off);
+    for (;;) {
+      const head = readExact(4);
+      const m = JSON.parse(readExact(head.readUInt32LE(0)).toString("utf8"));
+      if (m.id !== id) continue;
+      if (m.error != null) throw new Error(m.error);
+      return m.value ?? null;
     }
   }
+
   return {
     resolveId: (id, importer) => call("resolveId", [id, importer]),
     load: (id) => call("load", [id]),
     transform: (code, id) => call("transform", [code, id]),
     transformUserCode: (code, id) => call("transformUserCode", [code, id]),
     env: () => call("__env", []),
-    heap: () => call("__heap", []),
+    // Diagnostics must not force a connect (that would put host readiness on
+    // the full-hit warm path when OJ_SSR_MEM_STATS is on).
+    heap: () => (state === "up" ? call("__heap", []) : null),
+    // Nonblocking bootstrap probe (cross-process analog of an in-worker
+    // bootstrap-done flag): the host writes `ready` after the SSR container's
+    // buildStart completes.
+    bootstrapDone: () => existsSync(join(dir, "ready")),
   };
 }

@@ -21,3 +21,6 @@ serde_json.workspace = true
 blake3.workspace = true
 simdutf8.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

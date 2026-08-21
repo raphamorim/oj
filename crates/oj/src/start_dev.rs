@@ -49,7 +49,12 @@ pub async fn start_dev(
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("app root not found: {}: {e}", root.display()))?;
     let cache = root.join(".oj-cache").join("start");
+    oj_server::ensure_cache_gitignore(&root);
     oj_server::write_start_assets(&cache)?;
+    // Before any child spawns: the runner's loader and the plugin host meet on
+    // this FIFO pair, and a stale sentinel from a previous run must be gone
+    // before the loader can observe it.
+    oj_server::plugins::prepare_ssr_bridge(&root);
     oj_server::boot_phase("start_dev begin");
 
     // build_app (vite.config extract + plugin host boot) needs only the root;
@@ -137,11 +142,44 @@ pub async fn start_dev(
         .await
         .map_err(|e| anyhow::anyhow!("cannot bind {addr}: {e}"))?;
     oj_server::boot_phase("listening");
+    // Graceful-shutdown FIFO cleanup. Unlink-after-connect is unsafe (the
+    // loader connects lazily and a runner reload reopens by path), so the
+    // bridge dir lives until exit; prepare_ssr_bridge clears anything a
+    // non-graceful death leaves behind.
+    {
+        let root = root.clone();
+        tokio::spawn(async move {
+            let code = shutdown_signal().await;
+            oj_server::plugins::cleanup_ssr_bridge(&root);
+            std::process::exit(code);
+        });
+    }
     println!("  {} dev (tanstack start)", oj_server::oj_brand());
     let url = format!("http://localhost:{}/", built.port);
     println!("  {}", oj_server::link(&url, &oj_server::cell(&url)));
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Resolves with the conventional exit code when SIGINT or SIGTERM arrives.
+async fn shutdown_signal() -> i32 {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => return tokio::signal::ctrl_c().await.map(|_| 130).unwrap_or(130),
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => 130,
+            _ = term.recv() => 143,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        130
+    }
 }
 
 async fn reload_runner(state: &StartState) {
@@ -316,6 +354,7 @@ pub async fn start_build(root: PathBuf) -> anyhow::Result<()> {
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("app root not found: {}: {e}", root.display()))?;
     let cache = root.join(".oj-cache").join("start");
+    oj_server::ensure_cache_gitignore(&root);
     oj_server::write_start_assets(&cache)?;
     generate_route_tree(&root, &cache)?;
     generate_server_fn_resolver(&root, &cache)?;
@@ -540,6 +579,10 @@ async fn spawn_node_service(root: &Path, script: &Path) -> anyhow::Result<Runner
     cmd.arg(script)
         .env("OJ_APP_ROOT", root)
         .env("NODE_ENV", "development")
+        .env(
+            "OJ_SSR_BRIDGE_DIR",
+            oj_server::plugins::ssr_bridge_dir(root),
+        )
         .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

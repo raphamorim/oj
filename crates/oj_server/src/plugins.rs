@@ -33,6 +33,110 @@ pub enum PluginSource {
     ViteConfig(std::path::PathBuf),
 }
 
+/// FIFO pair + sentinel files the start runner's SSR loader uses to reach the
+/// plugin host's SSR container (see container-bridge.mjs / plugin-host.mjs).
+/// Lives in the OS temp dir, never inside the app tree: source scanners walk
+/// the app (Tailwind's oxide scanner opens every candidate file), and
+/// open(2)/read(2) on a FIFO blocks forever.
+pub fn ssr_bridge_dir(root: &Path) -> PathBuf {
+    if let Some(dir) = std::env::var_os("OJ_SSR_BRIDGE_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    let id = blake3::hash(root.to_string_lossy().as_bytes()).to_hex();
+    std::env::temp_dir().join(format!("oj-ssr-bridge-{}", &id.as_str()[..16]))
+}
+
+fn create_bridge_dir(dir: &Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    true
+}
+
+/// Older builds put the bridge under the app tree, where the FIFOs poison any
+/// later source scan in the checkout even after oj exits. Heal on sight.
+pub fn remove_legacy_ssr_bridge(root: &Path) {
+    let legacy = root.join(".oj-cache").join("start").join("ssr-bridge");
+    if legacy != ssr_bridge_dir(root) {
+        let _ = std::fs::remove_dir_all(&legacy);
+    }
+}
+
+/// Remove the bridge dir (graceful-shutdown cleanup; the next boot's
+/// prepare_ssr_bridge handles ungraceful leftovers).
+pub fn cleanup_ssr_bridge(root: &Path) {
+    let _ = std::fs::remove_dir_all(ssr_bridge_dir(root));
+}
+
+/// Tells the loader there is no SSR container to wait for (host failed,
+/// filtered to zero plugins, or platform has no FIFOs).
+pub fn disable_ssr_bridge(root: &Path) {
+    let dir = ssr_bridge_dir(root);
+    if !create_bridge_dir(&dir) {
+        return;
+    }
+    let _ = std::fs::write(dir.join("disabled"), b"1");
+}
+
+#[cfg(unix)]
+fn mkfifo_at(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    unsafe { libc::mkfifo(c.as_ptr(), 0o600) == 0 }
+}
+
+/// Recreates the FIFO pair and clears stale sentinels. Call once per server
+/// boot, before the plugin host and runner spawn — a leftover `disabled` from
+/// a previous run must not silence this run's container, and recreating later
+/// could unlink an end the runner already holds open.
+pub fn prepare_ssr_bridge(root: &Path) -> Option<PathBuf> {
+    remove_legacy_ssr_bridge(root);
+    let dir = ssr_bridge_dir(root);
+    if !create_bridge_dir(&dir) {
+        return None;
+    }
+    let _ = std::fs::remove_file(dir.join("disabled"));
+    let _ = std::fs::remove_file(dir.join("ready"));
+    #[cfg(unix)]
+    {
+        for name in ["req.fifo", "rep.fifo"] {
+            let p = dir.join(name);
+            let _ = std::fs::remove_file(&p);
+            if !mkfifo_at(&p) {
+                disable_ssr_bridge(root);
+                return None;
+            }
+        }
+        Some(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        disable_ssr_bridge(root);
+        None
+    }
+}
+
+/// Create-if-absent variant for callers that may run after the runner spawned.
+pub fn ensure_ssr_bridge(root: &Path) -> Option<PathBuf> {
+    let dir = ssr_bridge_dir(root);
+    if dir.join("req.fifo").exists()
+        && dir.join("rep.fifo").exists()
+        && !dir.join("disabled").exists()
+    {
+        return Some(dir);
+    }
+    prepare_ssr_bridge(root)
+}
+
 static VITE_CONFIG_OVERRIDE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
 pub fn set_vite_config_override(path: std::path::PathBuf) {
@@ -706,6 +810,50 @@ impl PluginHost {
                 })
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod ssr_bridge_tests {
+    use super::*;
+
+    fn temp_root(label: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("oj-bridge-test-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn bridge_dir_defaults_outside_the_app_tree() {
+        let root = Path::new("/some/app");
+        let dir = ssr_bridge_dir(root);
+        assert!(!dir.starts_with(root));
+        assert!(dir.starts_with(std::env::temp_dir()));
+        assert_eq!(dir, ssr_bridge_dir(root));
+        assert_ne!(dir, ssr_bridge_dir(Path::new("/other/app")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_heals_the_legacy_in_tree_bridge_and_creates_a_private_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_root("legacy");
+        let legacy = root.join(".oj-cache").join("start").join("ssr-bridge");
+        std::fs::create_dir_all(&legacy).unwrap();
+        assert!(mkfifo_at(&legacy.join("req.fifo")));
+
+        let dir = prepare_ssr_bridge(&root).expect("bridge dir");
+        assert!(!legacy.exists(), "legacy in-tree bridge dir must be removed");
+        assert!(!dir.starts_with(&root));
+        assert!(dir.join("req.fifo").exists() && dir.join("rep.fifo").exists());
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        cleanup_ssr_bridge(&root);
+        assert!(!dir.exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
