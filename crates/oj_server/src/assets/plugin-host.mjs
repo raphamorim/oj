@@ -17,6 +17,18 @@ const ssrEnvBase = { ...process.env };
 process.env.VITE_CONFIG_NATIVE_IGNORE_WARNING ??= "true";
 const env = initial.env ?? { command: "serve", mode: "development" };
 
+// This process hosts untrusted third-party plugin code. A plugin that spawns a
+// worker or a floating promise which throws asynchronously would otherwise take
+// the whole host down, and with it every other plugin. The host's own request
+// handling is synchronous and locally guarded, so a plugin's stray async
+// failure is logged and swallowed rather than made fatal.
+process.on("uncaughtException", (e) => {
+  process.stderr.write(`oj plugin host: uncaught plugin error (ignored): ${(e && (e.stack || e.message)) || e}\n`);
+});
+process.on("unhandledRejection", (e) => {
+  process.stderr.write(`oj plugin host: unhandled plugin rejection (ignored): ${(e && (e.stack || e.message)) || e}\n`);
+});
+
 // Start mode hosts only configureServer middleware for a framework config oj
 // owns (TanStack Start): the framework plugins drive the module graph and SSR
 // themselves, so their config lifecycle hooks are tolerated per-plugin instead
@@ -183,6 +195,12 @@ const OJ_NATIVE_PLUGIN_NAMES = new Set([
   "vite:react-swc:resolve-runtime",
 ]);
 
+// Dev-tooling plugins oj cannot host: they drive a full Vite dev server (ws
+// error overlay, file watcher, a worker running tsc/eslint) that oj does not
+// provide, and they have no effect on the served or built output. Left in, the
+// worker they spawn throws asynchronously; skip them outright.
+const OJ_UNSUPPORTED_PLUGIN_NAMES = new Set(["vite-plugin-checker"]);
+
 let plugins = [];
 let allPlugins = [];
 try {
@@ -197,6 +215,7 @@ try {
   plugins = (Array.isArray(list) ? list : [list]).filter(Boolean);
   allPlugins = plugins;
   plugins = plugins.filter((p) => !OJ_NATIVE_PLUGIN_NAMES.has(p && p.name));
+  plugins = plugins.filter((p) => !OJ_UNSUPPORTED_PLUGIN_NAMES.has(p && p.name));
   plugins = plugins.filter((p) => {
     if (p.apply == null) return true;
     try {
