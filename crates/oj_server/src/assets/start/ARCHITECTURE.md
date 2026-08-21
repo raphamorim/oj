@@ -56,13 +56,17 @@ Shared build helpers:
 
 Dev:
 
-- `loader.mjs` is a Node ESM loader hook. It resolves the framework aliases,
-  the app's `#`-imports and tsconfig `paths`, asset conventions, `virtual:`
-  ids, `.mdx` and `.svg`, and provides CJS-to-ESM interop; it compiles TS/JSX
-  with rolldown's `transformSync` on the fly.
-- `runner.mjs` is the persistent SSR process. It registers `loader.mjs`,
-  imports the server entry, and answers render requests over stdio. A reload
-  message re-imports the entry in place (warm reload).
+- `loader.mjs` is a Node ESM loader hook (in-thread, synchronous — installed
+  via `module.registerHooks`). It resolves the framework aliases, the app's
+  `#`-imports and tsconfig `paths`, asset conventions, `virtual:` ids, `.mdx`
+  and `.svg`, and provides CJS-to-ESM interop; it compiles TS/JSX with
+  rolldown's `transformSync` on the fly. The async Vite plugin container runs
+  in a worker (`container-host.mjs`) behind an Atomics-based sync bridge
+  (`container-bridge.mjs`), so the hooks stay synchronous and container
+  bootstrap overlaps module loading.
+- `runner.mjs` is the persistent SSR process. It imports `loader.mjs` and
+  registers its hooks, imports the server entry, and answers render requests
+  over stdio. A reload message re-imports the entry in place (warm reload).
 - `generate.mjs` runs `@tanstack/router-generator` to write `routeTree.gen.ts`.
 - `gen-resolver.mjs` scans `src` for `createServerFn` and emits the server-fn
   resolver (`getServerFnById`) with static imports.

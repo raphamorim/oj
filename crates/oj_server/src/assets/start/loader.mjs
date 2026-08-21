@@ -6,7 +6,7 @@ import { writeFile, appendFile, rename, mkdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { resolve as pathResolve, dirname } from "node:path";
 import { importPkg, viteEnvDefine, emptyVirtualStub } from "./resolve-pkg.mjs";
-import { loadPluginContainer } from "./vite-plugin-bridge.mjs";
+import { loadPluginContainerSync } from "./container-bridge.mjs";
 import { transformGlob } from "./glob-transform.mjs";
 import {
   EXTS, isFile, JS_TO_TS, probe, RESERVED, nearestPkgType,
@@ -17,16 +17,10 @@ import {
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
 const { transformSync } = await importPkg(APP, "rolldown/experimental", ["vite", "@tanstack/react-start"]);
-const container = await loadPluginContainer(APP, { command: "serve", environment: "ssr" });
-// Vite runs buildStart before serving any module; plugins that compile sources
-// (e.g. i18n message compilers) populate the state their load() hook serves.
-if (container) {
-  // buildStart degrades per-plugin inside the container (a plugin oj can't
-  // fully support is logged and skipped); this guards against a container-level
-  // failure without taking the SSR runner down.
-  try { await container.buildStart(); }
-  catch (e) { process.stderr.write(`oj: SSR buildStart failed: ${(e && (e.stack || e.message)) || e}\n`); }
-}
+// The plugin container (config eval + buildStart + plugin hooks) lives in a
+// worker behind a sync bridge: registerHooks hooks cannot await, and hosting
+// it off-thread keeps its bootstrap out of the module-loading critical path.
+const container = loadPluginContainerSync(APP, { command: "serve", environment: "ssr" });
 const VIRTUAL_SCHEME = "ojvirtual:///";
 const DEFINE = viteEnvDefine({ ssr: true });
 
@@ -93,13 +87,15 @@ async function drainWrites() {
   if (draining) return;
   draining = true;
   while (writeQueue.length > 0) {
-    const { file, body } = writeQueue.shift();
-    try {
-      await mkdir(dirname(file), { recursive: true });
-      const tmp = file.replace(/\.json$/, ".tmp");
-      await writeFile(tmp, body);
-      await rename(tmp, file);
-    } catch {}
+    const batch = writeQueue.splice(0, 64);
+    await Promise.all(batch.map(async ({ file, body }) => {
+      try {
+        await mkdir(dirname(file), { recursive: true });
+        const tmp = file.replace(/\.json$/, ".tmp");
+        await writeFile(tmp, body);
+        await rename(tmp, file);
+      } catch {}
+    }));
   }
   draining = false;
 }
@@ -163,6 +159,15 @@ function rememberResolve(key, entry) {
   if (!resolveFlushTimer) resolveFlushTimer = setTimeout(flushResolveCache, 250);
 }
 
+// With synchronous in-thread hooks the event loop never turns during a boot
+// or an SSR render, so the setTimeout-driven drains above starve until the
+// process idles — and a dev server killed shortly after boot would persist
+// almost nothing. The runner calls this at ready and after each response.
+export function flushCaches() {
+  if (writeQueue.length > 0) drainWrites();
+  if (resolvePending.length > 0) flushResolveCache();
+}
+
 function reportCacheStats() {
   if (!EPOCH) return;
   process.stderr.write(
@@ -171,9 +176,8 @@ function reportCacheStats() {
 }
 
 let V = 0;
-export async function initialize(data) {
-  if (data && data.port) data.port.on("message", (v) => (v === "stats" ? reportCacheStats() : (V = v)));
-}
+export function setVersion(v) { V = v; }
+export { reportCacheStats };
 const stripQ = (u) => u.split("?")[0];
 const withV = (u) => (V ? `${stripQ(u)}?ojv=${V}` : stripQ(u));
 const isTanstack = (u) => /\/@tanstack\//.test(u) && /\.(js|mjs)$/.test(stripQ(u));
@@ -233,7 +237,15 @@ function resolveTsPaths(spec) {
   return null;
 }
 
-export async function resolve(spec, context, next) {
+// Hooks are registered with module.registerHooks(), so they run synchronously
+// in-thread — and, unlike module.register(), they also see require() traffic.
+// Bail out of require operations entirely: the async-hooks design never
+// customized them, and the cjsFacade sources require() the module they front
+// (customizing that would recurse).
+const isRequire = (context) => context.conditions && context.conditions.includes("require");
+
+export function resolve(spec, context, next) {
+  if (isRequire(context)) return next(spec, context);
   if (context.parentURL) context = { ...context, parentURL: stripQ(context.parentURL) };
   const key = (context.parentURL ?? "") + "\0" + spec;
   const rc = EPOCH ? resolveCache.get(key) : undefined;
@@ -249,7 +261,7 @@ export async function resolve(spec, context, next) {
     } catch {}
     resolveCache.delete(key);
   }
-  const r = await resolveUncached(spec, context, next);
+  const r = resolveUncached(spec, context, next);
   if (EPOCH && r && r.url && !r.url.startsWith(VIRTUAL_SCHEME)) {
     cacheStats.rmisses += 1;
     const versioned = r._ojv === true;
@@ -259,12 +271,12 @@ export async function resolve(spec, context, next) {
   return r;
 }
 
-async function resolveUncached(spec, context, next) {
+function resolveUncached(spec, context, next) {
   if (container && (spec.startsWith("virtual:") || spec.startsWith("\0"))) {
     const importer = context.parentURL && context.parentURL.startsWith("file:")
       ? fileURLToPath(context.parentURL)
       : undefined;
-    const rid = await container.resolveId(spec, importer);
+    const rid = container.resolveId(spec, importer);
     if (rid != null) return { url: VIRTUAL_SCHEME + encodeURIComponent(rid), shortCircuit: true };
   }
   const suffix = spec.match(ASSET_SUFFIX);
@@ -281,7 +293,7 @@ async function resolveUncached(spec, context, next) {
     }
     if (!abs && clean.startsWith("#")) abs = resolveImports(clean);
     if (!abs) {
-      try { abs = fileURLToPath(stripQ((await next(clean, context)).url)); } catch {}
+      try { abs = fileURLToPath(stripQ(next(clean, context).url)); } catch {}
     }
     if (abs) return { url: pathToFileURL(abs).href + `?ojasset=${kind}`, shortCircuit: true };
   }
@@ -296,7 +308,7 @@ async function resolveUncached(spec, context, next) {
       abs = resolveTsPaths(clean);
     }
     if (!abs) {
-      try { abs = fileURLToPath(stripQ((await next(clean, context)).url)); } catch {}
+      try { abs = fileURLToPath(stripQ(next(clean, context).url)); } catch {}
     }
     if (abs) return { url: pathToFileURL(abs).href + "?ojsvg=react", shortCircuit: true };
   }
@@ -319,7 +331,7 @@ async function resolveUncached(spec, context, next) {
   }
   let r;
   try {
-    r = await next(spec, context);
+    r = next(spec, context);
   } catch (err) {
     if (err && err.code === "ERR_MODULE_NOT_FOUND") {
       const tried = err.url && err.url.startsWith("file:")
@@ -339,10 +351,11 @@ function transformServerFns(code, path) {
   return rewriteServerFns(code, rel);
 }
 
-export async function load(url, context, next) {
+export function load(url, context, next) {
+  if (isRequire(context)) return next(url, context);
   if (url.startsWith(VIRTUAL_SCHEME)) {
     const rid = decodeURIComponent(url.slice(VIRTUAL_SCHEME.length));
-    const code = container ? await container.load(rid) : null;
+    const code = container ? container.load(rid) : null;
     return { format: "module", source: code ?? emptyVirtualStub(APP, rid), shortCircuit: true };
   }
   const clean = stripQ(url);
@@ -377,7 +390,7 @@ export async function load(url, context, next) {
     }
     // A plugin load() overrides the on-disk file (Vite: load runs before fs read).
     // Its result can differ from the disk bytes, so it is what the key hashes.
-    let raw = userFile ? await container.load(path) : null;
+    let raw = userFile ? container.load(path) : null;
     if (raw == null) raw = diskRaw ?? readFileSync(path, "utf8");
     const key = cacheKey("ssr-loader", path, raw);
     if (raw !== diskRaw) {
@@ -385,7 +398,7 @@ export async function load(url, context, next) {
       if (hit != null) return { format: "module", source: hit, shortCircuit: true };
     }
     if (userFile) {
-      const t = await container.transformUserCode(raw, path);
+      const t = container.transformUserCode(raw, path);
       if (t != null) raw = t;
     }
     const src = transformServerFns(transformGlob(raw, path), path);
@@ -405,7 +418,7 @@ export async function load(url, context, next) {
   if (clean.endsWith(".svg")) {
     const path = fileURLToPath(clean);
     const id = /[?&]ojsvg=react/.test(url) ? path + "?react" : path;
-    const loaded = container ? await container.load(id) : null;
+    const loaded = container ? container.load(id) : null;
     const src = loaded != null ? loaded : `export default ${JSON.stringify("/@oj-start/fs" + path)};`;
     return { format: "module", source: src, shortCircuit: true };
   }
@@ -415,7 +428,7 @@ export async function load(url, context, next) {
     const key = cacheKey("ssr-loader-mdx", path, raw);
     const hit = cacheGet(key);
     if (hit != null) return { format: "module", source: hit, shortCircuit: true };
-    const compiled = await container.transform(raw, path);
+    const compiled = container.transform(raw, path);
     if (compiled != null) {
       const out = transformSync(path, compiled, {
         lang: "jsx", jsx: { runtime: "automatic" },
@@ -432,7 +445,7 @@ export async function load(url, context, next) {
   if (container && (clean.endsWith(".js") || clean.endsWith(".mjs"))) {
     const path = fileURLToPath(clean);
     if (!path.includes("/node_modules/")) {
-      const loaded = await container.load(path);
+      const loaded = container.load(path);
       if (loaded != null) {
         return { format: "module", source: transformGlob(loaded, path), shortCircuit: true };
       }
@@ -441,8 +454,8 @@ export async function load(url, context, next) {
   if (clean.startsWith("file:") && clean.includes("/node_modules/")) {
     const path = fileURLToPath(clean);
     if (isCjsFile(path)) {
-      // cjsFacade require()s the module on the loader thread just to
-      // enumerate export names; a hit skips that duplicate graph eval.
+      // cjsFacade require()s the module just to enumerate export names;
+      // a hit skips that duplicate graph eval.
       let key = null;
       try { key = cacheKey("ssr-loader-cjs", path, readFileSync(path)); } catch {}
       const hit = cacheGet(key);

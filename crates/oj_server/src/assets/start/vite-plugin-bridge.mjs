@@ -87,7 +87,7 @@ async function withBuildStartLock(fn) {
   finally { try { rmSync(lock, { recursive: true, force: true }); } catch {} }
 }
 
-function findConfig(app) {
+export function findConfig(app) {
   for (const f of CONFIG_FILES) {
     const p = join(app, f);
     if (existsSync(p)) return p;
