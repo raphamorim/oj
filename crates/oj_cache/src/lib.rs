@@ -4,6 +4,9 @@
 use std::fs;
 use std::path::PathBuf;
 
+pub mod integrity;
+pub mod start_bundle;
+
 use serde::{Deserialize, Serialize};
 
 pub mod start_codegen;

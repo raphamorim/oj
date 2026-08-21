@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve, relative } from "node:path";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, resolve, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { importPkg, viteEnvDefine } from "./resolve-pkg.mjs";
 import { assetsPlugin, makeVitePlugins, nodeBuiltinShims, workspaceRoot } from "./rolldown-assets.mjs";
@@ -51,6 +51,19 @@ const container = await loadPluginContainer(APP, { command: "serve", environment
 
 const cssUrls = [];
 
+// Records every module the build traverses. chunk.modules alone is not enough:
+// tree-shaking drops most of the graph from the rendered chunk, but traversal
+// still shapes the output (e.g. manifest cssUrls come from css imports found
+// anywhere in the graph), so the cache key must cover all visited files.
+const visitedIds = new Set();
+const closureRecorder = {
+  name: "oj-closure-recorder",
+  transform(code, id) {
+    visitedIds.add(id);
+    return null;
+  },
+};
+
 const serverFnClient = {
   name: "server-fn-client",
   transform: {
@@ -92,6 +105,7 @@ const result = await build({
     },
   },
   plugins: [
+    closureRecorder,
     makeVitePlugins({ container, appRoot: APP, mode: "dev" }),
     assetsPlugin({ mode: "dev", cssUrls }),
     serverFnClient,
@@ -132,6 +146,31 @@ writeFileSync(
 // Module count for the editor's update-progress narration ("(N modules)").
 writeFileSync(join(HERE, "client-entry.modules"), String(moduleCount));
 
+// Closure manifest for the Rust-side whole-bundle cache: every real file
+// whose content shaped this build.
+const closure = new Set([routerEntry(), ...visitedIds, ...(container?.configDependencies ?? []), ...(container?.watchFiles ?? [])]);
+for (const o of result.output) {
+  if (o.type !== "chunk") continue;
+  for (const id of Object.keys(o.modules ?? {})) closure.add(id);
+}
+const closureFiles = [...closure]
+  .map((id) => String(id).split("?")[0])
+  .filter((p) => !p.startsWith("\0"))
+  // config dependencies come back root-relative from loadConfigFromFile
+  .map((p) => (isAbsolute(p) ? p : resolve(APP, p)))
+  // Derived files poison the key. HERE holds oj-generated files: static
+  // assets are covered by the oj version in the cache salt, and manifest.ts
+  // is this build's own output. The route tree is regenerated on every boot
+  // and rewritten again mid-run by the runner's generator with different
+  // formatting; its real inputs (route file names and contents) are already
+  // in the key.
+  .filter((p) => !p.startsWith(HERE) && !/(^|\/)routeTree\.gen\.[jt]sx?$/.test(p))
+  .filter((p) => {
+    try { return statSync(p).isFile(); } catch { return false; }
+  })
+  .sort();
+writeFileSync(join(HERE, "closure.json"), JSON.stringify(closureFiles));
+
 const devManifest = {
   routes: {
     __root__: {
@@ -145,6 +184,10 @@ writeFileSync(
   join(HERE, "manifest.ts"),
   `export const tsrStartManifest = () => (${JSON.stringify(devManifest)});\n`,
 );
+// Raw stylesheet-URL list for the store's generation manifest; write-then-
+// rename so a concurrent read never sees a partial JSON.
+writeFileSync(join(HERE, "css-urls.json.tmp"), JSON.stringify(cssUrls));
+renameSync(join(HERE, "css-urls.json.tmp"), join(HERE, "css-urls.json"));
 const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
 const OJ = _ojTTY ? "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m" : "oj";
 process.stderr.write(`${OJ}${_ojTTY ? "" : ":"} client bundled (${result.output.length} files)\n`);

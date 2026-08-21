@@ -1,0 +1,210 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Raphael Amorim
+
+//! Shared cache-integrity primitives: atomic whole-file writes and
+//! verified reads of content-addressed artifacts. Every store in this
+//! crate is expected to write through `atomic_write` and read stored
+//! artifacts through `verify_file`/`verified_read`, so a torn write or
+//! a corrupted entry degrades to a cache miss, never to wrong output.
+
+use std::fmt;
+use std::fs;
+use std::io;
+use std::path::Path;
+
+/// How deeply stored artifacts are checked against their recorded
+/// size and hash. `Standard` trusts existence + size (git's trust
+/// model); `Full` re-hashes content on every read. Selected at the
+/// call site, normally via [`VerifyMode::from_env`] (`OJ_CACHE_VERIFY=full`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyMode {
+    Standard,
+    Full,
+}
+
+impl VerifyMode {
+    pub fn from_env() -> Self {
+        match std::env::var("OJ_CACHE_VERIFY") {
+            Ok(v) if v.eq_ignore_ascii_case("full") => VerifyMode::Full,
+            _ => VerifyMode::Standard,
+        }
+    }
+}
+
+/// What an artifact on disk must look like: its byte length and the
+/// blake3 hash of its content (hex).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedFile {
+    pub size: u64,
+    pub hash: String,
+}
+
+#[derive(Debug)]
+pub enum VerifyError {
+    Io(io::Error),
+    WrongSize { expected: u64, actual: u64 },
+    WrongHash { expected: String, actual: String },
+}
+
+impl fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VerifyError::Io(e) => write!(f, "io: {e}"),
+            VerifyError::WrongSize { expected, actual } => {
+                write!(f, "size mismatch: expected {expected} B, found {actual} B")
+            }
+            VerifyError::WrongHash { expected, actual } => {
+                write!(
+                    f,
+                    "hash mismatch: expected {}…, found {}…",
+                    expected.get(..12).unwrap_or(expected),
+                    actual.get(..12).unwrap_or(actual)
+                )
+            }
+        }
+    }
+}
+
+/// Write `bytes` to `path` via a same-directory temp file + rename, so a
+/// concurrent reader sees either the old content or the new, never a tear.
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let dir = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "atomic_write needs a parent dir")
+    })?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("artifact");
+    let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
+}
+
+/// Check an on-disk artifact against `expected` without returning its
+/// content. `Standard`: a stat pass (existence + size). `Full`: also
+/// read and re-hash.
+pub fn verify_file(path: &Path, expected: &ExpectedFile, mode: VerifyMode) -> Result<(), VerifyError> {
+    match mode {
+        VerifyMode::Standard => {
+            let meta = fs::metadata(path).map_err(VerifyError::Io)?;
+            if meta.len() != expected.size {
+                return Err(VerifyError::WrongSize {
+                    expected: expected.size,
+                    actual: meta.len(),
+                });
+            }
+            Ok(())
+        }
+        VerifyMode::Full => verified_read(path, expected, mode).map(|_| ()),
+    }
+}
+
+/// Read an artifact and check it against `expected`. Size is checked in
+/// both modes; `Full` also re-hashes the content.
+pub fn verified_read(
+    path: &Path,
+    expected: &ExpectedFile,
+    mode: VerifyMode,
+) -> Result<Vec<u8>, VerifyError> {
+    let bytes = fs::read(path).map_err(VerifyError::Io)?;
+    if bytes.len() as u64 != expected.size {
+        return Err(VerifyError::WrongSize {
+            expected: expected.size,
+            actual: bytes.len() as u64,
+        });
+    }
+    if mode == VerifyMode::Full {
+        let actual = blake3::hash(&bytes).to_hex().to_string();
+        if actual != expected.hash {
+            return Err(VerifyError::WrongHash {
+                expected: expected.hash.clone(),
+                actual,
+            });
+        }
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn tmp(label: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("oj-integrity-{}-{label}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn expected_for(bytes: &[u8]) -> ExpectedFile {
+        ExpectedFile {
+            size: bytes.len() as u64,
+            hash: blake3::hash(bytes).to_hex().to_string(),
+        }
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_temp_file() {
+        let d = tmp("atomic");
+        let p = d.join("out.json");
+        atomic_write(&p, b"{}").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"{}");
+        let leftovers: Vec<_> = fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn verified_read_returns_bytes_on_match() {
+        let d = tmp("ok");
+        let p = d.join("blob");
+        fs::write(&p, b"hello").unwrap();
+        let exp = expected_for(b"hello");
+        assert_eq!(verified_read(&p, &exp, VerifyMode::Standard).unwrap(), b"hello");
+        assert_eq!(verified_read(&p, &exp, VerifyMode::Full).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn wrong_size_fails_in_both_modes() {
+        let d = tmp("size");
+        let p = d.join("blob");
+        fs::write(&p, b"hello!").unwrap();
+        let exp = expected_for(b"hello");
+        assert!(matches!(
+            verified_read(&p, &exp, VerifyMode::Standard),
+            Err(VerifyError::WrongSize { expected: 5, actual: 6 })
+        ));
+        assert!(verify_file(&p, &exp, VerifyMode::Standard).is_err());
+    }
+
+    #[test]
+    fn same_size_corruption_needs_full_mode() {
+        let d = tmp("flip");
+        let p = d.join("blob");
+        fs::write(&p, b"hellX").unwrap();
+        let exp = expected_for(b"hello");
+        assert!(verified_read(&p, &exp, VerifyMode::Standard).is_ok());
+        assert!(verify_file(&p, &exp, VerifyMode::Standard).is_ok());
+        assert!(matches!(
+            verified_read(&p, &exp, VerifyMode::Full),
+            Err(VerifyError::WrongHash { .. })
+        ));
+        assert!(verify_file(&p, &exp, VerifyMode::Full).is_err());
+    }
+
+    #[test]
+    fn missing_file_is_io_error() {
+        let d = tmp("missing");
+        let exp = expected_for(b"hello");
+        assert!(matches!(
+            verify_file(&d.join("nope"), &exp, VerifyMode::Standard),
+            Err(VerifyError::Io(_))
+        ));
+    }
+}
