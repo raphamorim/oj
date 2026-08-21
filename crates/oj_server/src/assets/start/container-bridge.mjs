@@ -18,6 +18,7 @@ export function loadPluginContainerSync(app, _opts) {
   let reqFd = -1;
   let repFd = -1;
   let seq = 0;
+  const seen = new Set();
 
   function connect() {
     const deadline = Date.now() + 300_000;
@@ -65,8 +66,14 @@ export function loadPluginContainerSync(app, _opts) {
 
   function call(method, args) {
     if (state === "down") return null;
-    if (state === "idle" && !connect()) return null;
     const id = ++seq;
+    const first = !!process.env.OJ_BOOT_PHASES
+      && (process.env.OJ_BOOT_PHASES === "2" || !seen.has(method));
+    if (first) {
+      seen.add(method);
+      process.stderr.write(`[oj-phase] ${Date.now()} bridge: ${method}#${id} (${String(args[0] ?? "").slice(-80)})\n`);
+    }
+    if (state === "idle" && !connect()) return null;
     const json = Buffer.from(JSON.stringify({ id, method, args }));
     const frame = Buffer.allocUnsafe(4 + json.length);
     frame.writeUInt32LE(json.length, 0);
@@ -77,6 +84,7 @@ export function loadPluginContainerSync(app, _opts) {
       const head = readExact(4);
       const m = JSON.parse(readExact(head.readUInt32LE(0)).toString("utf8"));
       if (m.id !== id) continue;
+      if (first) process.stderr.write(`[oj-phase] ${Date.now()} bridge: ${method}#${id} returned\n`);
       if (m.error != null) throw new Error(m.error);
       return m.value ?? null;
     }

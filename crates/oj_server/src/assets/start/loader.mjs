@@ -17,7 +17,7 @@ import {
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
 const { transformSync } = await importPkg(APP, "rolldown/experimental", ["vite", "@tanstack/react-start"]);
-const container = loadPluginContainerSync(APP, { command: "serve", environment: "ssr" });
+const rawContainer = loadPluginContainerSync(APP, { command: "serve", environment: "ssr" });
 const VIRTUAL_SCHEME = "ojvirtual:///";
 const CACHE_DIR = pathResolve(APP, ".oj-cache");
 
@@ -74,7 +74,7 @@ function gitStateBytes() {
 }
 const ENV_DELTA_FILE = pathResolve(CACHE_DIR, "ssr-env.json");
 const envDelta = (() => {
-  if (!container) return {};
+  if (!rawContainer) return {};
   let deltaKey = null;
   if (process.env.OJ_SSR_LOADER_CACHE !== "off") {
     try {
@@ -95,7 +95,7 @@ const envDelta = (() => {
     } catch {}
   }
   let fresh = {};
-  try { fresh = container.env() ?? {}; } catch {}
+  try { fresh = rawContainer.env() ?? {}; } catch {}
   if (deltaKey) {
     (async () => {
       try {
@@ -133,6 +133,98 @@ function cacheKey(mode, path, source) {
   }
 }
 const cachePath = (key) => pathResolve(CACHE_DIR, key.slice(0, 2), `${key}.json`);
+
+const SPEC_FILE = pathResolve(CACHE_DIR, "ssr-bridge-pack.jsonl");
+const specPack = new Map();
+let specFileReady = false;
+if (EPOCH && rawContainer) {
+  try {
+    const lines = readFileSync(SPEC_FILE, "utf8").split("\n");
+    if (JSON.parse(lines[0]).epoch === EPOCH) {
+      specFileReady = true;
+      for (let i = 1; i < lines.length; i++) {
+        if (!lines[i]) continue;
+        try { const e = JSON.parse(lines[i]); specPack.set(e.k, e.v); } catch {}
+      }
+    }
+  } catch {}
+}
+let specPending = [];
+let specDirty = false;
+function flushSpecPack() {
+  if (specDirty) {
+    specDirty = false;
+    specPending = [];
+    const body = [JSON.stringify({ epoch: EPOCH })];
+    for (const [k, v] of specPack) body.push(JSON.stringify({ k, v }));
+    specFileReady = true;
+    writeFile(SPEC_FILE, body.join("\n") + "\n").catch(() => {});
+    return;
+  }
+  const batch = specPending;
+  specPending = [];
+  if (batch.length === 0) return;
+  const body = batch.map((e) => JSON.stringify(e)).join("\n") + "\n";
+  const first = !specFileReady;
+  specFileReady = true;
+  (first
+    ? writeFile(SPEC_FILE, JSON.stringify({ epoch: EPOCH }) + "\n" + body)
+    : appendFile(SPEC_FILE, body)
+  ).catch(() => {});
+}
+function specKey(method, args) {
+  try {
+    const h = createHash("sha256");
+    h.update(method);
+    for (const a of args) { h.update("\0"); h.update(String(a ?? "")); }
+    if (method === "load") {
+      const p = String(args[0] ?? "").split("?")[0];
+      if (p.startsWith("/") && isFile(p)) { h.update("\0src\0"); h.update(readFileSync(p)); }
+    }
+    return h.digest("hex");
+  } catch { return null; }
+}
+const speculatedCalls = new Map();
+let specWindowOpen = true;
+function speculativeContainer(raw) {
+  const wrap = (method) => (...args) => {
+    const key = EPOCH ? specKey(method, args) : null;
+    if (key && specWindowOpen && specPack.has(key)) {
+      if (!speculatedCalls.has(key)) speculatedCalls.set(key, { method, args });
+      return specPack.get(key);
+    }
+    const v = raw[method](...args) ?? null;
+    if (key && !specPack.has(key)) {
+      specPack.set(key, v);
+      specPending.push({ k: key, v });
+    }
+    return v;
+  };
+  return {
+    ...raw,
+    resolveId: wrap("resolveId"),
+    load: wrap("load"),
+    transformUserCode: wrap("transformUserCode"),
+  };
+}
+const container = rawContainer ? speculativeContainer(rawContainer) : null;
+
+export function revalidateSpeculation() {
+  specWindowOpen = false;
+  let stale = false;
+  for (const [key, { method, args }] of speculatedCalls) {
+    let live;
+    try { live = rawContainer[method](...args) ?? null; } catch { continue; }
+    if (JSON.stringify(live) !== JSON.stringify(specPack.get(key) ?? null)) {
+      specPack.set(key, live);
+      specDirty = true;
+      stale = true;
+    }
+  }
+  speculatedCalls.clear();
+  if (specDirty) flushSpecPack();
+  return stale;
+}
 
 const LOAD_PACK_FILE = pathResolve(CACHE_DIR, "ssr-load-pack.jsonl");
 const loadPack = new Map();
@@ -304,6 +396,7 @@ export function flushCaches() {
   if (writeQueue.length > 0) drainWrites();
   if (packPending.length > 0) flushLoadPack();
   if (resolvePending.length > 0) flushResolveCache();
+  if (specPending.length > 0 || specDirty) flushSpecPack();
 }
 
 function reportCacheStats() {
@@ -427,7 +520,10 @@ function resolveUncached(spec, context, next) {
       ? fileURLToPath(context.parentURL)
       : undefined;
     const rid = container.resolveId(spec, importer);
-    if (rid != null) return { url: VIRTUAL_SCHEME + encodeURIComponent(rid), shortCircuit: true };
+    if (rid != null) {
+      const u = VIRTUAL_SCHEME + encodeURIComponent(rid);
+      return { url: V ? `${u}?ojv=${V}` : u, shortCircuit: true };
+    }
   }
   const suffix = spec.match(ASSET_SUFFIX);
   const isCss = !spec.includes("?") && /\.css$/.test(spec);
@@ -504,7 +600,7 @@ function transformServerFns(code, path) {
 export function load(url, context, next) {
   if (isRequire(context)) return next(url, context);
   if (url.startsWith(VIRTUAL_SCHEME)) {
-    const rid = decodeURIComponent(url.slice(VIRTUAL_SCHEME.length));
+    const rid = decodeURIComponent(stripQ(url).slice(VIRTUAL_SCHEME.length));
     const code = container ? container.load(rid) : null;
     return { format: "module", source: code ?? emptyVirtualStub(APP, rid), shortCircuit: true };
   }
@@ -542,8 +638,15 @@ export function load(url, context, next) {
       if (hit != null) return { format: "module", source: hit, shortCircuit: true };
     }
     if (userFile) {
-      const t = container.transformUserCode(raw, path);
-      if (t != null) raw = t;
+      const tucKey = cacheKey("ssr-tuc", path, raw);
+      const tucHit = cacheGet(tucKey);
+      if (tucHit != null) {
+        if (tucHit !== "\0none") raw = tucHit;
+      } else {
+        const t = container.transformUserCode(raw, path);
+        cachePut(tucKey, t ?? "\0none");
+        if (t != null) raw = t;
+      }
     }
     const src = transformServerFns(transformGlob(raw, path), path);
     const out = transformSync(path, src, {
@@ -587,10 +690,15 @@ export function load(url, context, next) {
   if (container && (clean.endsWith(".js") || clean.endsWith(".mjs"))) {
     const path = fileURLToPath(clean);
     if (!path.includes("/node_modules/")) {
+      let diskRaw = null;
+      try { diskRaw = readFileSync(path, "utf8"); } catch {}
+      const key = diskRaw != null ? cacheKey("ssr-loader-unclaimed", path, diskRaw) : null;
+      if (key && cacheGet(key) != null) return next(url, context);
       const loaded = container.load(path);
       if (loaded != null) {
         return { format: "module", source: transformGlob(loaded, path), shortCircuit: true };
       }
+      cachePut(key, "1");
     }
   }
   if (clean.startsWith("file:") && clean.includes("/node_modules/")) {

@@ -454,6 +454,9 @@ if (ssrBridgeDir) {
       if (ssrEnvBase[k] !== v) ssrEnvDelta[k] = v;
     }
     try { writeFileSync(join(ssrBridgeDir, "ready"), "1"); } catch {}
+    if (process.env.OJ_BOOT_PHASES) {
+      process.stderr.write(`[oj-phase] ${Date.now()} container: bootstrap done\n`);
+    }
     ssrResolveReady();
   })();
 }

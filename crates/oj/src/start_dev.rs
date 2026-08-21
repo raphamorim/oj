@@ -71,23 +71,34 @@ pub async fn start_dev(
         tokio::task::spawn_blocking(move || generate_server_fn_resolver(&root, &cache))
     };
     route_tree.await??;
+    oj_server::boot_phase("route tree ready");
     let bundle = {
         let (root, cache) = (root.clone(), cache.clone());
         tokio::task::spawn_blocking(move || bundle_client_entry_cached(&root, &cache))
     };
     resolver.await??;
+    oj_server::boot_phase("resolver ready");
     let runner = Arc::new(tokio::sync::Mutex::new(
         spawn_start_runner(&root, &cache).await?,
     ));
+    oj_server::boot_phase("runner spawned");
+    let (reload_tx, _) = broadcast::channel::<()>(16);
     {
         let runner = Arc::clone(&runner);
+        let reload_tx = reload_tx.clone();
         tokio::spawn(async move {
             let _ = forward(&runner, "GET".into(), "/".into(), vec![], None).await;
+            oj_server::boot_phase("prewarm complete");
+            if revalidate_runner(&runner).await {
+                let _ = reload_tx.send(());
+            }
+            oj_server::boot_phase("revalidate complete");
         });
     }
     let (bundle_res, built_res) = tokio::join!(bundle, built_task);
     let pinned = bundle_res??;
     let built = built_res??;
+    oj_server::boot_phase("bundle+build joined");
     let css_host = if app_uses_tailwind(&root) {
         spawn_node_service(&root, &cache.join("css-host.mjs"))
             .await
@@ -96,7 +107,6 @@ pub async fn start_dev(
     } else {
         None
     };
-    let (reload_tx, _) = broadcast::channel::<()>(16);
     let state = Arc::new(StartState {
         proxy_prefixes: built.proxy_prefixes.clone(),
         plugin_mw_port: built.plugin_mw_port,
@@ -161,6 +171,26 @@ async fn shutdown_signal() -> i32 {
         let _ = tokio::signal::ctrl_c().await;
         130
     }
+}
+
+async fn revalidate_runner(runner: &Arc<tokio::sync::Mutex<Runner>>) -> bool {
+    let mut guard = runner.lock().await;
+    if guard
+        .stdin
+        .write_all(b"{\"cmd\":\"revalidate\"}\n")
+        .await
+        .is_err()
+        || guard.stdin.flush().await.is_err()
+    {
+        return false;
+    }
+    let Ok(Some(line)) = guard.lines.next_line().await else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&line)
+        .ok()
+        .and_then(|v| v.get("reloaded").and_then(|b| b.as_bool()))
+        .unwrap_or(false)
 }
 
 async fn reload_runner(state: &StartState) {
@@ -972,7 +1002,7 @@ mod tests {
 
     #[test]
     fn app_uses_tailwind_detects_postcss_vite_and_bare() {
-        let base = tmp("tw-pkg");
+        let base = tmp("tw");
         let cases = [
             (r#"{"devDependencies":{"@tailwindcss/postcss":"4"}}"#, true),
             (r#"{"devDependencies":{"@tailwindcss/vite":"4"}}"#, true),
