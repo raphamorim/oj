@@ -249,7 +249,7 @@ function connectHmr() {
 connectHmr();
 
 try {
-  if (fstatSync(0).isFIFO()) {
+  if (fstatSync(0, { bigint: true }).isFIFO()) {
     process.stdin.once("end", () => process.exit(0));
     process.stdin.once("close", () => process.exit(0));
   }
