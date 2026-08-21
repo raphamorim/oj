@@ -12,6 +12,7 @@ import {
   EXTS, isFile, JS_TO_TS, probe, RESERVED, nearestPkgType,
   hasEsmSyntax, isCjsFile, cjsFacade, stripJsonc, readJsonc, rewriteServerFns, substituteAlias,
   parseImportsField, mergeTsConfig,
+  PACK_FMT, PACK_PREFIX, packHash, packLine, packIntegrityFail, scanPack,
 } from "./loader-util.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -134,43 +135,42 @@ function cacheKey(mode, path, source) {
 }
 const cachePath = (key) => pathResolve(CACHE_DIR, key.slice(0, 2), `${key}.json`);
 
+const VERIFY_FULL = process.env.OJ_CACHE_VERIFY === "full";
+const packHeaderLine = () => packLine({ fmt: PACK_FMT, epoch: EPOCH });
+
 const SPEC_FILE = pathResolve(CACHE_DIR, "ssr-bridge-pack.jsonl");
 const specPack = new Map();
 let specFileReady = false;
 if (EPOCH && rawContainer) {
-  try {
-    const lines = readFileSync(SPEC_FILE, "utf8").split("\n");
-    if (JSON.parse(lines[0]).epoch === EPOCH) {
-      specFileReady = true;
-      for (let i = 1; i < lines.length; i++) {
-        if (!lines[i]) continue;
-        try { const e = JSON.parse(lines[i]); specPack.set(e.k, e.v); } catch {}
-      }
-    }
-  } catch {}
+  const bytes = scanPack(SPEC_FILE, "bridge-pack", EPOCH, true, (rec) => {
+    let e;
+    try { e = JSON.parse(rec.payload.toString("utf8")); } catch { return false; }
+    specPack.set(e.k, e.v);
+  });
+  if (bytes != null) specFileReady = true;
 }
 let specPending = [];
 let specDirty = false;
+let specFlushChain = Promise.resolve();
 function flushSpecPack() {
   if (specDirty) {
     specDirty = false;
     specPending = [];
-    const body = [JSON.stringify({ epoch: EPOCH })];
-    for (const [k, v] of specPack) body.push(JSON.stringify({ k, v }));
+    const body = [packHeaderLine()];
+    for (const [k, v] of specPack) body.push(packLine({ k, v }));
     specFileReady = true;
-    writeFile(SPEC_FILE, body.join("\n") + "\n").catch(() => {});
+    specFlushChain = specFlushChain.then(() => writeFile(SPEC_FILE, body.join(""))).catch(() => {});
     return;
   }
   const batch = specPending;
   specPending = [];
   if (batch.length === 0) return;
-  const body = batch.map((e) => JSON.stringify(e)).join("\n") + "\n";
+  const body = batch.map((e) => packLine(e)).join("");
   const first = !specFileReady;
   specFileReady = true;
-  (first
-    ? writeFile(SPEC_FILE, JSON.stringify({ epoch: EPOCH }) + "\n" + body)
-    : appendFile(SPEC_FILE, body)
-  ).catch(() => {});
+  specFlushChain = specFlushChain
+    .then(() => (first ? writeFile(SPEC_FILE, packHeaderLine() + body) : appendFile(SPEC_FILE, body)))
+    .catch(() => {});
 }
 function specKey(method, args) {
   try {
@@ -234,25 +234,19 @@ let packFd = -1;
 let packFileBytes = 0;
 let loadPackFileReady = false;
 if (EPOCH) {
-  try {
-    const buf = readFileSync(LOAD_PACK_FILE);
-    const nl0 = buf.indexOf(10);
-    if (nl0 > 0 && JSON.parse(buf.toString("utf8", 0, nl0)).epoch === EPOCH) {
-      loadPackFileReady = true;
-      packFileBytes = buf.length;
-      let off = nl0 + 1;
-      while (off < buf.length) {
-        let end = buf.indexOf(10, off);
-        if (end === -1) end = buf.length;
-        if (end - off > 70 && buf[off] === 0x7b) {
-          const key = buf.toString("utf8", off + 6, off + 70);
-          if (PACK_KEY_RE.test(key)) packIndex.set(key, [off, end - off]);
-        }
-        off = end + 1;
-      }
-      if (packIndex.size > 0) packFd = openSync(LOAD_PACK_FILE, "r");
+  const bytes = scanPack(LOAD_PACK_FILE, "load-pack", EPOCH, VERIFY_FULL, (rec, buf) => {
+    if (rec.len > 70 && buf[rec.payloadOff] === 0x7b) {
+      const key = buf.toString("utf8", rec.payloadOff + 6, rec.payloadOff + 70);
+      if (PACK_KEY_RE.test(key)) packIndex.set(key, [rec.payloadOff, rec.len, rec.hash]);
     }
-  } catch {}
+  });
+  if (bytes != null) {
+    loadPackFileReady = true;
+    packFileBytes = bytes;
+    if (packIndex.size > 0) {
+      try { packFd = openSync(LOAD_PACK_FILE, "r"); } catch { packIndex.clear(); }
+    }
+  }
 }
 function packGet(key) {
   const mem = loadPack.get(key);
@@ -262,9 +256,12 @@ function packGet(key) {
   try {
     const b = Buffer.allocUnsafe(loc[1]);
     readSync(packFd, b, 0, loc[1], loc[0]);
-    const e = JSON.parse(b.toString("utf8"));
-    if (e.k === key && typeof e.c === "string") return e.c;
+    if (packHash(b) === loc[2]) {
+      const e = JSON.parse(b.toString("utf8"));
+      if (e.k === key && typeof e.c === "string") return e.c;
+    }
   } catch {}
+  packIntegrityFail("load-pack", { action: "drop", key });
   packIndex.delete(key);
   return undefined;
 }
@@ -274,14 +271,14 @@ function flushLoadPack() {
   const batch = packPending;
   packPending = [];
   if (batch.length === 0) return;
-  const lines = batch.map((e) => JSON.stringify(e) + "\n");
+  const lines = batch.map((e) => packLine(e));
   const first = !loadPackFileReady;
   loadPackFileReady = true;
   packFlushChain = packFlushChain.then(async () => {
     try {
       await mkdir(CACHE_DIR, { recursive: true });
       if (first) {
-        const header = JSON.stringify({ epoch: EPOCH }) + "\n";
+        const header = packHeaderLine();
         await writeFile(LOAD_PACK_FILE, header + lines.join(""));
         packFileBytes = Buffer.byteLength(header);
       } else {
@@ -289,7 +286,7 @@ function flushLoadPack() {
       }
       for (let i = 0; i < batch.length; i++) {
         const len = Buffer.byteLength(lines[i]);
-        packIndex.set(batch[i].k, [packFileBytes, len - 1]);
+        packIndex.set(batch[i].k, [packFileBytes + PACK_PREFIX, len - PACK_PREFIX - 1, lines[i].slice(8, PACK_PREFIX)]);
         packFileBytes += len;
         loadPack.delete(batch[i].k);
       }
@@ -355,34 +352,31 @@ const RESOLVE_CACHE_FILE = pathResolve(CACHE_DIR, "ssr-resolve.jsonl");
 const resolveCache = new Map();
 let resolveFileReady = false;
 if (EPOCH) {
-  try {
-    const lines = readFileSync(RESOLVE_CACHE_FILE, "utf8").split("\n");
-    if (JSON.parse(lines[0]).epoch === EPOCH) {
-      resolveFileReady = true;
-      for (let i = 1; i < lines.length; i++) {
-        if (!lines[i]) continue;
-        try { const e = JSON.parse(lines[i]); resolveCache.set(e.k, e); } catch {}
-      }
-    }
-  } catch {}
+  const bytes = scanPack(RESOLVE_CACHE_FILE, "resolve-cache", EPOCH, true, (rec) => {
+    let e;
+    try { e = JSON.parse(rec.payload.toString("utf8")); } catch { return false; }
+    resolveCache.set(e.k, e);
+  });
+  if (bytes != null) resolveFileReady = true;
 }
 let resolvePending = [];
 let resolveFlushTimer = null;
-async function flushResolveCache() {
+let resolveFlushChain = Promise.resolve();
+function flushResolveCache() {
   resolveFlushTimer = null;
   const batch = resolvePending;
   resolvePending = [];
   if (batch.length === 0) return;
-  const body = batch.map((e) => JSON.stringify(e)).join("\n") + "\n";
-  try {
-    await mkdir(CACHE_DIR, { recursive: true });
-    if (resolveFileReady) {
-      await appendFile(RESOLVE_CACHE_FILE, body);
-    } else {
-      await writeFile(RESOLVE_CACHE_FILE, JSON.stringify({ epoch: EPOCH }) + "\n" + body);
-      resolveFileReady = true;
-    }
-  } catch {}
+  const body = batch.map((e) => packLine(e)).join("");
+  const first = !resolveFileReady;
+  resolveFileReady = true;
+  resolveFlushChain = resolveFlushChain
+    .then(async () => {
+      await mkdir(CACHE_DIR, { recursive: true });
+      if (first) await writeFile(RESOLVE_CACHE_FILE, packHeaderLine() + body);
+      else await appendFile(RESOLVE_CACHE_FILE, body);
+    })
+    .catch(() => {});
 }
 function rememberResolve(key, entry) {
   if (!EPOCH || resolveCache.has(key)) return;

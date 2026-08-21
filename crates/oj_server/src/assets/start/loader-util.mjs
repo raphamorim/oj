@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, statSync, truncateSync, unlinkSync } from "node:fs";
 import { resolve as pathResolve, dirname } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
 
 export const EXTS = [
   ".ts", ".tsx", ".js", ".jsx", ".mjs",
@@ -153,4 +154,66 @@ export function rewriteServerFns(code, rel) {
   });
   if (!changed) return code;
   return `import { createServerRpc } from "@tanstack/react-start/server-rpc";\n${out}`;
+}
+
+export const PACK_FMT = 2;
+export const PACK_PREFIX = 24;
+const PACK_LEN_RE = /^[0-9a-f]{8}$/;
+
+export const packHash = (payload) => createHash("sha256").update(payload).digest("hex").slice(0, 16);
+
+export function packLine(obj) {
+  const payload = JSON.stringify(obj);
+  return Buffer.byteLength(payload).toString(16).padStart(8, "0") + packHash(payload) + payload + "\n";
+}
+
+export function packRecordAt(buf, off) {
+  if (off + PACK_PREFIX > buf.length) return null;
+  const lenHex = buf.toString("latin1", off, off + 8);
+  if (!PACK_LEN_RE.test(lenHex)) return null;
+  const len = parseInt(lenHex, 16);
+  const end = off + PACK_PREFIX + len + 1;
+  if (end > buf.length || buf[end - 1] !== 10) return null;
+  return {
+    off,
+    end,
+    len,
+    hash: buf.toString("latin1", off + 8, off + PACK_PREFIX),
+    payloadOff: off + PACK_PREFIX,
+    payload: buf.subarray(off + PACK_PREFIX, off + PACK_PREFIX + len),
+  };
+}
+
+export function packIntegrityFail(store, detail) {
+  process.stderr.write(`oj: pack integrity: ${JSON.stringify({ store, ...detail })}\n`);
+}
+
+export function scanPack(file, store, epoch, verifyHashes, onRecord) {
+  let buf;
+  try { buf = readFileSync(file); } catch { return null; }
+  const head = packRecordAt(buf, 0);
+  let header = null;
+  if (head && head.hash === packHash(head.payload)) {
+    try { header = JSON.parse(head.payload.toString("utf8")); } catch {}
+  }
+  if (!header || header.fmt !== PACK_FMT) {
+    packIntegrityFail(store, { action: "delete", reason: "format" });
+    try { unlinkSync(file); } catch {}
+    return null;
+  }
+  if (header.epoch !== epoch) return null;
+  let off = head.end;
+  while (off < buf.length) {
+    const rec = packRecordAt(buf, off);
+    if (!rec) {
+      packIntegrityFail(store, { action: "truncate", offset: off, dropped: buf.length - off });
+      try { truncateSync(file, off); } catch {}
+      return off;
+    }
+    if ((verifyHashes && rec.hash !== packHash(rec.payload)) || onRecord(rec, buf) === false) {
+      packIntegrityFail(store, { action: "skip", offset: off, bytes: rec.end - rec.off });
+    }
+    off = rec.end;
+  }
+  return buf.length;
 }
