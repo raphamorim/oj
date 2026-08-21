@@ -5,6 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub mod config_extract;
 pub mod integrity;
 pub mod start_bundle;
 

@@ -47,6 +47,18 @@ pub async fn start_dev(
         .map_err(|e| anyhow::anyhow!("app root not found: {}: {e}", root.display()))?;
     let cache = root.join(".oj-cache").join("start");
     oj_server::write_start_assets(&cache)?;
+    oj_server::boot_phase("start_dev begin");
+
+    let built_task = tokio::spawn(
+        oj_server::DevServer {
+            root: root.clone(),
+            port,
+            bundle: false,
+            host,
+            config: None,
+        }
+        .build_app(),
+    );
 
     let route_tree = {
         let (root, cache) = (root.clone(), cache.clone());
@@ -61,14 +73,6 @@ pub async fn start_dev(
         let (root, cache) = (root.clone(), cache.clone());
         tokio::task::spawn_blocking(move || bundle_client_entry_cached(&root, &cache))
     };
-    let built_fut = oj_server::DevServer {
-        root: root.clone(),
-        port,
-        bundle: false,
-        host,
-        config: None,
-    }
-    .build_app();
     resolver.await??;
     let runner = Arc::new(tokio::sync::Mutex::new(
         spawn_start_runner(&root, &cache).await?,
@@ -79,9 +83,9 @@ pub async fn start_dev(
             let _ = forward(&runner, "GET".into(), "/".into(), vec![], None).await;
         });
     }
-    let (bundle_res, built_res) = tokio::join!(bundle, built_fut);
+    let (bundle_res, built_res) = tokio::join!(bundle, built_task);
     let pinned = bundle_res??;
-    let built = built_res?;
+    let built = built_res??;
     let css_host = if app_uses_tailwind(&root) {
         spawn_node_service(&root, &cache.join("css-host.mjs"))
             .await
@@ -121,6 +125,7 @@ pub async fn start_dev(
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| anyhow::anyhow!("cannot bind {addr}: {e}"))?;
+    oj_server::boot_phase("listening");
     println!("  {} dev (tanstack start)", oj_server::oj_brand());
     let url = format!("http://localhost:{}/", built.port);
     println!("  {}", oj_server::link(&url, &oj_server::cell(&url)));

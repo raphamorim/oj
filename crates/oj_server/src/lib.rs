@@ -159,6 +159,17 @@ const START_ASSETS: &[(&str, &str)] = &[
     ("manifest-dev.ts", include_str!("assets/start/manifest-dev.ts")),
 ];
 
+pub fn boot_phase(label: &str) {
+    if std::env::var_os("OJ_BOOT_PHASES").is_none() {
+        return;
+    }
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    eprintln!("[oj-phase] {ms} {label}");
+}
+
 pub fn node_compile_cache(root: &Path) -> std::ffi::OsString {
     std::env::var_os("NODE_COMPILE_CACHE")
         .unwrap_or_else(|| root.join(".oj-cache").join("v8").into_os_string())
@@ -287,8 +298,10 @@ impl DevServer {
             plugins::set_vite_config_override(cfg);
         }
 
+        boot_phase("build_app begin");
         let mut config = oj_config::load(&root).map_err(|e| anyhow::anyhow!("{e}"))?;
         plugins::adopt_vite_config_values(&mut config, &root);
+        boot_phase("vite config values adopted");
 
         let env_prefix = config.env_prefix.as_deref().unwrap_or("VITE_");
         let env_dir = config
@@ -372,6 +385,7 @@ impl DevServer {
         let plugin_config = plugin_cfg.to_string();
         plugin_cfg["environment"]["name"] = serde_json::json!("ssr");
         let ssr_plugin_config = plugin_cfg.to_string();
+        boot_phase("plugin host spawning");
         let plugin_host = match plugins_path {
             Some(file) => match PluginHost::spawn(&root, &file, &plugin_config).await {
                 Ok(host) => {
@@ -401,6 +415,7 @@ impl DevServer {
             },
             None => None,
         };
+        boot_phase("plugin host ready");
         let plugin_mw_port = match &plugin_host {
             Some(host) => host.middleware_port().await,
             None => None,
