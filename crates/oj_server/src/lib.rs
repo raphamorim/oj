@@ -1764,18 +1764,22 @@ async fn ensure_module(
         return Ok((key, module));
     }
     // The persistent (cross-restart) cache holds post-plugin-transform code. A
-    // transform can have in-memory side effects the cached code depends on —
-    // wyw-in-js records each module's extracted CSS in a `cssLookup` its `load`
-    // hook serves, and the cached code still `import`s those `.wyw-in-js.css`
-    // ids. On a warm start the transform never re-runs, so that map is empty and
-    // every such import 404s. So skip the persistent cache for app modules when
-    // transform plugins are active and re-run the transform (Vite likewise keeps
-    // no cross-restart transform cache). The in-memory session cache above still
-    // applies, and deps (no user transform) still use the persistent cache.
-    let skip_persistent = state.plugins_have_transform && !is_dep_early;
-    if !skip_persistent {
-        if let Some(module) = state.cache.get(&key) {
-            let module = Arc::new(module);
+    // transform can append an import to a plugin-served *virtual* whose content
+    // lives only in the plugin's in-memory state: wyw-in-js records each module's
+    // extracted CSS in a `cssLookup` its `load` hook serves, and the cached code
+    // still `import`s that `.wyw-in-js.css` id. On a warm start the transform
+    // never re-runs, so that map is empty and the import 404s. Detect it
+    // precisely — a cached module whose imports include a filesystem path with no
+    // file on disk depends on such a virtual — and re-run the transform for just
+    // those. Modules whose imports are all real files (svgr on disk, plain
+    // source, deps) keep the fast persistent cache (Vite has no cross-restart
+    // transform cache at all; this preserves oj's where it is sound).
+    if let Some(module) = state.cache.get(&key) {
+        let module = Arc::new(module);
+        let needs_retransform = state.plugins_have_transform
+            && !is_dep_early
+            && imports_a_plugin_virtual(&module.imports, &state.root, &state.dir_cache);
+        if !needs_retransform {
             memory_put(state, url, &key, &module);
             register_in_graph(state, url, &module);
             replay_module_parsed(state, file, &key, is_dep_early, is_server).await;
@@ -2562,6 +2566,28 @@ type DirCache = std::collections::HashMap<
     PathBuf,
     std::sync::Arc<std::collections::HashMap<std::ffi::OsString, bool>>,
 >;
+
+// Whether any of a cached module's imports is a plugin-served virtual — a
+// filesystem-path import (not an oj-internal `/@…` route or an external URL)
+// with no file on disk. Such a module's transform produced in-memory state
+// (e.g. wyw-in-js's extracted CSS) that a warm start would lose, so it must be
+// re-transformed. Import URLs are either root-relative (`/src/x.ts`) or absolute
+// (`/Users/…/x.wyw-in-js.css`); check both interpretations before concluding a
+// path is virtual.
+fn imports_a_plugin_virtual(imports: &[String], root: &Path, dir_cache: &Mutex<DirCache>) -> bool {
+    imports.iter().any(|imp| {
+        let p = imp.split('?').next().unwrap_or(imp);
+        if !p.starts_with('/') || p.starts_with("/@") || p.contains("://") {
+            return false;
+        }
+        let as_root = root.join(p.trim_start_matches('/'));
+        if is_file_cached(dir_cache, &as_root) {
+            return false;
+        }
+        let as_abs = Path::new(p);
+        !is_file_cached(dir_cache, as_abs)
+    })
+}
 
 fn is_file_cached(cache: &Mutex<DirCache>, path: &Path) -> bool {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
@@ -4294,6 +4320,41 @@ mod tests {
         // No header (older browsers / non-browser clients): default to the
         // module form so JS imports keep working.
         assert!(!wants_raw_resource(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn imports_a_plugin_virtual_flags_only_missing_fs_paths() {
+        // A cached module is re-transformed on warm start only if it imports a
+        // plugin-served virtual: a filesystem-path import with no file on disk.
+        // Real files (source, svgr's .svg) and oj-internal /@ routes keep the
+        // fast persistent cache.
+        let root = std::env::temp_dir().join(format!("oj-ipv-test-{}", std::process::id()));
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("real.ts"), "export {}\n").unwrap();
+        let dc = Mutex::new(DirCache::new());
+        let r = root.as_path();
+
+        // All-real imports -> keep cache.
+        assert!(!imports_a_plugin_virtual(&["/src/real.ts".to_string()], r, &dc));
+        // oj-internal routes and external urls are never plugin-state virtuals.
+        assert!(!imports_a_plugin_virtual(
+            &["/@id/abc".to_string(), "/@virtual/x".to_string(), "https://cdn/x.js".to_string()],
+            r,
+            &dc,
+        ));
+        // A missing absolute path (wyw's .wyw-in-js.css) -> re-transform.
+        assert!(imports_a_plugin_virtual(
+            &["/src/real.ts".to_string(), "/Users/nope/x.wyw-in-js.css".to_string()],
+            r,
+            &dc,
+        ));
+        // A missing root-relative path -> re-transform.
+        assert!(imports_a_plugin_virtual(&["/src/gone.css".to_string()], r, &dc));
+        // Query strings are stripped before the on-disk check.
+        assert!(!imports_a_plugin_virtual(&["/src/real.ts?import".to_string()], r, &dc));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
