@@ -3,7 +3,7 @@
 
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 import { writeFileSync, readFileSync } from "node:fs";
 
 const configPath = process.argv[2];
@@ -37,6 +37,9 @@ function resolvePkg(spec) {
   return null;
 }
 
+const absDeps = (deps) =>
+  (deps ?? []).filter((d) => typeof d === "string").map((d) => resolve(appRoot, d));
+
 async function loadConfig() {
   let viteErr = null;
   const vitePath = resolvePkg("vite");
@@ -45,7 +48,9 @@ async function loadConfig() {
       const vite = await import(pathToFileURL(vitePath).href);
       if (typeof vite.loadConfigFromFile === "function") {
         const loaded = await vite.loadConfigFromFile({ command, mode }, configPath, appRoot);
-        if (loaded && loaded.config) return loaded.config;
+        if (loaded && loaded.config) {
+          return { config: loaded.config, deps: absDeps(loaded.dependencies) };
+        }
       }
     } catch (e) {
       viteErr = e;
@@ -60,6 +65,7 @@ async function loadConfig() {
     const r = await esbuild.build({
       entryPoints: [configPath], bundle: true, platform: "node", format: "esm",
       packages: "external", write: false, logLevel: "silent", absWorkingDir: appRoot,
+      metafile: true,
       define: {
         __dirname: JSON.stringify(dirname(configPath)),
         __filename: JSON.stringify(configPath),
@@ -68,10 +74,16 @@ async function loadConfig() {
     const out = `${appRoot}/.oj-cache/oj-vite-config.mjs`;
     writeFileSync(out, r.outputFiles[0].text);
     const m = await import(pathToFileURL(out).href);
-    return typeof m.default === "function" ? await m.default({ command, mode }) : m.default;
+    return {
+      config: typeof m.default === "function" ? await m.default({ command, mode }) : m.default,
+      deps: absDeps(Object.keys(r.metafile?.inputs ?? {})),
+    };
   }
   const m = await import(pathToFileURL(configPath).href);
-  return typeof m.default === "function" ? await m.default({ command, mode }) : m.default;
+  return {
+    config: typeof m.default === "function" ? await m.default({ command, mode }) : m.default,
+    deps: [],
+  };
 }
 
 function extractAlias(alias) {
@@ -142,10 +154,13 @@ function warnUnsupported(c) {
 }
 
 try {
-  const c = (await loadConfig()) ?? {};
+  const { config, deps } = (await loadConfig()) ?? {};
+  const c = config ?? {};
   warnUnsupported(c);
   process.stdout.write(
     JSON.stringify({
+      __ok: true,
+      __deps: deps ?? [],
       base: typeof c.base === "string" ? c.base : null,
       publicDir: typeof c.publicDir === "string" ? c.publicDir : null,
       port: typeof c.server?.port === "number" ? c.server.port : null,

@@ -88,6 +88,23 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
         return None;
     }
     let vite = vite_config_file(root)?;
+    let store = oj_cache::config_extract::ConfigExtractStore::new(
+        root,
+        &format!(
+            "{}:{}",
+            env!("CARGO_PKG_VERSION"),
+            blake3::hash(VITE_EXTRACT_JS.as_bytes()).to_hex()
+        ),
+    );
+    if let Some(hit) = store.lookup(&vite, "serve", "development") {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&hit.output) {
+            if !hit.stderr.is_empty() {
+                eprint!("{}", hit.stderr);
+            }
+            crate::boot_phase("vite-extract cache hit");
+            return Some(parse_vite_values(&json));
+        }
+    }
     let cache = root.join(".oj-cache");
     let _ = std::fs::create_dir_all(&cache);
     let script = cache.join("oj-vite-extract.mjs");
@@ -102,10 +119,31 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
         .current_dir(root)
         .output()
         .ok()?;
-    if !out.stderr.is_empty() {
-        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if !stderr.is_empty() {
+        eprint!("{stderr}");
     }
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    if json.get("__ok").and_then(|v| v.as_bool()) == Some(true) {
+        let deps: Vec<PathBuf> = json
+            .get("__deps")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|d| d.as_str().map(PathBuf::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        store.store(
+            &vite,
+            "serve",
+            "development",
+            &deps,
+            &String::from_utf8_lossy(&out.stdout),
+            &stderr,
+        );
+    }
+    crate::boot_phase("vite-extract cache miss (subprocess ran)");
     Some(parse_vite_values(&json))
 }
 

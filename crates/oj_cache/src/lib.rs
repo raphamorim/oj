@@ -4,6 +4,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+pub mod config_extract;
 pub mod integrity;
 pub mod start_bundle;
 
