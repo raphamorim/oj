@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { readFileSync } from "node:fs";
+import { readFileSync, unlinkSync } from "node:fs";
+import { writeFile, appendFile, rename, mkdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { resolve as pathResolve, dirname } from "node:path";
 import { importPkg, viteEnvDefine, emptyVirtualStub } from "./resolve-pkg.mjs";
 import { loadPluginContainer } from "./vite-plugin-bridge.mjs";
@@ -26,10 +28,135 @@ if (container) {
   catch (e) { process.stderr.write(`oj: SSR buildStart failed: ${(e && (e.stack || e.message)) || e}\n`); }
 }
 const VIRTUAL_SCHEME = "ojvirtual:///";
+const DEFINE = viteEnvDefine({ ssr: true });
+
+const CACHE_DIR = pathResolve(APP, ".oj-cache");
+const cacheStats = { hits: 0, misses: 0, uncached: 0, rhits: 0, rmisses: 0 };
+const EPOCH = (() => {
+  if (process.env.OJ_SSR_LOADER_CACHE === "off") return null;
+  try {
+    const h = createHash("sha256");
+    const add = (label, bytes) => { h.update(label); h.update("\0"); h.update(bytes); h.update("\0"); };
+    add("v", "oj-ssr-loader-cache-v1");
+    add("node", process.version);
+    for (const name of [
+      "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "package.json",
+      "vite.config.ts", "vite.config.js", "vite.config.mjs", "vite.config.mts",
+      "oj.config.ts", "oj.config.js", "oj.config.mjs",
+    ]) {
+      try { add(name, readFileSync(pathResolve(APP, name))); } catch {}
+    }
+    for (const name of ["loader.mjs", "loader-util.mjs", "glob-transform.mjs", "vite-plugin-bridge.mjs", "resolve-pkg.mjs"]) {
+      try { add(name, readFileSync(pathResolve(HERE, name))); } catch {}
+    }
+    add("define", JSON.stringify(DEFINE));
+    add("fnbase", process.env.TSS_SERVER_FN_BASE ?? "");
+    return h.digest("hex");
+  } catch {
+    return null;
+  }
+})();
+function cacheKey(mode, path, source) {
+  if (!EPOCH) return null;
+  try {
+    const h = createHash("sha256");
+    for (const part of [EPOCH, mode, path, source]) { h.update(part); h.update("\0"); }
+    return h.digest("hex");
+  } catch {
+    return null;
+  }
+}
+const cachePath = (key) => pathResolve(CACHE_DIR, key.slice(0, 2), `${key}.json`);
+function cacheGet(key) {
+  if (!key) return null;
+  const file = cachePath(key);
+  let bytes;
+  try { bytes = readFileSync(file, "utf8"); } catch { return null; }
+  try {
+    const entry = JSON.parse(bytes);
+    if (typeof entry.code === "string") { cacheStats.hits += 1; return entry.code; }
+  } catch {}
+  try { unlinkSync(file); } catch {}
+  return null;
+}
+const writeQueue = [];
+let draining = false;
+async function drainWrites() {
+  if (draining) return;
+  draining = true;
+  while (writeQueue.length > 0) {
+    const { file, body } = writeQueue.shift();
+    try {
+      await mkdir(dirname(file), { recursive: true });
+      const tmp = file.replace(/\.json$/, ".tmp");
+      await writeFile(tmp, body);
+      await rename(tmp, file);
+    } catch {}
+  }
+  draining = false;
+}
+function cachePut(key, code) {
+  if (!key) { cacheStats.uncached += 1; return; }
+  cacheStats.misses += 1;
+  try {
+    writeQueue.push({
+      file: cachePath(key),
+      body: JSON.stringify({ code, map_data_url: null, imports: [], is_boundary: false, kind: "ssr-loader" }),
+    });
+    setTimeout(drainWrites, 0);
+  } catch {}
+}
+const RESOLVE_CACHE_FILE = pathResolve(CACHE_DIR, "ssr-resolve.jsonl");
+const resolveCache = new Map();
+let resolveFileReady = false;
+if (EPOCH) {
+  try {
+    const lines = readFileSync(RESOLVE_CACHE_FILE, "utf8").split("\n");
+    if (JSON.parse(lines[0]).epoch === EPOCH) {
+      resolveFileReady = true;
+      for (let i = 1; i < lines.length; i++) {
+        if (!lines[i]) continue;
+        try { const e = JSON.parse(lines[i]); resolveCache.set(e.k, e); } catch {}
+      }
+    }
+  } catch {}
+}
+let resolvePending = [];
+let resolveFlushTimer = null;
+async function flushResolveCache() {
+  resolveFlushTimer = null;
+  const batch = resolvePending;
+  resolvePending = [];
+  if (batch.length === 0) return;
+  const body = batch.map((e) => JSON.stringify(e)).join("\n") + "\n";
+  try {
+    await mkdir(CACHE_DIR, { recursive: true });
+    if (resolveFileReady) {
+      await appendFile(RESOLVE_CACHE_FILE, body);
+    } else {
+      await writeFile(RESOLVE_CACHE_FILE, JSON.stringify({ epoch: EPOCH }) + "\n" + body);
+      resolveFileReady = true;
+    }
+  } catch {}
+}
+function rememberResolve(key, entry) {
+  if (!EPOCH || resolveCache.has(key)) return;
+  entry.k = key;
+  resolveCache.set(key, entry);
+  resolvePending.push(entry);
+  if (!resolveFlushTimer) resolveFlushTimer = setTimeout(flushResolveCache, 250);
+}
+
+function reportCacheStats() {
+  if (!EPOCH) return;
+  process.stderr.write(
+    `oj: ssr loader cache: load ${cacheStats.hits}/${cacheStats.hits + cacheStats.misses} hits (${cacheStats.uncached} uncacheable), resolve ${cacheStats.rhits}/${cacheStats.rhits + cacheStats.rmisses} hits\n`,
+  );
+}
 
 let V = 0;
 export async function initialize(data) {
-  if (data && data.port) data.port.on("message", (v) => (V = v));
+  if (data && data.port) data.port.on("message", (v) => (v === "stats" ? reportCacheStats() : (V = v)));
 }
 const stripQ = (u) => u.split("?")[0];
 const withV = (u) => (V ? `${stripQ(u)}?ojv=${V}` : stripQ(u));
@@ -90,6 +217,31 @@ function resolveTsPaths(spec) {
 
 export async function resolve(spec, context, next) {
   if (context.parentURL) context = { ...context, parentURL: stripQ(context.parentURL) };
+  const key = (context.parentURL ?? "") + "\0" + spec;
+  const rc = EPOCH ? resolveCache.get(key) : undefined;
+  if (rc !== undefined) {
+    try {
+      const cleanUrl = stripQ(rc.u);
+      if (!cleanUrl.startsWith("file:") || isFile(fileURLToPath(cleanUrl))) {
+        cacheStats.rhits += 1;
+        const out = { url: rc.v ? withV(rc.u) : rc.u, shortCircuit: true };
+        if (rc.f) out.format = rc.f;
+        return out;
+      }
+    } catch {}
+    resolveCache.delete(key);
+  }
+  const r = await resolveUncached(spec, context, next);
+  if (EPOCH && r && r.url && !r.url.startsWith(VIRTUAL_SCHEME)) {
+    cacheStats.rmisses += 1;
+    const versioned = r._ojv === true;
+    rememberResolve(key, { u: versioned ? stripQ(r.url) : r.url, v: versioned ? 1 : 0, f: r.format ?? null });
+  }
+  if (r && r._ojv) delete r._ojv;
+  return r;
+}
+
+async function resolveUncached(spec, context, next) {
   if (container && (spec.startsWith("virtual:") || spec.startsWith("\0"))) {
     const importer = context.parentURL && context.parentURL.startsWith("file:")
       ? fileURLToPath(context.parentURL)
@@ -132,20 +284,20 @@ export async function resolve(spec, context, next) {
   }
   if (ALIASES[spec]) {
     const hit = probe(ALIASES[spec]);
-    if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true };
+    if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true, _ojv: true };
   }
   if (spec.startsWith("#")) {
     const hit = resolveImports(spec);
-    if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true };
+    if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true, _ojv: true };
   }
   if (!spec.startsWith(".") && !spec.startsWith("/")) {
     const hit = resolveTsPaths(spec);
-    if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true };
+    if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true, _ojv: true };
   }
   if (spec.startsWith(".") && context.parentURL) {
     const base = pathResolve(dirname(fileURLToPath(context.parentURL)), spec);
     const hit = probe(base);
-    if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true };
+    if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true, _ojv: true };
   }
   let r;
   try {
@@ -160,7 +312,7 @@ export async function resolve(spec, context, next) {
     }
     throw err;
   }
-  if (r && r.url && isTanstack(r.url)) return { ...r, url: withV(r.url), shortCircuit: true };
+  if (r && r.url && isTanstack(r.url)) return { ...r, url: withV(r.url), shortCircuit: true, _ojv: true };
   return r;
 }
 
@@ -192,9 +344,22 @@ export async function load(url, context, next) {
   if (clean.endsWith(".tsx") || clean.endsWith(".ts")) {
     const path = fileURLToPath(clean);
     const userFile = container && !path.includes("/node_modules/");
+    let diskRaw = null;
+    if (userFile) {
+      try { diskRaw = readFileSync(path, "utf8"); } catch {}
+      if (diskRaw != null) {
+        const diskHit = cacheGet(cacheKey("ssr-loader", path, diskRaw));
+        if (diskHit != null) return { format: "module", source: diskHit, shortCircuit: true };
+      }
+    }
     // A plugin load() overrides the on-disk file (Vite: load runs before fs read).
     let raw = userFile ? await container.load(path) : null;
-    if (raw == null) raw = readFileSync(path, "utf8");
+    if (raw == null) raw = diskRaw ?? readFileSync(path, "utf8");
+    const key = cacheKey("ssr-loader", path, raw);
+    if (raw !== diskRaw) {
+      const hit = cacheGet(key);
+      if (hit != null) return { format: "module", source: hit, shortCircuit: true };
+    }
     if (userFile) {
       const t = await container.transformUserCode(raw, path);
       if (t != null) raw = t;
@@ -203,8 +368,9 @@ export async function load(url, context, next) {
     const out = transformSync(path, src, {
       lang: clean.endsWith("tsx") ? "tsx" : "ts",
       jsx: { runtime: "automatic" },
-      define: viteEnvDefine({ ssr: true }),
+      define: DEFINE,
     });
+    cachePut(raw.includes("import.meta.glob") ? null : key, out.code);
     return { format: "module", source: out.code, shortCircuit: true };
   }
   if (url.includes("?ojv=") && isTanstack(url)) {
@@ -219,12 +385,17 @@ export async function load(url, context, next) {
   }
   if (container && clean.endsWith(".mdx")) {
     const path = fileURLToPath(clean);
-    const compiled = await container.transform(readFileSync(path, "utf8"), path);
+    const raw = readFileSync(path, "utf8");
+    const key = cacheKey("ssr-loader-mdx", path, raw);
+    const hit = cacheGet(key);
+    if (hit != null) return { format: "module", source: hit, shortCircuit: true };
+    const compiled = await container.transform(raw, path);
     if (compiled != null) {
       const out = transformSync(path, compiled, {
         lang: "jsx", jsx: { runtime: "automatic" },
-        define: viteEnvDefine({ ssr: true }),
+        define: DEFINE,
       });
+      cachePut(compiled.includes("import.meta.glob") ? null : key, out.code);
       return { format: "module", source: out.code, shortCircuit: true };
     }
   }
@@ -244,7 +415,15 @@ export async function load(url, context, next) {
   if (clean.startsWith("file:") && clean.includes("/node_modules/")) {
     const path = fileURLToPath(clean);
     if (isCjsFile(path)) {
-      try { return { format: "module", source: cjsFacade(path), shortCircuit: true }; } catch {}
+      let key = null;
+      try { key = cacheKey("ssr-loader-cjs", path, readFileSync(path)); } catch {}
+      const hit = cacheGet(key);
+      if (hit != null) return { format: "module", source: hit, shortCircuit: true };
+      try {
+        const src = cjsFacade(path);
+        cachePut(key, src);
+        return { format: "module", source: src, shortCircuit: true };
+      } catch {}
     }
   }
   return next(url, context);
