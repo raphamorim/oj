@@ -56,9 +56,7 @@ pub async fn start_dev(
     };
     let resolver = {
         let (root, cache) = (root.clone(), cache.clone());
-        tokio::task::spawn_blocking(move || {
-            run_node(&root, &cache.join("gen-resolver.mjs"), "server-fn resolver")
-        })
+        tokio::task::spawn_blocking(move || generate_server_fn_resolver(&root, &cache))
     };
     route_tree.await??;
     let bundle = {
@@ -250,7 +248,7 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
                         || std::fs::read_to_string(p).is_ok_and(|s| s.contains("createServerFn")))
             });
             if routes_changed || server_fn_changed {
-                let _ = run_node(&root, &cache.join("gen-resolver.mjs"), "server-fn resolver");
+                let _ = generate_server_fn_resolver(&root, &cache);
             }
             // Narrate the compile batch to the editor: "Applying changes…" while
             // it rebuilds, then done so the pill clears.
@@ -293,7 +291,7 @@ pub async fn start_build(root: PathBuf) -> anyhow::Result<()> {
     let cache = root.join(".oj-cache").join("start");
     oj_server::write_start_assets(&cache)?;
     generate_route_tree(&root, &cache)?;
-    run_node(&root, &cache.join("gen-resolver.mjs"), "server-fn resolver")?;
+    generate_server_fn_resolver(&root, &cache)?;
     let prerender = oj_config::load(&root)
         .ok()
         .and_then(|c| c.build)
@@ -305,6 +303,7 @@ pub async fn start_build(root: PathBuf) -> anyhow::Result<()> {
         .env("OJ_APP_ROOT", &root)
         .env("NODE_ENV", "production")
         .env("OJ_PRERENDER", &prerender)
+        .env("NODE_COMPILE_CACHE", oj_server::node_compile_cache(&root))
         .current_dir(&root)
         .status()
         .map_err(|e| anyhow::anyhow!("could not run production build (node): {e}"))?;
@@ -320,8 +319,110 @@ pub async fn start_build(root: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn codegen_store(
+    root: &Path,
+    cache: &Path,
+    kind: &str,
+    script: &str,
+    marker: Option<&str>,
+) -> oj_cache::start_codegen::StartCodegenStore {
+    let mut extra = std::fs::read(cache.join(script)).unwrap_or_default();
+    for name in [
+        "tsr.config.json",
+        "package.json",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "bun.lockb",
+    ] {
+        if let Ok(bytes) = std::fs::read(root.join(name)) {
+            extra.extend_from_slice(name.as_bytes());
+            extra.push(0);
+            extra.extend_from_slice(&bytes);
+            extra.push(0);
+        }
+    }
+    oj_cache::start_codegen::StartCodegenStore::new(
+        root,
+        kind,
+        env!("CARGO_PKG_VERSION"),
+        &extra,
+        marker,
+    )
+}
+
 fn generate_route_tree(root: &Path, cache: &Path) -> anyhow::Result<()> {
-    run_node(root, &cache.join("generate.mjs"), "route tree generation")
+    let store = codegen_store(root, cache, "route-tree", "generate.mjs", None);
+    let dest = root.join("src").join("routeTree.gen.ts");
+    let outputs = [("routeTree.gen.ts", dest.as_path())];
+    let inputs: Vec<PathBuf> = list_route_files(root).into_iter().collect();
+    match store.restore(&inputs, &outputs) {
+        Ok(stats) => {
+            println!(
+                "  oj start: route tree restored from cache (key {}…, {} route file(s) verified in {}ms)",
+                stats.key.get(..8).unwrap_or(&stats.key),
+                stats.keyed_files,
+                stats.elapsed_ms
+            );
+            return Ok(());
+        }
+        Err(miss) => println!("  oj start: route tree cache miss ({miss})"),
+    }
+    run_node(root, &cache.join("generate.mjs"), "route tree generation")?;
+    // The generator normalizes route files in place, so key over the post-run
+    // (fixed-point) contents; the pre-run state would never be seen again.
+    let inputs: Vec<PathBuf> = list_route_files(root).into_iter().collect();
+    store.persist(&inputs, &outputs);
+    Ok(())
+}
+
+fn generate_server_fn_resolver(root: &Path, cache: &Path) -> anyhow::Result<()> {
+    let store = codegen_store(
+        root,
+        cache,
+        "server-fn",
+        "gen-resolver.mjs",
+        Some("createServerFn"),
+    );
+    let dest = cache.join("server-fn-resolver.mjs");
+    let outputs = [("server-fn-resolver.mjs", dest.as_path())];
+    let inputs = list_src_ts_files(root);
+    match store.restore(&inputs, &outputs) {
+        Ok(stats) => {
+            println!(
+                "  oj start: server-fn resolver restored from cache (key {}…, {} server-fn file(s), {} of {} rehashed, {}ms)",
+                stats.key.get(..8).unwrap_or(&stats.key),
+                stats.keyed_files,
+                stats.rehashed,
+                inputs.len(),
+                stats.elapsed_ms
+            );
+            return Ok(());
+        }
+        Err(miss) => println!("  oj start: server-fn resolver cache miss ({miss})"),
+    }
+    run_node(root, &cache.join("gen-resolver.mjs"), "server-fn resolver")?;
+    store.persist(&inputs, &outputs);
+    Ok(())
+}
+
+fn list_src_ts_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "ts" || x == "tsx") {
+                out.push(p);
+            }
+        }
+    }
+    walk(&root.join("src"), &mut out);
+    out
 }
 
 fn bundle_client_entry(root: &Path, cache: &Path) -> anyhow::Result<()> {
@@ -383,6 +484,7 @@ fn run_node(root: &Path, script: &Path, what: &str) -> anyhow::Result<()> {
         .arg(script)
         .env("OJ_APP_ROOT", root)
         .env("NODE_ENV", "development")
+        .env("NODE_COMPILE_CACHE", oj_server::node_compile_cache(root))
         .current_dir(root)
         .status()
         .map_err(|e| anyhow::anyhow!("could not run {what} (node): {e}"))?;
@@ -397,15 +499,19 @@ async fn spawn_start_runner(root: &Path, cache: &Path) -> anyhow::Result<Runner>
 }
 
 async fn spawn_node_service(root: &Path, script: &Path) -> anyhow::Result<Runner> {
-    let mut child = tokio::process::Command::new("node")
-        .arg(script)
+    let mut cmd = tokio::process::Command::new("node");
+    cmd.arg(script)
         .env("OJ_APP_ROOT", root)
         .env("NODE_ENV", "development")
         .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    if let Some(v8) = oj_server::node_compile_cache_opt_in(root) {
+        cmd.env("NODE_COMPILE_CACHE", v8);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("could not spawn node service {}: {e}", script.display()))?;
     let stdin = child.stdin.take().expect("piped stdin");
@@ -878,7 +984,7 @@ mod tests {
 
     #[test]
     fn app_uses_tailwind_reads_package_json() {
-        let base = tmp("tw");
+        let base = tmp("tw-pkg");
         std::fs::write(
             base.join("package.json"),
             r#"{"devDependencies":{"@tailwindcss/postcss":"4"}}"#,
@@ -968,6 +1074,21 @@ mod tests {
         assert!(!names
             .iter()
             .any(|n| n.ends_with(".css") || n.ends_with(".json")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_src_ts_files_walks_all_of_src() {
+        let root = tmp("srcwalk");
+        let src = root.join("src");
+        std::fs::create_dir_all(src.join("routes")).unwrap();
+        std::fs::create_dir_all(src.join("lib")).unwrap();
+        std::fs::write(src.join("routes").join("index.tsx"), "").unwrap();
+        std::fs::write(src.join("lib").join("fns.ts"), "").unwrap();
+        std::fs::write(src.join("lib").join("types.d.ts"), "").unwrap();
+        std::fs::write(src.join("styles.css"), "").unwrap();
+        let found = list_src_ts_files(&root);
+        assert_eq!(found.len(), 3, "ts/tsx (incl. .d.ts) only: {found:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -86,17 +86,21 @@ async fn spawn_runner(root: &Path, base: &str, entry_abs: &Path) -> anyhow::Resu
     let script = dir.join("runner.mjs");
     std::fs::write(&script, oj_server::SSR_RUNNER_JS)?;
 
-    let mut child = tokio::process::Command::new("node")
-        .args([
-            "--experimental-vm-modules",
-            &script.to_string_lossy(),
-            base,
-            &entry_abs.to_string_lossy(),
-        ])
-        .current_dir(root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+    let mut cmd = tokio::process::Command::new("node");
+    cmd.args([
+        "--experimental-vm-modules",
+        &script.to_string_lossy(),
+        base,
+        &entry_abs.to_string_lossy(),
+    ])
+    .current_dir(root)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::inherit());
+    if let Some(v8) = oj_server::node_compile_cache_opt_in(root) {
+        cmd.env("NODE_COMPILE_CACHE", v8);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("could not spawn SSR runner (node): {e}"))?;
 

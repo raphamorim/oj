@@ -10,6 +10,7 @@ name = "oj"
 path = "src/main.rs"
 
 [dependencies]
+oj_cache.workspace = true
 oj_compiler.workspace = true
 oj_env.workspace = true
 oj_config.workspace = true

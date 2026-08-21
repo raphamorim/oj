@@ -150,6 +150,22 @@ const START_ASSETS: &[(&str, &str)] = &[
     ("manifest.ts", include_str!("assets/start/manifest.ts")),
 ];
 
+// V8 bytecode cache for every node child oj spawns; a user-set value wins.
+pub fn node_compile_cache(root: &Path) -> std::ffi::OsString {
+    std::env::var_os("NODE_COMPILE_CACHE")
+        .unwrap_or_else(|| root.join(".oj-cache").join("v8").into_os_string())
+}
+
+// The SSR runner and css-host pay more in V8 cache maintenance than they save
+// (measured net 1-3s cost), so for those services the cache is opt-in.
+pub fn node_compile_cache_opt_in(root: &Path) -> Option<std::ffi::OsString> {
+    let v = std::env::var_os("OJ_V8_COMPILE_CACHE")?;
+    if v.is_empty() || v == "0" {
+        return None;
+    }
+    Some(node_compile_cache(root))
+}
+
 pub fn write_start_assets(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     for (name, content) in START_ASSETS {

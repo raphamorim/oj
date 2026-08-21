@@ -6,6 +6,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub mod start_codegen;
+
 pub const CACHE_FORMAT: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -25,7 +25,18 @@ if (!installed) {
 }
 
 execSync("cargo build -p oj", { cwd: repo, stdio: "inherit" });
-const rm = (p) => fs.rmSync(p, { recursive: true, force: true });
+// Retried: SIGKILLed servers orphan node children for a beat, and their
+// NODE_COMPILE_CACHE flush into .oj-cache/v8 races the removal (ENOTEMPTY).
+const rm = (p) => {
+  for (let i = 0; ; i++) {
+    try {
+      return fs.rmSync(p, { recursive: true, force: true });
+    } catch (e) {
+      if (i >= 20) throw e;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    }
+  }
+};
 
 const get = async (port, route = "/") => {
   const res = await fetch(`http://localhost:${port}${route}`);
