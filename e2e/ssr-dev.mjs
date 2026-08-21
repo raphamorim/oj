@@ -4,6 +4,7 @@
 import { spawn, execSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -174,6 +175,58 @@ try {
       throw new Error("ssr load did not return the plugin virtual module source: " + mod);
     }
     console.log("ssr-dev: plugin resolveId + load ok (virtual module resolves/loads server-side)");
+  }
+
+  {
+    // The SSR module endpoint and the server-function endpoint both take a path
+    // from the request. Neither may reach a file outside the project: a browser
+    // can POST to /__oj_fn cross-origin without a preflight (a JSON body with
+    // content-type text/plain is a simple request), so "any module on the
+    // developer's machine" would be reachable from any page they have open.
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "oj-ssr-outside-"));
+    const outside = path.join(outsideDir, "outside.server.mjs");
+    fs.writeFileSync(outside, `export function leak() { return "PWNED"; }\n`);
+    const rel = path.relative(path.join(repo, "playground"), outside);
+
+    const call = async (module) => {
+      const res = await fetch(`${base}/__oj_fn`, {
+        method: "POST",
+        headers: { "content-type": "text/plain" },
+        body: JSON.stringify({ module, name: "leak", args: [] }),
+      });
+      return { status: res.status, body: await res.text() };
+    };
+    for (const hostile of [rel, outside, "../../../etc/passwd", "src/App.tsx"]) {
+      const r = await call(hostile);
+      if (r.status !== 403 || r.body.includes("PWNED")) {
+        throw new Error(`server fn accepted ${hostile}: ${r.status} ${r.body.slice(0, 120)}`);
+      }
+    }
+    const good = await fetch(`${base}/__oj_fn`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ module: "/src/greeting.server.ts", name: "greet", args: ["oj"] }),
+    });
+    const greeting = await good.text();
+    if (good.status !== 200 || !greeting.includes("server=true")) {
+      throw new Error(`a real server function stopped working: ${good.status} ${greeting}`);
+    }
+
+    const read = async (id) =>
+      await fetch(`${base}/@ssr-module?id=${encodeURIComponent(id)}`);
+    for (const hostile of [outside, path.join(outsideDir, "..", path.basename(outsideDir), "outside.server.mjs")]) {
+      const r = await read(hostile);
+      if (r.status !== 403) {
+        throw new Error(`ssr-module served ${hostile}: ${r.status} ${(await r.text()).slice(0, 120)}`);
+      }
+    }
+    const inRoot = await read(path.join(repo, "playground", "src", "App.tsx"));
+    if (inRoot.status !== 200) throw new Error("ssr-module stopped serving project files");
+    const dep = await read(path.join(repo, "playground", "node_modules", "react", "index.js"));
+    if (dep.status !== 200) throw new Error("ssr-module stopped serving dependencies");
+
+    fs.rmSync(outsideDir, { recursive: true, force: true });
+    console.log("ssr-dev: module + server-fn endpoints confined to the project ok");
   }
 
   let pw = null;
