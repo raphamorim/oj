@@ -398,8 +398,8 @@ fn a_cjs_dep_without_module_syntax_is_wrapped() {
     // local shim over the statically imported dependency map.
     assert!(out.code.contains("__oj_deps"), "{}", out.code);
     assert!(
-        out.code.contains("import { __cjs_exports as"),
-        "the dep must become a static import: {}",
+        out.code.contains("import * as __oj_ns_0"),
+        "the dep must become a static namespace import: {}",
         out.code
     );
     assert!(out.code.contains("function require(id)"), "{}", out.code);

@@ -34,6 +34,11 @@ pub struct ResolveFailure {
     pub specifier: String,
     pub importer: PathBuf,
     pub reason: String,
+    /// The package deliberately maps this specifier to `false` (a package.json
+    /// `browser` field entry or a `{ find, replacement: false }` alias). Not a
+    /// real failure: the module is meant to be empty in this target, so it
+    /// should be served as an empty stub rather than 404'd.
+    pub ignored: bool,
 }
 
 impl OjResolver {
@@ -70,11 +75,14 @@ impl OjResolver {
             extensions: [".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs", ".json"]
                 .map(String::from)
                 .to_vec(),
-            // Vite's default package entry resolution: exports still wins (via
-            // condition_names), these are the fallbacks so ESM-only-via-`module`
-            // / `browser` deps don't fall back to their CJS `main`. `browser`
-            // alias_fields honors the package.json `browser` object remap.
-            main_fields: ["browser", "module", "jsnext:main", "jsnext", "main"]
+            // Package entry resolution for legacy deps without an `exports` map
+            // (with one, condition_names decides and this is unused). `module`
+            // leads so a dep shipping both an ESM build and a `browser` STRING
+            // that points at a UMD/CJS bundle (e.g. transliteration) serves its
+            // ESM — real named exports, no CJS-interop guessing. The `browser`
+            // OBJECT remap (node-shim swaps) is unaffected: it runs through
+            // alias_fields below, not here.
+            main_fields: ["module", "browser", "jsnext:main", "jsnext", "main"]
                 .map(String::from)
                 .to_vec(),
             alias_fields: vec![vec!["browser".to_string()]],
@@ -126,6 +134,7 @@ impl OjResolver {
                     specifier: specifier.to_string(),
                     importer: importer_dir.to_path_buf(),
                     reason: err.to_string(),
+                    ignored: err.is_ignore(),
                 })
             }
         }

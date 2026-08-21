@@ -84,6 +84,7 @@ fn bytes_to_string(bytes: Vec<u8>) -> std::io::Result<String> {
 const CLIENT_JS: &str = include_str!("assets/client.js");
 pub const OJ_ROUTES_JS: &str = include_str!("assets/oj-routes.js");
 const SERVER_FN_JS: &str = include_str!("assets/server-fn.js");
+const LINGUI_MACRO_SHIM_JS: &str = include_str!("assets/lingui-macro-shim.mjs");
 const REFRESH_RUNTIME_JS: &str = include_str!("assets/refresh-runtime.js");
 const REFRESH_PREAMBLE_JS: &str = include_str!("assets/refresh-preamble.js");
 const BUNDLE_RUNTIME_JS: &str = include_str!("assets/bundle-runtime.js");
@@ -630,6 +631,10 @@ impl DevServer {
             .route("/@oj/worker.js", get(serve_worker_chunk))
             .route("/@oj/routes.js", get(serve_oj_routes))
             .route("/@oj/server-fn.js", get(|| async { js(SERVER_FN_JS) }))
+            .route(
+                "/@oj/lingui-macro-shim.js",
+                get(|| async { js(LINGUI_MACRO_SHIM_JS) }),
+            )
             .route("/@ssr-resolve", get(ssr_resolve))
             .route("/@ssr-module", get(ssr_module))
             .route("/__ws", get(ws_upgrade))
@@ -1331,6 +1336,17 @@ async fn serve_path(
         };
     }
 
+    if uri.path() == "/@oj-empty" {
+        return (
+            [
+                (header::CONTENT_TYPE, "text/javascript"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            "// oj: browser-externalized module (package maps it to false)\nexport default {};\nexport const __cjs_exports = {};\n",
+        )
+            .into_response();
+    }
+
     if let Some(id) = uri.path().strip_prefix("/@virtual/") {
         return match state.virtual_modules.get(id) {
             Some(code) => (
@@ -1380,6 +1396,9 @@ async fn serve_path(
                 {
                     return resp;
                 }
+                if let Some(resp) = serve_plugin_load_fallback(&state, &uri).await {
+                    return resp;
+                }
                 if is_spa_navigation(rel, &headers) {
                     return serve_index_html(&state).await;
                 }
@@ -1404,9 +1423,12 @@ async fn serve_path(
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {e}")).into_response(),
         };
     }
-    if is_style_ext(ext) && uri.query().is_some_and(|q| q.contains("import")) {
-        let url = url_of(&state.root, &file);
-        return serve_css_wrapper(&state, &file, &url).await;
+    if is_style_ext(ext) {
+        let import_query = uri.query().is_some_and(|q| q.contains("import"));
+        if import_query || !wants_raw_resource(&headers) {
+            let url = url_of(&state.root, &file);
+            return serve_css_wrapper(&state, &file, &url).await;
+        }
     }
     if COMPILABLE.contains(&ext) {
         let url = url_of(&state.root, &file);
@@ -1423,6 +1445,23 @@ async fn serve_path(
     if ext == "json" && !file.starts_with(&state.public_dir) {
         let url = url_of(&state.root, &file);
         return serve_compiled(&state, &file, &url, uri.query(), &headers).await;
+    }
+    if is_importable_asset_ext(ext)
+        && query_asset_kind(uri.query()).is_none()
+        && !wants_raw_resource(&headers)
+    {
+        let url = url_of(&state.root, &file);
+        return match asset_module(&file, &url, "url").await {
+            Ok(js) => (
+                [
+                    (header::CONTENT_TYPE, "text/javascript"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
+                js,
+            )
+                .into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {e}")).into_response(),
+        };
     }
 
     match tokio::fs::read(&file).await {
@@ -2271,6 +2310,48 @@ fn is_style_ext(ext: &str) -> bool {
     matches!(ext, "css" | "scss" | "sass" | "less" | "styl" | "stylus")
 }
 
+// The browser stamps every request with Sec-Fetch-Dest describing what it will
+// do with the bytes: `style` (<link rel=stylesheet>), `image` (<img>), `font`
+// (@font-face), media. Those want the raw resource. A JS `import` fetches the
+// module with dest `script`/`empty`/worker, which wants the JS-module form: a
+// style-injecting module for CSS, a URL-exporting module for an asset. Vite draws
+// the same line; a `.css` reached from JS is served as JS, not text/css.
+fn wants_raw_resource(headers: &HeaderMap) -> bool {
+    matches!(
+        headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok()),
+        Some("style" | "image" | "font" | "audio" | "video" | "track" | "object" | "embed")
+    )
+}
+
+// Assets that, when imported from JS, resolve to a URL-exporting module (Vite's
+// default asset handling). svg is excluded: it is routed to vite-plugin-svgr.
+fn is_importable_asset_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "ico" | "bmp"
+            | "woff" | "woff2" | "ttf" | "otf" | "eot"
+            | "mp4" | "webm" | "ogg" | "mp3" | "wav" | "flac" | "m4a" | "aac" | "mov"
+            | "pdf" | "webmanifest"
+    )
+}
+
+// Node core modules. When one reaches the browser graph (usually via config-time
+// tooling a dep drags along), Vite serves a browser-externalized stub rather than
+// 404ing the whole module chain; oj does the same so the app still mounts.
+fn is_node_builtin(spec: &str) -> bool {
+    let name = spec.strip_prefix("node:").unwrap_or(spec);
+    let base = name.split('/').next().unwrap_or(name);
+    matches!(
+        base,
+        "assert" | "buffer" | "child_process" | "cluster" | "console" | "constants"
+            | "crypto" | "dgram" | "diagnostics_channel" | "dns" | "domain" | "events"
+            | "fs" | "http" | "http2" | "https" | "inspector" | "module" | "net" | "os"
+            | "path" | "perf_hooks" | "process" | "punycode" | "querystring" | "readline"
+            | "repl" | "stream" | "string_decoder" | "sys" | "timers" | "tls" | "trace_events"
+            | "tty" | "url" | "util" | "v8" | "vm" | "wasi" | "worker_threads" | "zlib"
+    )
+}
+
 fn is_style_url(url: &str) -> bool {
     let f = url.split('?').next().unwrap_or(url);
     std::path::Path::new(f)
@@ -2482,6 +2563,11 @@ fn rewrite_specifier(
         return None;
     }
 
+    if is_lingui_macro_specifier(spec) {
+        warn_lingui_macro_shim_once();
+        return Some("/@oj/lingui-macro-shim.js".to_string());
+    }
+
     if let Some((base, query)) = spec.split_once('?') {
         if matches!(
             query,
@@ -2540,6 +2626,13 @@ fn rewrite_specifier(
         Ok(resolved) => {
             fs_allow.lock().unwrap().insert(package_root(&resolved));
             Some(url_of(root, &resolved))
+        }
+        Err(err) if err.ignored => {
+            // The package maps this specifier to `false` for the browser (a
+            // package.json `browser` field, e.g. typescript's `fs`/`crypto`/
+            // `source-map-support`). Vite serves an empty module here; do the
+            // same so the importing dep still loads instead of 404ing.
+            Some("/@oj-empty".to_string())
         }
         Err(err) => {
             // Plugin-provided ids (virtual: modules, \0-prefixed) are expected
@@ -2850,6 +2943,16 @@ async fn serve_plugin_id(state: &Arc<ServerState>, spec: &str, importer: &str) -
     let id = match host.resolve_id(spec, importer).await {
         Ok(Some(id)) => id,
         Ok(None) => {
+            if is_node_builtin(spec) {
+                return (
+                    [
+                        (header::CONTENT_TYPE, "text/javascript"),
+                        (header::CACHE_CONTROL, "no-cache"),
+                    ],
+                    format!("// oj: browser-externalized node builtin {:?}\nexport default {{}};\nexport const __cjs_exports = {{}};\n", spec),
+                )
+                    .into_response();
+            }
             return (
                 StatusCode::NOT_FOUND,
                 format!("oj: no plugin resolved {spec}"),
@@ -2900,8 +3003,106 @@ async fn serve_plugin_id(state: &Arc<ServerState>, spec: &str, importer: &str) -
     }
 }
 
+// A plugin can `load` a module whose id is neither an on-disk file nor a bare
+// specifier: wyw-in-js/linaria appends `import "<abs>.wyw-in-js.css"` to each
+// transformed module and serves that absolute-path id from its own `load` hook,
+// keeping the extracted CSS in memory. On a disk miss, consult the plugin
+// container (resolveId -> load) before giving up. CSS a plugin returns is
+// wrapped as a style-injecting JS module, matching Vite's `vite:css` handling of
+// a `.css` import reached from JS (so the browser gets text/javascript, not a
+// text/css module script the strict MIME check rejects).
+async fn serve_plugin_load_fallback(state: &Arc<ServerState>, uri: &Uri) -> Option<Response> {
+    let host = state.plugins.as_ref()?;
+    let spec = uri.path().to_string();
+    let id = match host.resolve_id(&spec, "").await {
+        Ok(Some(id)) => id,
+        _ => return None,
+    };
+    let source = match host.load(&id).await {
+        Ok(Some(src)) => src,
+        _ => return None,
+    };
+    let id_path = id.split('?').next().unwrap_or(&id);
+    let is_css = Path::new(id_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(is_style_ext);
+    if is_css {
+        let url = id_path.to_string();
+        let body = format!(
+            "import {{ createHotContext as __oj_hot, updateStyle as __oj_updateStyle }} from \"/@oj/client.js\";\n\
+             import.meta.hot = __oj_hot({url:?});\n\
+             __oj_updateStyle({url:?}, {css});\n\
+             export default void 0;\n\
+             import.meta.hot.accept(() => {{}});\n",
+            css = serde_json::Value::String(source),
+        );
+        return Some(
+            (
+                [
+                    (header::CONTENT_TYPE, "text/javascript"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
+                body,
+            )
+                .into_response(),
+        );
+    }
+    let root = state.root.clone();
+    let resolver = Arc::clone(&state.resolver);
+    let fs_allow = Arc::clone(&state.fs_allow);
+    let dir_cache = Arc::clone(&state.dir_cache);
+    let compiled = tokio::task::spawn_blocking(move || {
+        let mut rewrite =
+            |s: &str| rewrite_specifier(&root, &root, &resolver, &fs_allow, &dir_cache, s, true);
+        oj_compiler::compile_module(
+            Path::new("plugin.tsx"),
+            &source,
+            &oj_compiler::CompileOptions::dev(),
+            Some(&mut rewrite),
+        )
+        .map(|o| o.code_with_inline_map())
+        .map_err(|e| format!("{e}"))
+    })
+    .await;
+    match compiled {
+        Ok(Ok(code)) => Some(
+            (
+                [
+                    (header::CONTENT_TYPE, "text/javascript"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
+                code,
+            )
+                .into_response(),
+        ),
+        _ => None,
+    }
+}
+
 fn is_bare_specifier(spec: &str) -> bool {
     !spec.starts_with('.') && !spec.starts_with('/') && !spec.contains("://")
+}
+
+// The lingui macro entrypoints. Their transform is done by @lingui/swc-plugin
+// (an SWC WASM plugin oj cannot run); left untransformed they drag the babel
+// macro toolchain into the browser. oj serves a runtime identity shim instead.
+fn is_lingui_macro_specifier(spec: &str) -> bool {
+    matches!(
+        spec,
+        "@lingui/macro" | "@lingui/core/macro" | "@lingui/react/macro"
+    )
+}
+
+fn warn_lingui_macro_shim_once() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "oj: @lingui/*/macro is served by a runtime identity shim (i18n renders \
+             source strings, no catalog lookup). oj cannot run @lingui/swc-plugin, \
+             which is what normally compiles these macros."
+        );
+    });
 }
 
 fn hex_encode(s: &str) -> String {
@@ -4016,6 +4217,61 @@ mod tests {
         assert!(!is_bare_specifier("../up"));
         assert!(!is_bare_specifier("/abs"));
         assert!(!is_bare_specifier("https://cdn/x.js"));
+    }
+
+    #[test]
+    fn sec_fetch_dest_decides_raw_vs_module_form() {
+        // A `<link>`/`<img>`/@font-face request wants the raw resource; a JS
+        // `import` (script/empty dest) wants the JS-module form. This is how a
+        // `.css` reached from JS is served as JS, not a text/css module script.
+        let raw = |d: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("sec-fetch-dest", d.parse().unwrap());
+            wants_raw_resource(&h)
+        };
+        assert!(raw("style"));
+        assert!(raw("image"));
+        assert!(raw("font"));
+        assert!(!raw("script"));
+        assert!(!raw("empty"));
+        // No header (older browsers / non-browser clients): default to the
+        // module form so JS imports keep working.
+        assert!(!wants_raw_resource(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn lingui_macro_specifiers_are_matched_exactly() {
+        assert!(is_lingui_macro_specifier("@lingui/macro"));
+        assert!(is_lingui_macro_specifier("@lingui/core/macro"));
+        assert!(is_lingui_macro_specifier("@lingui/react/macro"));
+        // The runtime packages (not the macro entrypoints) must NOT be shimmed.
+        assert!(!is_lingui_macro_specifier("@lingui/core"));
+        assert!(!is_lingui_macro_specifier("@lingui/react"));
+        assert!(!is_lingui_macro_specifier("@lingui/macro/extra"));
+    }
+
+    #[test]
+    fn node_builtins_are_recognized_for_stubbing() {
+        assert!(is_node_builtin("fs"));
+        assert!(is_node_builtin("node:fs"));
+        assert!(is_node_builtin("fs/promises"));
+        assert!(is_node_builtin("crypto"));
+        assert!(is_node_builtin("perf_hooks"));
+        // Not builtins: real packages and app specifiers.
+        assert!(!is_node_builtin("source-map-support"));
+        assert!(!is_node_builtin("react"));
+        assert!(!is_node_builtin("./local"));
+    }
+
+    #[test]
+    fn importable_asset_exts_exclude_code_and_svg() {
+        assert!(is_importable_asset_ext("webp"));
+        assert!(is_importable_asset_ext("png"));
+        assert!(is_importable_asset_ext("woff2"));
+        // svg is routed to vite-plugin-svgr, not URL-exported here.
+        assert!(!is_importable_asset_ext("svg"));
+        assert!(!is_importable_asset_ext("css"));
+        assert!(!is_importable_asset_ext("js"));
     }
 
     #[test]

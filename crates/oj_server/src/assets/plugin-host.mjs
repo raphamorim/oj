@@ -2,10 +2,10 @@
 // Copyright (c) 2026 Raphael Amorim
 
 import http from "node:http";
-import { createReadStream, fstatSync, openSync, write as fsWrite, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, fstatSync, openSync, statSync, write as fsWrite, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve as pathResolve } from "node:path";
 import readline from "node:readline";
 import { AsyncLocalStorage } from "node:async_hooks";
 
@@ -103,9 +103,80 @@ if (ojStartMode && initial.ssrBridge && initial.ssrBridge.dir) {
   }
 }
 
+// Vite's ResolvedConfig exposes createResolver(): a standalone module resolver
+// built from the config's resolve options. Plugins that must resolve modules
+// outside a hook context use it (e.g. wyw-in-js/linaria resolves the imports it
+// reaches while evaluating `styled`/`css` template literals). It returns
+// `(id, importer, aliasOnly, ssr) => Promise<string|undefined>` where the string
+// is an absolute path. A faithful-enough subset — alias map + extension probe,
+// with a Node fallback for bare specifiers — covers what those plugins need.
+const RESOLVE_EXTS = [".mjs", ".js", ".mts", ".ts", ".jsx", ".tsx", ".cjs", ".cts", ".json"];
+
+function aliasEntries(alias) {
+  if (!alias) return [];
+  if (Array.isArray(alias)) return alias.map((e) => [e.find, e.replacement]);
+  return Object.entries(alias);
+}
+
+function applyAlias(id, entries) {
+  for (const [find, replacement] of entries) {
+    if (typeof replacement !== "string") continue;
+    if (find instanceof RegExp) {
+      if (find.test(id)) return id.replace(find, replacement);
+    } else if (typeof find === "string") {
+      if (id === find) return replacement;
+      if (id.startsWith(find + "/")) return replacement + id.slice(find.length);
+    }
+  }
+  return id;
+}
+
+function probeFile(p, exts) {
+  const st = statSync(p, { throwIfNoEntry: false });
+  if (st?.isFile()) return p;
+  if (st?.isDirectory()) {
+    for (const ext of exts) {
+      const idx = join(p, "index" + ext);
+      if (existsSync(idx)) return idx;
+    }
+    return null;
+  }
+  for (const ext of exts) {
+    if (existsSync(p + ext)) return p + ext;
+  }
+  return null;
+}
+
+function makeCreateResolver(config) {
+  const entries = aliasEntries(config.resolve?.alias);
+  const exts =
+    Array.isArray(config.resolve?.extensions) && config.resolve.extensions.length
+      ? config.resolve.extensions
+      : RESOLVE_EXTS;
+  const root = config.root ?? process.cwd();
+  return function createResolver() {
+    return async (id, importer, _aliasOnly, _ssr) => {
+      if (!id) return undefined;
+      let spec = id.split("?", 1)[0];
+      if (spec.startsWith("\0") || spec.startsWith("/@")) return undefined;
+      spec = applyAlias(spec, entries);
+      const baseDir = importer
+        ? dirname(importer.startsWith("file://") ? fileURLToPath(importer) : importer)
+        : root;
+      if (spec.startsWith(".")) return probeFile(pathResolve(baseDir, spec), exts) ?? undefined;
+      if (isAbsolute(spec)) return probeFile(spec, exts) ?? undefined;
+      try {
+        return createRequire(join(baseDir, "__oj_resolver__.js")).resolve(spec);
+      } catch {
+        return undefined;
+      }
+    };
+  };
+}
+
 function withResolvedDefaults(config) {
   const c = config ?? {};
-  return deepMerge(
+  const merged = deepMerge(
     {
       command: env.command,
       mode: env.mode,
@@ -129,6 +200,8 @@ function withResolvedDefaults(config) {
     },
     c,
   );
+  if (typeof merged.createResolver !== "function") merged.createResolver = makeCreateResolver(merged);
+  return merged;
 }
 
 const envName = initial.environment?.name ?? "client";

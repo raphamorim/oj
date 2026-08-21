@@ -139,10 +139,12 @@ pub fn wrap_cjs(
     for (i, spec) in unique_requires.iter().enumerate() {
         match resolve(spec) {
             Some(dep_url) => {
-                out.push_str(&format!(
-                    "import {{ __cjs_exports as __oj_dep_{i} }} from {dep_url:?};\n"
-                ));
-                deps.push_str(&format!("  {spec:?}: __oj_dep_{i},\n"));
+                // Namespace import, not `{ __cjs_exports }`: a required dep may be
+                // a genuine ESM module (e.g. an aliased polyfill) with no
+                // __cjs_exports. __oj_cjs_interop unwraps oj-compiled CJS to its
+                // module.exports and passes an ESM namespace through as-is.
+                out.push_str(&format!("import * as __oj_ns_{i} from {dep_url:?};\n"));
+                deps.push_str(&format!("  {spec:?}: __oj_cjs_interop(__oj_ns_{i}),\n"));
                 resolved_imports.push(dep_url);
             }
             None => unresolved.push(spec),
@@ -155,7 +157,10 @@ pub fn wrap_cjs(
     }
 
     out.push_str(&format!(
-        r#"const __oj_deps = {{
+        r#"function __oj_cjs_interop(ns) {{
+  return ns && Object.prototype.hasOwnProperty.call(ns, "__cjs_exports") ? ns.__cjs_exports : ns;
+}}
+const __oj_deps = {{
 {deps}}};
 const module = {{ exports: {{}} }};
 var exports = module.exports;
@@ -202,6 +207,25 @@ export default (module.exports && module.exports.__esModule) ? module.exports["d
         dynamic_imports: Vec::new(),
         is_refresh_boundary: false,
     })
+}
+
+// The simple name a callee ultimately invokes, unwrapping member access and the
+// `(0, obj.method)` sequence form emitted by transpilers.
+fn call_name<'a>(expr: &'a Expression) -> Option<&'a str> {
+    match expr {
+        Expression::Identifier(id) => Some(id.name.as_str()),
+        Expression::StaticMemberExpression(m) => Some(m.property.name.as_str()),
+        Expression::ParenthesizedExpression(p) => call_name(&p.expression),
+        Expression::SequenceExpression(s) => s.expressions.last().and_then(call_name),
+        _ => None,
+    }
+}
+
+fn is_export_star_helper(callee: &Expression) -> bool {
+    matches!(
+        call_name(callee),
+        Some("__exportStar" | "__export" | "_export_star" | "__reExport")
+    )
 }
 
 fn is_valid_export_name(name: &str) -> bool {
@@ -252,6 +276,20 @@ impl<'a> Visit<'a> for CjsAnalyzer {
                 match require_specifier(it) {
                     Some(spec) => self.requires.push(spec.to_string()),
                     None => self.has_dynamic_require = true,
+                }
+            }
+        }
+        // TypeScript/tslib/swc compile `export * from "x"` to a helper call
+        // (`__exportStar(require("x"), exports)`, `__export(require("x"))`,
+        // `tslib_1.__exportStar(...)`, `(0, tslib_1.__exportStar)(...)`). Without
+        // this a barrel like @sniptt/guards re-exporting its submodules exposes
+        // no named exports, so `import { isUndefined }` fails.
+        if is_export_star_helper(&it.callee) {
+            if let Some(Expression::CallExpression(inner)) =
+                it.arguments.first().and_then(|a| a.as_expression())
+            {
+                if let Some(spec) = require_specifier(inner) {
+                    self.reexport_requires.push(spec.to_string());
                 }
             }
         }
@@ -311,6 +349,74 @@ impl CjsAnalyzer {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn ts_compiled_export_star_helper_becomes_a_reexport() {
+        // TypeScript compiles `export * from "./primitives"` to a standalone
+        // `__exportStar(require("./primitives"), exports)` call, and tslib to
+        // `(0, tslib_1.__exportStar)(require("./primitives"), exports)`. Both
+        // must surface as `export * from` or a barrel like @sniptt/guards loses
+        // its named exports.
+        let src = r#"
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+var tslib_1 = require("tslib");
+__exportStar(require("./guards/primitives"), exports);
+(0, tslib_1.__exportStar)(require("./guards/convenience"), exports);
+"#;
+        let mut resolve = |spec: &str| -> Option<String> {
+            Some(format!("/node_modules/@sniptt/guards/build/{}.js", spec.trim_start_matches("./")))
+        };
+        let out = wrap_cjs(
+            Path::new("index.js"),
+            "/node_modules/@sniptt/guards/build/index.js",
+            src,
+            &mut resolve,
+        )
+        .unwrap();
+        assert!(
+            out.code.contains(r#"export * from "/node_modules/@sniptt/guards/build/guards/primitives.js""#),
+            "plain __exportStar(require()) must re-export:\n{}",
+            out.code
+        );
+        assert!(
+            out.code.contains(r#"export * from "/node_modules/@sniptt/guards/build/guards/convenience.js""#),
+            "tslib (0, tslib_1.__exportStar)(require()) must re-export:\n{}",
+            out.code
+        );
+    }
+
+    #[test]
+    fn required_dep_is_namespace_imported_and_interopped() {
+        // A required dep may be genuine ESM (e.g. an aliased polyfill) with no
+        // __cjs_exports; the require must go through a namespace import and the
+        // interop helper, never `import { __cjs_exports }` (which throws when
+        // the dep is ESM).
+        let src = r#"
+"use strict";
+var path = require("path");
+module.exports = { join: path.join };
+"#;
+        let mut resolve =
+            |_spec: &str| -> Option<String> { Some("/node_modules/rpnp/polyfills/path.js".to_string()) };
+        let out = wrap_cjs(Path::new("m.js"), "/node_modules/pkg/m.js", src, &mut resolve).unwrap();
+        assert!(
+            out.code.contains(r#"import * as __oj_ns_0 from "/node_modules/rpnp/polyfills/path.js""#),
+            "require target must be namespace-imported:\n{}",
+            out.code
+        );
+        assert!(
+            out.code.contains("function __oj_cjs_interop(ns)")
+                && out.code.contains("__oj_cjs_interop(__oj_ns_0)"),
+            "require value must pass through the interop helper:\n{}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("{ __cjs_exports as"),
+            "must not import __cjs_exports by name from a possibly-ESM dep:\n{}",
+            out.code
+        );
+    }
 
     #[test]
     fn node_env_branch_becomes_single_star_reexport() {
@@ -384,9 +490,9 @@ exports.render = function () { return react && scheduler; };
         let mut resolve = |spec: &str| Some(format!("/node_modules/{spec}/index.js"));
         let out = wrap_cjs(Path::new("x.js"), "/n/x.js", src, &mut resolve).unwrap();
         assert!(out.code.contains(
-            r#"import { __cjs_exports as __oj_dep_0 } from "/node_modules/react/index.js""#
+            r#"import * as __oj_ns_0 from "/node_modules/react/index.js""#
         ));
-        assert!(out.code.contains(r#""scheduler": __oj_dep_1"#));
+        assert!(out.code.contains(r#""scheduler": __oj_cjs_interop(__oj_ns_1)"#));
         assert_eq!(out.imports.len(), 2);
     }
 
@@ -492,9 +598,9 @@ exports.named = 1;
         let mut resolve = |spec: &str| Some(format!("/node_modules/{spec}/index.js"));
         let out = wrap_cjs(Path::new("d.js"), "/n/d.js", src, &mut resolve).unwrap();
         assert_eq!(out.imports, vec!["/node_modules/dep/index.js".to_string()]);
-        assert!(out.code.contains("__oj_dep_0"));
+        assert!(out.code.contains("__oj_ns_0"));
         assert!(
-            !out.code.contains("__oj_dep_1"),
+            !out.code.contains("__oj_ns_1"),
             "second require must dedupe: {}",
             out.code
         );
