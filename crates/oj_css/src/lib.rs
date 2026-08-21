@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use lightningcss::css_modules;
 use lightningcss::printer::PrinterOptions;
@@ -26,12 +27,101 @@ pub fn is_sass(url: &str) -> bool {
     f.ends_with(".scss") || f.ends_with(".sass")
 }
 
+// If `p.scss`/`p.sass` exists as a real file, return it. Used to treat a
+// dotted-basename stylesheet as resolvable.
+fn dotted_stylesheet(p: &Path) -> Option<PathBuf> {
+    for ext in ["scss", "sass"] {
+        let mut s = p.as_os_str().to_owned();
+        s.push(".");
+        s.push(ext);
+        let c = PathBuf::from(s);
+        if c.is_file() {
+            return Some(c);
+        }
+    }
+    None
+}
+
+// Map a grass directory-index probe `.../X/index.scss` (or _index/.sass) back
+// to a real `.../X.scss` file when `X` is a dotted-basename stylesheet. The
+// mapping is extension-faithful: an `index.sass` probe only matches a real
+// `.sass` file, so scss content is never parsed as the indented syntax.
+fn index_target(p: &Path) -> Option<PathBuf> {
+    let name = p.file_name()?.to_str()?;
+    let ext = match name {
+        "index.scss" | "_index.scss" => "scss",
+        "index.sass" | "_index.sass" => "sass",
+        _ => return None,
+    };
+    let mut s = p.parent()?.as_os_str().to_owned();
+    s.push(".");
+    s.push(ext);
+    let c = PathBuf::from(s);
+    c.is_file().then_some(c)
+}
+
+// grass 0.13 treats a trailing `.segment` in an `@use`/`@import` path as an
+// extension, so `@use "../css/variables.module"` never probes
+// `variables.module.scss` and fails on the CSS-modules `.module.scss`
+// convention. grass does probe the basename as a directory, so present a real
+// `name.segment.scss` file as a directory whose index is that file. This makes
+// resolution match dart-sass (what Vite uses), which treats the whole basename
+// as the stylesheet name.
+#[derive(Debug)]
+struct DottedFs;
+
+impl grass::Fs for DottedFs {
+    fn is_dir(&self, p: &Path) -> bool {
+        p.is_dir() || dotted_stylesheet(p).is_some()
+    }
+    fn is_file(&self, p: &Path) -> bool {
+        p.is_file() || index_target(p).is_some()
+    }
+    fn read(&self, p: &Path) -> io::Result<Vec<u8>> {
+        if p.is_file() {
+            return std::fs::read(p);
+        }
+        match index_target(p) {
+            Some(real) => std::fs::read(real),
+            None => std::fs::read(p),
+        }
+    }
+}
+
+// grass also mishandles an explicit `.scss`/`.sass` extension on a dotted
+// basename (`@use "../css/vars.module.scss"`), probing only CWD-relative and
+// never through the load paths. Drop the extension on `@use`/`@forward`/
+// `@import` specifiers so every import takes the bare-name path (which DottedFs
+// resolves); Sass treats `@use "x"` and `@use "x.scss"` identically. `.css` is
+// left alone (it stays a plain CSS import), as are `url(...)` lines.
+fn strip_sass_import_ext(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    for line in source.split_inclusive('\n') {
+        let t = line.trim_start();
+        let is_import = t.starts_with("@use") || t.starts_with("@forward") || t.starts_with("@import");
+        if is_import && !line.contains("url(") {
+            out.push_str(
+                &line
+                    .replace(".scss\"", "\"")
+                    .replace(".scss'", "'")
+                    .replace(".sass\"", "\"")
+                    .replace(".sass'", "'"),
+            );
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
 pub fn compile_sass(source: &str, load_dir: Option<&Path>) -> Result<String, String> {
-    let mut options = grass::Options::default();
+    let fs = DottedFs;
+    let mut options = grass::Options::default().fs(&fs);
     if let Some(dir) = load_dir {
         options = options.load_path(dir);
     }
-    grass::from_string(source.to_string(), &options).map_err(|e| format!("sass error: {e}"))
+    let source = strip_sass_import_ext(source);
+    grass::from_string(source, &options).map_err(|e| format!("sass error: {e}"))
 }
 
 fn default_targets() -> Targets {
@@ -148,6 +238,73 @@ mod tests {
         let css = compile_sass(".a { .b { color: red } }", None).unwrap();
         let out = compile_css("/x.scss", &css, true).unwrap();
         assert!(out.css.contains(".a .b{color:red}"), "{}", out.css);
+    }
+
+    // grass 0.13 mis-reads a dotted basename (`variables.module`) as an
+    // extension and never finds `variables.module.scss`; the DottedFs shim
+    // makes the CSS-modules `.module.scss` convention resolve like dart-sass.
+    #[test]
+    fn sass_resolves_dotted_module_import() {
+        let base = std::env::temp_dir().join(format!("oj-css-dotmod-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("comp")).unwrap();
+        std::fs::create_dir_all(base.join("css")).unwrap();
+        std::fs::write(base.join("css/variables.module.scss"), "$c: #f00;").unwrap();
+        // a plain (non-dotted) sibling must keep working too
+        std::fs::write(base.join("css/plain.scss"), "$p: 2px;").unwrap();
+        // Both the bare and the explicit-extension forms must resolve, matching
+        // dart-sass / Vite (verified against dart-sass 1.51: both give the same
+        // output). Excalidraw uses both across its stylesheets.
+        for spec in ["../css/variables.module", "../css/variables.module.scss"] {
+            let src = format!(
+                "@use \"{spec}\" as v;\n@use \"../css/plain\" as p;\n.x {{ color: v.$c; margin: p.$p; }}"
+            );
+            let css = compile_sass(&src, Some(&base.join("comp")))
+                .unwrap_or_else(|e| panic!("`{spec}` should resolve: {e}"));
+            assert!(css.contains("color: red") || css.contains("#f00"), "{spec}: {css}");
+            assert!(css.contains("margin: 2px"), "{spec}: {css}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn strip_sass_import_ext_only_touches_import_specifiers() {
+        // extension dropped on @use/@forward/@import so grass takes the bare path
+        assert_eq!(
+            strip_sass_import_ext("@use \"../css/vars.module.scss\" as *;\n"),
+            "@use \"../css/vars.module\" as *;\n"
+        );
+        assert_eq!(
+            strip_sass_import_ext("@forward './theme.scss';\n"),
+            "@forward './theme';\n"
+        );
+        // a plain CSS @import keeps its .css; url(...) is left alone
+        assert_eq!(
+            strip_sass_import_ext("@import \"reset.css\";\n"),
+            "@import \"reset.css\";\n"
+        );
+        assert_eq!(
+            strip_sass_import_ext("@import url(\"x.scss\");\n"),
+            "@import url(\"x.scss\");\n"
+        );
+        // a `.scss` string in a normal declaration must not be rewritten
+        assert_eq!(
+            strip_sass_import_ext(".a { content: \"file.scss\"; }\n"),
+            ".a { content: \"file.scss\"; }\n"
+        );
+    }
+
+    #[test]
+    fn sass_missing_import_still_errors() {
+        let base = std::env::temp_dir().join(format!("oj-css-miss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let src = "@use \"./nope.module\" as *;\n.x { color: red; }";
+        assert!(
+            compile_sass(src, Some(&base)).is_err(),
+            "a genuinely missing dotted import must still fail, not resolve to nothing"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
