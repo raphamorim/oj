@@ -170,7 +170,7 @@ pub fn boot_phase(label: &str) {
 // V8 bytecode cache for every node child oj spawns; a user-set value wins.
 pub fn node_compile_cache(root: &Path) -> std::ffi::OsString {
     std::env::var_os("NODE_COMPILE_CACHE")
-        .unwrap_or_else(|| root.join(".oj-cache").join("v8").into_os_string())
+        .unwrap_or_else(|| oj_cache::cache_root(root).join("v8").into_os_string())
 }
 
 // The SSR runner and css-host pay more in V8 cache maintenance than they save
@@ -183,9 +183,11 @@ pub fn node_compile_cache_opt_in(root: &Path) -> Option<std::ffi::OsString> {
     Some(node_compile_cache(root))
 }
 
-/// Not every app gitignores `.oj-cache`; an unignored cache dir leaks into
-/// `git status` and into gitignore-respecting source scanners.
-pub fn ensure_cache_gitignore(root: &Path) {
+/// Boot-time cache-root upkeep: gitignore the dir (not every app does, and
+/// an unignored cache leaks into `git status` and gitignore-respecting
+/// source scanners), heal any pre-versioned layout, and create the
+/// versioned root every store lives under.
+pub fn prepare_cache_root(root: &Path) {
     let dir = root.join(".oj-cache");
     if std::fs::create_dir_all(&dir).is_err() {
         return;
@@ -194,6 +196,8 @@ pub fn ensure_cache_gitignore(root: &Path) {
     if !gitignore.exists() {
         let _ = std::fs::write(gitignore, "*\n");
     }
+    oj_cache::heal_legacy_layout(root);
+    let _ = std::fs::create_dir_all(oj_cache::cache_root(root));
 }
 
 pub fn write_start_assets(dir: &Path) -> std::io::Result<()> {
@@ -312,7 +316,7 @@ impl DevServer {
         }
 
         boot_phase("build_app begin");
-        ensure_cache_gitignore(&root);
+        prepare_cache_root(&root);
         let mut config = oj_config::load(&root).map_err(|e| anyhow::anyhow!("{e}"))?;
         plugins::adopt_vite_config_values(&mut config, &root);
         boot_phase("vite config values adopted");
@@ -534,7 +538,7 @@ impl DevServer {
                 &oj_config::resolve_alias(&config, "ssr"),
                 &oj_config::resolve_dedupe(&config),
             )),
-            cache: PersistentCache::new(root.join(".oj-cache"), env!("CARGO_PKG_VERSION")),
+            cache: PersistentCache::new(oj_cache::cache_root(&root), env!("CARGO_PKG_VERSION")),
             memory: Mutex::new(MemoryCache::new(memory_cache_budget())),
             mtime_keys: Mutex::new(HashMap::new()),
             compile_locks: Mutex::new(HashMap::new()),
@@ -3469,7 +3473,7 @@ fn spawn_crawl(state: Arc<ServerState>, done_tx: tokio::sync::watch::Sender<bool
 }
 
 fn snapshot_path(root: &Path) -> PathBuf {
-    root.join(".oj-cache").join("graph-snapshot.json")
+    oj_cache::cache_root(&root).join("graph-snapshot.json")
 }
 
 fn load_graph_snapshot(root: &Path) -> Vec<String> {

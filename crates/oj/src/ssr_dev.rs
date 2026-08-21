@@ -81,7 +81,7 @@ pub async fn ssr_dev(
 }
 
 async fn spawn_runner(root: &Path, base: &str, entry_abs: &Path) -> anyhow::Result<Runner> {
-    let dir = root.join(".oj-cache").join("ssr");
+    let dir = oj_cache::cache_root(&root).join("ssr");
     std::fs::create_dir_all(&dir)?;
     let script = dir.join("runner.mjs");
     std::fs::write(&script, oj_server::SSR_RUNNER_JS)?;
@@ -100,6 +100,7 @@ async fn spawn_runner(root: &Path, base: &str, entry_abs: &Path) -> anyhow::Resu
     if let Some(v8) = oj_server::node_compile_cache_opt_in(root) {
         cmd.env("NODE_COMPILE_CACHE", v8);
     }
+    cmd.env("OJ_CACHE_ROOT", oj_cache::cache_root(&root));
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("could not spawn SSR runner (node): {e}"))?;

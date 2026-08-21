@@ -20,7 +20,7 @@ const APP = process.env.OJ_APP_ROOT ?? process.cwd();
 // saves.
 if (process.env.OJ_V8_COMPILE_CACHE === "on") {
   try {
-    const v8Dir = join(APP, ".oj-cache", "v8");
+    const v8Dir = process.env.NODE_COMPILE_CACHE ?? join(HERE, "..", "v8");
     process.env.NODE_COMPILE_CACHE ??= v8Dir;
     module.enableCompileCache?.(v8Dir);
   } catch {}

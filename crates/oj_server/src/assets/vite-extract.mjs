@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Raphael Amorim
 
 import { createRequire } from "node:module";
-import { pathToFileURL } from "node:url";
+import { pathToFileURL, fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { writeFileSync, readFileSync } from "node:fs";
 
@@ -71,7 +71,8 @@ async function loadConfig() {
         __filename: JSON.stringify(configPath),
       },
     });
-    const out = `${appRoot}/.oj-cache/oj-vite-config.mjs`;
+    // Beside this script, i.e. inside the versioned cache root oj wrote it to.
+    const out = resolve(dirname(fileURLToPath(import.meta.url)), "oj-vite-config.mjs");
     writeFileSync(out, r.outputFiles[0].text);
     const m = await import(pathToFileURL(out).href);
     return {

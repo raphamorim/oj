@@ -24,7 +24,9 @@ const { transformSync } = await importPkg(APP, "rolldown/experimental", ["vite",
 // module-loading critical path.
 const rawContainer = loadPluginContainerSync(APP, { command: "serve", environment: "ssr" });
 const VIRTUAL_SCHEME = "ojvirtual:///";
-const CACHE_DIR = pathResolve(APP, ".oj-cache");
+// The versioned cache root, plumbed by oj; loader.mjs itself is
+// materialized under <cache root>/start, hence the fallback.
+const CACHE_DIR = process.env.OJ_CACHE_ROOT ?? pathResolve(HERE, "..");
 
 const BASE_FILES = [
   "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "package.json",

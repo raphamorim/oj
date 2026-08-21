@@ -34,7 +34,7 @@ const server = spawn(
 const cleanup = () => {
   fs.writeFileSync(counter, baseline);
   server.kill("SIGKILL");
-  fs.rmSync(path.join(repo, "playground", ".oj-cache", "ssr"), { recursive: true, force: true });
+  fs.rmSync(path.join(repo, "playground", ".oj-cache", "v1", "ssr"), { recursive: true, force: true });
   fs.rmSync(errLog, { force: true });
 };
 
@@ -122,7 +122,7 @@ try {
   fs.writeFileSync(counter, baseline.replace("useState<number>(0)", "useState<number>(8)"));
   await waitFor((h) => /ssr[^0-9]*8[^0-9]/.test(stripTags(h) + " "));
   fs.writeFileSync(counter, baseline);
-  const runnerScript = path.join(repo, "playground", ".oj-cache", "ssr", "runner.mjs");
+  const runnerScript = path.join(repo, "playground", ".oj-cache", "v1", "ssr", "runner.mjs");
   if (!fs.existsSync(runnerScript)) throw new Error("module runner script was not spawned");
   console.log("ssr-dev: module runner re-eval ok (ssr: 41, then 8)");
 

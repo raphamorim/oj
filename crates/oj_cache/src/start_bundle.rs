@@ -193,7 +193,7 @@ struct MemoFile {
 impl StartBundleStore {
     pub fn new(root: &Path, tool_version: &str, verify: VerifyMode) -> Self {
         Self {
-            dir: root.join(".oj-cache").join("start-bundle"),
+            dir: crate::cache_root(root).join("start-bundle"),
             salt: format!(
                 "{tool_version}:{START_BUNDLE_FORMAT}:start-bundle:{}",
                 epoch(root)
@@ -751,7 +751,7 @@ mod tests {
                 std::process::id()
             ));
             let _ = fs::remove_dir_all(&root);
-            let start = root.join(".oj-cache").join("start");
+            let start = crate::cache_root(&root).join("start");
             fs::create_dir_all(root.join("src")).unwrap();
             fs::create_dir_all(&start).unwrap();
             fs::write(root.join("package.json"), b"{}").unwrap();
@@ -827,11 +827,11 @@ mod tests {
         }
 
         fn entry_dir(&self, key: &str) -> PathBuf {
-            self.root.join(".oj-cache/start-bundle").join(key)
+            crate::cache_root(&self.root).join("start-bundle").join(key)
         }
 
         fn blob_dir(&self) -> PathBuf {
-            self.root.join(".oj-cache/start-bundle").join(BLOBS_DIR)
+            crate::cache_root(&self.root).join("start-bundle").join(BLOBS_DIR)
         }
 
         fn blob_count(&self) -> usize {
@@ -955,7 +955,7 @@ mod tests {
         assert_eq!(stats.key, key);
         assert_eq!(fx.entry_bytes(&pinned), "bundle-v1");
         let current = fs::read_to_string(
-            fx.root.join(".oj-cache/start-bundle").join(CURRENT_FILE),
+            crate::cache_root(&fx.root).join("start-bundle").join(CURRENT_FILE),
         )
         .unwrap();
         assert_eq!(current.trim(), key, "pointer swaps to the pinned generation");
@@ -1096,7 +1096,7 @@ mod tests {
         let (key3, _) = store.persist(&fx.start).unwrap();
         assert_eq!(fx.blob_count(), 4, "3 entry blobs + 1 shared blob");
 
-        let dir = fx.root.join(".oj-cache/start-bundle");
+        let dir = crate::cache_root(&fx.root).join("start-bundle");
         store.prune(u64::MAX);
         assert!(dir.join(&key1).is_dir(), "under budget: nothing evicted");
         assert_eq!(fx.blob_count(), 4, "all blobs still referenced");

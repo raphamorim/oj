@@ -9,7 +9,7 @@ const send = process.stdout.write.bind(process.stdout);
 process.stdout.write = process.stderr.write.bind(process.stderr);
 
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
-if (process.env.OJ_V8_COMPILE_CACHE === "on") { try { module.enableCompileCache?.(APP + "/.oj-cache/v8"); } catch {} }
+if (process.env.OJ_V8_COMPILE_CACHE === "on" && process.env.NODE_COMPILE_CACHE) { try { module.enableCompileCache?.(process.env.NODE_COMPILE_CACHE); } catch {} }
 const req = createRequire(APP + "/package.json");
 
 let postcssProcessor;
