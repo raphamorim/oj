@@ -14,6 +14,13 @@ const repo = path.join(here, "..", "..");
 const sidecar = path.join(repo, "crates/oj_server/src/assets/optimize-deps.mjs");
 const esbuildSrc = path.join(repo, "e2e/fixtures/start-app/node_modules/esbuild");
 
+// The pre-bundler shells out to esbuild via the start-app fixture's install;
+// skip (rather than hard-fail) where that fixture has no node_modules, matching
+// the rolldown-fixture convention in asset-routing.test.mjs.
+const it = fs.existsSync(esbuildSrc)
+  ? test
+  : (name, fn) => test(name, { skip: "fixture esbuild not installed" }, () => {});
+
 const pkg = (nm, root, main, files) => {
   const dir = path.join(root, "node_modules", nm);
   fs.mkdirSync(dir, { recursive: true });
@@ -58,7 +65,7 @@ function fixture() {
   return root;
 }
 
-test("optimize-deps: scans + pre-bundles CJS deps with correct interop", async () => {
+it("optimize-deps: scans + pre-bundles CJS deps with correct interop", async () => {
   const root = fixture();
   const outDir = path.join(root, ".oj-cache", "deps");
   const cfg = JSON.stringify({ root, outDir, entries: [path.join(root, "entry.js")] });
