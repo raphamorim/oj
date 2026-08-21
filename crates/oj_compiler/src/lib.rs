@@ -248,8 +248,8 @@ pub fn compile_module(
             .any(|(k, _)| !k.starts_with("import.meta") && source_text.contains(k.as_str()));
     if needs_defines {
         if let Ok(config) = ReplaceGlobalDefinesConfig::new(&defines) {
-            let _ = ReplaceGlobalDefines::new(&allocator, config)
-                .build(transform_ret.scoping, &mut program);
+            let scoping = SemanticBuilder::new().build(&program).semantic.into_scoping();
+            let _ = ReplaceGlobalDefines::new(&allocator, config).build(scoping, &mut program);
         }
     }
 
@@ -365,6 +365,33 @@ impl<'a> oxc_ast_visit::VisitMut<'a> for DynamicImportRewriter<'a, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn defines_apply_after_jsx_transform_without_reference_id_panic() {
+        // import.meta.env inside JSX: the JSX/TS transform introduces
+        // IdentifierReferences without reference_ids, and ReplaceGlobalDefines
+        // reads reference_id() while walking the whole program. Before scoping
+        // was rebuilt on the transformed program this panicked; it must compile
+        // and still apply the defines.
+        let src = r#"
+export function App() {
+  return <div className={import.meta.env.DEV ? "dev" : "prod"}>{import.meta.env.MODE}</div>;
+}
+"#;
+        let out =
+            compile_module(Path::new("App.tsx"), src, &CompileOptions::prod(), None).unwrap();
+        assert!(out.code.contains("false"), "import.meta.env.DEV -> false: {}", out.code);
+        assert!(out.code.contains("production"), "MODE -> production: {}", out.code);
+    }
+
+    #[test]
+    fn enum_declarations_compile() {
+        // oxc's TS enum transform requires with_enum_eval(true); without it the
+        // transformer panics on any enum.
+        let src = "export enum Dir { Up, Down }\nexport const d = Dir.Up;";
+        let out = compile_module(Path::new("e.ts"), src, &CompileOptions::prod(), None).unwrap();
+        assert!(!out.code.is_empty(), "{}", out.code);
+    }
 
     #[test]
     fn exports_lists_named_and_default() {
