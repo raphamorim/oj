@@ -86,6 +86,20 @@ async function loadConfig() {
   };
 }
 
+function aliasKeyFromRegex(source) {
+  let s = source;
+  if (s.startsWith("^")) s = s.slice(1);
+  if (s.endsWith("$")) s = s.slice(0, -1);
+  s = s.replace(/\\?\/?\((?:\.\*|\.\+)\??\)\??$/, "");
+  s = s.replace(/\\(.)/g, "$1");
+  return s.replace(/\/$/, "");
+}
+function aliasDirFromReplacement(replacement) {
+  return replacement
+    .replace(/[\\/]\$\d+$/, "")
+    .replace(/[\\/]index\.[a-z]+$/i, "");
+}
+
 function extractAlias(alias) {
   const out = {};
   if (!alias) return out;
@@ -93,7 +107,17 @@ function extractAlias(alias) {
     ? alias.map((e) => [e.find, e.replacement])
     : Object.entries(alias);
   for (const [find, replacement] of entries) {
-    if (typeof find === "string" && typeof replacement === "string") out[find] = replacement;
+    if (typeof replacement !== "string") continue;
+    if (typeof find === "string") {
+      out[find] = replacement;
+    } else if (find instanceof RegExp) {
+      const key = aliasKeyFromRegex(find.source);
+      if (!key || /[.*+?()[\]{}|^$]/.test(key)) {
+        warn(`resolve.alias regex ${find} not convertible to a path alias; skipped`);
+        continue;
+      }
+      if (out[key] == null) out[key] = aliasDirFromReplacement(replacement);
+    }
   }
   return out;
 }
@@ -153,7 +177,10 @@ function warnUnsupported(c) {
   }
 }
 
-try {
+const isMainRun = import.meta.url === pathToFileURL(process.argv[1] || "").href;
+export { extractAlias };
+
+if (isMainRun) try {
   const { config, deps } = (await loadConfig()) ?? {};
   const c = config ?? {};
   warnUnsupported(c);
