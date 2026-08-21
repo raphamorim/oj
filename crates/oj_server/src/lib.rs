@@ -216,6 +216,8 @@ pub struct DevServer {
     pub config: Option<PathBuf>,
     /// Disable the on-disk module cache (always recompile).
     pub no_cache: bool,
+    /// Skip the eager graph crawl; compile modules on demand (Vite's default).
+    pub lazy: bool,
 }
 
 struct ServerState {
@@ -617,7 +619,17 @@ impl DevServer {
             });
         }
         spawn_watcher(Arc::clone(&state));
-        spawn_crawl(Arc::clone(&state), crawl_tx);
+        if self.lazy {
+            // Lazy mode (Vite's default): no eager graph crawl. Modules are
+            // compiled on demand as the browser requests them, so the first
+            // paint only pays for the first route's modules instead of the whole
+            // graph up front. Mark the crawl "done" immediately so preload
+            // injection and chunk assembly never block waiting for a crawl that
+            // will not run; the module graph still fills in per request.
+            let _ = crawl_tx.send(true);
+        } else {
+            spawn_crawl(Arc::clone(&state), crawl_tx);
+        }
 
         let mut app = Router::new()
             .route("/@oj/client.js", get(|| async { js(CLIENT_JS) }))

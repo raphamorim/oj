@@ -38,6 +38,11 @@ enum Command {
         /// Disable the on-disk module cache (always recompile; also OJ_NO_CACHE=1).
         #[arg(long)]
         no_cache: bool,
+        /// Eagerly crawl and compile the whole module graph on boot. Off by
+        /// default: oj compiles on demand (Vite's model), which paints the first
+        /// route faster, especially on very large apps. Rarely needed.
+        #[arg(long)]
+        eager: bool,
     },
     Compile {
         file: PathBuf,
@@ -82,6 +87,7 @@ async fn run() -> anyhow::Result<()> {
             host,
             config,
             no_cache,
+            eager,
         } => {
             let root = root.unwrap_or_else(|| {
                 let playground = PathBuf::from("playground");
@@ -103,6 +109,7 @@ async fn run() -> anyhow::Result<()> {
                     host,
                     config,
                     no_cache,
+                    lazy: !eager,
                 }
                 .run()
                 .await

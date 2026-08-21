@@ -59,6 +59,7 @@ pub async fn start_dev(
             host,
             config: None,
             no_cache: false,
+            lazy: false,
         }
         .build_app(),
     );
