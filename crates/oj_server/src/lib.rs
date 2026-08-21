@@ -19,6 +19,7 @@ use axum::{
 use oj_cache::{CachedModule, PersistentCache};
 
 pub mod optimize;
+pub mod pkg_bundle;
 pub mod plugins;
 pub mod sidecar;
 pub mod svgr;
@@ -1367,6 +1368,10 @@ async fn serve_path(
             .into_response();
     }
 
+    if uri.path().starts_with(pkg_bundle::PKG_PREFIX) {
+        return serve_pkg_bundle(&state, uri.path()).await;
+    }
+
     if let Some(id) = uri.path().strip_prefix("/@virtual/") {
         return match state.virtual_modules.get(id) {
             Some(code) => (
@@ -2020,7 +2025,10 @@ async fn ensure_module(
                                     .any(|c| c.as_os_str() == "node_modules");
                                 if in_node_modules && is_cjs_dep_file(&resolved) {
                                     fs_allow.lock().unwrap().insert(package_root(&resolved));
-                                    return Some(url_of(&root, &resolved));
+                                    // With partial bundling on this is the /@oj-pkg
+                                    // bundle URL, which exports __cjs_exports too, so
+                                    // the destructured interop still reads names off it.
+                                    return Some(dep_serve_url(&resolved, &root));
                                 }
                             }
                         }
@@ -2637,6 +2645,32 @@ fn is_file_cached(cache: &Mutex<DirCache>, path: &Path) -> bool {
     result
 }
 
+// Partial bundling (oj-native per-package dep bundling) is opt-in for now.
+fn partial_bundle_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OJ_PARTIAL_BUNDLE").is_ok_and(|v| !v.is_empty() && v != "0"))
+}
+
+// The URL oj serves a resolved bare dependency from. With partial bundling on, a
+// CommonJS package under node_modules is served as a single `/@oj-pkg` bundle
+// (keyed by its entry path, so every reference to the same entry — the app's
+// import and other packages' requires — collapses to one shared bundle);
+// everything else keeps its normal per-file URL. Both the importer-interop and
+// specifier-rewrite paths route through here so a dep never gets two URLs.
+fn dep_serve_url(resolved: &Path, root: &Path) -> String {
+    if partial_bundle_enabled()
+        && resolved.components().any(|c| c.as_os_str() == "node_modules")
+        && is_cjs_dep_file(resolved)
+    {
+        return format!(
+            "{}{}",
+            pkg_bundle::PKG_PREFIX,
+            hex_encode(&resolved.to_string_lossy())
+        );
+    }
+    url_of(root, resolved)
+}
+
 fn rewrite_specifier(
     root: &Path,
     dir: &Path,
@@ -2712,7 +2746,7 @@ fn rewrite_specifier(
         Ok(resolved) if resolved.starts_with(root) => Some(url_of(root, &resolved)),
         Ok(resolved) => {
             fs_allow.lock().unwrap().insert(package_root(&resolved));
-            Some(url_of(root, &resolved))
+            Some(dep_serve_url(&resolved, root))
         }
         Err(err) if err.ignored => {
             // The package maps this specifier to `false` for the browser (a
@@ -3098,6 +3132,55 @@ async fn serve_plugin_id(state: &Arc<ServerState>, spec: &str, importer: &str) -
 // wrapped as a style-injecting JS module, matching Vite's `vite:css` handling of
 // a `.css` import reached from JS (so the browser gets text/javascript, not a
 // text/css module script the strict MIME check rejects).
+// Serve a `/@oj-pkg/<hex>` package bundle: one request covering a CommonJS
+// package's whole internal file graph (oj-native partial bundling). A package
+// that can't be bundled in v1 (ESM entry, unsupported files) falls back to the
+// entry's normal per-file compiled output, served at this same URL so the
+// importer's interop (which reads __cjs_exports) still resolves.
+async fn serve_pkg_bundle(state: &Arc<ServerState>, path: &str) -> Response {
+    let js = |code: String| {
+        (
+            [
+                (header::CONTENT_TYPE, "text/javascript"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            code,
+        )
+            .into_response()
+    };
+    if let Some(code) = pkg_bundle::cached(path) {
+        return js((*code).clone());
+    }
+    let Some(entry) = pkg_bundle::entry_from_url(path) else {
+        return (StatusCode::NOT_FOUND, "oj: bad pkg bundle path").into_response();
+    };
+    let resolver = Arc::clone(&state.resolver);
+    let root = state.root.clone();
+    let entry_owned = entry.clone();
+    let outcome =
+        tokio::task::spawn_blocking(move || pkg_bundle::build(&entry_owned, resolver.as_ref(), &root))
+            .await;
+    match outcome {
+        Ok(pkg_bundle::BundleOutcome::Bundle(code)) => {
+            let code = Arc::new(code);
+            pkg_bundle::store(path, Arc::clone(&code));
+            js((*code).clone())
+        }
+        Ok(pkg_bundle::BundleOutcome::Fallback) => {
+            let url = url_of(&state.root, &entry);
+            match ensure_module(state, &entry, &url).await {
+                Ok((_, module)) => js(module.code.clone()),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {e}")).into_response(),
+            }
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("oj: pkg bundle task failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 async fn serve_plugin_load_fallback(state: &Arc<ServerState>, uri: &Uri) -> Option<Response> {
     let host = state.plugins.as_ref()?;
     let spec = uri.path().to_string();
@@ -3193,10 +3276,18 @@ fn is_cjs_dep_file(path: &Path) -> bool {
     if let Some(&v) = cache.lock().unwrap().get(path) {
         return v;
     }
-    let v = match std::fs::read_to_string(path) {
-        Ok(src) => !oj_compiler::cjs::has_module_syntax_pub(path, &src),
-        Err(_) => false,
-    };
+    // Only JavaScript files can be CommonJS. A `.css`/`.json`/asset dep has no
+    // ES-module syntax either, but it is not CJS — treating it as one routes it
+    // to the CJS interop / package-bundle path and serves raw CSS as JS.
+    let is_js = matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("js" | "cjs" | "jsx")
+    );
+    let v = is_js
+        && match std::fs::read_to_string(path) {
+            Ok(src) => !oj_compiler::cjs::has_module_syntax_pub(path, &src),
+            Err(_) => false,
+        };
     cache.lock().unwrap().insert(path.to_path_buf(), v);
     v
 }
