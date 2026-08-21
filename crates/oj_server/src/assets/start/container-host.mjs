@@ -39,6 +39,10 @@ for (const [k, v] of Object.entries(process.env)) {
 
 port.on("message", async ({ id, method, args }) => {
   if (method === "__env") return respond({ id, value: envDelta });
+  if (method === "__heap") {
+    const v8 = await import("node:v8");
+    return respond({ id, value: v8.default.getHeapStatistics() });
+  }
   if (!container) return respond({ id, value: null });
   try {
     respond({ id, value: await container[method](...args) });

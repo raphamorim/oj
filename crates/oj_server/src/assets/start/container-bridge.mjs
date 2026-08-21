@@ -53,5 +53,6 @@ export function loadPluginContainerSync(app, opts) {
     transform: (code, id) => call("transform", [code, id]),
     transformUserCode: (code, id) => call("transformUserCode", [code, id]),
     env: () => call("__env", []),
+    heap: () => call("__heap", []),
   };
 }
