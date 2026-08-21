@@ -1763,12 +1763,24 @@ async fn ensure_module(
         register_in_graph(state, url, &module);
         return Ok((key, module));
     }
-    if let Some(module) = state.cache.get(&key) {
-        let module = Arc::new(module);
-        memory_put(state, url, &key, &module);
-        register_in_graph(state, url, &module);
-        replay_module_parsed(state, file, &key, is_dep_early, is_server).await;
-        return Ok((key, module));
+    // The persistent (cross-restart) cache holds post-plugin-transform code. A
+    // transform can have in-memory side effects the cached code depends on —
+    // wyw-in-js records each module's extracted CSS in a `cssLookup` its `load`
+    // hook serves, and the cached code still `import`s those `.wyw-in-js.css`
+    // ids. On a warm start the transform never re-runs, so that map is empty and
+    // every such import 404s. So skip the persistent cache for app modules when
+    // transform plugins are active and re-run the transform (Vite likewise keeps
+    // no cross-restart transform cache). The in-memory session cache above still
+    // applies, and deps (no user transform) still use the persistent cache.
+    let skip_persistent = state.plugins_have_transform && !is_dep_early;
+    if !skip_persistent {
+        if let Some(module) = state.cache.get(&key) {
+            let module = Arc::new(module);
+            memory_put(state, url, &key, &module);
+            register_in_graph(state, url, &module);
+            replay_module_parsed(state, file, &key, is_dep_early, is_server).await;
+            return Ok((key, module));
+        }
     }
 
     if is_server {
