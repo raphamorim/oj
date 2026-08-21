@@ -63,6 +63,53 @@ test("makeResolver reaches a transitive dep through a direct-dep anchor", () => 
   }
 });
 
+test("makeResolver reaches a dep two hops deep (transitive through a transitive)", () => {
+  // Mirrors the real TanStack Start layout under pnpm:
+  //   app -> @tanstack/react-start -> @tanstack/start-plugin-core -> @tanstack/router-generator
+  // The generator is two hops from the app root, resolvable only by walking the
+  // dependency graph, not by anchoring a single level down. The old single-hop
+  // resolver threw here; the breadth-first walk finds it.
+  const root = mkdtempSync(join(tmpdir(), "oj-resolve-2hop-"));
+  try {
+    writeFileSync(join(root, "package.json"), '{"name":"app","dependencies":{"anchor":"1.0.0"}}');
+    const anchorDir = join(root, "node_modules", "anchor");
+    mkdirSync(anchorDir, { recursive: true });
+    writeFileSync(join(anchorDir, "package.json"), '{"name":"anchor","main":"index.js","dependencies":{"mid":"1.0.0"}}');
+    writeFileSync(join(anchorDir, "index.js"), "module.exports = {};");
+    const midDir = join(anchorDir, "node_modules", "mid");
+    mkdirSync(midDir, { recursive: true });
+    writeFileSync(join(midDir, "package.json"), '{"name":"mid","main":"index.js","dependencies":{"deep":"1.0.0"}}');
+    writeFileSync(join(midDir, "index.js"), "module.exports = {};");
+    pkg(join(midDir, "node_modules", "deep"), "deep");
+    const resolve = makeResolver(root);
+    assert.match(resolve("deep"), /mid[/\\]node_modules[/\\]deep[/\\]index\.js$/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("makeResolver walks past an intermediate whose exports omit ./package.json", () => {
+  // Some packages expose an exports map that does not list "./package.json", so
+  // "<name>/package.json" is not resolvable; the walk must still find the
+  // package's own manifest to read its dependencies and continue.
+  const root = mkdtempSync(join(tmpdir(), "oj-resolve-exports-"));
+  try {
+    writeFileSync(join(root, "package.json"), '{"name":"app","dependencies":{"anchor":"1.0.0"}}');
+    const anchorDir = join(root, "node_modules", "anchor");
+    mkdirSync(anchorDir, { recursive: true });
+    writeFileSync(
+      join(anchorDir, "package.json"),
+      '{"name":"anchor","exports":{".":"./index.js"},"dependencies":{"deep":"1.0.0"}}',
+    );
+    writeFileSync(join(anchorDir, "index.js"), "module.exports = {};");
+    pkg(join(anchorDir, "node_modules", "deep"), "deep");
+    assert.throws(() => makeResolver(root)("anchor/package.json"));
+    assert.match(makeResolver(root)("deep"), /anchor[/\\]node_modules[/\\]deep[/\\]index\.js$/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("makeResolver throws a clear error for a missing package", () => {
   const root = mkdtempSync(join(tmpdir(), "oj-resolve-miss-"));
   try {
