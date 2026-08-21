@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { readFileSync, unlinkSync, statSync } from "node:fs";
+import { readFileSync, unlinkSync, statSync, openSync, readSync } from "node:fs";
 import { writeFile, appendFile, rename, mkdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { resolve as pathResolve, dirname } from "node:path";
@@ -152,26 +152,55 @@ function cacheKey(mode, path, source) {
 }
 const cachePath = (key) => pathResolve(CACHE_DIR, key.slice(0, 2), `${key}.json`);
 
-// Load pack: an in-memory index over the per-entry load cache, persisted as
-// one JSONL file (header line carries the epoch) and read once at init. A
-// warm boot serves its ~6k load hits from this Map instead of ~6k per-file
-// open/read/parse round trips. The per-entry cache stays authoritative: a key
-// missing here falls back to the per-file path below, and such hits are
-// re-appended so the pack converges opportunistically.
+// Load pack: an index over the per-entry load cache, persisted as one JSONL
+// file (header line carries the epoch). At init only byte offsets are indexed;
+// a hit reads its line back from the open fd, so a warm boot's ~6k load hits
+// cost one pread each instead of one open/read/parse round trip — and the
+// sources are not held in memory after they are served. The per-entry cache
+// stays authoritative: a key missing here falls back to the per-file path
+// below, and such hits are re-appended so the pack converges opportunistically.
 const LOAD_PACK_FILE = pathResolve(CACHE_DIR, "ssr-load-pack.jsonl");
 const loadPack = new Map();
+const packIndex = new Map();
+const PACK_KEY_RE = /^[0-9a-f]{64}$/;
+let packFd = -1;
+let packFileBytes = 0;
 let loadPackFileReady = false;
 if (EPOCH) {
   try {
-    const lines = readFileSync(LOAD_PACK_FILE, "utf8").split("\n");
-    if (JSON.parse(lines[0]).epoch === EPOCH) {
+    const buf = readFileSync(LOAD_PACK_FILE);
+    const nl0 = buf.indexOf(10);
+    if (nl0 > 0 && JSON.parse(buf.toString("utf8", 0, nl0)).epoch === EPOCH) {
       loadPackFileReady = true;
-      for (let i = 1; i < lines.length; i++) {
-        if (!lines[i]) continue;
-        try { const e = JSON.parse(lines[i]); loadPack.set(e.k, e.c); } catch {}
+      packFileBytes = buf.length;
+      let off = nl0 + 1;
+      while (off < buf.length) {
+        let end = buf.indexOf(10, off);
+        if (end === -1) end = buf.length;
+        // Lines are written as {"k":"<64 hex>","c":...}; anything else is skipped.
+        if (end - off > 70 && buf[off] === 0x7b) {
+          const key = buf.toString("utf8", off + 6, off + 70);
+          if (PACK_KEY_RE.test(key)) packIndex.set(key, [off, end - off]);
+        }
+        off = end + 1;
       }
+      if (packIndex.size > 0) packFd = openSync(LOAD_PACK_FILE, "r");
     }
   } catch {}
+}
+function packGet(key) {
+  const mem = loadPack.get(key);
+  if (mem !== undefined) return mem;
+  const loc = packIndex.get(key);
+  if (loc === undefined || packFd < 0) return undefined;
+  try {
+    const b = Buffer.allocUnsafe(loc[1]);
+    readSync(packFd, b, 0, loc[1], loc[0]);
+    const e = JSON.parse(b.toString("utf8"));
+    if (e.k === key && typeof e.c === "string") return e.c;
+  } catch {}
+  packIndex.delete(key);
+  return undefined;
 }
 let packPending = [];
 let packFlushChain = Promise.resolve();
@@ -179,26 +208,39 @@ function flushLoadPack() {
   const batch = packPending;
   packPending = [];
   if (batch.length === 0) return;
-  const body = batch.map((e) => JSON.stringify(e)).join("\n") + "\n";
+  const lines = batch.map((e) => JSON.stringify(e) + "\n");
   const first = !loadPackFileReady;
   loadPackFileReady = true;
   packFlushChain = packFlushChain.then(async () => {
     try {
       await mkdir(CACHE_DIR, { recursive: true });
-      if (first) await writeFile(LOAD_PACK_FILE, JSON.stringify({ epoch: EPOCH }) + "\n" + body);
-      else await appendFile(LOAD_PACK_FILE, body);
+      if (first) {
+        const header = JSON.stringify({ epoch: EPOCH }) + "\n";
+        await writeFile(LOAD_PACK_FILE, header + lines.join(""));
+        packFileBytes = Buffer.byteLength(header);
+      } else {
+        await appendFile(LOAD_PACK_FILE, lines.join(""));
+      }
+      // Persisted entries are index-servable; drop their in-memory sources.
+      for (let i = 0; i < batch.length; i++) {
+        const len = Buffer.byteLength(lines[i]);
+        packIndex.set(batch[i].k, [packFileBytes, len - 1]);
+        packFileBytes += len;
+        loadPack.delete(batch[i].k);
+      }
+      if (packFd < 0) packFd = openSync(LOAD_PACK_FILE, "r");
     } catch {}
   });
 }
 function rememberPack(key, code) {
-  if (!EPOCH || loadPack.has(key)) return;
+  if (!EPOCH || loadPack.has(key) || packIndex.has(key)) return;
   loadPack.set(key, code);
   packPending.push({ k: key, c: code });
 }
 
 function cacheGet(key) {
   if (!key) return null;
-  const packed = loadPack.get(key);
+  const packed = packGet(key);
   if (packed !== undefined) { cacheStats.hits += 1; return packed; }
   const file = cachePath(key);
   let bytes;
@@ -310,6 +352,26 @@ function reportCacheStats() {
   process.stderr.write(
     `oj: ssr loader cache: load ${cacheStats.hits}/${cacheStats.hits + cacheStats.misses} hits (${cacheStats.uncached} uncacheable), resolve ${cacheStats.rhits}/${cacheStats.rhits + cacheStats.rmisses} hits\n`,
   );
+}
+
+// Debug accounting for OJ_SSR_MEM_STATS: what the loader's own structures hold.
+export function memStats() {
+  let packMemChars = 0;
+  for (const c of loadPack.values()) packMemChars += c.length;
+  let resolveChars = 0;
+  for (const e of resolveCache.values()) {
+    resolveChars += e.k.length + e.u.length + (e.f ? e.f.length : 0);
+  }
+  let containerHeap = null;
+  try { containerHeap = container ? container.heap() : null; } catch {}
+  return {
+    packIndexEntries: packIndex.size,
+    packMemEntries: loadPack.size,
+    packMemChars,
+    resolveEntries: resolveCache.size,
+    resolveChars,
+    containerHeap,
+  };
 }
 
 let V = 0;
