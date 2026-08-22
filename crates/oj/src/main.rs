@@ -35,7 +35,11 @@ enum Command {
         host: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Disable the on-disk module cache (always recompile; also OJ_NO_CACHE=1).
+        /// Enable the experimental on-disk module cache (also OJ_ENABLE_CACHE=1).
+        /// Off by default; warm restarts then re-serve compiled modules from disk.
+        #[arg(long)]
+        enable_cache: bool,
+        /// Force the on-disk module cache off even if enabled (also OJ_NO_CACHE=1).
         #[arg(long)]
         no_cache: bool,
         /// Compile modules on demand instead of eagerly crawling the whole graph
@@ -87,6 +91,7 @@ async fn run() -> anyhow::Result<()> {
             ssr,
             host,
             config,
+            enable_cache,
             no_cache,
             lazy,
         } => {
@@ -109,6 +114,7 @@ async fn run() -> anyhow::Result<()> {
                     bundle,
                     host,
                     config,
+                    enable_cache,
                     no_cache,
                     lazy,
                 }
