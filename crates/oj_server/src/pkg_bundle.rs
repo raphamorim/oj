@@ -99,7 +99,32 @@ fn resolve_relative(from_dir: &Path, spec: &str) -> Option<PathBuf> {
     None
 }
 
-/// Build the bundle for a CommonJS package `entry`. Returns `Fallback` if the
+/// A bare specifier (e.g. `jotai/react`) that resolves to a file *inside the
+/// same package* is internal, not a cross-package edge: bundling it keeps its
+/// exports concrete (so `export * from 'jotai/react'` becomes real static
+/// re-exports, not runtime-only properties an `import { x }` can't see).
+fn resolve_same_package(
+    pkg_root: &Path,
+    from_dir: &Path,
+    spec: &str,
+    resolver: &OjResolver,
+) -> Option<PathBuf> {
+    let resolved = normalize(&resolver.resolve(from_dir, spec).ok()?);
+    // Compare via canonical paths so a symlinked layout (pnpm, or macOS
+    // /var -> /private/var) doesn't hide that the file is inside this package.
+    let root_c = std::fs::canonicalize(pkg_root).ok()?;
+    let resolved_c = std::fs::canonicalize(&resolved).ok()?;
+    let rel = resolved_c.strip_prefix(&root_c).ok()?;
+    // Inside this package, and not down a nested node_modules of it.
+    if rel.components().any(|c| c.as_os_str() == "node_modules") {
+        return None;
+    }
+    let ext = rel.extension().and_then(|e| e.to_str()).unwrap_or("");
+    // Return the target under the *original* pkg_root so `id_of` strips cleanly.
+    INTERNAL_EXTS.contains(&ext).then(|| pkg_root.join(rel))
+}
+
+/// Build the bundle for a package `entry`. Returns `Fallback` if the
 /// package isn't safely bundleable in v1.
 pub fn build(entry: &Path, resolver: &OjResolver, root: &Path) -> BundleOutcome {
     if read(entry).is_none() {
@@ -178,6 +203,19 @@ pub fn build(entry: &Path, resolver: &OjResolver, root: &Path) -> BundleOutcome 
                         }
                         discovered.push(target);
                         Some(format!("#{tid}"))
+                    } else if let Some(target) = resolve_same_package(&pkg_root, &dir, spec, resolver)
+                    {
+                        // Same-package subpath (`jotai/react`): treat as internal.
+                        match id_of(&pkg_root, &target) {
+                            Some(tid) => {
+                                discovered.push(target);
+                                Some(format!("#{tid}"))
+                            }
+                            None => {
+                                bail_spec = Some(format!("same-package import {spec:?} has no id"));
+                                None
+                            }
+                        }
                     } else {
                         match external_url(spec, &dir, resolver, root) {
                             Some(u) => {
@@ -207,12 +245,11 @@ pub fn build(entry: &Path, resolver: &OjResolver, root: &Path) -> BundleOutcome 
                     return BundleOutcome::Fallback;
                 }
             };
-            // Dynamic import inside a dep would need the lazy-import runtime; bail.
+            // Dynamic imports are fine: compile_esm_factory lowered them to
+            // `__oj_import_lazy("#id"|"@url")`, which the emitted bundle runtime
+            // resolves (internal -> resolved namespace, external -> native import).
             if factory.kind != oj_compiler::bundle::FactoryKind::Esm {
                 return bail("compiled as CJS unexpectedly", &file);
-            }
-            if !factory.dynamic_imports.is_empty() {
-                return bail("uses dynamic import()", &file);
             }
             for target in discovered {
                 queue.push_back(target);
@@ -257,6 +294,13 @@ pub fn build(entry: &Path, resolver: &OjResolver, root: &Path) -> BundleOutcome 
                 if !INTERNAL_EXTS.contains(&t_ext) {
                     return bail(&format!("relative require({spec:?}) -> unsupported .{t_ext}"), &file);
                 }
+                deps.push((spec.clone(), DepTarget::Internal(tid)));
+                queue.push_back(target);
+            } else if let Some(target) = resolve_same_package(&pkg_root, &dir, spec, resolver) {
+                // Same-package subpath require: internal.
+                let Some(tid) = id_of(&pkg_root, &target) else {
+                    return bail(&format!("same-package require({spec:?}) has no id"), &file);
+                };
                 deps.push((spec.clone(), DepTarget::Internal(tid)));
                 queue.push_back(target);
             } else {
@@ -462,6 +506,41 @@ mod tests {
         assert_eq!(v["def"], serde_json::json!(7), "esm default: {v}");
         assert_eq!(v["version"], serde_json::json!("1.0"), "esm direct named: {v}");
         assert_eq!(v["sum"], serde_json::json!(5), "star-barrel re-export callable: {v}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn same_package_subpath_star_export_is_internal_and_named() {
+        // jotai shape: the entry `export * from 'pkg/react'` (a bare same-package
+        // subpath). It must bundle react.mjs internally and expose its names as
+        // real static ESM exports, not runtime-only properties.
+        let root = std::env::temp_dir().join(format!("oj-pkg-subpath-{}", std::process::id()));
+        let nm = root.join("node_modules").join("jotaiish");
+        std::fs::create_dir_all(nm.join("esm")).unwrap();
+        std::fs::write(
+            nm.join("package.json"),
+            r#"{"name":"jotaiish","type":"module","exports":{".":"./esm/index.mjs","./react":"./esm/react.mjs"}}"#,
+        )
+        .unwrap();
+        std::fs::write(nm.join("esm").join("index.mjs"), "export * from 'jotaiish/react';\n").unwrap();
+        std::fs::write(
+            nm.join("esm").join("react.mjs"),
+            "function useAtomValue(a) { return a; }\nexport { useAtomValue };\n",
+        )
+        .unwrap();
+        let resolver = OjResolver::new(&root);
+        let src = match build(&nm.join("esm").join("index.mjs"), &resolver, &root) {
+            BundleOutcome::Bundle(s) => s,
+            BundleOutcome::Fallback => panic!("expected bundle, got fallback"),
+        };
+        // react.mjs bundled internally (no external import for the subpath).
+        assert!(!src.contains("import * as __oj_extns"), "subpath must be internal: {src}");
+        let v = eval_named(
+            &root,
+            &src,
+            "import { useAtomValue } from BUNDLE;\nprocess.stdout.write(JSON.stringify({ ok: typeof useAtomValue }));\n",
+        );
+        assert_eq!(v["ok"], serde_json::json!("function"), "subpath name statically re-exported: {v}");
         std::fs::remove_dir_all(&root).ok();
     }
 

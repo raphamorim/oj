@@ -195,6 +195,11 @@ pub fn emit_package_bundle(
          \x20 const rec = __oj_get(id);\n\
          \x20 if (rec.kind === \"cjs\") { if (!rec.ns) rec.ns = __oj_cjs_ns(rec); return rec.ns; }\n\
          \x20 return rec.exports;\n\
+         }\n\
+         function __oj_import_lazy(t) {\n\
+         \x20 if (t[0] === \"#\") return Promise.resolve(__oj_ns_of(t.slice(1)));\n\
+         \x20 if (t[0] === \"@\") return import(t.slice(1));\n\
+         \x20 return import(t);\n\
          }\n",
     );
 
@@ -379,6 +384,25 @@ mod tests {
             "import { v } from BUNDLE;\nprocess.stdout.write(JSON.stringify({ v }));\n",
         );
         assert_eq!(v["v"], serde_json::json!(42), "cjs reads named export of internal esm: {v}");
+    }
+
+    #[test]
+    fn dynamic_import_of_internal_resolves_to_namespace() {
+        // `import("./lazy")` lowers to `__oj_import_lazy("#lazy.js")`, which the
+        // runtime resolves to the already-bundled module's namespace (a promise).
+        let modules = vec![
+            esm(
+                "index.js",
+                "__oj_esm(__oj_exports, { \"load\": () => load });\nasync function load() { const m = await __oj_import_lazy(\"#lazy.js\"); return m.gift; }",
+            ),
+            esm("lazy.js", "__oj_esm(__oj_exports, { \"gift\": () => gift });\nconst gift = 7;"),
+        ];
+        let src = emit_package_bundle(&modules, "index.js", &[], &["load".into()]);
+        let v = run_probe(
+            &src,
+            "import { load } from BUNDLE;\nload().then((g) => process.stdout.write(JSON.stringify({ g })));\n",
+        );
+        assert_eq!(v["g"], serde_json::json!(7), "dynamic import of internal works: {v}");
     }
 
     #[test]
