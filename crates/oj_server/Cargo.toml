@@ -21,6 +21,9 @@ serde_json.workspace = true
 blake3.workspace = true
 simdutf8.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+rolldown = "1.2.5"
+rolldown_common = "1.2.5"
+rolldown_plugin = "1.2.5"
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -6,6 +6,7 @@ pub mod cjs;
 pub mod glob;
 pub mod interop;
 pub mod json;
+pub mod pkgbundle;
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;

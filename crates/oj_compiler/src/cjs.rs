@@ -44,6 +44,12 @@ pub fn has_module_syntax_pub(path: &Path, source_text: &str) -> bool {
 pub struct CjsFactoryAnalysis {
     pub body: String,
     pub requires: Vec<String>,
+    /// Statically-detected `exports.X = ...` / `module.exports = { X }` names,
+    /// used to re-export a bundled package entry's members as ESM named exports.
+    pub named_exports: Vec<String>,
+    /// `require()`d specifiers that are re-export sources (`module.exports =
+    /// require("./x")` / `__exportStar`), so a bundler can pull their names too.
+    pub reexport_requires: Vec<String>,
 }
 
 pub fn analyze_for_factory(
@@ -51,11 +57,13 @@ pub fn analyze_for_factory(
     source_text: &str,
 ) -> Result<CjsFactoryAnalysis, CompileError> {
     let (body, analysis) = lower_and_analyze(path, source_text)?;
+    let named_exports = analysis.named_exports.clone();
+    let reexport_requires = analysis.reexport_requires.clone();
     let mut requires = analysis.requires;
     requires.extend(analysis.reexport_requires);
     let mut seen = std::collections::HashSet::new();
     requires.retain(|s| seen.insert(s.clone()));
-    Ok(CjsFactoryAnalysis { body, requires })
+    Ok(CjsFactoryAnalysis { body, requires, named_exports, reexport_requires })
 }
 
 fn has_module_syntax(_path: &Path, source_text: &str) -> bool {

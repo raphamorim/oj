@@ -1,0 +1,16 @@
+{
+  "name": "pbench-app",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "description": "Partial-bundling latency benchmark fixture: a React SPA that pulls a few dependency graphs with large file counts (date-fns, lodash-es) so the effect of collapsing many dep requests into a few /@oj-pkg bundles is measurable.",
+  "dependencies": {
+    "clsx": "^2.1.1",
+    "date-fns": "^3.6.0",
+    "lodash-es": "^4.17.21",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.26.2",
+    "tailwind-merge": "^2.5.2"
+  }
+}
