@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-use oj_compiler::pkgbundle::{emit_package_bundle, DepTarget, PkgModule};
+use oj_compiler::pkgbundle::{emit_package_bundle, DepTarget, ModuleKind, PkgModule};
 use oj_resolver::OjResolver;
 
 use crate::{hex_encode, is_node_builtin, normalize, package_root, url_of};
@@ -30,7 +30,7 @@ pub enum BundleOutcome {
     Fallback,
 }
 
-const INTERNAL_EXTS: &[&str] = &["js", "cjs", "jsx", "json"];
+const INTERNAL_EXTS: &[&str] = &["js", "cjs", "mjs", "jsx", "json"];
 
 fn bundle_url_for(entry_abs: &Path) -> String {
     format!("{PKG_PREFIX}{}", hex_encode(&entry_abs.to_string_lossy()))
@@ -58,6 +58,18 @@ pub fn store(url: &str, code: std::sync::Arc<String>) {
 
 fn read(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
+}
+
+fn pb_debug() -> bool {
+    std::env::var("OJ_PB_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Return `Fallback`, logging why (and for which file) when `OJ_PB_DEBUG` is set.
+fn bail(reason: &str, file: &Path) -> BundleOutcome {
+    if pb_debug() {
+        eprintln!("oj[pb] fallback: {reason} @ {}", file.display());
+    }
+    BundleOutcome::Fallback
 }
 
 fn is_esm(path: &Path, src: &str) -> bool {
@@ -90,12 +102,7 @@ fn resolve_relative(from_dir: &Path, spec: &str) -> Option<PathBuf> {
 /// Build the bundle for a CommonJS package `entry`. Returns `Fallback` if the
 /// package isn't safely bundleable in v1.
 pub fn build(entry: &Path, resolver: &OjResolver, root: &Path) -> BundleOutcome {
-    let Some(entry_src) = read(entry) else {
-        return BundleOutcome::Fallback;
-    };
-    // Only CommonJS entries: an ESM entry is already native and doesn't need the
-    // CJS runtime (and mixing ESM factories into the inline registry is future work).
-    if entry.extension().and_then(|e| e.to_str()) == Some("mjs") || is_esm(entry, &entry_src) {
+    if read(entry).is_none() {
         return BundleOutcome::Fallback;
     }
     let pkg_root = package_root(entry);
@@ -121,11 +128,11 @@ pub fn build(entry: &Path, resolver: &OjResolver, root: &Path) -> BundleOutcome 
             continue;
         }
         let Some(id) = id_of(&pkg_root, &file) else {
-            return BundleOutcome::Fallback; // escaped the package
+            return bail("path escaped the package", &file);
         };
         let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
         let Some(src) = read(&file) else {
-            return BundleOutcome::Fallback;
+            return bail("could not read file", &file);
         };
 
         // JSON internal module: expose the parsed value as module.exports.
@@ -133,18 +140,106 @@ pub fn build(entry: &Path, resolver: &OjResolver, root: &Path) -> BundleOutcome 
             export_info.insert(id.clone(), (Vec::new(), Vec::new()));
             modules.push(PkgModule {
                 id,
+                kind: ModuleKind::Cjs,
                 body: format!("module.exports = {};", src.trim()),
                 deps: Vec::new(),
             });
             continue;
         }
+
+        // ES module inside the package: compile it to an ESM factory (same lowering
+        // oj uses in --bundle mode) and register it alongside the CJS ones. The
+        // resolve callback rewrites each import to a bundle-internal ("#id") or
+        // cross-package ("@url") target that the runtime interprets.
         if ext == "mjs" || is_esm(&file, &src) {
-            return BundleOutcome::Fallback; // ESM inside the package: v1 bails
+            // import.meta.url / .resolve can't be honored inside a factory function.
+            if src.contains("import.meta.url") || src.contains("import.meta.resolve") {
+                return bail("uses import.meta.url/resolve", &file);
+            }
+            let file_url = url_of(root, &file);
+            let dir = file.parent().unwrap_or(&pkg_root).to_path_buf();
+            let mut bail_spec: Option<String> = None;
+            let mut discovered: Vec<PathBuf> = Vec::new();
+            let factory = {
+                let mut resolve = |spec: &str| -> Option<String> {
+                    if spec.starts_with('.') {
+                        let Some(target) = resolve_relative(&dir, spec) else {
+                            bail_spec = Some(format!("unresolved import {spec:?}"));
+                            return None;
+                        };
+                        let Some(tid) = id_of(&pkg_root, &target) else {
+                            bail_spec = Some(format!("import {spec:?} escapes package"));
+                            return None;
+                        };
+                        let t_ext = target.extension().and_then(|e| e.to_str()).unwrap_or("");
+                        if !INTERNAL_EXTS.contains(&t_ext) {
+                            bail_spec = Some(format!("import {spec:?} -> unsupported .{t_ext}"));
+                            return None;
+                        }
+                        discovered.push(target);
+                        Some(format!("#{tid}"))
+                    } else {
+                        match external_url(spec, &dir, resolver, root) {
+                            Some(u) => {
+                                if ext_seen.insert(u.clone()) {
+                                    externals.push(u.clone());
+                                }
+                                Some(format!("@{u}"))
+                            }
+                            None => {
+                                bail_spec = Some(format!("unresolvable import {spec:?}"));
+                                None
+                            }
+                        }
+                    }
+                };
+                oj_compiler::bundle::compile_factory(&file, &file_url, &src, &mut resolve)
+            };
+            if let Some(reason) = bail_spec {
+                return bail(&reason, &file);
+            }
+            let factory = match factory {
+                Ok(f) => f,
+                Err(e) => {
+                    if pb_debug() {
+                        eprintln!("oj[pb] fallback: esm compile error ({e}) @ {}", file.display());
+                    }
+                    return BundleOutcome::Fallback;
+                }
+            };
+            // Dynamic import inside a dep would need the lazy-import runtime; bail.
+            if factory.kind != oj_compiler::bundle::FactoryKind::Esm {
+                return bail("compiled as CJS unexpectedly", &file);
+            }
+            if !factory.dynamic_imports.is_empty() {
+                return bail("uses dynamic import()", &file);
+            }
+            for target in discovered {
+                queue.push_back(target);
+            }
+            let reexport_ids: Vec<String> = factory
+                .esm_star_targets
+                .iter()
+                .filter_map(|t| t.strip_prefix('#').map(|s| s.to_string()))
+                .collect();
+            export_info.insert(id.clone(), (factory.esm_named.clone(), reexport_ids));
+            modules.push(PkgModule {
+                id,
+                kind: ModuleKind::Esm,
+                body: factory.code,
+                deps: Vec::new(),
+            });
+            continue;
         }
 
         let analysis = match oj_compiler::cjs::analyze_for_factory(&file, &src) {
             Ok(a) => a,
-            Err(_) => return BundleOutcome::Fallback,
+            Err(e) => {
+                if pb_debug() {
+                    eprintln!("oj[pb] fallback: cjs analyze error ({e}) @ {}", file.display());
+                }
+                return BundleOutcome::Fallback;
+            }
         };
 
         let dir = file.parent().unwrap_or(&pkg_root).to_path_buf();
@@ -153,14 +248,14 @@ pub fn build(entry: &Path, resolver: &OjResolver, root: &Path) -> BundleOutcome 
             if spec.starts_with('.') {
                 // Relative: stay inside the package or bail.
                 let Some(target) = resolve_relative(&dir, spec) else {
-                    return BundleOutcome::Fallback;
+                    return bail(&format!("unresolved relative require({spec:?})"), &file);
                 };
                 let Some(tid) = id_of(&pkg_root, &target) else {
-                    return BundleOutcome::Fallback;
+                    return bail(&format!("relative require({spec:?}) escapes package"), &file);
                 };
                 let t_ext = target.extension().and_then(|e| e.to_str()).unwrap_or("");
                 if !INTERNAL_EXTS.contains(&t_ext) {
-                    return BundleOutcome::Fallback;
+                    return bail(&format!("relative require({spec:?}) -> unsupported .{t_ext}"), &file);
                 }
                 deps.push((spec.clone(), DepTarget::Internal(tid)));
                 queue.push_back(target);
@@ -168,7 +263,7 @@ pub fn build(entry: &Path, resolver: &OjResolver, root: &Path) -> BundleOutcome 
                 // Bare: another package (its own bundle) or a node builtin (stub).
                 let url = external_url(spec, &dir, resolver, root);
                 let Some(url) = url else {
-                    return BundleOutcome::Fallback; // unresolvable
+                    return bail(&format!("unresolvable bare require({spec:?})"), &file);
                 };
                 if ext_seen.insert(url.clone()) {
                     externals.push(url.clone());
@@ -189,7 +284,7 @@ pub fn build(entry: &Path, resolver: &OjResolver, root: &Path) -> BundleOutcome 
             })
             .collect();
         export_info.insert(id.clone(), (analysis.named_exports.clone(), reexport_ids));
-        modules.push(PkgModule { id, body: analysis.body, deps });
+        modules.push(PkgModule { id, kind: ModuleKind::Cjs, body: analysis.body, deps });
     }
 
     let entry_named = collect_exports(&entry_id, &export_info);
@@ -328,15 +423,73 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    // Node-eval a built bundle: write it to disk, import it, print a JSON probe
+    // of the given expression list.
+    fn eval_named(root: &Path, src: &str, probe: &str) -> serde_json::Value {
+        let f = root.join(format!("bundle-{}.mjs", fnv(src)));
+        std::fs::write(&f, src).unwrap();
+        let pf = root.join(format!("probe-{}.mjs", fnv(&(src.to_string() + probe))));
+        std::fs::write(&pf, probe.replace("BUNDLE", &format!("{:?}", f.to_string_lossy()))).unwrap();
+        let out = std::process::Command::new("node").arg(&pf).output().unwrap();
+        assert!(out.status.success(), "node: {}", String::from_utf8_lossy(&out.stderr));
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+
     #[test]
-    fn esm_entry_falls_back() {
+    fn bundles_esm_package_with_internal_graph() {
+        // Pure-ESM package: entry re-exports a submodule (star barrel) and has a
+        // direct named + default export. All of it must survive one bundled file.
         let root = std::env::temp_dir().join(format!("oj-pkg-esm-{}", std::process::id()));
         let nm = root.join("node_modules").join("esmpkg");
-        std::fs::create_dir_all(&nm).unwrap();
-        std::fs::write(nm.join("package.json"), r#"{"name":"esmpkg","module":"index.mjs"}"#).unwrap();
-        std::fs::write(nm.join("index.js"), "export const x = 1;\n").unwrap();
+        std::fs::create_dir_all(nm.join("lib")).unwrap();
+        std::fs::write(nm.join("package.json"), r#"{"name":"esmpkg","type":"module","main":"index.js"}"#).unwrap();
+        std::fs::write(
+            nm.join("index.js"),
+            "export * from './lib/util.js';\nexport const version = '1.0';\nexport default 7;\n",
+        )
+        .unwrap();
+        std::fs::write(nm.join("lib").join("util.js"), "export const add = (a, b) => a + b;\n").unwrap();
         let resolver = OjResolver::new(&root);
-        assert!(matches!(build(&nm.join("index.js"), &resolver, &root), BundleOutcome::Fallback));
+        let src = match build(&nm.join("index.js"), &resolver, &root) {
+            BundleOutcome::Bundle(s) => s,
+            BundleOutcome::Fallback => panic!("expected esm bundle, got fallback"),
+        };
+        let v = eval_named(
+            &root,
+            &src,
+            "import def, { version, add } from BUNDLE;\nprocess.stdout.write(JSON.stringify({ def, version, sum: add(2,3) }));\n",
+        );
+        assert_eq!(v["def"], serde_json::json!(7), "esm default: {v}");
+        assert_eq!(v["version"], serde_json::json!("1.0"), "esm direct named: {v}");
+        assert_eq!(v["sum"], serde_json::json!(5), "star-barrel re-export callable: {v}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn bundles_mixed_esm_entry_over_cjs_internal() {
+        // ESM entry that imports an internal CJS helper (the common real-world
+        // shape: an ESM index over a CJS impl). Interop must resolve.
+        let root = std::env::temp_dir().join(format!("oj-pkg-mixed-{}", std::process::id()));
+        let nm = root.join("node_modules").join("mixed");
+        std::fs::create_dir_all(&nm).unwrap();
+        std::fs::write(nm.join("package.json"), r#"{"name":"mixed","main":"index.js"}"#).unwrap();
+        std::fs::write(
+            nm.join("index.js"),
+            "import impl from './impl.cjs';\nexport const shout = (s) => impl(s).toUpperCase();\n",
+        )
+        .unwrap();
+        std::fs::write(nm.join("impl.cjs"), "module.exports = (s) => 'hi ' + s;\n").unwrap();
+        let resolver = OjResolver::new(&root);
+        let src = match build(&nm.join("index.js"), &resolver, &root) {
+            BundleOutcome::Bundle(s) => s,
+            BundleOutcome::Fallback => panic!("expected mixed bundle, got fallback"),
+        };
+        let v = eval_named(
+            &root,
+            &src,
+            "import { shout } from BUNDLE;\nprocess.stdout.write(JSON.stringify({ out: shout('ada') }));\n",
+        );
+        assert_eq!(v["out"], serde_json::json!("HI ADA"), "esm-over-cjs interop: {v}");
         std::fs::remove_dir_all(&root).ok();
     }
 

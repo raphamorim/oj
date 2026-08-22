@@ -31,6 +31,12 @@ pub struct FactoryOutput {
     pub kind: FactoryKind,
     pub dynamic_imports: Vec<String>,
     pub is_refresh_boundary: bool,
+    /// ESM only: the statically-known exported names (excluding `default`).
+    /// Empty for CJS. Used by partial bundling to re-export an ESM entry.
+    pub esm_named: Vec<String>,
+    /// ESM only: the (already-rewritten) sources of `export *` declarations,
+    /// so a bundler can follow star barrels for the transitive export set.
+    pub esm_star_targets: Vec<String>,
 }
 
 impl FactoryOutput {
@@ -76,6 +82,8 @@ fn compile_cjs_factory(
         kind: FactoryKind::Cjs,
         dynamic_imports: Vec::new(),
         is_refresh_boundary: false,
+        esm_named: Vec::new(),
+        esm_star_targets: Vec::new(),
     })
 }
 
@@ -177,6 +185,11 @@ fn compile_esm_factory(
     let mut getters: Vec<(String, String)> = Vec::new();
     let mut stars: Vec<usize> = Vec::new();
     let mut has_default_expr = false;
+    // Imported local name -> the expression it lowers to (`_oj_mN` or
+    // `_oj_mN.member`). A re-export `export { x }` of an imported binding `x`
+    // must emit a getter over this expression, not the bare local name (whose
+    // `import` statement is stripped), otherwise `x` is a dangling reference.
+    let mut import_local_expr: HashMap<String, String> = HashMap::new();
 
     let mut var_for = |url: &str, import_vars: &mut Vec<String>| -> usize {
         if let Some(&i) = var_of_url.get(url) {
@@ -208,6 +221,11 @@ fn compile_esm_factory(
                         }
                         ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => (&s.local, None),
                     };
+                    let expr = match &member {
+                        Some(m) => format!("_oj_m{vi}.{m}"),
+                        None => format!("_oj_m{vi}"),
+                    };
+                    import_local_expr.insert(local.name.to_string(), expr);
                     let Some(symbol_id) = local.symbol_id.get() else {
                         continue;
                     };
@@ -231,7 +249,10 @@ fn compile_esm_factory(
                 for spec in &decl.specifiers {
                     let local = export_name(&spec.local);
                     let exported = export_name(&spec.exported);
-                    getters.push((exported, local));
+                    // If `local` names an imported binding, re-export the lowered
+                    // expression; a plain local binding re-exports by its own name.
+                    let expr = import_local_expr.get(&local).cloned().unwrap_or(local);
+                    getters.push((exported, expr));
                 }
             }
             Statement::ExportFromDeclaration(decl) => {
@@ -350,6 +371,16 @@ fn compile_esm_factory(
     }
     program.body = new_body;
 
+    let esm_named: Vec<String> = getters
+        .iter()
+        .map(|(exported, _)| exported.clone())
+        .filter(|n| n != "default")
+        .collect();
+    let esm_star_targets: Vec<String> = stars
+        .iter()
+        .filter_map(|&vi| import_vars.get(vi).cloned())
+        .collect();
+
     let code = Codegen::new().build(&program).code;
     Ok(FactoryOutput {
         code,
@@ -358,6 +389,8 @@ fn compile_esm_factory(
         kind: FactoryKind::Esm,
         dynamic_imports,
         is_refresh_boundary,
+        esm_named,
+        esm_star_targets,
     })
 }
 
@@ -521,6 +554,35 @@ mod tests {
             true,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn reexported_import_binding_uses_lowered_expr() {
+        // `export { x }` where `x` is an imported binding must emit a getter over
+        // the lowered `_oj_mN.member`, not the bare local (whose import is stripped).
+        // Regression: date-fns format.mjs re-exports its imported `longFormatters`.
+        let out = factory(
+            r#"
+import { longFormatters } from "./_lib/longFormatters";
+export { longFormatters };
+export const x = 1;
+"#,
+        );
+        let code = &out.code;
+        assert!(
+            code.contains("() => _oj_m0.longFormatters"),
+            "re-exported import must reference lowered expr: {code}"
+        );
+        assert!(
+            !code.contains("() => longFormatters"),
+            "must not reference the stripped local binding: {code}"
+        );
+        assert!(
+            out.esm_named.contains(&"longFormatters".to_string())
+                && out.esm_named.contains(&"x".to_string()),
+            "both names exported: {:?}",
+            out.esm_named
+        );
     }
 
     #[test]

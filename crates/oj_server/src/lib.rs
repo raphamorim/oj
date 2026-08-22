@@ -2660,7 +2660,7 @@ fn partial_bundle_enabled() -> bool {
 fn dep_serve_url(resolved: &Path, root: &Path) -> String {
     if partial_bundle_enabled()
         && resolved.components().any(|c| c.as_os_str() == "node_modules")
-        && is_cjs_dep_file(resolved)
+        && is_bundleable_dep_file(resolved)
     {
         return format!(
             "{}{}",
@@ -2743,6 +2743,14 @@ fn rewrite_specifier(
     }
 
     match resolver.resolve(dir, spec) {
+        // A node_modules dependency routes through `dep_serve_url` even when it
+        // sits under the app root (the common layout), so partial bundling can
+        // collapse it. `dep_serve_url` returns the plain per-file URL when partial
+        // bundling is off or the file isn't bundleable, so this is a no-op then.
+        Ok(resolved) if resolved.components().any(|c| c.as_os_str() == "node_modules") => {
+            fs_allow.lock().unwrap().insert(package_root(&resolved));
+            Some(dep_serve_url(&resolved, root))
+        }
         Ok(resolved) if resolved.starts_with(root) => Some(url_of(root, &resolved)),
         Ok(resolved) => {
             fs_allow.lock().unwrap().insert(package_root(&resolved));
@@ -3270,6 +3278,17 @@ fn is_lingui_macro_specifier(spec: &str) -> bool {
 // (rewriting the named import to a property read off the default), since a CJS
 // dep whose named exports are assigned at runtime (e.g. file-saver's `saveAs`)
 // exposes no static ESM named bindings. Cached: a file's module kind is stable.
+// A node_modules JS-family file that partial bundling should try to collapse
+// into one `/@oj-pkg` bundle, whether it's CommonJS or ESM. (`.css`/`.json`/asset
+// deps stay per-file; the builder itself falls back if a JS package can't be
+// bundled safely.)
+fn is_bundleable_dep_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("js" | "cjs" | "jsx" | "mjs")
+    )
+}
+
 fn is_cjs_dep_file(path: &Path) -> bool {
     static CACHE: std::sync::OnceLock<Mutex<HashMap<PathBuf, bool>>> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
