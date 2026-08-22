@@ -3171,6 +3171,14 @@ async fn serve_pkg_bundle(state: &Arc<ServerState>, path: &str) -> Response {
     };
     let resolver = Arc::clone(&state.resolver);
     let root = state.root.clone();
+    // Known-hard packages (e.g. object-inspect) produce a concatenator bundle
+    // that builds but breaks at runtime, so they never bail into the fallback.
+    // Force those straight through rolldown, bypassing the concatenator.
+    if pkg_rolldown::enabled() && pkg_rolldown::is_forced(&entry) {
+        if let Some(code) = pkg_rolldown::build(&entry, &state.root, Arc::clone(&resolver)).await {
+            return js((*code).clone());
+        }
+    }
     let entry_owned = entry.clone();
     let build_resolver = Arc::clone(&resolver);
     let outcome = tokio::task::spawn_blocking(move || {

@@ -39,6 +39,47 @@ pub fn enabled() -> bool {
     })
 }
 
+// Packages the concatenator gets wrong (it produces a bundle that builds but is
+// broken at runtime, so it never "bails" and the fallback never fires). We can't
+// detect those statically, so we keep a short curated list and force them through
+// rolldown directly. `object-inspect` is the canonical case: its conditional
+// `require` of Node's util lands on `undefined`, and the concatenated bundle then
+// reads `.custom` off it. Extend at runtime with `OJ_PB_ROLLDOWN_FORCE=a,b`.
+const BUILTIN_FORCE: &[&str] = &["object-inspect"];
+
+fn force_set() -> &'static std::collections::HashSet<String> {
+    static S: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    S.get_or_init(|| {
+        let mut set: std::collections::HashSet<String> =
+            BUILTIN_FORCE.iter().map(|s| s.to_string()).collect();
+        if let Ok(v) = std::env::var("OJ_PB_ROLLDOWN_FORCE") {
+            for name in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                set.insert(name.to_string());
+            }
+        }
+        set
+    })
+}
+
+/// The npm package name a node_modules path belongs to (`@scope/name` or `name`),
+/// taken from the last `node_modules/` segment.
+fn package_name(entry: &Path) -> Option<String> {
+    let comps: Vec<&std::ffi::OsStr> = entry.components().map(|c| c.as_os_str()).collect();
+    let idx = comps.iter().rposition(|c| *c == "node_modules")?;
+    let first = comps.get(idx + 1)?.to_str()?;
+    if first.starts_with('@') {
+        Some(format!("{first}/{}", comps.get(idx + 2)?.to_str()?))
+    } else {
+        Some(first.to_string())
+    }
+}
+
+/// Should this package skip the concatenator and go straight to rolldown? True
+/// for the curated known-broken list plus any `OJ_PB_ROLLDOWN_FORCE` additions.
+pub fn is_forced(entry: &Path) -> bool {
+    package_name(entry).is_some_and(|n| force_set().contains(&n))
+}
+
 // Cache of emitted chunks keyed by their served path (`/@oj-pkg/<filename>`), so
 // a package's sibling chunks are already present when the browser requests them.
 fn chunk_cache() -> &'static Mutex<std::collections::HashMap<String, Arc<String>>> {
@@ -155,6 +196,37 @@ fn external(id: String) -> HookResolveIdOutput {
         id: id.into(),
         external: Some(ResolvedExternal::Bool(true)),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_forced, package_name};
+    use std::path::Path;
+
+    #[test]
+    fn package_name_from_node_modules_path() {
+        assert_eq!(
+            package_name(Path::new("/app/node_modules/object-inspect/index.js")).as_deref(),
+            Some("object-inspect")
+        );
+        assert_eq!(
+            package_name(Path::new("/app/node_modules/@apollo/client/core/index.js")).as_deref(),
+            Some("@apollo/client")
+        );
+        // deepest node_modules wins (a nested dependency)
+        assert_eq!(
+            package_name(Path::new("/app/node_modules/a/node_modules/b/index.js")).as_deref(),
+            Some("b")
+        );
+        assert_eq!(package_name(Path::new("/app/src/main.tsx")), None);
+    }
+
+    #[test]
+    fn builtin_hard_packages_are_forced() {
+        // The curated known-broken package is forced without any env override.
+        assert!(is_forced(Path::new("/x/node_modules/object-inspect/index.js")));
+        assert!(!is_forced(Path::new("/x/node_modules/lodash-es/index.js")));
     }
 }
 
