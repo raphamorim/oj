@@ -20,6 +20,7 @@ use oj_cache::{CachedModule, PersistentCache};
 
 pub mod optimize;
 pub mod pkg_bundle;
+pub mod pkg_rolldown;
 pub mod plugins;
 pub mod sidecar;
 pub mod svgr;
@@ -3156,6 +3157,12 @@ async fn serve_pkg_bundle(state: &Arc<ServerState>, path: &str) -> Response {
         )
             .into_response()
     };
+    // A chunk emitted by a previous rolldown fallback (a code-split sibling, or
+    // the entry re-served). These paths aren't decodable entry hexes, so they
+    // must be checked before entry_from_url.
+    if let Some(code) = pkg_rolldown::cached_chunk(path) {
+        return js((*code).clone());
+    }
     if let Some(code) = pkg_bundle::cached(path) {
         return js((*code).clone());
     }
@@ -3165,9 +3172,11 @@ async fn serve_pkg_bundle(state: &Arc<ServerState>, path: &str) -> Response {
     let resolver = Arc::clone(&state.resolver);
     let root = state.root.clone();
     let entry_owned = entry.clone();
-    let outcome =
-        tokio::task::spawn_blocking(move || pkg_bundle::build(&entry_owned, resolver.as_ref(), &root))
-            .await;
+    let build_resolver = Arc::clone(&resolver);
+    let outcome = tokio::task::spawn_blocking(move || {
+        pkg_bundle::build(&entry_owned, build_resolver.as_ref(), &root)
+    })
+    .await;
     match outcome {
         Ok(pkg_bundle::BundleOutcome::Bundle(code)) => {
             let code = Arc::new(code);
@@ -3175,6 +3184,18 @@ async fn serve_pkg_bundle(state: &Arc<ServerState>, path: &str) -> Response {
             js((*code).clone())
         }
         Ok(pkg_bundle::BundleOutcome::Fallback) => {
+            // The concatenator bailed. Before serving per-file, try bundling this
+            // one package with rolldown (the robust path, Vite-style), if enabled.
+            if pkg_rolldown::enabled() {
+                if let Some(code) =
+                    pkg_rolldown::build(&entry, &state.root, Arc::clone(&resolver)).await
+                {
+                    return js((*code).clone());
+                }
+                if std::env::var("OJ_PB_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0") {
+                    eprintln!("oj[pb] rolldown fallback failed, serving per-file: {path}");
+                }
+            }
             let url = url_of(&state.root, &entry);
             match ensure_module(state, &entry, &url).await {
                 Ok((_, module)) => js(module.code.clone()),
