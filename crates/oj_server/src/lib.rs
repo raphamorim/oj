@@ -321,6 +321,17 @@ impl DevServer {
         plugins::adopt_vite_config_values(&mut config, &root);
         boot_phase("vite config values adopted");
 
+        // Feed optimizeDeps.include/exclude/needsInterop into partial bundling so
+        // the same vite.config field that drives Vite's dep pre-bundle drives oj's.
+        {
+            let (include, exclude, _entries) = oj_config::optimize_deps_lists(&config);
+            pkg_bundle::configure(
+                include,
+                exclude,
+                oj_config::optimize_deps_needs_interop(&config),
+            );
+        }
+
         let env_prefix = config.env_prefix.as_deref().unwrap_or("VITE_");
         let env_dir = config
             .env_dir
@@ -605,6 +616,8 @@ impl DevServer {
                         entries,
                         dedupe: oj_config::resolve_dedupe(&config),
                         alias: oj_config::resolve_alias(&config, "client"),
+                        force: oj_config::optimize_deps_force(&config),
+                        bundler_options: oj_config::optimize_deps_bundler_options(&config),
                     },
                 )
             }),
@@ -2024,7 +2037,13 @@ async fn ensure_module(
                                 let in_node_modules = resolved
                                     .components()
                                     .any(|c| c.as_os_str() == "node_modules");
-                                if in_node_modules && is_cjs_dep_file(&resolved) {
+                                // optimizeDeps.needsInterop forces the interop
+                                // rewrite even when static analysis reads the dep
+                                // as ESM (its real exports only appear at runtime).
+                                if in_node_modules
+                                    && (is_cjs_dep_file(&resolved)
+                                        || pkg_bundle::needs_forced_interop(&resolved))
+                                {
                                     fs_allow.lock().unwrap().insert(package_root(&resolved));
                                     // With partial bundling on this is the /@oj-pkg
                                     // bundle URL, which exports __cjs_exports too, so
@@ -2662,6 +2681,8 @@ fn dep_serve_url(resolved: &Path, root: &Path) -> String {
     if partial_bundle_enabled()
         && resolved.components().any(|c| c.as_os_str() == "node_modules")
         && is_bundleable_dep_file(resolved)
+        // optimizeDeps.exclude: serve this package per-file, never bundled.
+        && !pkg_bundle::is_excluded(resolved)
     {
         return format!(
             "{}{}",

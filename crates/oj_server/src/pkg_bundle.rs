@@ -64,6 +64,71 @@ fn pb_debug() -> bool {
     std::env::var("OJ_PB_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
+/// Runtime view of the user's `optimizeDeps` config, set once at server startup.
+#[derive(Default)]
+pub struct OptimizeConfig {
+    /// `optimizeDeps.include`: force these packages to be pre-bundled (rolldown).
+    pub include: std::collections::HashSet<String>,
+    /// `optimizeDeps.exclude`: never partial-bundle these; serve per-file.
+    pub exclude: std::collections::HashSet<String>,
+    /// `optimizeDeps.needsInterop`: force CJS->ESM interop for these.
+    pub needs_interop: std::collections::HashSet<String>,
+}
+
+fn opt_config() -> &'static std::sync::OnceLock<OptimizeConfig> {
+    static C: std::sync::OnceLock<OptimizeConfig> = std::sync::OnceLock::new();
+    &C
+}
+
+/// Install the resolved `optimizeDeps` config. Called once at startup; later
+/// calls are ignored (the first wins), matching the OnceLock semantics.
+pub fn configure(include: Vec<String>, exclude: Vec<String>, needs_interop: Vec<String>) {
+    let cfg = OptimizeConfig {
+        include: include.into_iter().collect(),
+        exclude: exclude.into_iter().collect(),
+        needs_interop: needs_interop.into_iter().collect(),
+    };
+    let _ = opt_config().set(cfg);
+}
+
+fn config() -> Option<&'static OptimizeConfig> {
+    opt_config().get()
+}
+
+/// The npm package name a node_modules path belongs to (`@scope/name` or `name`).
+pub fn package_name(entry: &Path) -> Option<String> {
+    let comps: Vec<&std::ffi::OsStr> = entry.components().map(|c| c.as_os_str()).collect();
+    let idx = comps.iter().rposition(|c| *c == "node_modules")?;
+    let first = comps.get(idx + 1)?.to_str()?;
+    if first.starts_with('@') {
+        Some(format!("{first}/{}", comps.get(idx + 2)?.to_str()?))
+    } else {
+        Some(first.to_string())
+    }
+}
+
+fn pkg_in(path: &Path, set: impl Fn(&OptimizeConfig) -> &std::collections::HashSet<String>) -> bool {
+    match (config(), package_name(path)) {
+        (Some(c), Some(name)) => set(c).contains(&name),
+        _ => false,
+    }
+}
+
+/// `optimizeDeps.include` names this package (force it through pre-bundling).
+pub fn is_include_forced(path: &Path) -> bool {
+    pkg_in(path, |c| &c.include)
+}
+
+/// `optimizeDeps.exclude` names this package (skip partial bundling, serve per-file).
+pub fn is_excluded(path: &Path) -> bool {
+    pkg_in(path, |c| &c.exclude)
+}
+
+/// `optimizeDeps.needsInterop` names this package (force CJS->ESM interop).
+pub fn needs_forced_interop(path: &Path) -> bool {
+    pkg_in(path, |c| &c.needs_interop)
+}
+
 /// Return `Fallback`, logging why (and for which file) when `OJ_PB_DEBUG` is set.
 fn bail(reason: &str, file: &Path) -> BundleOutcome {
     if pb_debug() {
@@ -393,6 +458,41 @@ fn external_url(spec: &str, from_dir: &Path, resolver: &OjResolver, root: &Path)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_name_from_node_modules_path() {
+        assert_eq!(
+            package_name(Path::new("/a/node_modules/object-inspect/index.js")).as_deref(),
+            Some("object-inspect")
+        );
+        assert_eq!(
+            package_name(Path::new("/a/node_modules/@apollo/client/core/index.js")).as_deref(),
+            Some("@apollo/client")
+        );
+        // Nested dependency: the deepest node_modules wins.
+        assert_eq!(
+            package_name(Path::new("/a/node_modules/x/node_modules/y/i.js")).as_deref(),
+            Some("y")
+        );
+        assert_eq!(package_name(Path::new("/a/src/main.tsx")), None);
+    }
+
+    #[test]
+    fn optimize_config_drives_include_exclude_interop() {
+        // OnceLock is process-global and set-once; this is the only test that
+        // configures it, so first-wins is deterministic here.
+        configure(
+            vec!["object-inspect".into()],
+            vec!["big-esm".into()],
+            vec!["@scope/legacy".into()],
+        );
+        assert!(is_include_forced(Path::new("/a/node_modules/object-inspect/index.js")));
+        assert!(!is_include_forced(Path::new("/a/node_modules/react/index.js")));
+        assert!(is_excluded(Path::new("/a/node_modules/big-esm/dist/x.js")));
+        assert!(!is_excluded(Path::new("/a/node_modules/object-inspect/index.js")));
+        assert!(needs_forced_interop(Path::new("/a/node_modules/@scope/legacy/index.js")));
+        assert!(!needs_forced_interop(Path::new("/a/node_modules/big-esm/x.js")));
+    }
 
     // Build a synthetic package on disk, bundle it, node-eval the result.
     fn eval_bundle(src: &str) -> serde_json::Value {

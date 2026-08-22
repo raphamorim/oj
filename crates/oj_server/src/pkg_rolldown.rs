@@ -61,23 +61,13 @@ fn force_set() -> &'static std::collections::HashSet<String> {
     })
 }
 
-/// The npm package name a node_modules path belongs to (`@scope/name` or `name`),
-/// taken from the last `node_modules/` segment.
-fn package_name(entry: &Path) -> Option<String> {
-    let comps: Vec<&std::ffi::OsStr> = entry.components().map(|c| c.as_os_str()).collect();
-    let idx = comps.iter().rposition(|c| *c == "node_modules")?;
-    let first = comps.get(idx + 1)?.to_str()?;
-    if first.starts_with('@') {
-        Some(format!("{first}/{}", comps.get(idx + 2)?.to_str()?))
-    } else {
-        Some(first.to_string())
-    }
-}
-
 /// Should this package skip the concatenator and go straight to rolldown? True
-/// for the curated known-broken list plus any `OJ_PB_ROLLDOWN_FORCE` additions.
+/// for the curated known-broken list, any `OJ_PB_ROLLDOWN_FORCE` additions, and
+/// any package the user named in `optimizeDeps.include` (the config-driven
+/// promotion of the env override).
 pub fn is_forced(entry: &Path) -> bool {
-    package_name(entry).is_some_and(|n| force_set().contains(&n))
+    crate::pkg_bundle::package_name(entry).is_some_and(|n| force_set().contains(&n))
+        || crate::pkg_bundle::is_include_forced(entry)
 }
 
 // Cache of emitted chunks keyed by their served path (`/@oj-pkg/<filename>`), so
@@ -201,30 +191,13 @@ fn external(id: String) -> HookResolveIdOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_forced, package_name};
+    use super::is_forced;
     use std::path::Path;
 
     #[test]
-    fn package_name_from_node_modules_path() {
-        assert_eq!(
-            package_name(Path::new("/app/node_modules/object-inspect/index.js")).as_deref(),
-            Some("object-inspect")
-        );
-        assert_eq!(
-            package_name(Path::new("/app/node_modules/@apollo/client/core/index.js")).as_deref(),
-            Some("@apollo/client")
-        );
-        // deepest node_modules wins (a nested dependency)
-        assert_eq!(
-            package_name(Path::new("/app/node_modules/a/node_modules/b/index.js")).as_deref(),
-            Some("b")
-        );
-        assert_eq!(package_name(Path::new("/app/src/main.tsx")), None);
-    }
-
-    #[test]
     fn builtin_hard_packages_are_forced() {
-        // The curated known-broken package is forced without any env override.
+        // The curated known-broken package is forced without any env override or
+        // config; a benign package is not (config include is unset in tests).
         assert!(is_forced(Path::new("/x/node_modules/object-inspect/index.js")));
         assert!(!is_forced(Path::new("/x/node_modules/lodash-es/index.js")));
     }

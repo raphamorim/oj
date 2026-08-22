@@ -51,9 +51,12 @@ impl OptimizedDeps {
         let hash = lockfile_hash(root, version, &input);
         let (tx, rx) = watch::channel(None);
 
-        if let Some(map) = load_manifest(&dir, &hash) {
-            let _ = tx.send(Some(Arc::new(map)));
-            return OptimizedDeps { rx, dir };
+        // optimizeDeps.force: ignore any cached pre-bundle and always rebuild.
+        if !input.force {
+            if let Some(map) = load_manifest(&dir, &hash) {
+                let _ = tx.send(Some(Arc::new(map)));
+                return OptimizedDeps { rx, dir };
+            }
         }
 
         let root = root.to_path_buf();
@@ -77,6 +80,10 @@ pub struct OptimizeInput {
     pub entries: Vec<String>,
     pub dedupe: Vec<String>,
     pub alias: Vec<(String, String)>,
+    /// `optimizeDeps.force`: bypass the cached pre-bundle and rebuild.
+    pub force: bool,
+    /// `optimizeDeps.esbuildOptions`/`rolldownOptions`: forwarded to the sidecar.
+    pub bundler_options: Option<serde_json::Value>,
 }
 
 fn lockfile_hash(root: &Path, version: &str, input: &OptimizeInput) -> String {
@@ -112,6 +119,10 @@ fn lockfile_hash(root: &Path, version: &str, input: &OptimizeInput) -> String {
         hasher.update(find.as_bytes());
         hasher.update(b"=");
         hasher.update(replacement.as_bytes());
+    }
+    if let Some(opts) = &input.bundler_options {
+        hasher.update(b"\0o");
+        hasher.update(opts.to_string().as_bytes());
     }
     hasher.finalize().to_hex().to_string()
 }
@@ -189,6 +200,7 @@ async fn run_optimizer(
         "dedupe": input.dedupe,
         "alias": alias,
         "autoDiscover": auto_discover,
+        "esbuildOptions": input.bundler_options,
     })
     .to_string();
     let out = tokio::process::Command::new("node")
@@ -221,6 +233,7 @@ mod tests {
             entries: entries.iter().map(|s| s.to_string()).collect(),
             dedupe: dedupe.iter().map(|s| s.to_string()).collect(),
             alias: Vec::new(),
+            ..Default::default()
         }
     }
 

@@ -30,6 +30,15 @@ pub struct OptimizeDepsConfig {
     pub include: Option<Vec<String>>,
     pub exclude: Option<Vec<String>>,
     pub entries: Option<Vec<String>>,
+    /// Deps whose CommonJS exports the scanner can't see statically; forces
+    /// CJS->ESM interop for them.
+    pub needs_interop: Option<Vec<String>>,
+    /// Ignore any cached pre-bundle and rebuild from scratch.
+    pub force: Option<bool>,
+    /// Opaque options forwarded to the underlying bundler (esbuild on Vite <=7).
+    pub esbuild_options: Option<serde_json::Value>,
+    /// Opaque options forwarded to the underlying bundler (rolldown on Vite 8).
+    pub rolldown_options: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -53,6 +62,15 @@ pub struct ServerConfig {
     pub headers: Option<BTreeMap<String, String>>,
     pub proxy: Option<BTreeMap<String, ProxyEntry>>,
     pub fs: Option<FsConfig>,
+    pub warmup: Option<WarmupConfig>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WarmupConfig {
+    /// Client modules to transform eagerly at startup so their first request is warm.
+    pub client_files: Option<Vec<String>>,
+    pub ssr_files: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
