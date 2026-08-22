@@ -216,7 +216,9 @@ pub struct DevServer {
     pub bundle: bool,
     pub host: Option<String>,
     pub config: Option<PathBuf>,
-    /// Disable the on-disk module cache (always recompile).
+    /// Enable the experimental on-disk module cache (off by default).
+    pub enable_cache: bool,
+    /// Force the on-disk module cache off even if enabled.
     pub no_cache: bool,
     /// Skip the eager graph crawl; compile modules on demand (Vite's default).
     pub lazy: bool,
@@ -372,10 +374,13 @@ impl DevServer {
         let server_cfg = config.server.clone().unwrap_or_default();
         let port = self.port.or(server_cfg.port).unwrap_or(5199);
         let bundle = self.bundle || config.bundle.unwrap_or(false);
-        // The on-disk module cache is on by default; `oj dev --no-cache` (or
-        // OJ_NO_CACHE=1) turns it off so every module recompiles each start.
-        let persistent_cache = !self.no_cache
-            && !std::env::var("OJ_NO_CACHE").is_ok_and(|v| !v.is_empty() && v != "0");
+        // The on-disk module cache is experimental and off by default. Opt in
+        // with `oj dev --enable-cache` (or OJ_ENABLE_CACHE=1); `--no-cache`
+        // (or OJ_NO_CACHE=1) forces it off even when otherwise enabled.
+        let env_flag = |k: &str| std::env::var(k).is_ok_and(|v| !v.is_empty() && v != "0");
+        let cache_enabled = self.enable_cache || env_flag("OJ_ENABLE_CACHE");
+        let cache_forced_off = self.no_cache || env_flag("OJ_NO_CACHE");
+        let persistent_cache = cache_enabled && !cache_forced_off;
         let host = resolve_host(self.host.as_deref().or(server_cfg.host.as_deref()));
         let proxy: Vec<(String, oj_config::ProxyEntry)> = server_cfg
             .proxy
