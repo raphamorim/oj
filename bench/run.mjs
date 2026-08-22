@@ -20,12 +20,12 @@ const OJ_BIN = path.join(repo, "target", "release", "oj");
 const TOOLS = {
   oj: {
     port: 5199,
-    spawn: () => spawn(OJ_BIN, ["dev", app, "--port", "5199"], { stdio: "ignore" }),
+    spawn: () => spawn(OJ_BIN, ["dev", app, "--port", "5199", "--enable-cache"], { stdio: "ignore" }),
     clearCache: () => fs.rmSync(path.join(app, ".oj-cache"), { recursive: true, force: true }),
   },
   "oj-bundle": {
     port: 5199,
-    spawn: () => spawn(OJ_BIN, ["dev", app, "--port", "5199", "--bundle"], { stdio: "ignore" }),
+    spawn: () => spawn(OJ_BIN, ["dev", app, "--port", "5199", "--bundle", "--enable-cache"], { stdio: "ignore" }),
     clearCache: () => fs.rmSync(path.join(app, ".oj-cache"), { recursive: true, force: true }),
   },
   vite: {
