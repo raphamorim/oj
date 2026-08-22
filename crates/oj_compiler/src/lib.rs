@@ -25,10 +25,20 @@ pub type ImportRewriter<'r> = dyn FnMut(&str) -> Option<String> + 'r;
 
 pub const COMPILE_STACK_SIZE: usize = 16 * 1024 * 1024;
 
-static F_IMPORT_META_ENV: LazyLock<Finder<'static>> =
+// SIMD substring scanners (memchr), built once and reused as cheap gates before
+// expensive transforms. Shared with `bundle.rs` so both compile paths scan the
+// same way instead of falling back to scalar `str::contains`.
+pub(crate) static F_IMPORT_META_ENV: LazyLock<Finder<'static>> =
     LazyLock::new(|| Finder::new("import.meta.env"));
-static F_IMPORT_META_GLOB: LazyLock<Finder<'static>> =
+pub(crate) static F_IMPORT_META_GLOB: LazyLock<Finder<'static>> =
     LazyLock::new(|| Finder::new("import.meta.glob"));
+pub(crate) static F_IMPORT_PAREN: LazyLock<Finder<'static>> =
+    LazyLock::new(|| Finder::new("import("));
+
+/// True if `source` contains the needle, via the SIMD memmem finder.
+pub(crate) fn scan(finder: &Finder<'static>, source: &str) -> bool {
+    finder.find(source.as_bytes()).is_some()
+}
 
 pub(crate) fn detect_refresh_registrations(program: &Program) -> bool {
     use oxc_ast::ast::{CallExpression, Expression};
@@ -265,7 +275,7 @@ pub fn compile_module(
 
     // Expand dynamic-import-vars (import(`./x/${v}.js`)) in dev too — the build
     // path already does; without it these work in `oj build` but throw in dev.
-    if source_text.contains("import(") {
+    if scan(&F_IMPORT_PAREN, source_text) {
         let dir = path.parent().unwrap_or(path);
         synthesized |= glob::expand_dynamic_import_vars(&allocator, dir, &mut program, source_text);
     }
