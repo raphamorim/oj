@@ -53,10 +53,50 @@ pub fn compile_factory(
 ) -> Result<FactoryOutput, CompileError> {
     let is_dep = url.starts_with("/node_modules/")
         || (url.starts_with("/@fs/") && url.contains("/node_modules/"));
-    if is_dep && !crate::cjs::has_module_syntax_pub(path, source_text) {
+    if !is_dep {
+        // App source is ESM.
+        return compile_esm_factory(path, url, source_text, resolve, true);
+    }
+
+    // Dependency: parse once to decide ESM vs CJS, and reuse that parse for the
+    // ESM pipeline instead of parsing a second time (the old path parsed once in
+    // `has_module_syntax` and again in `compile_esm_factory`). A file that can't
+    // parse as a module, or has no top-level import/export, is CommonJS and the
+    // CJS path re-parses it in sloppy mode (which allows `with`, top-level `this`,
+    // and other script-only forms an ESM parse rejects).
+    let allocator = Allocator::default();
+    let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::mjs());
+    let parsed = Parser::new(&allocator, source_text, source_type).parse();
+    if parsed.panicked {
         return compile_cjs_factory(path, source_text, resolve);
     }
-    compile_esm_factory(path, url, source_text, resolve, !is_dep)
+    let has_module_syntax = parsed.program.body.iter().any(|stmt| {
+        matches!(
+            stmt,
+            Statement::ImportDeclaration(_)
+                | Statement::ExportDeclaration(_)
+                | Statement::ExportNamedDeclaration(_)
+                | Statement::ExportFromDeclaration(_)
+                | Statement::ExportAllDeclaration(_)
+                | Statement::ExportDefaultDeclaration(_)
+        )
+    });
+    if !has_module_syntax {
+        return compile_cjs_factory(path, source_text, resolve);
+    }
+    if !parsed.diagnostics.is_empty() {
+        let message = parsed
+            .diagnostics
+            .into_iter()
+            .map(|d| format!("{:?}", d.with_source_code(source_text.to_string())))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(CompileError::Parse {
+            path: path.to_path_buf(),
+            message,
+        });
+    }
+    compile_esm_factory_from_parsed(&allocator, parsed.program, path, url, source_text, resolve, false)
 }
 
 fn compile_cjs_factory(
@@ -101,7 +141,6 @@ fn compile_esm_factory(
 ) -> Result<FactoryOutput, CompileError> {
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::mjs());
-
     let parsed = Parser::new(&allocator, source_text, source_type).parse();
     if parsed.panicked || !parsed.diagnostics.is_empty() {
         let message = parsed
@@ -115,7 +154,22 @@ fn compile_esm_factory(
             message,
         });
     }
-    let mut program = parsed.program;
+    compile_esm_factory_from_parsed(&allocator, parsed.program, path, url, source_text, resolve, refresh)
+}
+
+/// The ESM factory pipeline over an already-parsed program. Splitting the parse
+/// out lets `compile_factory` parse a dependency once to detect module syntax and
+/// then reuse that parse here, instead of parsing a second time to compile.
+fn compile_esm_factory_from_parsed<'a>(
+    allocator: &'a Allocator,
+    program: oxc_ast::ast::Program<'a>,
+    path: &Path,
+    url: &str,
+    source_text: &str,
+    resolve: &mut ImportRewriter,
+    refresh: bool,
+) -> Result<FactoryOutput, CompileError> {
+    let mut program = program;
 
     let scoping = SemanticBuilder::new()
         .with_excess_capacity(2.0)
@@ -129,7 +183,7 @@ fn compile_esm_factory(
     if refresh {
         transform_options.jsx.refresh = Some(ReactRefreshOptions::default());
     }
-    let ret = Transformer::new(&allocator, path, &transform_options)
+    let ret = Transformer::new(allocator, path, &transform_options)
         .build_with_scoping(scoping, &mut program);
     if !ret.diagnostics.is_empty() {
         let message = ret
@@ -146,16 +200,16 @@ fn compile_esm_factory(
 
     let is_refresh_boundary = refresh && crate::detect_refresh_registrations(&program);
 
-    if source_text.contains("import(") {
+    if crate::scan(&crate::F_IMPORT_PAREN, source_text) {
         crate::glob::expand_dynamic_import_vars(
-            &allocator,
+            allocator,
             path.parent().unwrap_or(path),
             &mut program,
             source_text,
         );
     }
 
-    if source_text.contains("import.meta.env") {
+    if crate::scan(&crate::F_IMPORT_META_ENV, source_text) {
         use oxc_transformer_plugins::{ReplaceGlobalDefines, ReplaceGlobalDefinesConfig};
         let scoping = SemanticBuilder::new()
             .build(&program)
@@ -163,16 +217,16 @@ fn compile_esm_factory(
             .into_scoping();
         let defines = crate::import_meta_env_defines(true);
         if let Ok(config) = ReplaceGlobalDefinesConfig::new(&defines) {
-            let _ = ReplaceGlobalDefines::new(&allocator, config).build(scoping, &mut program);
+            let _ = ReplaceGlobalDefines::new(allocator, config).build(scoping, &mut program);
         }
     }
 
-    if source_text.contains("import.meta.glob") {
-        crate::glob::expand(&allocator, path.parent().unwrap_or(path), &mut program);
+    if crate::scan(&crate::F_IMPORT_META_GLOB, source_text) {
+        crate::glob::expand(allocator, path.parent().unwrap_or(path), &mut program);
     }
 
     let (_, dynamic_imports) =
-        crate::rewrite_module_specifiers_pub(&allocator, &mut program, resolve);
+        crate::rewrite_module_specifiers_pub(allocator, &mut program, resolve);
 
     let semantic = SemanticBuilder::new()
         .with_build_nodes(true)
@@ -287,14 +341,14 @@ fn compile_esm_factory(
     drop(semantic);
 
     let mut rewriter = RefRewriter {
-        allocator: &allocator,
+        allocator: allocator,
         replacements: &replacements,
         url,
     };
     rewriter.visit_program(&mut program);
 
-    let old_body = std::mem::replace(&mut program.body, oxc_allocator::Vec::new_in(&&allocator));
-    let mut new_body = oxc_allocator::Vec::new_in(&&allocator);
+    let old_body = std::mem::replace(&mut program.body, oxc_allocator::Vec::new_in(&allocator));
+    let mut new_body = oxc_allocator::Vec::new_in(&allocator);
 
     let mut prologue = String::new();
     if has_default_expr {
@@ -318,7 +372,7 @@ fn compile_esm_factory(
     for vi in &stars {
         prologue.push_str(&format!("__oj_export_star(_oj_m{vi}, __oj_exports);\n"));
     }
-    for stmt in parse_snippet(&allocator, &prologue, path)? {
+    for stmt in parse_snippet(allocator, &prologue, path)? {
         new_body.push(stmt);
     }
 
@@ -342,7 +396,7 @@ fn compile_esm_factory(
                     }
                     K::FunctionDeclaration(f) => {
                         push_default_assignment(
-                            &allocator,
+                            allocator,
                             &mut new_body,
                             Expression::FunctionExpression(f),
                             path,
@@ -350,7 +404,7 @@ fn compile_esm_factory(
                     }
                     K::ClassDeclaration(c) => {
                         push_default_assignment(
-                            &allocator,
+                            allocator,
                             &mut new_body,
                             Expression::ClassExpression(c),
                             path,
@@ -358,7 +412,7 @@ fn compile_esm_factory(
                     }
                     kind => {
                         push_default_assignment(
-                            &allocator,
+                            allocator,
                             &mut new_body,
                             kind.into_expression(),
                             path,
