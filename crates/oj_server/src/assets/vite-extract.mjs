@@ -127,7 +127,7 @@ function extractAlias(alias) {
   for (const [find, replacement] of entries) {
     if (typeof replacement !== "string") continue;
     if (typeof find === "string") {
-      out[find] = replacement;
+      if (out[find] == null) out[find] = replacement;
     } else if (find instanceof RegExp) {
       const key = aliasKeyFromRegex(find.source);
       if (!key || /[.*+?()[\]{}|^$]/.test(key)) {
