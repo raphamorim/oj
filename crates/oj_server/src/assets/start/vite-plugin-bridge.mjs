@@ -105,7 +105,7 @@ export function findConfig(app) {
   return null;
 }
 
-export function createPluginContainer(vite, allPlugins, { command = "serve", mode = "development", environment = "client" } = {}) {
+export function createPluginContainer(vite, allPlugins, { command = "serve", mode = command === "build" ? "production" : "development", environment = "client" } = {}) {
   const plugins = ordered(
     allPlugins.filter(
       (p) => (p.resolveId || p.load || p.transform || p.generateBundle) && applyMatches(p, command, mode),
@@ -128,7 +128,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
     environment: {
       name: environment,
       mode: command === "build" ? "build" : "dev",
-      config: { command, consumer, mode: command === "build" ? "production" : "development" },
+      config: { command, consumer, mode },
     },
     meta: { rollupVersion: "4.0.0", watchMode: command !== "build", framework: "oj" },
     warn() {}, info() {}, debug() {},

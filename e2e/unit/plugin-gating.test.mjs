@@ -118,7 +118,9 @@ test("plugin hooks receive the configured Vite mode", async () => {
 
   const staging = createPluginContainer({}, [plugin], { command: "serve", mode: "staging" });
   const preview = createPluginContainer({}, [plugin], { command: "build", mode: "preview" });
+  const defaults = createPluginContainer({}, [plugin], { command: "build" });
 
   assert.equal(await staging.transform("", "/app.ts"), 'export default "staging";');
   assert.equal(await preview.transform("", "/app.ts"), 'export default "preview";');
+  assert.equal(await defaults.transform("", "/app.ts"), 'export default "production";');
 });
