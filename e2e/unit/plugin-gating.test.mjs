@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -108,4 +108,37 @@ test("hookHandler / hookFilter: function form and object form", () => {
 
   assert.equal(hookHandler(undefined), null);
   assert.equal(hookHandler({ handler: "not-a-fn" }), null);
+});
+
+test("plugin hook contexts resolve virtual dependencies without reentering themselves", async () => {
+  let resolverCalls = 0;
+  const container = createPluginContainer({}, [
+    {
+      name: "synthetic-delegating-resolver",
+      async resolveId(source, importer) {
+        if (source !== "virtual:entry") return null;
+        resolverCalls++;
+        const resolved = await this.resolve(source, importer, { skipSelf: true });
+        return `${resolved.id}?wrapped`;
+      },
+    },
+    {
+      name: "synthetic-fallback-resolver",
+      resolveId(source) {
+        return source.startsWith("virtual:") ? `\0resolved:${source.slice(8)}` : null;
+      },
+    },
+    {
+      name: "synthetic-dependency-loader",
+      async load(id) {
+        if (id !== "\0resolved:entry?wrapped") return null;
+        const dependency = await this.resolve("virtual:dependency", id);
+        return `export default ${JSON.stringify(dependency.id)};`;
+      },
+    },
+  ]);
+
+  assert.equal(await container.resolveId("virtual:entry", "/app.ts"), "\0resolved:entry?wrapped");
+  assert.equal(resolverCalls, 1);
+  assert.equal(await container.load("\0resolved:entry?wrapped"), 'export default "\\u0000resolved:dependency";');
 });
