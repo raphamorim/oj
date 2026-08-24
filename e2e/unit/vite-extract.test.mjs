@@ -14,6 +14,15 @@ test("array-form string aliases are read from find/replacement", () => {
   assert.deepEqual(out, { "@app": "/src" });
 });
 
+test("duplicate array-form aliases preserve Vite first-match precedence", () => {
+  const out = extractAlias([
+    { find: "@app", replacement: "/first/src" },
+    { find: "@app", replacement: "/second/src" },
+  ]);
+
+  assert.equal(out["@app"], "/first/src");
+});
+
 test("a monorepo regex alias pair collapses to one directory alias", () => {
   // The standard TanStack/monorepo shape: an exact match to the package entry
   // plus a subpath match. Both must collapse to `@x/pkg -> .../src`.
