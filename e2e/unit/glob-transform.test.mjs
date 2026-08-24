@@ -140,6 +140,21 @@ test("non-eager import:default awaits the default export", () => {
   }
 });
 
+test("glob query objects are serialized into generated import specifiers", () => {
+  const dir = fixture();
+  try {
+    const out = transformGlob(
+      'const modules = import.meta.glob("./content/*.md", { query: { raw: "", locale: "en US" } });',
+      join(dir, "index.ts"),
+    );
+
+    assert.match(out, /import\("\.\/content\/a\.md\?raw=&locale=en\+US"\)/);
+    assert.match(out, /"\.\/content\/a\.md":/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("negated patterns exclude matches", () => {
   const dir = fixture();
   try {
