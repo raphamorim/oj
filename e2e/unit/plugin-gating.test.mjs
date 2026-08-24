@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -108,4 +108,22 @@ test("hookHandler / hookFilter: function form and object form", () => {
 
   assert.equal(hookHandler(undefined), null);
   assert.equal(hookHandler({ handler: "not-a-fn" }), null);
+});
+
+test("transform hooks honor per-hook pre and post ordering", async () => {
+  const plugin = (name, order) => ({
+    name,
+    transform: {
+      ...(order ? { order } : {}),
+      handler(code) { return `${code}${name};`; },
+    },
+  });
+  const container = createPluginContainer({}, [
+    plugin("post", "post"),
+    plugin("normal"),
+    plugin("pre", "pre"),
+  ]);
+
+  assert.equal(await container.transform("", "/app.ts"), "pre;normal;post;");
+  assert.equal(await container.transformUserCode("", "/app.ts"), "pre;normal;post;");
 });
