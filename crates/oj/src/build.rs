@@ -1070,7 +1070,8 @@ pub async fn build(
 
     let mut config =
         oj_config::load_with(&root, "build", mode).map_err(|e| anyhow::anyhow!("{e}"))?;
-    oj_server::plugins::adopt_vite_config_values(&mut config, &root);
+    oj_server::plugins::adopt_vite_config_values(&mut config, &root)
+        .map_err(|error| anyhow::anyhow!(error))?;
     let build_cfg = config.build.clone().unwrap_or_default();
     let ro_opts = oj_config::rolldown_options(&config);
     let out = out
@@ -1527,7 +1528,8 @@ pub(crate) async fn build_ssr(
 
     let mut config =
         oj_config::load_with(root, "build", "production").map_err(|e| anyhow::anyhow!("{e}"))?;
-    oj_server::plugins::adopt_vite_config_values(&mut config, root);
+    oj_server::plugins::adopt_vite_config_values(&mut config, root)
+        .map_err(|error| anyhow::anyhow!(error))?;
     let ssr_base = config.base.clone().unwrap_or_else(|| "/".into());
     let plugin_host = user_plugin_host(
         root,
@@ -2033,7 +2035,8 @@ async fn build_client_entry(
 
     let mut config =
         oj_config::load_with(root, "build", "production").map_err(|e| anyhow::anyhow!("{e}"))?;
-    oj_server::plugins::adopt_vite_config_values(&mut config, root);
+    oj_server::plugins::adopt_vite_config_values(&mut config, root)
+        .map_err(|error| anyhow::anyhow!(error))?;
     let client_base = config.base.clone().unwrap_or_else(|| "/".into());
     let plugin_host = user_plugin_host(
         root,

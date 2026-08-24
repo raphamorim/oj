@@ -213,25 +213,27 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
         eprint!("{stderr}");
     }
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    if json.get("__ok").and_then(|v| v.as_bool()) == Some(true) {
-        let deps: Vec<PathBuf> = json
-            .get("__deps")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|d| d.as_str().map(PathBuf::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        store.store(
-            &vite,
-            "serve",
-            "development",
-            &deps,
-            &String::from_utf8_lossy(&out.stdout),
-            &stderr,
-        );
+    if json.get("__ok").and_then(|value| value.as_bool()) != Some(true) {
+        return None;
     }
+    let deps: Vec<PathBuf> = json
+        .get("__deps")
+        .and_then(|values| values.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|dependency| dependency.as_str().map(PathBuf::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    store.store(
+        &vite,
+        "serve",
+        "development",
+        &deps,
+        &String::from_utf8_lossy(&out.stdout),
+        &stderr,
+    );
     crate::boot_phase("vite-extract cache miss (subprocess ran)");
     Some(parse_vite_values(&json))
 }
@@ -273,11 +275,20 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
 }
 
 #[inline]
-pub fn adopt_vite_config_values(config: &mut oj_config::OjConfig, root: &Path) {
+pub fn adopt_vite_config_values(
+    config: &mut oj_config::OjConfig,
+    root: &Path,
+) -> Result<(), String> {
     let Some(v) = extract_vite_values(root) else {
-        return;
+        if plugins_file(root).is_none() {
+            if let Some(path) = vite_config_file(root) {
+                return Err(format!("failed to load Vite config: {}", path.display()));
+            }
+        }
+        return Ok(());
     };
     merge_vite_values(config, v);
+    Ok(())
 }
 
 fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
