@@ -48,9 +48,17 @@ function matchPattern(fileDir, pattern) {
   const starIdx = absGlob.search(/[*?{]/);
   const base = starIdx === -1 ? dirname(absGlob) : absGlob.slice(0, absGlob.lastIndexOf("/", starIdx));
   const re = globToRegExp(absGlob);
+  const explicitHidden = absGlob.slice(base.length + 1).split("/")
+    .filter((part) => part.startsWith("."))
+    .map(globToRegExp);
   const all = [];
   walk(base.split("/").join(sep), all);
-  return all.filter((f) => re.test(f.split(sep).join("/")));
+  return all.filter((f) => {
+    const normalized = f.split(sep).join("/");
+    if (!re.test(normalized)) return false;
+    return normalized.slice(base.length + 1).split("/")
+      .every((part) => !part.startsWith(".") || explicitHidden.some((pattern) => pattern.test(part)));
+  });
 }
 
 const toRel = (fileDir, abs) => {

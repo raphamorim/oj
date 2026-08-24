@@ -38,6 +38,24 @@ test("expands a lazy glob to a map of dynamic imports", () => {
   }
 });
 
+test("glob wildcards omit hidden paths unless explicitly requested", () => {
+  const dir = fixture();
+  try {
+    writeFileSync(join(dir, "content", ".hidden.md"), "hidden");
+    mkdirSync(join(dir, "content", ".draft"), { recursive: true });
+    writeFileSync(join(dir, "content", ".draft", "nested.md"), "draft");
+
+    const normal = transformGlob('const modules = import.meta.glob("./content/**/*.md");', join(dir, "index.ts"));
+    const explicit = transformGlob('const modules = import.meta.glob("./content/.*.md");', join(dir, "index.ts"));
+
+    assert.match(normal, /\.\/content\/a\.md/);
+    assert.doesNotMatch(normal, /\.hidden\.md|\.draft/);
+    assert.match(explicit, /\.\/content\/\.hidden\.md/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("handles the <T> type argument and a single-star segment", () => {
   const dir = fixture();
   try {
