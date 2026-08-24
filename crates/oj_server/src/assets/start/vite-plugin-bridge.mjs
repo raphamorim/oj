@@ -40,7 +40,10 @@ function envAllows(plugin, environment) {
 }
 
 function matchOne(pat, id) {
-  if (pat instanceof RegExp) return pat.test(id);
+  if (pat instanceof RegExp) {
+    pat.lastIndex = 0;
+    return pat.test(id);
+  }
   if (typeof pat === "string") return id.includes(pat);
   return false;
 }

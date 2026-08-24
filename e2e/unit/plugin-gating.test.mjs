@@ -13,6 +13,16 @@ test("matchOne: RegExp tests, string is a substring match", () => {
   assert.ok(!matchOne("virtual:", "./real"));
 });
 
+test("global and sticky expression filters match consistently across modules", () => {
+  const global = /\.tsx$/g;
+  const sticky = /component/y;
+
+  assert.ok(matchOne(global, "/src/first.tsx"));
+  assert.ok(matchOne(global, "/src/second.tsx"));
+  assert.ok(matchOne(sticky, "component-one"));
+  assert.ok(matchOne(sticky, "component-two"));
+});
+
 test("idAllowed: no filter allows everything", () => {
   assert.ok(idAllowed(undefined, "anything"));
   assert.ok(idAllowed(null, "anything"));
