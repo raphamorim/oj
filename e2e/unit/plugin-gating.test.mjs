@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -108,4 +108,17 @@ test("hookHandler / hookFilter: function form and object form", () => {
 
   assert.equal(hookHandler(undefined), null);
   assert.equal(hookHandler({ handler: "not-a-fn" }), null);
+});
+
+test("plugin hooks receive the configured Vite mode", async () => {
+  const plugin = {
+    name: "synthetic-mode-transform",
+    transform() { return `export default ${JSON.stringify(this.environment.config.mode)};`; },
+  };
+
+  const staging = createPluginContainer({}, [plugin], { command: "serve", mode: "staging" });
+  const preview = createPluginContainer({}, [plugin], { command: "build", mode: "preview" });
+
+  assert.equal(await staging.transform("", "/app.ts"), 'export default "staging";');
+  assert.equal(await preview.transform("", "/app.ts"), 'export default "preview";');
 });
