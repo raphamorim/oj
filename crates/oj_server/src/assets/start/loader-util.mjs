@@ -114,11 +114,20 @@ export function readJsonc(file) {
 }
 
 export function parseImportsField(imports = {}) {
+  const targetOf = (target) => {
+    if (typeof target === "string") return target;
+    if (Array.isArray(target)) {
+      for (const entry of target) {
+        const resolved = targetOf(entry);
+        if (resolved) return resolved;
+      }
+      return null;
+    }
+    if (!target || typeof target !== "object") return null;
+    return targetOf(target.import) ?? targetOf(target.default) ?? targetOf(target.node);
+  };
   return Object.entries(imports)
-    .map(([pattern, target]) => [
-      pattern,
-      typeof target === "string" ? target : target?.import ?? target?.default ?? target?.node,
-    ])
+    .map(([pattern, target]) => [pattern, targetOf(target)])
     .filter(([, t]) => typeof t === "string");
 }
 
