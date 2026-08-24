@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: MIT
-import assert from "node:assert/strict";
-import assert from "node:assert/strict";
-import assert from "node:assert/strict";
-import assert from "node:assert/strict";
 
+import assert from "node:assert/strict";
 import { test } from "node:test";
 import { __test, createPluginContainer, findConfig, loadPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
-
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
 test("matchOne: RegExp tests, string is a picomatch-style glob (Vite pluginFilter)", () => {
@@ -21,19 +20,6 @@ test("matchOne: RegExp tests, string is a picomatch-style glob (Vite pluginFilte
   assert.ok(matchOne("src/**/*.tsx", root + "/src/pages/a.tsx"));
   assert.ok(!matchOne("src/**/*.tsx", "/elsewhere/src/pages/a.tsx"));
   assert.ok(!matchOne("virtual:", "virtual:foo"));
-});
-
-test("findConfig discovers CommonJS Vite configuration formats", () => {
-  for (const name of ["vite.config.cjs", "vite.config.cts"]) {
-    const root = mkdtempSync(join(tmpdir(), "oj-config-format-"));
-    try {
-      const config = join(root, name);
-      writeFileSync(config, "module.exports = {};\n");
-      assert.equal(findConfig(root), config);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  }
 });
 
 test("idAllowed: no filter allows everything", () => {
@@ -153,6 +139,21 @@ test("generateBundle honors environment consumer gates", async () => {
   assert.equal(emitted[0].fileName, "server-manifest.json");
 });
 
+// PR #54
+test("findConfig discovers CommonJS Vite configuration formats", () => {
+  for (const name of ["vite.config.cjs", "vite.config.cts"]) {
+    const root = mkdtempSync(join(tmpdir(), "oj-config-format-"));
+    try {
+      const config = join(root, name);
+      writeFileSync(config, "module.exports = {};\n");
+      assert.equal(findConfig(root), config);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+// PR #55
 test("plugin container preserves an explicitly disabled Vite public directory", async () => {
   const root = mkdtempSync(join(tmpdir(), "oj-no-public-"));
   try {
@@ -170,6 +171,7 @@ test("plugin container preserves an explicitly disabled Vite public directory", 
   }
 });
 
+// PR #43
 test("plugin hooks receive the configured Vite mode", async () => {
   const plugin = {
     name: "synthetic-mode-transform",
@@ -185,6 +187,7 @@ test("plugin hooks receive the configured Vite mode", async () => {
   assert.equal(await defaults.transform("", "/app.ts"), 'export default "production";');
 });
 
+// PR #44
 test("resolveId and load receive Vite SSR hook options", async () => {
   const plugin = {
     name: "synthetic-environment-module",
@@ -192,14 +195,6 @@ test("resolveId and load receive Vite SSR hook options", async () => {
       return `\0${options?.ssr ? "server" : "client"}:${source}`;
     },
     load(_id, options) {
-      return `export default ${JSON.stringify(options?.ssr ? "server" : "client")};`;
-    },
-  };
-
-test("transform hooks receive the active SSR environment option", async () => {
-  const plugin = {
-    name: "synthetic-environment-transform",
-    transform(_code, _id, options) {
       return `export default ${JSON.stringify(options?.ssr ? "server" : "client")};`;
     },
   };
@@ -213,6 +208,7 @@ test("transform hooks receive the active SSR environment option", async () => {
   assert.equal(await client.load("\0client:virtual:entry"), 'export default "client";');
 });
 
+// PR #52
 test("transform hooks receive the active SSR environment option", async () => {
   const plugin = {
     name: "synthetic-environment-transform",
@@ -228,6 +224,7 @@ test("transform hooks receive the active SSR environment option", async () => {
   assert.equal(await client.transform("", "/page.mdx"), 'export default "client";');
 });
 
+// PR #41
 test("buildStart runs plugins whose only hook initializes generated sources", async () => {
   let initialized = 0;
   const container = createPluginContainer({}, [{
@@ -241,6 +238,7 @@ test("buildStart runs plugins whose only hook initializes generated sources", as
   assert.equal(initialized, 1);
 });
 
+// PR #67
 test("moduleParsed plugins observe transformed framework and user modules", async () => {
   const parsed = [];
   const container = createPluginContainer({}, [

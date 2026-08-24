@@ -158,7 +158,8 @@ export function findConfig(app) {
 export function createPluginContainer(vite, allPlugins, { command = "serve", mode = command === "build" ? "production" : "development", environment = "client" } = {}) {
   const plugins = ordered(
     allPlugins.filter(
-      (p) => (p.buildStart || p.resolveId || p.load || p.transform || p.generateBundle) && applyMatches(p, command, mode),
+      (p) => (p.buildStart || p.resolveId || p.load || p.transform || p.moduleParsed || p.generateBundle)
+        && applyMatches(p, command, mode),
     ),
   );
 
@@ -215,6 +216,14 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
     return null;
   }
 
+  async function moduleParsed(id, code) {
+    const info = { id, code, importedIds: [] };
+    for (const plugin of plugins) {
+      const handler = hookHandler(plugin.moduleParsed);
+      if (handler && envAllows(plugin, environment)) await handler.call(ctx, info);
+    }
+  }
+
   async function transform(code, id) {
     let current = code, changed = false;
     for (const p of plugins) {
@@ -226,6 +235,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
       const next = r == null ? null : typeof r === "string" ? r : r.code;
       if (next != null) { current = next; changed = true; }
     }
+    await moduleParsed(id, current);
     return changed ? current : null;
   }
 
@@ -241,6 +251,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
       const next = r == null ? null : typeof r === "string" ? r : r.code;
       if (next != null) { current = next; changed = true; }
     }
+    await moduleParsed(id, current);
     return changed ? current : null;
   }
 
