@@ -132,6 +132,18 @@ test("parseImportsField tolerates an empty/absent map", () => {
   assert.deepEqual(parseImportsField({}), []);
 });
 
+test("parseImportsField resolves fallback arrays and nested import conditions", () => {
+  const rules = Object.fromEntries(parseImportsField({
+    "#fallback": [null, "./src/fallback.ts"],
+    "#nested": { import: { default: "./src/nested.ts" } },
+    "#array-condition": [{ require: "./ignored.cjs" }, { import: "./src/module.ts" }],
+  }));
+
+  assert.equal(rules["#fallback"], "./src/fallback.ts");
+  assert.equal(rules["#nested"], "./src/nested.ts");
+  assert.equal(rules["#array-condition"], "./src/module.ts");
+});
+
 test("mergeTsConfig merges paths across an extends chain, later wins", () => {
   const base = "/app";
   const chain = [
