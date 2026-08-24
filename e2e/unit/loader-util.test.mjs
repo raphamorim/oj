@@ -224,3 +224,17 @@ test("stripJsonc + readJsonc tolerate comments and trailing commas", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("readJsonc preserves comma-and-bracket sequences inside string values", () => {
+  const dir = mk("jsonc-string");
+  try {
+    const file = join(dir, "tsconfig.json");
+    writeFileSync(file, '{"compilerOptions":{"custom":"literal,} and ,]",},}');
+
+    assert.deepEqual(readJsonc(file), {
+      compilerOptions: { custom: "literal,} and ,]" },
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

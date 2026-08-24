@@ -97,6 +97,9 @@ export function stripJsonc(s) {
     if (c === '"' || c === "'") { inStr = true; q = c; out += c; i++; continue; }
     if (c === "/" && n === "/") { while (i < s.length && s[i] !== "\n") i++; continue; }
     if (c === "/" && n === "*") { i += 2; while (i < s.length && !(s[i] === "*" && s[i + 1] === "/")) i++; i += 2; continue; }
+    if (c === "," && /^(?:\s|\/\/[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*[}\]]/.test(s.slice(i + 1))) {
+      i++; continue;
+    }
     out += c; i++;
   }
   return out;
@@ -104,7 +107,7 @@ export function stripJsonc(s) {
 
 export function readJsonc(file) {
   try {
-    return JSON.parse(stripJsonc(readFileSync(file, "utf8")).replace(/,(\s*[}\]])/g, "$1"));
+    return JSON.parse(stripJsonc(readFileSync(file, "utf8")));
   } catch {
     return null;
   }
