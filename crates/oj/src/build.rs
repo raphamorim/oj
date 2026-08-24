@@ -1100,11 +1100,27 @@ pub async fn build(
         return build_library(&root, &out_dir, lib, minify, sourcemap).await;
     }
 
-    let html_path = root.join("index.html");
-    let html = fs::read_to_string(&html_path)
-        .with_context(|| format!("no index.html in {}", root.display()))?;
-
-    let entries = module_script_srcs(&html);
+    let html_paths = configured_html_inputs(&root, ro_opts);
+    let mut html_pages: Vec<(PathBuf, String)> = html_paths
+        .into_iter()
+        .map(|html_path| {
+            fs::read_to_string(&html_path)
+                .map(|source| (html_path, source))
+                .with_context(|| format!("cannot read HTML entry in {}", root.display()))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    if html_pages.is_empty() {
+        bail!("no index.html in {}", root.display());
+    }
+    let (html_path, html) = html_pages.remove(0);
+    let mut entries = module_script_srcs(&html);
+    for (_, page) in &html_pages {
+        for entry in module_script_srcs(page) {
+            if !entries.contains(&entry) {
+                entries.push(entry);
+            }
+        }
+    }
     if entries.is_empty() {
         bail!("index.html has no <script type=\"module\" src=...> entry");
     }
@@ -1248,6 +1264,10 @@ pub async fn build(
         oj_env::html_env_map(&defines)
     };
     let mut rewritten_html = oj_env::replace_html_env(&html, &html_env);
+    let mut additional_html: Vec<(PathBuf, String)> = html_pages
+        .into_iter()
+        .map(|(path, source)| (path, oj_env::replace_html_env(&source, &html_env)))
+        .collect();
     let mut emitted: Vec<(String, usize)> = Vec::new();
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
     let mut imports_map: std::collections::HashMap<String, Vec<String>> =
@@ -1307,6 +1327,9 @@ pub async fn build(
                         if Path::new(facade.as_ref()) == entry_abs.as_path() {
                             rewritten_html = rewritten_html
                                 .replace(entry.as_str(), &with_base(&filename, &base));
+                            for (_, page) in &mut additional_html {
+                                *page = page.replace(entry.as_str(), &with_base(&filename, &base));
+                            }
                         }
                     }
                 }
@@ -1345,6 +1368,12 @@ pub async fn build(
             ),
             None => format!("{links}\n{rewritten_html}"),
         };
+        for (_, page) in &mut additional_html {
+            *page = match page.find("</head>") {
+                Some(index) => format!("{}{}\n{}", &page[..index], links, &page[index..]),
+                None => format!("{links}\n{page}"),
+            };
+        }
     }
 
     for href in link_hrefs(&html) {
@@ -1401,6 +1430,12 @@ pub async fn build(
                 ),
                 None => format!("{link}\n{rewritten_html}"),
             };
+            for (_, page) in &mut additional_html {
+                *page = match page.find("</head>") {
+                    Some(index) => format!("{}{}\n{}", &page[..index], link, &page[index..]),
+                    None => format!("{link}\n{page}"),
+                };
+            }
             for entry in &mut manifest_entries {
                 if entry.is_entry {
                     entry.css.push(css_name.clone());
@@ -1433,7 +1468,32 @@ pub async fn build(
             rewritten_html = out;
         }
     }
-    fs::write(out_dir.join("index.html"), rewritten_html)?;
+    write_html_output(&root, &out_dir, &html_path, &rewritten_html)?;
+
+    for (page_path, mut page) in additional_html {
+        if css_split {
+            let stylesheets: std::collections::BTreeSet<_> = manifest_entries
+                .iter()
+                .flat_map(|entry| entry.css.iter())
+                .collect();
+            for stylesheet in stylesheets {
+                let link = format!(
+                    "<link rel=\"stylesheet\" href=\"{}\" />",
+                    with_base(stylesheet, &base)
+                );
+                page = match page.find("</head>") {
+                    Some(index) => format!("{}{}\n{}", &page[..index], link, &page[index..]),
+                    None => format!("{link}\n{page}"),
+                };
+            }
+        }
+        if let Some(host) = &plugin_host {
+            if let Ok(transformed) = host.transform_index_html(&page).await {
+                page = transformed;
+            }
+        }
+        write_html_output(&root, &out_dir, &page_path, &page)?;
+    }
 
     let public_dir = config
         .public_dir
@@ -1466,6 +1526,63 @@ fn human_bytes(bytes: usize) -> String {
     } else {
         format!("{bytes}B")
     }
+}
+
+fn configured_html_inputs(root: &Path, options: Option<&serde_json::Value>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let configured = options.and_then(|value| value.get("input"));
+    let candidates: Vec<&str> = match configured {
+        Some(serde_json::Value::String(value)) => vec![value.as_str()],
+        Some(serde_json::Value::Array(values)) => {
+            values.iter().filter_map(|value| value.as_str()).collect()
+        }
+        Some(serde_json::Value::Object(values)) => {
+            values.values().filter_map(|value| value.as_str()).collect()
+        }
+        _ => Vec::new(),
+    };
+
+    for candidate in candidates {
+        let candidate = PathBuf::from(candidate);
+        if candidate
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("html")
+        {
+            continue;
+        }
+        let candidate = if candidate.is_absolute() {
+            candidate
+        } else {
+            root.join(candidate)
+        };
+        if !paths.contains(&candidate) {
+            paths.push(candidate);
+        }
+    }
+
+    let index = root.join("index.html");
+    if paths.is_empty() && index.is_file() {
+        paths.push(index);
+    } else if let Some(position) = paths.iter().position(|candidate| candidate == &index) {
+        paths.swap(0, position);
+    }
+    paths
+}
+
+fn write_html_output(root: &Path, out_dir: &Path, input: &Path, html: &str) -> anyhow::Result<()> {
+    let relative = input.strip_prefix(root).with_context(|| {
+        format!(
+            "HTML entry is outside the project root: {}",
+            input.display()
+        )
+    })?;
+    let output = out_dir.join(relative);
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(output, html)?;
+    Ok(())
 }
 
 fn module_script_srcs(html: &str) -> Vec<String> {
@@ -2730,6 +2847,38 @@ mod tests {
         assert_eq!(module_script_srcs(html), vec!["src/index.tsx"]);
         let html2 = r#"<script type="module" src="./app/main.ts"></script>"#;
         assert_eq!(module_script_srcs(html2), vec!["./app/main.ts"]);
+    }
+
+    #[test]
+    fn configured_html_inputs_keep_index_first_and_ignore_non_html_entries() {
+        let root = Path::new("/project");
+        let options = serde_json::json!({
+            "input": {
+                "about": "/project/about.html",
+                "home": "/project/index.html",
+                "script": "/project/standalone.js"
+            }
+        });
+
+        assert_eq!(
+            configured_html_inputs(root, Some(&options)),
+            vec![
+                PathBuf::from("/project/index.html"),
+                PathBuf::from("/project/about.html")
+            ]
+        );
+    }
+
+    #[test]
+    fn html_output_rejects_entries_outside_the_project_root() {
+        let result = write_html_output(
+            Path::new("/project"),
+            Path::new("/project/dist"),
+            Path::new("/outside/private.html"),
+            "<html></html>",
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]
