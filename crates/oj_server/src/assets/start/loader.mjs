@@ -107,7 +107,18 @@ const envDelta = (() => {
   }
   return fresh;
 })();
-const DEFINE = viteEnvDefine({ ssr: true, env: { ...process.env, ...envDelta } });
+const configDefines = (() => {
+  try {
+    return Object.fromEntries(
+      Object.entries(rawContainer?.defines() ?? {})
+        .map(([key, value]) => [key, typeof value === "string" ? value : JSON.stringify(value)])
+        .filter(([, value]) => typeof value === "string"),
+    );
+  } catch {
+    return {};
+  }
+})();
+const DEFINE = { ...viteEnvDefine({ ssr: true, env: { ...process.env, ...envDelta } }), ...configDefines };
 
 const cacheStats = { hits: 0, misses: 0, uncached: 0, rhits: 0, rmisses: 0 };
 const EPOCH = (() => {
