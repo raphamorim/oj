@@ -105,7 +105,7 @@ export function findConfig(app) {
   return null;
 }
 
-export function createPluginContainer(vite, allPlugins, { command = "serve", mode = "development", environment = "client" } = {}) {
+export function createPluginContainer(vite, allPlugins, { command = "serve", mode = "development", environment = "client", buildStartTimeoutMs = 5_000 } = {}) {
   const plugins = ordered(
     allPlugins.filter(
       (p) => (p.resolveId || p.load || p.transform || p.generateBundle) && applyMatches(p, command, mode),
@@ -230,10 +230,19 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
         // dev server — a plugin that genuinely needed buildStart will surface as
         // its own load() output being wrong, which is strictly better than one
         // unsupported plugin taking down every other plugin's startup.
-        try { await h.call(ctx, {}); }
+        let timer;
+        try {
+          await Promise.race([
+            h.call(ctx, {}),
+            new Promise((_, reject) => {
+              timer = setTimeout(() => reject(new Error(`timed out after ${buildStartTimeoutMs}ms`)), buildStartTimeoutMs);
+            }),
+          ]);
+        }
         catch (e) {
           process.stderr.write(`oj: plugin "${p.name || "?"}" buildStart failed (skipped): ${(e && e.message) || e}\n`);
         }
+        finally { clearTimeout(timer); }
       }
     });
   }
