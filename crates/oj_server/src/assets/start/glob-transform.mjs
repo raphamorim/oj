@@ -85,7 +85,11 @@ export function transformGlob(code, filePath) {
     const files = [...new Set(includes.flatMap((p) => matchPattern(fileDir, p)))]
       .filter((f) => !exclude.has(f))
       .sort();
-    const query = typeof opts.query === "string" ? opts.query : "";
+    const query = typeof opts.query === "string"
+      ? opts.query
+      : opts.query && typeof opts.query === "object"
+        ? `?${new URLSearchParams(opts.query)}`
+        : "";
     const wantDefault = opts.import === "default";
     const entries = files.map((f, idx) => {
       const rel = toRel(fileDir, f);
