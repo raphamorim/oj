@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: MIT
+import assert from "node:assert/strict";
 
 import { test } from "node:test";
-import assert from "node:assert/strict";
 import { __test, createPluginContainer, findConfig, loadPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -168,4 +165,17 @@ test("plugin container preserves an explicitly disabled Vite public directory", 
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("plugin hooks receive the configured Vite mode", async () => {
+  const plugin = {
+    name: "synthetic-mode-transform",
+    transform() { return `export default ${JSON.stringify(this.environment.config.mode)};`; },
+  };
+
+  const staging = createPluginContainer({}, [plugin], { command: "serve", mode: "staging" });
+  const preview = createPluginContainer({}, [plugin], { command: "build", mode: "preview" });
+
+  assert.equal(await staging.transform("", "/app.ts"), 'export default "staging";');
+  assert.equal(await preview.transform("", "/app.ts"), 'export default "preview";');
 });
