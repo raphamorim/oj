@@ -190,7 +190,12 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
     addWatchFile(id) { watchFiles.add(String(id)); }, getWatchFiles() { return [...watchFiles]; },
     getModuleInfo(id) { return moduleInfo.get(id) ?? null; },
     getModuleIds() { return moduleInfo.keys(); },
-    async resolve() { return null; }, async load() { return null; },
+    async resolve() { return null; },
+    async load(options) {
+      const id = typeof options === "string" ? options : options.id;
+      const code = await load(id);
+      return code == null ? null : { id, code };
+    },
     parse,
   };
 
