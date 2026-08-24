@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import assert from "node:assert/strict";
 import assert from "node:assert/strict";
+import assert from "node:assert/strict";
 
 import { test } from "node:test";
 import { __test, createPluginContainer, findConfig, loadPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
@@ -238,4 +239,30 @@ test("buildStart runs plugins whose only hook initializes generated sources", as
   await container.buildStart();
 
   assert.equal(initialized, 1);
+});
+
+test("moduleParsed plugins observe transformed framework and user modules", async () => {
+  const parsed = [];
+  const container = createPluginContainer({}, [
+    {
+      name: "synthetic-module-graph-observer",
+      moduleParsed(info) {
+        parsed.push({ id: info.id, code: info.code, importedIds: info.importedIds });
+      },
+    },
+    {
+      name: "synthetic-module-transform",
+      transform(code) {
+        return `${code}\ntransformed();`;
+      },
+    },
+  ]);
+
+  await container.transform("entry();", "/entry.ts");
+  await container.transformUserCode("page();", "/page.ts");
+
+  assert.deepEqual(parsed, [
+    { id: "/entry.ts", code: "entry();\ntransformed();", importedIds: [] },
+    { id: "/page.ts", code: "page();\ntransformed();", importedIds: [] },
+  ]);
 });
