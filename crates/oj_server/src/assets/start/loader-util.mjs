@@ -107,7 +107,7 @@ export function stripJsonc(s) {
 
 export function readJsonc(file) {
   try {
-    return JSON.parse(stripJsonc(readFileSync(file, "utf8")));
+    return JSON.parse(stripJsonc(readFileSync(file, "utf8").replace(/^\ufeff/, "")));
   } catch {
     return null;
   }
