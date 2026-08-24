@@ -155,6 +155,25 @@ test("glob query objects are serialized into generated import specifiers", () =>
   }
 });
 
+test("named glob imports select the requested export in eager and lazy modes", () => {
+  const dir = fixture();
+  try {
+    const lazy = transformGlob(
+      'const modules = import.meta.glob("./content/*.md", { import: "metadata" });',
+      join(dir, "index.ts"),
+    );
+    const eager = transformGlob(
+      'const modules = import.meta.glob("./content/*.md", { eager: true, import: "metadata" });',
+      join(dir, "index.ts"),
+    );
+
+    assert.match(lazy, /import\("\.\/content\/a\.md"\)\.then\(\(m\) => m\["metadata"\]\)/);
+    assert.match(eager, /^import \{ metadata as __oj_glob0_0 \} from "\.\/content\/a\.md";/m);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("negated patterns exclude matches", () => {
   const dir = fixture();
   try {
