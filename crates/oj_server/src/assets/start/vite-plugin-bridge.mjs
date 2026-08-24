@@ -256,7 +256,9 @@ export async function loadPluginContainer(app, opts = {}) {
   }
   const all = (loaded?.config?.plugins ?? []).flat(Infinity).filter(Boolean);
   const container = createPluginContainer(vite, all, opts);
-  const publicDir = typeof loaded?.config?.publicDir === "string" ? loaded.config.publicDir : null;
+  const publicDir = loaded?.config?.publicDir === false
+    ? false
+    : typeof loaded?.config?.publicDir === "string" ? loaded.config.publicDir : null;
   const configDependencies = [configFile, ...(loaded?.dependencies ?? [])];
   return { ...container, publicDir, configDependencies };
 }

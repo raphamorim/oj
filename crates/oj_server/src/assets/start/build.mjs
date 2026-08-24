@@ -252,8 +252,10 @@ writeFileSync(
     '}\n',
 );
 
-const publicDir = resolve(APP, clientContainer?.publicDir ?? "public");
-if (existsSync(publicDir)) cpSync(publicDir, CLIENT, { recursive: true });
+if (clientContainer?.publicDir !== false) {
+  const publicDir = resolve(APP, clientContainer?.publicDir ?? "public");
+  if (existsSync(publicDir)) cpSync(publicDir, CLIENT, { recursive: true });
+}
 
 const prerender = (process.env.OJ_PRERENDER || "").split(",").map((s) => s.trim()).filter(Boolean);
 if (prerender.length) {
