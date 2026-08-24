@@ -162,6 +162,10 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
         && applyMatches(p, command, mode),
     ),
   );
+  const transformPlugins = [...plugins].sort((a, b) => {
+    const rank = (hook) => hook?.order === "pre" ? -1 : hook?.order === "post" ? 1 : 0;
+    return rank(a.transform) - rank(b.transform);
+  });
 
   const parse = typeof vite?.parseAst === "function"
     ? (code, opts) => vite.parseAst(code, opts)
@@ -248,7 +252,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
   async function transform(code, id) {
     moduleInfo.set(id, { id, code, importedIds: [] });
     let current = code, changed = false;
-    for (const p of plugins) {
+    for (const p of transformPlugins) {
       if (!envAllows(p, environment)) continue;
       const h = hookHandler(p.transform);
       const filter = hookFilter(p.transform);
@@ -266,7 +270,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
     moduleInfo.set(id, { id, code, importedIds: [] });
     const ssr = environment === "ssr";
     let current = code, changed = false;
-    for (const p of plugins) {
+    for (const p of transformPlugins) {
       if (ojReimplemented(p.name) || !envAllows(p, environment)) continue;
       const h = hookHandler(p.transform);
       const filter = hookFilter(p.transform);

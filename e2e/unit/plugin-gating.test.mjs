@@ -376,3 +376,22 @@ test("transform hook code filters gate both transform entry points", async () =>
   assert.equal(await container.transformUserCode("plain();", "/app.tsx"), null);
   assert.equal(await container.transformUserCode("/* @enabled */", "/app.tsx"), "/* @enabled */\ntransformed();");
 });
+
+// PR #50
+test("transform hooks honor per-hook pre and post ordering", async () => {
+  const plugin = (name, order) => ({
+    name,
+    transform: {
+      ...(order ? { order } : {}),
+      handler(code) { return `${code}${name};`; },
+    },
+  });
+  const container = createPluginContainer({}, [
+    plugin("post", "post"),
+    plugin("normal"),
+    plugin("pre", "pre"),
+  ]);
+
+  assert.equal(await container.transform("", "/app.ts"), "pre;normal;post;");
+  assert.equal(await container.transformUserCode("", "/app.ts"), "pre;normal;post;");
+});
