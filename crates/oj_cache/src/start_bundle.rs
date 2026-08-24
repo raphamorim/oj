@@ -497,6 +497,8 @@ fn epoch(root: &Path) -> String {
         "vite.config.js",
         "vite.config.mjs",
         "vite.config.mts",
+        "vite.config.cjs",
+        "vite.config.cts",
         "oj.config.ts",
         "oj.config.js",
         "oj.config.mjs",

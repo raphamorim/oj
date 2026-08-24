@@ -2,7 +2,10 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { __test, findConfig } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -11,6 +14,19 @@ test("matchOne: RegExp tests, string is a substring match", () => {
   assert.ok(!matchOne(/\.mdx$/, "/a/b.tsx"));
   assert.ok(matchOne("virtual:", "virtual:foo"));
   assert.ok(!matchOne("virtual:", "./real"));
+});
+
+test("findConfig discovers CommonJS Vite configuration formats", () => {
+  for (const name of ["vite.config.cjs", "vite.config.cts"]) {
+    const root = mkdtempSync(join(tmpdir(), "oj-config-format-"));
+    try {
+      const config = join(root, name);
+      writeFileSync(config, "module.exports = {};\n");
+      assert.equal(findConfig(root), config);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
 });
 
 test("idAllowed: no filter allows everything", () => {

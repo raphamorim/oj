@@ -24,7 +24,7 @@ const CACHE_DIR = process.env.OJ_CACHE_ROOT ?? pathResolve(HERE, "..");
 
 const BASE_FILES = [
   "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "package.json",
-  "vite.config.ts", "vite.config.js", "vite.config.mjs", "vite.config.mts",
+  "vite.config.ts", "vite.config.js", "vite.config.mjs", "vite.config.mts", "vite.config.cjs", "vite.config.cts",
   "oj.config.ts", "oj.config.js", "oj.config.mjs",
 ];
 const LOADER_FILES = ["loader.mjs", "loader-util.mjs", "glob-transform.mjs", "vite-plugin-bridge.mjs", "resolve-pkg.mjs"];

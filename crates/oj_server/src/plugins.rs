@@ -137,6 +137,8 @@ pub fn vite_config_file(root: &Path) -> Option<std::path::PathBuf> {
         "vite.config.mts",
         "vite.config.mjs",
         "vite.config.js",
+        "vite.config.cjs",
+        "vite.config.cts",
     ]
     .into_iter()
     .map(|f| root.join(f))
@@ -846,6 +848,21 @@ mod ssr_bridge_tests {
 #[cfg(test)]
 mod vite_values_tests {
     use super::*;
+
+    #[test]
+    fn finds_commonjs_vite_config_formats() {
+        for extension in ["cjs", "cts"] {
+            let root = std::env::temp_dir().join(format!(
+                "oj-config-format-{}-{extension}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join(format!("vite.config.{extension}"));
+            std::fs::write(&path, "module.exports = {};").unwrap();
+            assert_eq!(vite_config_file(&root), Some(path));
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+    }
 
     #[test]
     fn parse_reads_all_fields() {
