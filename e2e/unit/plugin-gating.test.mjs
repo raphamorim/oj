@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: MIT
 import assert from "node:assert/strict";
 import assert from "node:assert/strict";
+import assert from "node:assert/strict";
 
 import { test } from "node:test";
 import { __test, createPluginContainer, findConfig, loadPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
-import assert from "node:assert/strict";
-import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -226,4 +225,17 @@ test("transform hooks receive the active SSR environment option", async () => {
 
   assert.equal(await server.transform("", "/page.mdx"), 'export default "server";');
   assert.equal(await client.transform("", "/page.mdx"), 'export default "client";');
+});
+
+test("buildStart runs plugins whose only hook initializes generated sources", async () => {
+  let initialized = 0;
+  const container = createPluginContainer({}, [{
+    name: "synthetic-source-generator",
+    buildStart() { initialized++; },
+  }]);
+
+  await container.buildStart();
+  await container.buildStart();
+
+  assert.equal(initialized, 1);
 });
