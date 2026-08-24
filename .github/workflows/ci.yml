@@ -46,6 +46,9 @@ jobs:
       - run: npx --prefix e2e playwright install --with-deps chromium
       - name: run e2e suite
         run: node e2e/run.mjs ${{ matrix.mode == 'bundle' && '--bundle' || '' }}
+      - name: Vite config load failures
+        if: matrix.mode == 'unbundled'
+        run: node e2e/config-load-failure.mjs
       - name: warm-cache plugin side effects
         if: matrix.mode == 'unbundled'
         run: node e2e/warm-cache.mjs
