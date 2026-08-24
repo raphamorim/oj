@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -108,4 +108,64 @@ test("hookHandler / hookFilter: function form and object form", () => {
 
   assert.equal(hookHandler(undefined), null);
   assert.equal(hookHandler({ handler: "not-a-fn" }), null);
+});
+
+test("buildStart: a stalled plugin cannot block later plugins or SSR startup", async () => {
+  const events = [];
+  let release;
+  const stalled = new Promise((resolve) => { release = resolve; });
+  const container = createPluginContainer({}, [
+    {
+      name: "stalled-start",
+      enforce: "pre",
+      resolveId() {},
+      async buildStart() {
+        events.push("stalled");
+        await stalled;
+      },
+    },
+    {
+      name: "healthy-start",
+      resolveId() {},
+      async buildStart() {
+        events.push("healthy");
+      },
+    },
+  ], { environment: "ssr", buildStartTimeoutMs: 25 });
+
+  const pending = container.buildStart();
+  let deadline;
+  try {
+    const completed = await Promise.race([
+      pending.then(() => true),
+      new Promise((resolve) => { deadline = setTimeout(() => resolve(false), 250); }),
+    ]);
+    assert.equal(completed, true, "a non-settling buildStart must not block SSR readiness");
+    assert.deepEqual(events, ["stalled", "healthy"]);
+  } finally {
+    clearTimeout(deadline);
+    release();
+    await pending;
+  }
+});
+
+test("buildStart: successful asynchronous hooks retain plugin order", async () => {
+  const events = [];
+  const plugin = (name, enforce) => ({
+    name,
+    enforce,
+    resolveId() {},
+    async buildStart() {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      events.push(name);
+    },
+  });
+  const container = createPluginContainer({}, [
+    plugin("normal"),
+    plugin("post", "post"),
+    plugin("pre", "pre"),
+  ], { environment: "ssr", buildStartTimeoutMs: 50 });
+
+  await container.buildStart();
+  assert.deepEqual(events, ["pre", "normal", "post"]);
 });
