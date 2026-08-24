@@ -154,6 +154,25 @@ test("mergeTsConfig resolves baseUrl against its config dir and arrays targets",
   assert.deepEqual(Object.fromEntries(rules)["@x"], ["./x.ts"]);
 });
 
+test("mergeTsConfig preserves an inherited baseUrl when the child omits it", () => {
+  const chain = [
+    {
+      cfg: { compilerOptions: { baseUrl: "./shared", paths: { "@shared/*": ["./*"] } } },
+      dir: "/workspace/config",
+    },
+    {
+      cfg: { compilerOptions: { paths: { "@app/*": ["./app/*"] } } },
+      dir: "/workspace/apps/web",
+    },
+  ];
+
+  const { rules, baseDir } = mergeTsConfig(chain, "/workspace/apps/web");
+
+  assert.equal(baseDir, ["/workspace", "config", "shared"].join(sep));
+  assert.deepEqual(Object.fromEntries(rules)["@shared/*"], ["./*"]);
+  assert.deepEqual(Object.fromEntries(rules)["@app/*"], ["./app/*"]);
+});
+
 test("substituteAlias fills a trailing-star pattern (tsconfig + imports style)", () => {
   assert.equal(substituteAlias("@app/*", "./src/*", "@app/lib/format"), "./src/lib/format");
   assert.equal(substituteAlias("#lib/*", "./src/lib/*", "#lib/format"), "./src/lib/format");
