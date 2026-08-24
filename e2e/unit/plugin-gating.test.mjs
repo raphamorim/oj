@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 
 import { test } from "node:test";
 import { __test, createPluginContainer, findConfig, loadPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import assert from "node:assert/strict";
+import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -194,6 +196,14 @@ test("resolveId and load receive Vite SSR hook options", async () => {
     },
   };
 
+test("transform hooks receive the active SSR environment option", async () => {
+  const plugin = {
+    name: "synthetic-environment-transform",
+    transform(_code, _id, options) {
+      return `export default ${JSON.stringify(options?.ssr ? "server" : "client")};`;
+    },
+  };
+
   const server = createPluginContainer({}, [plugin], { environment: "ssr" });
   const client = createPluginContainer({}, [plugin], { environment: "client" });
 
@@ -201,4 +211,19 @@ test("resolveId and load receive Vite SSR hook options", async () => {
   assert.equal(await server.load("\0server:virtual:entry"), 'export default "server";');
   assert.equal(await client.resolveId("virtual:entry", "/app.ts"), "\0client:virtual:entry");
   assert.equal(await client.load("\0client:virtual:entry"), 'export default "client";');
+});
+
+test("transform hooks receive the active SSR environment option", async () => {
+  const plugin = {
+    name: "synthetic-environment-transform",
+    transform(_code, _id, options) {
+      return `export default ${JSON.stringify(options?.ssr ? "server" : "client")};`;
+    },
+  };
+
+  const server = createPluginContainer({}, [plugin], { environment: "ssr" });
+  const client = createPluginContainer({}, [plugin], { environment: "client" });
+
+  assert.equal(await server.transform("", "/page.mdx"), 'export default "server";');
+  assert.equal(await client.transform("", "/page.mdx"), 'export default "client";');
 });

@@ -222,7 +222,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
       const h = hookHandler(p.transform);
       if (!h || !idAllowed(hookFilter(p.transform), id)) continue;
       let r;
-      try { r = await h.call(ctx, current, id); } catch (e) { if (ojReimplemented(p.name)) continue; throw pluginError(e, p, id); }
+      try { r = await h.call(ctx, current, id, { ssr: environment === "ssr" }); } catch (e) { if (ojReimplemented(p.name)) continue; throw pluginError(e, p, id); }
       const next = r == null ? null : typeof r === "string" ? r : r.code;
       if (next != null) { current = next; changed = true; }
     }
