@@ -170,7 +170,8 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
     for (const p of plugins) {
       if (!envAllows(p, environment)) continue;
       const h = hookHandler(p.transform);
-      if (!h || !idAllowed(hookFilter(p.transform), id)) continue;
+      const filter = hookFilter(p.transform);
+      if (!h || !idAllowed(filter, id) || !idAllowed(filter?.code, current)) continue;
       let r;
       try { r = await h.call(ctx, current, id); } catch { continue; }
       const next = r == null ? null : typeof r === "string" ? r : r.code;
@@ -185,7 +186,8 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
     for (const p of plugins) {
       if (ojReimplemented(p.name) || !envAllows(p, environment)) continue;
       const h = hookHandler(p.transform);
-      if (!h || !idAllowed(hookFilter(p.transform), id)) continue;
+      const filter = hookFilter(p.transform);
+      if (!h || !idAllowed(filter, id) || !idAllowed(filter?.code, current)) continue;
       let r;
       try { r = await h.call(ctx, current, id, { ssr }); } catch { continue; }
       const next = r == null ? null : typeof r === "string" ? r : r.code;

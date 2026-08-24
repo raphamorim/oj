@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -108,4 +108,21 @@ test("hookHandler / hookFilter: function form and object form", () => {
 
   assert.equal(hookHandler(undefined), null);
   assert.equal(hookHandler({ handler: "not-a-fn" }), null);
+});
+
+test("transform hook code filters gate both transform entry points", async () => {
+  const plugin = {
+    name: "synthetic-selective-transform",
+    transform: {
+      filter: { id: /\.tsx$/, code: { include: /@enabled/, exclude: /@disabled/ } },
+      handler(code) { return `${code}\ntransformed();`; },
+    },
+  };
+  const container = createPluginContainer({}, [plugin]);
+
+  assert.equal(await container.transform("plain();", "/app.tsx"), null);
+  assert.equal(await container.transform("/* @enabled @disabled */", "/app.tsx"), null);
+  assert.equal(await container.transform("/* @enabled */", "/app.tsx"), "/* @enabled */\ntransformed();");
+  assert.equal(await container.transformUserCode("plain();", "/app.tsx"), null);
+  assert.equal(await container.transformUserCode("/* @enabled */", "/app.tsx"), "/* @enabled */\ntransformed();");
 });
