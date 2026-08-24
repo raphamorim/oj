@@ -115,12 +115,24 @@ fn strip_sass_import_ext(source: &str) -> String {
 }
 
 pub fn compile_sass(source: &str, load_dir: Option<&Path>) -> Result<String, String> {
+    compile_sass_with(source, load_dir, None)
+}
+
+pub fn compile_sass_with(
+    source: &str,
+    load_dir: Option<&Path>,
+    additional_data: Option<&str>,
+) -> Result<String, String> {
     let fs = DottedFs;
     let mut options = grass::Options::default().fs(&fs);
     if let Some(dir) = load_dir {
         options = options.load_path(dir);
     }
-    let source = strip_sass_import_ext(source);
+    let stripped = strip_sass_import_ext(source);
+    let source = match additional_data {
+        Some(data) if !data.is_empty() => format!("{data}\n{stripped}"),
+        _ => stripped,
+    };
     grass::from_string(source, &options).map_err(|e| format!("sass error: {e}"))
 }
 
@@ -238,6 +250,22 @@ mod tests {
         let css = compile_sass(".a { .b { color: red } }", None).unwrap();
         let out = compile_css("/x.scss", &css, true).unwrap();
         assert!(out.css.contains(".a .b{color:red}"), "{}", out.css);
+    }
+
+    #[test]
+    fn additional_data_is_prepended_before_compiling() {
+        // css.preprocessorOptions.scss.additionalData: a global variable the
+        // stylesheet never declares must resolve because it is injected first.
+        let scss = ".btn { color: $brand; }";
+        let css = compile_sass_with(scss, None, Some("$brand: #f00;")).unwrap();
+        assert!(css.contains("color: #f00"), "injected var resolved: {css}");
+        // Without the injection the same source fails (undefined variable).
+        assert!(
+            compile_sass(scss, None).is_err(),
+            "undeclared variable must fail without additionalData",
+        );
+        // Empty / absent additionalData leaves compilation unchanged.
+        assert!(compile_sass_with(".a { color: red; }", None, Some("")).is_ok());
     }
 
     // grass 0.13 mis-reads a dotted basename (`variables.module`) as an

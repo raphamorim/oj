@@ -13,6 +13,7 @@ pub struct OjConfig {
     pub public_dir: Option<String>,
     pub server: Option<ServerConfig>,
     pub resolve: Option<ResolveConfig>,
+    pub css: Option<CssConfig>,
     pub define: Option<BTreeMap<String, serde_json::Value>>,
     pub env_prefix: Option<StringOrList>,
     pub env_dir: Option<String>,
@@ -38,6 +39,18 @@ impl StringOrList {
             StringOrList::Many(v) => v.clone(),
         }
     }
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CssConfig {
+    pub preprocessor_options: Option<BTreeMap<String, PreprocessorEntry>>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PreprocessorEntry {
+    pub additional_data: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]

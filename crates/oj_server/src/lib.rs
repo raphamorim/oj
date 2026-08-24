@@ -248,6 +248,8 @@ struct ServerState {
     svelte: tokio::sync::OnceCell<std::sync::Arc<Sidecar>>,
     tailwind_urls: Mutex<std::collections::HashSet<String>>,
     has_postcss: bool,
+    scss_additional_data: Option<String>,
+    sass_additional_data: Option<String>,
     preload_snapshot: Vec<String>,
     proxy: Vec<(String, oj_config::ProxyEntry)>,
     http: reqwest::Client,
@@ -576,6 +578,8 @@ impl DevServer {
             svelte: tokio::sync::OnceCell::new(),
             tailwind_urls: Mutex::new(std::collections::HashSet::new()),
             has_postcss: has_postcss_config(&root),
+            scss_additional_data: oj_config::css_additional_data(&config, "scss"),
+            sass_additional_data: oj_config::css_additional_data(&config, "sass"),
             fs_allow: Arc::new(Mutex::new(
                 server_cfg
                     .fs
@@ -883,6 +887,18 @@ async fn ssr_plugin_host(state: &Arc<ServerState>) -> Option<std::sync::Arc<Plug
         })
         .await
         .clone()
+}
+
+fn sass_additional_data_for(state: &ServerState, url: &str) -> Option<String> {
+    if !oj_css::is_sass(url) {
+        return None;
+    }
+    let indented = url.split('?').next().unwrap_or(url).ends_with(".sass");
+    if indented {
+        state.sass_additional_data.clone()
+    } else {
+        state.scss_additional_data.clone()
+    }
 }
 
 fn ssr_css_module(root: &Path, path: &Path, source: &str) -> Result<String, String> {
@@ -1927,6 +1943,7 @@ async fn ensure_module(
         file.to_path_buf()
     };
     let url_owned = url.to_string();
+    let sass_data = sass_additional_data_for(state, &url_owned);
     let bundle = state.bundle;
     let plugin_fallback = state.plugins.is_some() && !bundle;
     let importer_abs = file.to_string_lossy().into_owned();
@@ -1960,7 +1977,7 @@ async fn ensure_module(
         }
         if is_css {
             let css_src = if oj_css::is_sass(&url_owned) {
-                oj_css::compile_sass(&source, Some(&dir))?
+                oj_css::compile_sass_with(&source, Some(&dir), sass_data.as_deref())?
             } else {
                 source.clone()
             };
