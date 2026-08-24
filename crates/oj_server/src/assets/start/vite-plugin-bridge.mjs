@@ -199,13 +199,23 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
     parse,
   };
 
-  async function resolveId(id, importer) {
+  function pluginContext(plugin, base = ctx) {
+    return Object.assign(Object.create(base), {
+      async resolve(source, importer, options = {}) {
+        const resolved = await resolveId(source, importer, options.skipSelf === false ? undefined : plugin);
+        return resolved == null ? null : { id: resolved };
+      },
+    });
+  }
+
+  async function resolveId(id, importer, skippedPlugin) {
     for (const p of plugins) {
+      if (p === skippedPlugin) continue;
       if (!envAllows(p, environment)) continue;
       const h = hookHandler(p.resolveId);
       if (!h || !idAllowed(hookFilter(p.resolveId), id)) continue;
       let r;
-      try { r = await h.call(ctx, id, importer, { isEntry: false, ssr: environment === "ssr" }); } catch (e) { if (ojReimplemented(p.name)) continue; throw pluginError(e, p, importer || id); }
+      try { r = await h.call(pluginContext(p), id, importer, { isEntry: false, ssr: environment === "ssr" }); } catch (e) { if (ojReimplemented(p.name)) continue; throw pluginError(e, p, importer || id); }
       if (r != null) return typeof r === "string" ? r : r.id;
     }
     return null;
@@ -217,7 +227,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
       const h = hookHandler(p.load);
       if (!h || !idAllowed(hookFilter(p.load), id)) continue;
       let r;
-      try { r = await h.call(ctx, id, { ssr: environment === "ssr" }); } catch (e) { if (ojReimplemented(p.name)) continue; throw pluginError(e, p, id); }
+      try { r = await h.call(pluginContext(p), id, { ssr: environment === "ssr" }); } catch (e) { if (ojReimplemented(p.name)) continue; throw pluginError(e, p, id); }
       if (r != null) {
         const code = typeof r === "string" ? r : r.code;
         moduleInfo.set(id, { id, code, importedIds: [] });
@@ -243,7 +253,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
       const h = hookHandler(p.transform);
       if (!h || !idAllowed(hookFilter(p.transform), id)) continue;
       let r;
-      try { r = await h.call(ctx, current, id, { ssr: environment === "ssr" }); } catch (e) { if (ojReimplemented(p.name)) continue; throw pluginError(e, p, id); }
+      try { r = await h.call(pluginContext(p), current, id, { ssr: environment === "ssr" }); } catch (e) { if (ojReimplemented(p.name)) continue; throw pluginError(e, p, id); }
       const next = r == null ? null : typeof r === "string" ? r : r.code;
       if (next != null) { current = next; changed = true; }
     }
@@ -260,7 +270,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
       const h = hookHandler(p.transform);
       if (!h || !idAllowed(hookFilter(p.transform), id)) continue;
       let r;
-      try { r = await h.call(ctx, current, id, { ssr }); } catch (e) { throw pluginError(e, p, id); }
+      try { r = await h.call(pluginContext(p), current, id, { ssr }); } catch (e) { throw pluginError(e, p, id); }
       const next = r == null ? null : typeof r === "string" ? r : r.code;
       if (next != null) { current = next; changed = true; }
     }
@@ -273,7 +283,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
     for (const p of plugins) {
       const h = hookHandler(p.generateBundle);
       if (!h || !envAllows(p, environment)) continue;
-      try { await h.call(genCtx, { format: "es" }, {}, false); } catch {}
+      try { await h.call(pluginContext(p, genCtx), { format: "es" }, {}, false); } catch {}
     }
   }
 
@@ -298,7 +308,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
         // dev server — a plugin that genuinely needed buildStart will surface as
         // its own load() output being wrong, which is strictly better than one
         // unsupported plugin taking down every other plugin's startup.
-        try { await h.call(ctx, {}); }
+        try { await h.call(pluginContext(p), {}); }
         catch (e) {
           process.stderr.write(`oj: plugin "${p.name || "?"}" buildStart failed (skipped): ${(e && e.message) || e}\n`);
         }
