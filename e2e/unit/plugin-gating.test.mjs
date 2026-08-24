@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -108,4 +108,24 @@ test("hookHandler / hookFilter: function form and object form", () => {
 
   assert.equal(hookHandler(undefined), null);
   assert.equal(hookHandler({ handler: "not-a-fn" }), null);
+});
+
+test("resolveId and load receive Vite SSR hook options", async () => {
+  const plugin = {
+    name: "synthetic-environment-module",
+    resolveId(source, _importer, options) {
+      return `\0${options?.ssr ? "server" : "client"}:${source}`;
+    },
+    load(_id, options) {
+      return `export default ${JSON.stringify(options?.ssr ? "server" : "client")};`;
+    },
+  };
+
+  const server = createPluginContainer({}, [plugin], { environment: "ssr" });
+  const client = createPluginContainer({}, [plugin], { environment: "client" });
+
+  assert.equal(await server.resolveId("virtual:entry", "/app.ts"), "\0server:virtual:entry");
+  assert.equal(await server.load("\0server:virtual:entry"), 'export default "server";');
+  assert.equal(await client.resolveId("virtual:entry", "/app.ts"), "\0client:virtual:entry");
+  assert.equal(await client.load("\0client:virtual:entry"), 'export default "client";');
 });
