@@ -147,7 +147,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
       const h = hookHandler(p.resolveId);
       if (!h || !idAllowed(hookFilter(p.resolveId), id)) continue;
       let r;
-      try { r = await h.call(ctx, id, importer, { isEntry: false }); } catch { continue; }
+      try { r = await h.call(ctx, id, importer, { isEntry: false, ssr: environment === "ssr" }); } catch { continue; }
       if (r != null) return typeof r === "string" ? r : r.id;
     }
     return null;
@@ -159,7 +159,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
       const h = hookHandler(p.load);
       if (!h || !idAllowed(hookFilter(p.load), id)) continue;
       let r;
-      try { r = await h.call(ctx, id); } catch { continue; }
+      try { r = await h.call(ctx, id, { ssr: environment === "ssr" }); } catch { continue; }
       if (r != null) return typeof r === "string" ? r : r.code;
     }
     return null;
