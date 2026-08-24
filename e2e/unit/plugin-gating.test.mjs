@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -108,4 +108,17 @@ test("hookHandler / hookFilter: function form and object form", () => {
 
   assert.equal(hookHandler(undefined), null);
   assert.equal(hookHandler({ handler: "not-a-fn" }), null);
+});
+
+test("buildStart runs plugins whose only hook initializes generated sources", async () => {
+  let initialized = 0;
+  const container = createPluginContainer({}, [{
+    name: "synthetic-source-generator",
+    buildStart() { initialized++; },
+  }]);
+
+  await container.buildStart();
+  await container.buildStart();
+
+  assert.equal(initialized, 1);
 });
