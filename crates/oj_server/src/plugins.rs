@@ -172,6 +172,10 @@ pub struct ViteValues {
 }
 
 pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
+    extract_vite_values_with(root, "serve", "development")
+}
+
+pub fn extract_vite_values_with(root: &Path, command: &str, mode: &str) -> Option<ViteValues> {
     if plugins_file(root).is_some() {
         return None;
     }
@@ -184,7 +188,7 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
             blake3::hash(VITE_EXTRACT_JS.as_bytes()).to_hex()
         ),
     );
-    if let Some(hit) = store.lookup(&vite, "serve", "development") {
+    if let Some(hit) = store.lookup(&vite, command, mode) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&hit.output) {
             if !hit.stderr.is_empty() {
                 eprint!("{}", hit.stderr);
@@ -201,8 +205,8 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
         .arg(&script)
         .arg(&vite)
         .arg(root)
-        .arg("serve")
-        .arg("development")
+        .arg(command)
+        .arg(mode)
         .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
         .env("NODE_COMPILE_CACHE", crate::node_compile_cache(root))
         .current_dir(root)
@@ -225,8 +229,8 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
             .unwrap_or_default();
         store.store(
             &vite,
-            "serve",
-            "development",
+            command,
+            mode,
             &deps,
             &String::from_utf8_lossy(&out.stdout),
             &stderr,
@@ -274,7 +278,16 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
 
 #[inline]
 pub fn adopt_vite_config_values(config: &mut oj_config::OjConfig, root: &Path) {
-    let Some(v) = extract_vite_values(root) else {
+    adopt_vite_config_values_with(config, root, "serve", "development");
+}
+
+pub fn adopt_vite_config_values_with(
+    config: &mut oj_config::OjConfig,
+    root: &Path,
+    command: &str,
+    mode: &str,
+) {
+    let Some(v) = extract_vite_values_with(root, command, mode) else {
         return;
     };
     merge_vite_values(config, v);
