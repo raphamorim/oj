@@ -30,6 +30,20 @@ test("probe finds an exact file, else a .ts for a .js import, else an index", ()
   }
 });
 
+test("probe resolves extensionless JSON modules and directory indexes", () => {
+  const dir = mk("json-probe");
+  try {
+    mkdirSync(join(dir, "config"), { recursive: true });
+    writeFileSync(join(dir, "settings.json"), "{}");
+    writeFileSync(join(dir, "config", "index.json"), "{}");
+
+    assert.equal(probe(join(dir, "settings")), join(dir, "settings.json"));
+    assert.equal(probe(join(dir, "config")), join(dir, "config", "index.json"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("hasEsmSyntax detects import/export at statement position", () => {
   assert.ok(hasEsmSyntax(fileWith("export const x = 1;")));
   assert.ok(hasEsmSyntax(fileWith("import x from 'y';")));

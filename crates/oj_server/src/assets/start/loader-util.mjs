@@ -7,8 +7,8 @@ import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 
 export const EXTS = [
-  ".ts", ".tsx", ".js", ".jsx", ".mjs",
-  "/index.ts", "/index.tsx", "/index.js", "/index.jsx", "/index.mjs",
+  ".ts", ".tsx", ".js", ".jsx", ".mjs", ".json",
+  "/index.ts", "/index.tsx", "/index.js", "/index.jsx", "/index.mjs", "/index.json",
 ];
 
 export const isFile = (p) => {
