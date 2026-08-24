@@ -7,6 +7,10 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { __test, findConfig } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { __test, loadPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -152,4 +156,21 @@ test("generateBundle honors environment consumer gates", async () => {
     .generateBundle((asset) => emitted.push(asset));
   assert.equal(emitted.length, 1);
   assert.equal(emitted[0].fileName, "server-manifest.json");
+});
+
+test("plugin container preserves an explicitly disabled Vite public directory", async () => {
+  const root = mkdtempSync(join(tmpdir(), "oj-no-public-"));
+  try {
+    const vite = join(root, "node_modules", "vite");
+    mkdirSync(vite, { recursive: true });
+    writeFileSync(join(root, "package.json"), '{"name":"synthetic-app"}');
+    writeFileSync(join(root, "vite.config.mjs"), "export default {};\n");
+    writeFileSync(join(vite, "package.json"), '{"name":"vite","type":"module","main":"./index.mjs"}');
+    writeFileSync(join(vite, "index.mjs"),
+      "export async function loadConfigFromFile() { return { config: { plugins: [], publicDir: false } }; }\n");
+
+    assert.equal((await loadPluginContainer(root)).publicDir, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
