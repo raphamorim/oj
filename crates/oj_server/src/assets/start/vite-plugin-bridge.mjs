@@ -198,13 +198,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
     const genCtx = { ...ctx, emitFile: (f) => (emit(f), "oj-emit-ref") };
     for (const p of plugins) {
       const h = hookHandler(p.generateBundle);
-      if (!h) continue;
-      const ae = p.applyToEnvironment;
-      if (typeof ae === "function") {
-        let ok;
-        try { ok = ae({ name: environment }); } catch { ok = true; }
-        if (ok === false) continue;
-      }
+      if (!h || !envAllows(p, environment)) continue;
       try { await h.call(genCtx, { format: "es" }, {}, false); } catch {}
     }
   }
