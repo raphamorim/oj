@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -108,4 +108,38 @@ test("hookHandler / hookFilter: function form and object form", () => {
 
   assert.equal(hookHandler(undefined), null);
   assert.equal(hookHandler({ handler: "not-a-fn" }), null);
+});
+
+test("plugin hooks can inspect loaded and transformed module metadata", async () => {
+  const dependencyId = "\0synthetic:dependency";
+  const dependencyCode = "export const value = 42;";
+  const container = createPluginContainer({}, [
+    {
+      name: "synthetic-virtual-module",
+      load(id) {
+        return id === dependencyId ? dependencyCode : null;
+      },
+    },
+    {
+      name: "synthetic-module-graph-inspector",
+      transform(code, id) {
+        const dependency = this.getModuleInfo(dependencyId);
+        const current = this.getModuleInfo(id);
+        const moduleIds = [...this.getModuleIds()];
+        return [
+          dependency.code,
+          dependency.importedIds.length,
+          current.code === code,
+          moduleIds.includes(dependencyId),
+          moduleIds.includes(id),
+        ].join(":");
+      },
+    },
+  ]);
+
+  assert.equal(await container.load(dependencyId), dependencyCode);
+  assert.equal(
+    await container.transform("export default 1;", "/app.ts"),
+    "export const value = 42;:0:true:true:true",
+  );
 });
