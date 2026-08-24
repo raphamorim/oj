@@ -125,6 +125,20 @@ test("cjsFacade unwraps default for __esModule (transpiled ESM) modules", () => 
   }
 });
 
+test("cjsFacade omits strict-mode reserved identifiers from named exports", () => {
+  const dir = mk("facade-reserved");
+  try {
+    const file = join(dir, "legacy.cjs");
+    writeFileSync(file, "module.exports = { interface: 1, implements: 2, private: 3, valid: 4 };");
+
+    const facade = cjsFacade(file);
+    assert.match(facade, /export const valid =/);
+    assert.doesNotMatch(facade, /export const (?:interface|implements|private) =/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("parseImportsField flattens string and conditional-object targets", () => {
   const rules = parseImportsField({
     "#lib/*": "./src/lib/*",

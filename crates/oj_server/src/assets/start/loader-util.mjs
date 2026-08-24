@@ -32,7 +32,7 @@ export function probe(base) {
 export const RESERVED = new Set(
   ("break case catch class const continue debugger default delete do else enum export extends false finally " +
     "for function if import in instanceof new null return super switch this throw true try typeof var void " +
-    "while with yield let static await").split(" "),
+    "while with yield let static await implements interface package private protected public arguments eval").split(" "),
 );
 
 const pkgTypeCache = new Map();
