@@ -264,3 +264,38 @@ test("moduleParsed plugins observe transformed framework and user modules", asyn
     { id: "/page.ts", code: "page();\ntransformed();", importedIds: [] },
   ]);
 });
+
+// PR #66
+test("plugin hooks can inspect loaded and transformed module metadata", async () => {
+  const dependencyId = "\0synthetic:dependency";
+  const dependencyCode = "export const value = 42;";
+  const container = createPluginContainer({}, [
+    {
+      name: "synthetic-virtual-module",
+      load(id) {
+        return id === dependencyId ? dependencyCode : null;
+      },
+    },
+    {
+      name: "synthetic-module-graph-inspector",
+      transform(code, id) {
+        const dependency = this.getModuleInfo(dependencyId);
+        const current = this.getModuleInfo(id);
+        const moduleIds = [...this.getModuleIds()];
+        return [
+          dependency.code,
+          dependency.importedIds.length,
+          current.code === code,
+          moduleIds.includes(dependencyId),
+          moduleIds.includes(id),
+        ].join(":");
+      },
+    },
+  ]);
+
+  assert.equal(await container.load(dependencyId), dependencyCode);
+  assert.equal(
+    await container.transform("export default 1;", "/app.ts"),
+    "export const value = 42;:0:true:true:true",
+  );
+});
