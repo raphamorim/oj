@@ -543,17 +543,27 @@ impl DevServer {
             bundle,
             reload_tx: reload_tx.clone(),
             graph: Mutex::new(ModuleGraph::new()),
-            resolver: Arc::new(OjResolver::with_options(
+            resolver: Arc::new(OjResolver::with_settings(
                 &root,
-                &oj_config::resolve_conditions(&config, "client"),
-                &oj_config::resolve_alias(&config, "client"),
-                &oj_config::resolve_dedupe(&config),
+                oj_resolver::ResolveSettings {
+                    conditions: oj_config::resolve_conditions(&config, "client"),
+                    alias: oj_config::resolve_alias(&config, "client"),
+                    dedupe: oj_config::resolve_dedupe(&config),
+                    extensions: oj_config::resolve_extensions(&config),
+                    main_fields: oj_config::resolve_main_fields(&config),
+                    preserve_symlinks: oj_config::resolve_preserve_symlinks(&config),
+                },
             )),
-            ssr_resolver: Arc::new(OjResolver::with_options(
+            ssr_resolver: Arc::new(OjResolver::with_settings(
                 &root,
-                &oj_config::resolve_conditions(&config, "ssr"),
-                &oj_config::resolve_alias(&config, "ssr"),
-                &oj_config::resolve_dedupe(&config),
+                oj_resolver::ResolveSettings {
+                    conditions: oj_config::resolve_conditions(&config, "ssr"),
+                    alias: oj_config::resolve_alias(&config, "ssr"),
+                    dedupe: oj_config::resolve_dedupe(&config),
+                    extensions: oj_config::resolve_extensions(&config),
+                    main_fields: oj_config::resolve_main_fields(&config),
+                    preserve_symlinks: oj_config::resolve_preserve_symlinks(&config),
+                },
             )),
             cache: PersistentCache::new(oj_cache::cache_root(&root), env!("CARGO_PKG_VERSION")),
             memory: Mutex::new(MemoryCache::new(memory_cache_budget())),

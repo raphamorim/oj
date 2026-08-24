@@ -130,7 +130,9 @@ pub struct ResolveConfig {
     pub alias: Option<BTreeMap<String, String>>,
     pub dedupe: Option<Vec<String>>,
     pub extensions: Option<Vec<String>>,
+    pub main_fields: Option<Vec<String>>,
     pub conditions: Option<Vec<String>>,
+    pub preserve_symlinks: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
