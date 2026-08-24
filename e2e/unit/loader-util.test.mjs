@@ -224,3 +224,15 @@ test("stripJsonc + readJsonc tolerate comments and trailing commas", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("readJsonc accepts TypeScript configuration with a UTF-8 byte-order mark", () => {
+  const dir = mk("jsonc-bom");
+  try {
+    const file = join(dir, "tsconfig.json");
+    writeFileSync(file, '\ufeff{"compilerOptions":{"baseUrl":"./src"}}');
+
+    assert.deepEqual(readJsonc(file), { compilerOptions: { baseUrl: "./src" } });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
