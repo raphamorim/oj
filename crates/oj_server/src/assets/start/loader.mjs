@@ -557,6 +557,7 @@ function resolveUncached(spec, context, next) {
       abs = probe(ALIASES[clean]);
     }
     if (!abs && clean.startsWith("#")) abs = resolveImports(clean);
+    if (!abs && !clean.startsWith("/") && !clean.startsWith(".")) abs = resolveTsPaths(clean);
     if (!abs) {
       try { abs = fileURLToPath(stripQ(next(clean, context).url)); } catch {}
     }
