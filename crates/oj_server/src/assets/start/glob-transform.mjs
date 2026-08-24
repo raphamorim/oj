@@ -86,7 +86,8 @@ export function transformGlob(code, filePath) {
       .filter((f) => !exclude.has(f))
       .sort();
     const query = typeof opts.query === "string" ? opts.query : "";
-    const wantDefault = opts.import === "default";
+    const importName = typeof opts.import === "string" ? opts.import : null;
+    const wantDefault = importName === "default";
     const entries = files.map((f, idx) => {
       const rel = toRel(fileDir, f);
       const spec = rel + query;
@@ -95,12 +96,16 @@ export function transformGlob(code, filePath) {
         const id = `__oj_glob${g}_${idx}`;
         prelude.push(wantDefault
           ? `import ${id} from ${JSON.stringify(spec)};`
-          : `import * as ${id} from ${JSON.stringify(spec)};`);
+          : importName
+            ? `import { ${importName} as ${id} } from ${JSON.stringify(spec)};`
+            : `import * as ${id} from ${JSON.stringify(spec)};`);
         return `${key}: ${id}`;
       }
       const imp = wantDefault
         ? `() => import(${JSON.stringify(spec)}).then((m) => m.default)`
-        : `() => import(${JSON.stringify(spec)})`;
+        : importName
+          ? `() => import(${JSON.stringify(spec)}).then((m) => m[${JSON.stringify(importName)}])`
+          : `() => import(${JSON.stringify(spec)})`;
       return `${key}: ${imp}`;
     });
     out += code.slice(last, m.index) + `{${entries.join(", ")}}`;
