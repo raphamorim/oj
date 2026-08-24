@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -108,4 +108,28 @@ test("hookHandler / hookFilter: function form and object form", () => {
 
   assert.equal(hookHandler(undefined), null);
   assert.equal(hookHandler({ handler: "not-a-fn" }), null);
+});
+
+test("plugin hook contexts load virtual dependency modules", async () => {
+  const container = createPluginContainer({}, [
+    {
+      name: "synthetic-virtual-module-loader",
+      load(id) {
+        return id === "\0synthetic:dependency" ? "export const value = 42;" : null;
+      },
+    },
+    {
+      name: "synthetic-dependency-transform",
+      async transform(_code, id) {
+        if (id !== "/app.ts") return null;
+        const dependency = await this.load({ id: "\0synthetic:dependency" });
+        return `export default ${JSON.stringify(dependency.code)};`;
+      },
+    },
+  ]);
+
+  assert.equal(
+    await container.transform("", "/app.ts"),
+    'export default "export const value = 42;";',
+  );
 });
