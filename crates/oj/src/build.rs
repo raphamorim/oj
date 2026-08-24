@@ -1469,34 +1469,92 @@ fn human_bytes(bytes: usize) -> String {
 }
 
 fn module_script_srcs(html: &str) -> Vec<String> {
-    scan_attrs(html, "<script", "src=\"")
+    scan_attrs(html, "<script", "src")
         .into_iter()
         .filter(|src| oj_server::html_entry_src(src).is_some())
         .collect()
 }
 
 fn link_hrefs(html: &str) -> Vec<String> {
-    scan_attrs(html, "<link", "href=\"")
+    scan_attrs(html, "<link", "href")
         .into_iter()
         .filter(|href| href.starts_with('/'))
         .collect()
 }
 
-fn scan_attrs(html: &str, tag_prefix: &str, attr_prefix: &str) -> Vec<String> {
+fn html_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let bytes = tag.as_bytes();
+    let mut cursor = bytes.iter().position(u8::is_ascii_whitespace)?;
+
+    while cursor < bytes.len() {
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        let start = cursor;
+        while cursor < bytes.len()
+            && !bytes[cursor].is_ascii_whitespace()
+            && bytes[cursor] != b'='
+            && bytes[cursor] != b'/'
+        {
+            cursor += 1;
+        }
+        if cursor == start {
+            cursor += 1;
+            continue;
+        }
+        let attribute = &tag[start..cursor];
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || bytes[cursor] != b'=' {
+            continue;
+        }
+        cursor += 1;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() {
+            return None;
+        }
+        let (value_start, value_end) = if matches!(bytes[cursor], b'\'' | b'"') {
+            let quote = bytes[cursor];
+            let start = cursor + 1;
+            cursor = start;
+            while cursor < bytes.len() && bytes[cursor] != quote {
+                cursor += 1;
+            }
+            let end = cursor;
+            cursor += usize::from(cursor < bytes.len());
+            (start, end)
+        } else {
+            let start = cursor;
+            while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            (start, cursor)
+        };
+        if attribute.eq_ignore_ascii_case(name) {
+            return Some(&tag[value_start..value_end]);
+        }
+    }
+
+    None
+}
+
+fn scan_attrs(html: &str, tag_prefix: &str, attr_name: &str) -> Vec<String> {
     let mut values = Vec::new();
     for (start, _) in html.match_indices(tag_prefix) {
         let Some(end) = html[start..].find('>') else {
             continue;
         };
         let tag = &html[start..start + end];
-        if tag_prefix == "<script" && !tag.contains("type=\"module\"") {
+        if tag_prefix == "<script"
+            && !html_attr(tag, "type").is_some_and(|value| value.eq_ignore_ascii_case("module"))
+        {
             continue;
         }
-        if let Some(at) = tag.find(attr_prefix) {
-            let rest = &tag[at + attr_prefix.len()..];
-            if let Some(close) = rest.find('"') {
-                values.push(rest[..close].to_string());
-            }
+        if let Some(value) = html_attr(tag, attr_name) {
+            values.push(value.to_string());
         }
     }
     values
