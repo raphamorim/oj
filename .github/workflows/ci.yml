@@ -77,6 +77,8 @@ jobs:
           node-version: 22
       - run: npm ci --prefix playground
       - run: cargo run -p oj -- build playground
+      - name: reject unresolved build imports
+        run: node e2e/build-unresolved.mjs
       - name: check outputs
         run: |
           test -f playground/dist/index.html
