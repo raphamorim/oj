@@ -299,3 +299,28 @@ test("plugin hooks can inspect loaded and transformed module metadata", async ()
     "export const value = 42;:0:true:true:true",
   );
 });
+
+// PR #65
+test("plugin hook contexts load virtual dependency modules", async () => {
+  const container = createPluginContainer({}, [
+    {
+      name: "synthetic-virtual-module-loader",
+      load(id) {
+        return id === "\0synthetic:dependency" ? "export const value = 42;" : null;
+      },
+    },
+    {
+      name: "synthetic-dependency-transform",
+      async transform(_code, id) {
+        if (id !== "/app.ts") return null;
+        const dependency = await this.load({ id: "\0synthetic:dependency" });
+        return `export default ${JSON.stringify(dependency.code)};`;
+      },
+    },
+  ]);
+
+  assert.equal(
+    await container.transform("", "/app.ts"),
+    'export default "export const value = 42;";',
+  );
+});
