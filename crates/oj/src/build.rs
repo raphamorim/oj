@@ -1214,6 +1214,19 @@ pub async fn build(
         .await
         .map_err(|errs| anyhow::anyhow!("close failed:\n{errs:?}"))?;
 
+    let unresolved: Vec<String> = output
+        .warnings
+        .iter()
+        .filter(|warning| warning.kind().to_string() == "UNRESOLVED_IMPORT")
+        .map(|warning| warning.to_string())
+        .collect();
+    if !unresolved.is_empty() {
+        bail!(
+            "build failed: unresolved imports:\n{}",
+            unresolved.join("\n")
+        );
+    }
+
     if let Some(host) = &plugin_host {
         if let Err(e) = host.build_end().await {
             eprintln!("oj build: plugin buildEnd failed: {e}");
