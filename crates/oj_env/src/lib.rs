@@ -118,7 +118,7 @@ pub fn import_meta_env_defines(
     mode: &str,
     dev: bool,
     base_url: &str,
-    prefix: &str,
+    prefixes: &[&str],
 ) -> Vec<(String, String)> {
     let mut obj = serde_json::Map::new();
     obj.insert("MODE".into(), mode.into());
@@ -127,7 +127,7 @@ pub fn import_meta_env_defines(
     obj.insert("PROD".into(), (!dev).into());
     obj.insert("SSR".into(), false.into());
     for (k, v) in loaded {
-        if k.starts_with(prefix) {
+        if prefixes.iter().any(|p| k.starts_with(p)) {
             obj.insert(k.clone(), serde_json::Value::String(v.clone()));
         }
     }
@@ -226,7 +226,7 @@ mod tests {
             "development",
             true,
             "/",
-            "VITE_",
+            &["VITE_"],
         );
         let env = html_env_map(&defines);
         let html =
@@ -263,7 +263,7 @@ mod tests {
             ("VITE_API".into(), "https://api.test".into()),
             ("SECRET".into(), "nope".into()),
         ];
-        let d = import_meta_env_defines(&loaded, "development", true, "/", "VITE_");
+        let d = import_meta_env_defines(&loaded, "development", true, "/", &["VITE_"]);
         let map: std::collections::HashMap<_, _> = d.iter().cloned().collect();
         assert_eq!(map["import.meta.env.MODE"], "\"development\"");
         assert_eq!(map["import.meta.env.DEV"], "true");

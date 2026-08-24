@@ -14,7 +14,7 @@ pub struct OjConfig {
     pub server: Option<ServerConfig>,
     pub resolve: Option<ResolveConfig>,
     pub define: Option<BTreeMap<String, serde_json::Value>>,
-    pub env_prefix: Option<String>,
+    pub env_prefix: Option<StringOrList>,
     pub env_dir: Option<String>,
     pub build: Option<BuildConfig>,
     pub preview: Option<PreviewConfig>,
@@ -22,6 +22,22 @@ pub struct OjConfig {
     pub bundle: Option<bool>,
     pub environments: Option<BTreeMap<String, serde_json::Value>>,
     pub optimize_deps: Option<OptimizeDepsConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum StringOrList {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl StringOrList {
+    pub fn to_vec(&self) -> Vec<String> {
+        match self {
+            StringOrList::One(s) => vec![s.clone()],
+            StringOrList::Many(v) => v.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]

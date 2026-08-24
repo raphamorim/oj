@@ -41,6 +41,15 @@ pub fn rolldown_options(config: &OjConfig) -> Option<&serde_json::Value> {
         .or(build.rollup_options.as_ref())
 }
 
+pub fn env_prefixes(config: &OjConfig) -> Vec<String> {
+    config
+        .env_prefix
+        .as_ref()
+        .map(|p| p.to_vec())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec!["VITE_".to_string()])
+}
+
 pub fn config_defines(config: &OjConfig) -> Vec<(String, String)> {
     config
         .define
@@ -454,6 +463,25 @@ mod tests {
         assert!(resolve_extensions(&empty).is_none());
         assert!(resolve_main_fields(&empty).is_none());
         assert!(!resolve_preserve_symlinks(&empty));
+    }
+
+    #[test]
+    fn env_prefix_accepts_string_or_array_and_defaults() {
+        // A single string stays a one-element list (back-compat).
+        let one: OjConfig = serde_json::from_str(r#"{"envPrefix":"PUBLIC_"}"#).unwrap();
+        assert_eq!(env_prefixes(&one), vec!["PUBLIC_".to_string()]);
+        // An array exposes every listed prefix.
+        let many: OjConfig =
+            serde_json::from_str(r#"{"envPrefix":["VITE_","PUBLIC_"]}"#).unwrap();
+        assert_eq!(
+            env_prefixes(&many),
+            vec!["VITE_".to_string(), "PUBLIC_".to_string()]
+        );
+        // Absent (or empty) falls back to Vite's default VITE_.
+        let none: OjConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(env_prefixes(&none), vec!["VITE_".to_string()]);
+        let empty: OjConfig = serde_json::from_str(r#"{"envPrefix":[]}"#).unwrap();
+        assert_eq!(env_prefixes(&empty), vec!["VITE_".to_string()]);
     }
 
     #[test]

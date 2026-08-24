@@ -1194,7 +1194,7 @@ pub async fn build(
                 let mut pairs: Vec<(String, String)> =
                     vec![("process.env.NODE_ENV".into(), "'production'".into())];
                 pairs.extend(oj_env::import_meta_env_defines(
-                    &env, mode, false, &base, "VITE_",
+                    &env, mode, false, &base, &["VITE_"],
                 ));
                 pairs.extend(oj_config::config_defines(&config));
                 pairs.extend(oj_config::environment_defines(&config, "client"));
@@ -1243,7 +1243,7 @@ pub async fn build(
     // before the plugin transformIndexHtml below.
     let html_env = {
         let env = oj_env::load(&root, mode);
-        let mut defines = oj_env::import_meta_env_defines(&env, mode, false, &base, "VITE_");
+        let mut defines = oj_env::import_meta_env_defines(&env, mode, false, &base, &["VITE_"]);
         defines.extend(oj_config::config_defines(&config));
         oj_env::html_env_map(&defines)
     };
@@ -2091,7 +2091,7 @@ async fn build_client_entry(
                     "production",
                     false,
                     "/",
-                    "VITE_",
+                    &["VITE_"],
                 ));
                 pairs.extend(oj_config::config_defines(&config));
                 pairs.extend(oj_config::environment_defines(&config, "client"));

@@ -334,7 +334,8 @@ impl DevServer {
             );
         }
 
-        let env_prefix = config.env_prefix.as_deref().unwrap_or("VITE_");
+        let env_prefixes = oj_config::env_prefixes(&config);
+        let env_prefix_refs: Vec<&str> = env_prefixes.iter().map(String::as_str).collect();
         let env_dir = config
             .env_dir
             .as_deref()
@@ -346,7 +347,7 @@ impl DevServer {
             "development",
             true,
             config.base.as_deref().unwrap_or("/"),
-            env_prefix,
+            &env_prefix_refs,
         );
         defines.extend(oj_config::config_defines(&config));
         defines.extend(oj_config::environment_defines(&config, "client"));

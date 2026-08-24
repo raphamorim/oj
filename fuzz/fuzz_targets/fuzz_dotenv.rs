@@ -25,7 +25,7 @@ fuzz_target!(|data: &[u8]| {
     }
 
     let prefix = "VITE_";
-    let defines = import_meta_env_defines(&loaded, "production", false, "/", prefix);
+    let defines = import_meta_env_defines(&loaded, "production", false, "/", &[prefix]);
 
     // The aggregate object is always valid JSON, and its keys are exactly the
     // individual defines.

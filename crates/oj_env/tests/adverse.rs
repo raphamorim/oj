@@ -139,7 +139,7 @@ fn unprefixed_variables_never_reach_the_defines() {
         ("XVITE_API".into(), "prefixed-secret".into()),
         ("VITE_OK".into(), "public".into()),
     ];
-    let defines = import_meta_env_defines(&loaded, "production", false, "/", "VITE_");
+    let defines = import_meta_env_defines(&loaded, "production", false, "/", &["VITE_"]);
     let blob = defines
         .iter()
         .map(|(k, v)| format!("{k}={v}\n"))
@@ -163,7 +163,7 @@ fn an_empty_prefix_exposes_everything_by_design() {
     // of this test is that the behavior is deliberate and visible, not a
     // surprise found in production.
     let loaded = vec![("DATABASE_URL".into(), "secret".into())];
-    let defines = import_meta_env_defines(&loaded, "production", false, "/", "");
+    let defines = import_meta_env_defines(&loaded, "production", false, "/", &[""]);
     let keys: Vec<&str> = defines.iter().map(|(k, _)| k.as_str()).collect();
     assert!(keys.contains(&"import.meta.env.DATABASE_URL"));
 }
@@ -174,7 +174,7 @@ fn secret_values_containing_define_syntax_stay_quoted_json() {
         "VITE_TRICK".into(),
         "\",\"SECRET\":\"leaked\",\"x\":\"".into(),
     )];
-    let defines = import_meta_env_defines(&loaded, "development", true, "/", "VITE_");
+    let defines = import_meta_env_defines(&loaded, "development", true, "/", &["VITE_"]);
     let obj = defines
         .iter()
         .find(|(k, _)| k == "import.meta.env")
@@ -249,7 +249,7 @@ fn html_substitution_keeps_multibyte_content_intact() {
         "development",
         true,
         "/",
-        "VITE_",
+        &["VITE_"],
     );
     let env = html_env_map(&defines);
     let out = replace_html_env("<title>%VITE_T%</title> 日本 %MODE%", &env);
@@ -319,10 +319,30 @@ fn a_dotenv_cannot_shadow_the_builtin_env_fields() {
         ("MODE".into(), "hacked".into()),
         ("DEV".into(), "hacked".into()),
     ];
-    let defines = import_meta_env_defines(&loaded, "production", false, "/base/", "VITE_");
+    let defines = import_meta_env_defines(&loaded, "production", false, "/base/", &["VITE_"]);
     let m: BTreeMap<_, _> = defines.into_iter().collect();
     assert_eq!(m["import.meta.env.MODE"], "\"production\"");
     assert_eq!(m["import.meta.env.DEV"], "false");
     assert_eq!(m["import.meta.env.PROD"], "true");
     assert_eq!(m["import.meta.env.BASE_URL"], "\"/base/\"");
+}
+
+#[test]
+fn multiple_prefixes_expose_every_matching_var() {
+    // envPrefix given as an array: a var is exposed if it matches ANY prefix;
+    // an unprefixed secret is still withheld.
+    let loaded = vec![
+        ("VITE_A".into(), "1".into()),
+        ("PUBLIC_B".into(), "2".into()),
+        ("SECRET_C".into(), "3".into()),
+    ];
+    let defines =
+        import_meta_env_defines(&loaded, "production", false, "/", &["VITE_", "PUBLIC_"]);
+    let keys: Vec<&str> = defines.iter().map(|(k, _)| k.as_str()).collect();
+    assert!(keys.contains(&"import.meta.env.VITE_A"));
+    assert!(keys.contains(&"import.meta.env.PUBLIC_B"));
+    assert!(
+        !keys.contains(&"import.meta.env.SECRET_C"),
+        "an unprefixed var must never leak",
+    );
 }
