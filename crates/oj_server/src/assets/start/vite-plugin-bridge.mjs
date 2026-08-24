@@ -251,7 +251,8 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
     for (const p of plugins) {
       if (!envAllows(p, environment)) continue;
       const h = hookHandler(p.transform);
-      if (!h || !idAllowed(hookFilter(p.transform), id)) continue;
+      const filter = hookFilter(p.transform);
+      if (!h || !idAllowed(filter, id) || !idAllowed(filter?.code, current)) continue;
       let r;
       try { r = await h.call(pluginContext(p), current, id, { ssr: environment === "ssr" }); } catch (e) { if (ojReimplemented(p.name)) continue; throw pluginError(e, p, id); }
       const next = r == null ? null : typeof r === "string" ? r : r.code;
@@ -268,7 +269,8 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
     for (const p of plugins) {
       if (ojReimplemented(p.name) || !envAllows(p, environment)) continue;
       const h = hookHandler(p.transform);
-      if (!h || !idAllowed(hookFilter(p.transform), id)) continue;
+      const filter = hookFilter(p.transform);
+      if (!h || !idAllowed(filter, id) || !idAllowed(filter?.code, current)) continue;
       let r;
       try { r = await h.call(pluginContext(p), current, id, { ssr }); } catch (e) { throw pluginError(e, p, id); }
       const next = r == null ? null : typeof r === "string" ? r : r.code;

@@ -358,3 +358,21 @@ test("plugin hook contexts resolve virtual dependencies without reentering thems
   assert.equal(resolverCalls, 1);
   assert.equal(await container.load("\0resolved:entry?wrapped"), 'export default "\\u0000resolved:dependency";');
 });
+
+// PR #49
+test("transform hook code filters gate both transform entry points", async () => {
+  const plugin = {
+    name: "synthetic-selective-transform",
+    transform: {
+      filter: { id: /\.tsx$/, code: { include: /@enabled/, exclude: /@disabled/ } },
+      handler(code) { return `${code}\ntransformed();`; },
+    },
+  };
+  const container = createPluginContainer({}, [plugin]);
+
+  assert.equal(await container.transform("plain();", "/app.tsx"), null);
+  assert.equal(await container.transform("/* @enabled @disabled */", "/app.tsx"), null);
+  assert.equal(await container.transform("/* @enabled */", "/app.tsx"), "/* @enabled */\ntransformed();");
+  assert.equal(await container.transformUserCode("plain();", "/app.tsx"), null);
+  assert.equal(await container.transformUserCode("/* @enabled */", "/app.tsx"), "/* @enabled */\ntransformed();");
+});
