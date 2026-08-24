@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 import assert from "node:assert/strict";
+import assert from "node:assert/strict";
 
 import { test } from "node:test";
 import { __test, createPluginContainer, findConfig, loadPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
@@ -180,4 +181,24 @@ test("plugin hooks receive the configured Vite mode", async () => {
   assert.equal(await staging.transform("", "/app.ts"), 'export default "staging";');
   assert.equal(await preview.transform("", "/app.ts"), 'export default "preview";');
   assert.equal(await defaults.transform("", "/app.ts"), 'export default "production";');
+});
+
+test("resolveId and load receive Vite SSR hook options", async () => {
+  const plugin = {
+    name: "synthetic-environment-module",
+    resolveId(source, _importer, options) {
+      return `\0${options?.ssr ? "server" : "client"}:${source}`;
+    },
+    load(_id, options) {
+      return `export default ${JSON.stringify(options?.ssr ? "server" : "client")};`;
+    },
+  };
+
+  const server = createPluginContainer({}, [plugin], { environment: "ssr" });
+  const client = createPluginContainer({}, [plugin], { environment: "client" });
+
+  assert.equal(await server.resolveId("virtual:entry", "/app.ts"), "\0server:virtual:entry");
+  assert.equal(await server.load("\0server:virtual:entry"), 'export default "server";');
+  assert.equal(await client.resolveId("virtual:entry", "/app.ts"), "\0client:virtual:entry");
+  assert.equal(await client.load("\0client:virtual:entry"), 'export default "client";');
 });
