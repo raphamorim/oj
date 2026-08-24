@@ -175,6 +175,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
   // import. Mirror Vite's shape so those plugins take their intended branch.
   const consumer = environment === "client" ? "client" : "server";
   const watchFiles = new Set();
+  const moduleInfo = new Map();
   const ctx = {
     environment: {
       name: environment,
@@ -187,7 +188,8 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
     emitFile() { return "oj-emit-ref"; },
     setAssetSource() {}, getFileName() { return ""; },
     addWatchFile(id) { watchFiles.add(String(id)); }, getWatchFiles() { return [...watchFiles]; },
-    getModuleInfo() { return null; }, getModuleIds() { return [][Symbol.iterator](); },
+    getModuleInfo(id) { return moduleInfo.get(id) ?? null; },
+    getModuleIds() { return moduleInfo.keys(); },
     async resolve() { return null; }, async load() { return null; },
     parse,
   };
@@ -211,7 +213,11 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
       if (!h || !idAllowed(hookFilter(p.load), id)) continue;
       let r;
       try { r = await h.call(ctx, id, { ssr: environment === "ssr" }); } catch (e) { if (ojReimplemented(p.name)) continue; throw pluginError(e, p, id); }
-      if (r != null) return typeof r === "string" ? r : r.code;
+      if (r != null) {
+        const code = typeof r === "string" ? r : r.code;
+        moduleInfo.set(id, { id, code, importedIds: [] });
+        return code;
+      }
     }
     return null;
   }
@@ -225,6 +231,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
   }
 
   async function transform(code, id) {
+    moduleInfo.set(id, { id, code, importedIds: [] });
     let current = code, changed = false;
     for (const p of plugins) {
       if (!envAllows(p, environment)) continue;
@@ -240,6 +247,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
   }
 
   async function transformUserCode(code, id) {
+    moduleInfo.set(id, { id, code, importedIds: [] });
     const ssr = environment === "ssr";
     let current = code, changed = false;
     for (const p of plugins) {
