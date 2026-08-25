@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `?worker&inline` emits an inline Blob worker (with a `data:` URI fallback) in bundle mode, matching Vite; in dev it serves a working module worker instead of a broken data URI.
 - Plugin `handleHotUpdate` now receives the full Vite `HmrContext` (`file`, `timestamp`, `type`, `modules`, `read()`) and its returned module list is honored to narrow (or, when empty, suppress) the update, folded across plugins as in Vite.
 - `build.rollupOptions`/`rolldownOptions.input` is honored (string, array, or `{ name: path }` object), so multi-page projects and projects without a root `index.html` build. HTML entries under nested directories are emitted at their root-relative path and their page-relative `<script>` sources are resolved against the page, matching Vite's `input` resolution.
-- Plugins can call `this.emitFile({ type: "chunk", id })` during `transform`; the chunk is bundled as an entry and `this.getFileName(referenceId)` resolves to its final hashed name in `generateBundle` (the emit-chunk mechanism CRXJS-style plugins use to add content scripts and pages).
+- Plugins can call `this.emitFile({ type: "chunk", id })` during `buildStart` or `transform`; the chunk is bundled as a build root and `this.getFileName(referenceId)` resolves to its final hashed name in `generateBundle`. Plugin `buildStart` now runs as a rolldown build hook and receives an `options` object with `input` (the emit-chunk mechanism CRXJS-style plugins use to emit their manifest root, content scripts, and pages).
 
 ### Changed
 - Plugin `transform` sourcemaps are now composed with oj's own transform map, so dev sourcemaps trace back to the original source through plugins that rewrite code.
