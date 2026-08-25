@@ -239,6 +239,7 @@ struct ServerState {
     compile_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     crawl_done: tokio::sync::watch::Receiver<bool>,
     fs_allow: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+    fs_deny: Vec<(glob::Pattern, bool)>,
     dir_cache: Arc<Mutex<DirCache>>,
     patch_seq: std::sync::atomic::AtomicU64,
     chunk_cache: Mutex<Option<(String, Arc<String>)>>,
@@ -600,6 +601,7 @@ impl DevServer {
                     })
                     .unwrap_or_default(),
             )),
+            fs_deny: compile_fs_deny(&oj_config::server_fs_deny(&config)),
             dir_cache: Arc::new(Mutex::new(DirCache::new())),
             patch_seq: std::sync::atomic::AtomicU64::new(0),
             chunk_cache: Mutex::new(None),
@@ -1478,6 +1480,10 @@ async fn serve_path(
             }
         }
     };
+
+    if path_is_denied(&file, &state.root, &state.fs_deny) {
+        return (StatusCode::FORBIDDEN, "oj: path denied by server.fs.deny").into_response();
+    }
 
     let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
     if let Some(kind) = query_asset_kind(uri.query()) {
@@ -2434,6 +2440,43 @@ fn is_dep_module(url: &str, file: &Path) -> bool {
 
 fn is_style_ext(ext: &str) -> bool {
     matches!(ext, "css" | "scss" | "sass" | "less" | "styl" | "stylus")
+}
+
+fn compile_fs_deny(user: &[String]) -> Vec<(glob::Pattern, bool)> {
+    const DEFAULTS: &[&str] = &[".env", ".env.*", "*.crt", "*.pem", "**/.git/**"];
+    DEFAULTS
+        .iter()
+        .map(|s| s.to_string())
+        .chain(user.iter().cloned())
+        .filter_map(|p| {
+            let base_only = !p.contains('/');
+            glob::Pattern::new(&p).ok().map(|pat| (pat, base_only))
+        })
+        .collect()
+}
+
+fn path_is_denied(file: &Path, root: &Path, deny: &[(glob::Pattern, bool)]) -> bool {
+    if deny.is_empty() {
+        return false;
+    }
+    let rel = file.strip_prefix(root).unwrap_or(file);
+    let rel_str = rel.to_string_lossy().replace('\\', "/");
+    let abs_str = file.to_string_lossy().replace('\\', "/");
+    let base = file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    for (pat, base_only) in deny {
+        let hit = if *base_only {
+            pat.matches(&base)
+        } else {
+            pat.matches(&rel_str) || pat.matches(&abs_str)
+        };
+        if hit {
+            return true;
+        }
+    }
+    false
 }
 
 // The browser stamps every request with Sec-Fetch-Dest describing what it will
@@ -4556,6 +4599,30 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("data:"), "binary asset stays a data URI: {out}");
+    }
+
+    #[test]
+    fn fs_deny_blocks_dotenv_and_git_by_default() {
+        // No user config: Vite's default deny set still protects secrets.
+        let root = Path::new("/proj");
+        let deny = compile_fs_deny(&[]);
+        assert!(path_is_denied(&root.join(".env"), root, &deny));
+        assert!(path_is_denied(&root.join(".env.local"), root, &deny));
+        assert!(path_is_denied(&root.join("certs/server.pem"), root, &deny));
+        assert!(path_is_denied(&root.join(".git/config"), root, &deny));
+        assert!(path_is_denied(&root.join("packages/app/.git/HEAD"), root, &deny));
+        // Ordinary source is served.
+        assert!(!path_is_denied(&root.join("src/main.tsx"), root, &deny));
+        assert!(!path_is_denied(&root.join("src/env.ts"), root, &deny));
+    }
+
+    #[test]
+    fn fs_deny_honors_user_patterns() {
+        let root = Path::new("/proj");
+        let deny = compile_fs_deny(&["secrets/**".to_string(), "*.key".to_string()]);
+        assert!(path_is_denied(&root.join("secrets/token.txt"), root, &deny));
+        assert!(path_is_denied(&root.join("id_rsa.key"), root, &deny));
+        assert!(!path_is_denied(&root.join("public/logo.svg"), root, &deny));
     }
 
     #[test]
