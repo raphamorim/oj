@@ -377,6 +377,8 @@ if (isMainRun) try {
       rollupOptions: markFunctions(c.build?.rolldownOptions ?? c.build?.rollupOptions ?? null),
       assetsInlineLimit:
         typeof c.build?.assetsInlineLimit === "number" ? c.build.assetsInlineLimit : null,
+      copyPublicDir:
+        typeof c.build?.copyPublicDir === "boolean" ? c.build.copyPublicDir : null,
       dedupe: Array.isArray(c.resolve?.dedupe)
         ? c.resolve.dedupe.filter((x) => typeof x === "string")
         : null,
