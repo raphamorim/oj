@@ -435,3 +435,63 @@ test("configResolved initializes plugin state once before concurrent module hook
   assert.equal(id, "/synthetic-app/virtual:entry");
   assert.equal(initializations, 1);
 });
+
+// PR #69
+test("plugin config hooks initialize state and merge nested configuration", async () => {
+  const root = mkdtempSync(join(tmpdir(), "oj-plugin-config-hooks-"));
+  try {
+    const vite = join(root, "node_modules", "vite");
+    mkdirSync(vite, { recursive: true });
+    writeFileSync(join(root, "package.json"), '{"name":"synthetic-app"}');
+    writeFileSync(join(root, "vite.config.mjs"), "export default {};\n");
+    writeFileSync(join(vite, "package.json"), '{"name":"vite","type":"module","main":"./index.mjs"}');
+    writeFileSync(join(vite, "index.mjs"), `
+      export async function loadConfigFromFile() {
+        let observed;
+        return {
+          config: {
+            define: { EXISTING: "preserved" },
+            resolve: { alias: ["initial"] },
+            plugins: [
+              {
+                name: "synthetic-unsupported-config",
+                config(config) {
+                  return config.build.rollupOptions;
+                },
+              },
+              {
+                name: "synthetic-config-producer",
+                async config(_config, environment) {
+                  return {
+                    define: { TOKEN: environment.command + ":" + environment.mode },
+                    resolve: { alias: ["configured"] },
+                    publicDir: "configured-public",
+                  };
+                },
+              },
+              {
+                name: "synthetic-config-consumer",
+                config(config) {
+                  observed = [config.define.TOKEN, config.define.EXISTING, config.resolve.alias.join(",")].join("|");
+                },
+                transform() {
+                  return observed ? "export default " + JSON.stringify(observed) + ";" : null;
+                },
+              },
+            ],
+          },
+        };
+      }
+    `);
+
+    const container = await loadPluginContainer(root, { command: "serve", mode: "staging" });
+
+    assert.equal(
+      await container.transform("", "/app.ts"),
+      'export default "serve:staging|preserved|initial,configured";',
+    );
+    assert.equal(container.publicDir, "configured-public");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
