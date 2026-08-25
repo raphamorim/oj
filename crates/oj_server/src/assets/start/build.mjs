@@ -209,6 +209,7 @@ if (clientContainer) {
     mkdirSync(dirname(outFile), { recursive: true });
     writeFileSync(outFile, source);
   });
+  await clientContainer.writeBundle(Object.fromEntries(client.output.map((output) => [output.fileName, output])));
 }
 
 const rootManifest = {
