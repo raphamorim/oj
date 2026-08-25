@@ -219,11 +219,47 @@ export function createPluginContainer(vite, allPlugins, {
     plugins: allPlugins,
     isProduction: mode === "production",
   };
+  const environmentModules = new Map();
+  const modulesByUrl = new Map();
+  const modulesByFile = new Map();
+  const moduleGraph = {
+    environment,
+    idToModuleMap: environmentModules,
+    urlToModuleMap: modulesByUrl,
+    fileToModulesMap: modulesByFile,
+    getModuleById(id) { return environmentModules.get(id); },
+    async getModuleByUrl(url) { return modulesByUrl.get(url); },
+    getModulesByFile(file) { return modulesByFile.get(file); },
+  };
+
+  function trackEnvironmentModule(id, code) {
+    let node = environmentModules.get(id);
+    if (!node) {
+      const file = id.split("?")[0];
+      node = {
+        id,
+        url: id,
+        file,
+        environment,
+        type: file.endsWith(".css") ? "css" : "js",
+        importedModules: new Set(),
+        importers: new Set(),
+      };
+      environmentModules.set(id, node);
+      modulesByUrl.set(id, node);
+      if (!modulesByFile.has(file)) modulesByFile.set(file, new Set());
+      modulesByFile.get(file).add(node);
+    }
+    node.transformResult = { code, map: null };
+    return node;
+  }
+
   const ctx = {
     environment: {
       name: environment,
       mode: command === "build" ? "build" : "dev",
       config: { ...resolvedConfig, consumer },
+      moduleGraph,
     },
     meta: { rollupVersion: "4.0.0", watchMode: command !== "build", framework: "oj" },
     warn() {}, info() {}, debug() {},
@@ -292,6 +328,7 @@ export function createPluginContainer(vite, allPlugins, {
       if (r != null) {
         const code = typeof r === "string" ? r : r.code;
         moduleInfo.set(id, { id, code, importedIds: [], meta: {} });
+        trackEnvironmentModule(id, code);
         return code;
       }
     }
@@ -310,6 +347,7 @@ export function createPluginContainer(vite, allPlugins, {
   async function transform(code, id) {
     await initializePlugins();
     moduleInfo.set(id, { id, code, importedIds: [], meta: {} });
+    trackEnvironmentModule(id, code);
     let current = code, changed = false;
     for (const p of byHook(plugins, "transform")) {
       if (!envAllows(p, environment)) continue;
@@ -321,6 +359,7 @@ export function createPluginContainer(vite, allPlugins, {
       const next = r == null ? null : typeof r === "string" ? r : r.code;
       if (next != null) { current = next; changed = true; }
     }
+    trackEnvironmentModule(id, current);
     await moduleParsed(id, current);
     return changed ? current : null;
   }
@@ -328,6 +367,7 @@ export function createPluginContainer(vite, allPlugins, {
   async function transformUserCode(code, id) {
     await initializePlugins();
     moduleInfo.set(id, { id, code, importedIds: [], meta: {} });
+    trackEnvironmentModule(id, code);
     const ssr = environment === "ssr";
     let current = code, changed = false;
     for (const p of byHook(plugins, "transform")) {
@@ -340,6 +380,7 @@ export function createPluginContainer(vite, allPlugins, {
       const next = r == null ? null : typeof r === "string" ? r : r.code;
       if (next != null) { current = next; changed = true; }
     }
+    trackEnvironmentModule(id, current);
     await moduleParsed(id, current);
     return changed ? current : null;
   }
