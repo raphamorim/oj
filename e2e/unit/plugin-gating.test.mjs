@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { __test, createPluginContainer, findConfig, loadPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 const { matchOne, idAllowed, codeAllowed, byHook, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
@@ -666,4 +666,51 @@ test("writeBundle observes emitted chunks after generation in the client environ
     "pre:client:entry();",
     "post:es:assets/chunk.js,assets/entry.js:true",
   ]);
+});
+
+// PR #83
+test("closeBundle runs finalizer-only plugins in their matching environment", async () => {
+  const finalized = [];
+  const plugin = {
+    name: "synthetic-build-finalizer",
+    applyToEnvironment: (environment) => environment.name === "client",
+    closeBundle() { finalized.push(this.environment.name); },
+  };
+
+  const client = createPluginContainer({}, [plugin], { command: "build", environment: "client" });
+  const server = createPluginContainer({}, [plugin], { command: "build", environment: "ssr" });
+
+  assert.equal(client.pluginCount, 1);
+  await client.closeBundle();
+  await server.closeBundle();
+
+  assert.deepEqual(finalized, ["client"]);
+});
+
+test("closeBundle supports object-form finalizers and continues past failed hooks", async () => {
+  const finalized = [];
+  const container = createPluginContainer({}, [
+    {
+      name: "synthetic-failed-finalizer",
+      closeBundle() { throw new Error("synthetic finalizer failure"); },
+    },
+    {
+      name: "synthetic-object-finalizer",
+      closeBundle: { handler() { finalized.push(this.environment.config.consumer); } },
+    },
+  ], { command: "build", environment: "ssr" });
+
+  await container.closeBundle();
+
+  assert.deepEqual(finalized, ["server"]);
+});
+
+test("production Start builds close both environment plugin containers", () => {
+  const source = readFileSync(
+    new URL("../../crates/oj_server/src/assets/start/build.mjs", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(source, /await clientContainer\?\.closeBundle\(\)/);
+  assert.match(source, /await serverContainer\?\.closeBundle\(\)/);
 });
