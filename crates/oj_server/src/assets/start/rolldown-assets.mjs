@@ -90,6 +90,9 @@ export function makeVitePlugins({ container, fallback, appRoot, mode = "dev", fs
       if (container?.buildStart) await container.buildStart();
       if (fallback?.buildStart && fallback !== container) await fallback.buildStart();
     },
+    async renderStart(outputOptions, inputOptions) {
+      if (container?.renderStart) await container.renderStart(outputOptions, inputOptions);
+    },
     resolveId: {
       filter: { id: { include: [/\.svg\?react$/, /^virtual:/, /^\0/] } },
       async handler(source, importer, options) {
