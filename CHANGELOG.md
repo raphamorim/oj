@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `resolve.extensions`, `resolve.mainFields`, and `resolve.preserveSymlinks` are now honored by the resolver.
 - `envPrefix` accepts an array of prefixes (`string | string[]`).
 - `css.preprocessorOptions.scss.additionalData` (and `sass`) injects a preamble before Sass compilation.
+- `server.strictPort` is honored; by default the dev and preview servers move to the next free port when the chosen one is busy (Vite parity), and error only when `strictPort` is set.
 
 ### Changed
 - CSS imported with `?inline` returns the compiled CSS string instead of a base64 `data:` URI.
