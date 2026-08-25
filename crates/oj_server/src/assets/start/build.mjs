@@ -203,13 +203,22 @@ const entryChunk = client.output.find((o) => o.type === "chunk" && o.isEntry);
 const clientUrl = "/" + entryChunk.fileName;
 
 if (clientContainer) {
+  const bundle = Object.fromEntries(client.output.map((output) => [output.fileName, output]));
+  const originalCode = new Map(client.output
+    .filter((output) => output.type === "chunk")
+    .map((output) => [output.fileName, output.code]));
   await clientContainer.generateBundle(({ type, fileName, source }) => {
     if (type !== "asset" || !fileName || source == null) return;
     const outFile = join(CLIENT, fileName);
     mkdirSync(dirname(outFile), { recursive: true });
     writeFileSync(outFile, source);
-  });
-  await clientContainer.writeBundle(Object.fromEntries(client.output.map((output) => [output.fileName, output])));
+  }, bundle);
+  for (const output of Object.values(bundle)) {
+    if (output.type === "chunk" && output.code !== originalCode.get(output.fileName)) {
+      writeFileSync(join(CLIENT, output.fileName), output.code);
+    }
+  }
+  await clientContainer.writeBundle(bundle);
 }
 
 const rootManifest = {

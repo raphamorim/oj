@@ -358,13 +358,13 @@ export function createPluginContainer(vite, allPlugins, {
     return changed ? current : null;
   }
 
-  async function generateBundle(emit) {
+  async function generateBundle(emit, bundle = {}) {
     await initializePlugins();
     const genCtx = { ...ctx, emitFile: (f) => (emit(f), "oj-emit-ref") };
     for (const p of byHook(plugins, "generateBundle")) {
       const h = hookHandler(p.generateBundle);
       if (!h || !envAllows(p, environment)) continue;
-      try { await h.call(pluginContext(p, genCtx), { format: "es" }, {}, false); } catch {}
+      try { await h.call(pluginContext(p, genCtx), { format: "es" }, bundle, false); } catch {}
     }
   }
 
