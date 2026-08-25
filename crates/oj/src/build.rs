@@ -781,40 +781,66 @@ fn copy_public_dir(src: &Path, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Shared state for chunks/pages a plugin emits during the build. Held by both
+// OjUserPlugin (which fills it inside hooks) and build() (which reads the
+// collected HTML pages afterward to render them).
+#[derive(Debug)]
+struct EmitState {
+    root: PathBuf,
+    // oj chunk ref id -> rolldown ref id, resolved to the hashed name later.
+    chunk_refs: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    // oj ref id -> an already-resolved output name (emitted `.html` pages, whose
+    // output path is known at emit time rather than via rolldown).
+    direct_names: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    // `.html` pages a plugin emitted as chunks, to render after the build.
+    html_docs: std::sync::Mutex<Vec<HtmlDoc>>,
+}
+
+impl EmitState {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            chunk_refs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            direct_names: std::sync::Mutex::new(std::collections::HashMap::new()),
+            html_docs: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct OjUserPlugin {
     host: Arc<PluginHost>,
     render_chunk_enabled: Arc<tokio::sync::OnceCell<bool>>,
-    // Maps a plugin-facing chunk reference id (`oj-chunk-N`, minted in the
-    // sidecar) to rolldown's own reference id, so `this.getFileName(refId)` can
-    // be answered with the final hashed name once chunks are generated.
-    emitted_chunk_refs: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    emit: Arc<EmitState>,
 }
 
 impl OjUserPlugin {
-    fn new(host: Arc<PluginHost>) -> Self {
+    fn new(host: Arc<PluginHost>, emit: Arc<EmitState>) -> Self {
         Self {
             host,
             render_chunk_enabled: Arc::new(tokio::sync::OnceCell::new()),
-            emitted_chunk_refs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            emit,
         }
     }
-
 }
 
 // Forward chunks a plugin emitted (in buildStart or transform) to rolldown as
-// build roots, remembering the plugin ref id -> rolldown ref id mapping so
-// getFileName can be answered later.
+// build roots. A `.html` id is not a JS module: its `<script type=module>` are
+// emitted as JS entries instead and the page is queued for rendering, with the
+// ref id resolving to the page's output path.
 fn forward_emitted_chunks(
     ctx: &PluginContext,
     chunks: &[oj_server::plugins::ChunkEmit],
-    refs: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+    emit: &EmitState,
 ) {
     if chunks.is_empty() {
         return;
     }
-    let mut refs = refs.lock().unwrap();
     for c in chunks {
+        if c.id.ends_with(".html") {
+            forward_emitted_html(ctx, c, emit);
+            continue;
+        }
         let emitted = rolldown_common::EmittedChunk {
             id: c.id.clone(),
             name: c.name.clone().map(Into::into),
@@ -822,9 +848,61 @@ fn forward_emitted_chunks(
             ..Default::default()
         };
         if let Ok(rd_ref) = ctx.emit_chunk(emitted) {
-            refs.insert(c.ref_id.clone(), rd_ref.to_string());
+            emit.chunk_refs
+                .lock()
+                .unwrap()
+                .insert(c.ref_id.clone(), rd_ref.to_string());
         }
     }
+}
+
+fn forward_emitted_html(
+    ctx: &PluginContext,
+    c: &oj_server::plugins::ChunkEmit,
+    emit: &EmitState,
+) {
+    let abs = if Path::new(&c.id).is_absolute() {
+        PathBuf::from(&c.id)
+    } else {
+        emit.root.join(&c.id)
+    };
+    let Ok(content) = fs::read_to_string(&abs) else {
+        return;
+    };
+    let html_dir = abs.parent().unwrap_or(&emit.root).to_path_buf();
+    let out_rel = abs
+        .strip_prefix(&emit.root)
+        .map(|p| p.display().to_string().replace('\\', "/"))
+        .unwrap_or_else(|_| {
+            abs.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| c.id.clone())
+        });
+    let scripts: Vec<HtmlScript> = module_script_srcs(&content)
+        .into_iter()
+        .map(|src| {
+            let sabs = resolve_html_ref(&src, &html_dir, &emit.root);
+            let emitted = rolldown_common::EmittedChunk {
+                id: sabs.display().to_string(),
+                name: sabs
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(Into::into),
+                ..Default::default()
+            };
+            let _ = ctx.emit_chunk(emitted);
+            HtmlScript { src, abs: sabs }
+        })
+        .collect();
+    emit.direct_names
+        .lock()
+        .unwrap()
+        .insert(c.ref_id.clone(), out_rel.clone());
+    emit.html_docs.lock().unwrap().push(HtmlDoc {
+        out_rel,
+        src_html: content,
+        scripts,
+    });
 }
 
 impl Plugin for OjUserPlugin {
@@ -850,7 +928,7 @@ impl Plugin for OjUserPlugin {
         _args: &rolldown_plugin::HookBuildStartArgs<'_>,
     ) -> rolldown_plugin::HookNoopReturn {
         match self.host.build_start().await {
-            Ok(chunks) => forward_emitted_chunks(ctx, &chunks, &self.emitted_chunk_refs),
+            Ok(chunks) => forward_emitted_chunks(ctx, &chunks, &self.emit),
             Err(e) => eprintln!("oj build: plugin buildStart failed: {e}"),
         }
         Ok(())
@@ -901,13 +979,13 @@ impl Plugin for OjUserPlugin {
         args: &HookTransformArgs<'_>,
     ) -> impl std::future::Future<Output = HookTransformReturn> + Send {
         let host = Arc::clone(&self.host);
-        let refs = Arc::clone(&self.emitted_chunk_refs);
+        let emit = Arc::clone(&self.emit);
         let code = args.code.to_string();
         let id = args.id.to_string();
         async move {
             match host.transform(&code, &id).await {
                 Ok((out, _, _, chunks)) => {
-                    forward_emitted_chunks(&ctx.inner, &chunks, &refs);
+                    forward_emitted_chunks(&ctx.inner, &chunks, &emit);
                     if out != code {
                         Ok(Some(HookTransformOutput {
                             code: Some(out),
@@ -931,18 +1009,31 @@ impl Plugin for OjUserPlugin {
         // seed them into the sidecar so `this.getFileName(refId)` (read here in
         // generateBundle) returns the real output filename.
         let refs: Vec<(String, String)> = self
-            .emitted_chunk_refs
+            .emit
+            .chunk_refs
             .lock()
             .unwrap()
             .iter()
             .map(|(a, b)| (a.clone(), b.clone()))
             .collect();
-        if !refs.is_empty() {
+        let direct: Vec<(String, String)> = self
+            .emit
+            .direct_names
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(a, b)| (a.clone(), b.clone()))
+            .collect();
+        if !refs.is_empty() || !direct.is_empty() {
             let mut map = serde_json::Map::new();
             for (oj_ref, rd_ref) in refs {
                 if let Ok(name) = ctx.get_file_name(&rd_ref) {
                     map.insert(oj_ref, serde_json::Value::String(name.to_string()));
                 }
+            }
+            // Emitted `.html` pages resolve directly to their output path.
+            for (oj_ref, name) in direct {
+                map.insert(oj_ref, serde_json::Value::String(name));
             }
             if !map.is_empty() {
                 let _ = self
@@ -1333,9 +1424,13 @@ pub async fn build(
         mode,
     )
     .await;
+    let emit = Arc::new(EmitState::new(root.to_path_buf()));
     let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
     if let Some(host) = &plugin_host {
-        oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host))));
+        oj_plugins.push(Arc::new(OjUserPlugin::new(
+            Arc::clone(host),
+            Arc::clone(&emit),
+        )));
     }
     oj_plugins.push(Arc::new(OjCssPlugin {
         collected: Arc::clone(&collected_css),
@@ -1534,6 +1629,13 @@ pub async fn build(
         None
     };
 
+    // Pages a plugin emitted as `.html` chunks during the build are rendered
+    // here alongside the statically-resolved input pages.
+    {
+        let mut emitted_pages = emit.html_docs.lock().unwrap();
+        html_docs.append(&mut emitted_pages);
+    }
+
     for doc in &html_docs {
         let mut rewritten_html = oj_env::replace_html_env(&doc.src_html, &html_env);
         // Rewrite each `<script src>` to its hashed output chunk and collect
@@ -1662,11 +1764,13 @@ fn module_script_srcs(html: &str) -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug)]
 struct HtmlScript {
     src: String,
     abs: PathBuf,
 }
 
+#[derive(Debug)]
 struct HtmlDoc {
     out_rel: String,
     src_html: String,
@@ -1783,9 +1887,13 @@ pub(crate) async fn build_ssr(
         },
     )));
 
+    let emit = Arc::new(EmitState::new(root.to_path_buf()));
     let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
     if let Some(host) = &plugin_host {
-        oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host))));
+        oj_plugins.push(Arc::new(OjUserPlugin::new(
+            Arc::clone(host),
+            Arc::clone(&emit),
+        )));
     }
     oj_plugins.push(Arc::new(OjCssPlugin {
         collected: Arc::clone(&collected_css),
@@ -2278,9 +2386,13 @@ async fn build_client_entry(
         "production",
     )
     .await;
+    let emit = Arc::new(EmitState::new(root.to_path_buf()));
     let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
     if let Some(host) = &plugin_host {
-        oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host))));
+        oj_plugins.push(Arc::new(OjUserPlugin::new(
+            Arc::clone(host),
+            Arc::clone(&emit),
+        )));
     }
     oj_plugins.push(Arc::new(OjCssPlugin {
         collected: Arc::clone(&collected_css),
