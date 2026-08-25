@@ -124,11 +124,47 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
   // import. Mirror Vite's shape so those plugins take their intended branch.
   const consumer = environment === "client" ? "client" : "server";
   const watchFiles = new Set();
+  const environmentModules = new Map();
+  const modulesByUrl = new Map();
+  const modulesByFile = new Map();
+  const moduleGraph = {
+    environment,
+    idToModuleMap: environmentModules,
+    urlToModuleMap: modulesByUrl,
+    fileToModulesMap: modulesByFile,
+    getModuleById(id) { return environmentModules.get(id); },
+    async getModuleByUrl(url) { return modulesByUrl.get(url); },
+    getModulesByFile(file) { return modulesByFile.get(file); },
+  };
+
+  function trackEnvironmentModule(id, code) {
+    let node = environmentModules.get(id);
+    if (!node) {
+      const file = id.split("?")[0];
+      node = {
+        id,
+        url: id,
+        file,
+        environment,
+        type: file.endsWith(".css") ? "css" : "js",
+        importedModules: new Set(),
+        importers: new Set(),
+      };
+      environmentModules.set(id, node);
+      modulesByUrl.set(id, node);
+      if (!modulesByFile.has(file)) modulesByFile.set(file, new Set());
+      modulesByFile.get(file).add(node);
+    }
+    node.transformResult = { code, map: null };
+    return node;
+  }
+
   const ctx = {
     environment: {
       name: environment,
       mode: command === "build" ? "build" : "dev",
       config: { command, consumer, mode: command === "build" ? "production" : "development" },
+      moduleGraph,
     },
     meta: { rollupVersion: "4.0.0", watchMode: command !== "build", framework: "oj" },
     warn() {}, info() {}, debug() {},
@@ -160,12 +196,17 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
       if (!h || !idAllowed(hookFilter(p.load), id)) continue;
       let r;
       try { r = await h.call(ctx, id); } catch { continue; }
-      if (r != null) return typeof r === "string" ? r : r.code;
+      if (r != null) {
+        const code = typeof r === "string" ? r : r.code;
+        trackEnvironmentModule(id, code);
+        return code;
+      }
     }
     return null;
   }
 
   async function transform(code, id) {
+    trackEnvironmentModule(id, code);
     let current = code, changed = false;
     for (const p of plugins) {
       if (!envAllows(p, environment)) continue;
@@ -176,10 +217,12 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
       const next = r == null ? null : typeof r === "string" ? r : r.code;
       if (next != null) { current = next; changed = true; }
     }
+    trackEnvironmentModule(id, current);
     return changed ? current : null;
   }
 
   async function transformUserCode(code, id) {
+    trackEnvironmentModule(id, code);
     const ssr = environment === "ssr";
     let current = code, changed = false;
     for (const p of plugins) {
@@ -191,6 +234,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
       const next = r == null ? null : typeof r === "string" ? r : r.code;
       if (next != null) { current = next; changed = true; }
     }
+    trackEnvironmentModule(id, current);
     return changed ? current : null;
   }
 
