@@ -4422,6 +4422,19 @@ fn spawn_watcher(state: Arc<ServerState>) {
 // Async because it is reached both from the watcher thread (via block_on) and
 // from the async /__hmr_flush handler; using block_on here panicked ("runtime
 // within a runtime") when the gate flushed on an async worker thread.
+fn parse_hmr_filter(raw: &str) -> Option<Vec<PathBuf>> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if v.get("action")?.as_str()? != "filter" {
+        return None;
+    }
+    let arr = v.get("modules")?.as_array()?;
+    Some(
+        arr.iter()
+            .filter_map(|m| m.as_str().map(PathBuf::from))
+            .collect(),
+    )
+}
+
 async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
     let mut messages: Vec<String> = Vec::new();
     let mut updates: Vec<serde_json::Value> = Vec::new();
@@ -4476,9 +4489,30 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
             if state.plugins_watch_change {
                 let _ = host.watch_change(&file, "update").await;
             }
-            if state.plugins_hot_update {
+            if state.plugins_hot_update && path.exists() {
                 let ts = now_millis() as u64;
-                match host.handle_hot_update(&file, ts).await {
+                let hmr_url = url_of(&state.root, path);
+                let modules_json = {
+                    let g = state.graph.lock().unwrap();
+                    match g.node(Path::new(&hmr_url)) {
+                        Some(n) => serde_json::json!([{
+                            "url": hmr_url,
+                            "id": hmr_url,
+                            "isSelfAccepting": n.is_self_accepting,
+                            "importers": n
+                                .importers
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>(),
+                        }])
+                        .to_string(),
+                        None => "[]".to_string(),
+                    }
+                };
+                match host
+                    .handle_hot_update(&file, ts, "update", &modules_json)
+                    .await
+                {
                     Ok(Some(d)) if d == "skip" => {
                         println!("oj: change {file} -> HMR suppressed by plugin");
                         continue;
@@ -4490,6 +4524,40 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
                                 .to_string(),
                         );
                         return messages;
+                    }
+                    Ok(Some(d)) => {
+                        if let Some(seeds) = parse_hmr_filter(&d) {
+                            if !state.bundle {
+                                let seed_refs: Vec<&Path> =
+                                    seeds.iter().map(PathBuf::as_path).collect();
+                                let decision =
+                                    state.graph.lock().unwrap().propagate_from_seeds(&seed_refs);
+                                match decision {
+                                    HmrDecision::Update { boundaries } => {
+                                        println!(
+                                            "oj: change {file} -> plugin-filtered update {boundaries:?}"
+                                        );
+                                        let timestamp = now_millis() as u64;
+                                        updates.extend(boundaries.iter().map(|b| {
+                                            let mut p = format!("{}", b.display());
+                                            if is_style_url(&p) {
+                                                p.push_str("?import");
+                                            }
+                                            serde_json::json!({ "path": p, "timestamp": timestamp })
+                                        }));
+                                        continue;
+                                    }
+                                    HmrDecision::FullReload { reason } => {
+                                        println!("oj: change {file} -> full-reload ({reason})");
+                                        messages.push(
+                                            serde_json::json!({ "type": "full-reload", "reason": reason })
+                                                .to_string(),
+                                        );
+                                        return messages;
+                                    }
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -4613,6 +4681,25 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_hmr_filter_reads_filter_module_urls() {
+        let seeds =
+            parse_hmr_filter(r#"{"action":"filter","modules":["/src/a.tsx","/src/b.tsx"]}"#).unwrap();
+        assert_eq!(
+            seeds,
+            vec![PathBuf::from("/src/a.tsx"), PathBuf::from("/src/b.tsx")]
+        );
+    }
+
+    #[test]
+    fn parse_hmr_filter_ignores_non_filter_payloads() {
+        assert!(parse_hmr_filter("skip").is_none());
+        assert!(parse_hmr_filter("full-reload").is_none());
+        assert!(parse_hmr_filter(r#"{"action":"reload"}"#).is_none());
+        assert!(parse_hmr_filter(r#"{"action":"filter"}"#).is_none());
+        assert!(parse_hmr_filter("not json at all").is_none());
+    }
 
     #[tokio::test]
     async fn bind_dev_listener_increments_unless_strict() {

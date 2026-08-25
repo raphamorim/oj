@@ -95,6 +95,28 @@ impl ModuleGraph {
         }
     }
 
+    pub fn node(&self, path: &Path) -> Option<&ModuleNode> {
+        self.modules.get(path)
+    }
+
+    pub fn propagate_from_seeds(&self, seeds: &[&Path]) -> HmrDecision {
+        for seed in seeds {
+            if !self.modules.contains_key(*seed) {
+                return HmrDecision::FullReload {
+                    reason: format!("{} is not in the module graph", seed.display()),
+                };
+            }
+        }
+        match self.collect_boundaries(seeds, &[]) {
+            Ok(mut boundaries) => {
+                boundaries.sort();
+                boundaries.dedup();
+                HmrDecision::Update { boundaries }
+            }
+            Err(reason) => HmrDecision::FullReload { reason },
+        }
+    }
+
     pub fn update_plan(&self, changed: &Path) -> Result<UpdatePlan, String> {
         match self.propagate_update(changed) {
             HmrDecision::FullReload { reason } => Err(reason),
@@ -274,6 +296,53 @@ mod tests {
                 boundaries: vec![p("Button.tsx")]
             }
         );
+    }
+
+    #[test]
+    fn propagate_from_seeds_matches_single_seed_propagation() {
+        let mut g = graph();
+        g.add_import(&p("Button.tsx"), &p("utils.ts"));
+        let seed = p("utils.ts");
+        let via_seeds = g.propagate_from_seeds(&[seed.as_path()]);
+        assert_eq!(
+            via_seeds,
+            HmrDecision::Update {
+                boundaries: vec![p("Button.tsx")]
+            }
+        );
+    }
+
+    #[test]
+    fn propagate_from_seeds_dedupes_shared_boundaries() {
+        let mut g = graph();
+        g.add_import(&p("Button.tsx"), &p("a.ts"));
+        g.add_import(&p("Button.tsx"), &p("b.ts"));
+        let a = p("a.ts");
+        let b = p("b.ts");
+        let decision = g.propagate_from_seeds(&[a.as_path(), b.as_path()]);
+        assert_eq!(
+            decision,
+            HmrDecision::Update {
+                boundaries: vec![p("Button.tsx")]
+            }
+        );
+    }
+
+    #[test]
+    fn propagate_from_seeds_unknown_seed_forces_full_reload() {
+        let g = graph();
+        let missing = p("does-not-exist.ts");
+        assert!(matches!(
+            g.propagate_from_seeds(&[missing.as_path()]),
+            HmrDecision::FullReload { .. }
+        ));
+    }
+
+    #[test]
+    fn node_returns_known_modules_only() {
+        let g = graph();
+        assert!(g.node(&p("App.tsx")).is_some());
+        assert!(g.node(&p("never-seen.ts")).is_none());
     }
 
     #[test]
