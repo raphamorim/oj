@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -108,4 +108,43 @@ test("hookHandler / hookFilter: function form and object form", () => {
 
   assert.equal(hookHandler(undefined), null);
   assert.equal(hookHandler({ handler: "not-a-fn" }), null);
+});
+
+test("configResolved initializes plugin state once before concurrent module hooks", async () => {
+  let resolved;
+  let initializations = 0;
+  const plugin = {
+    name: "synthetic-config-initialized-loader",
+    async configResolved(config) {
+      initializations++;
+      await Promise.resolve();
+      resolved = config;
+    },
+    resolveId(source) {
+      return `${resolved.root}/${source}`;
+    },
+    load() {
+      return `export default ${JSON.stringify(`${resolved.command}:${resolved.mode}:${resolved.base}`)};`;
+    },
+    transform(code) {
+      return `${code}:${resolved.plugins.length}`;
+    },
+  };
+  const container = createPluginContainer({}, [plugin], {
+    command: "serve",
+    mode: "staging",
+    environment: "ssr",
+    config: { root: "/synthetic-app", base: "/preview/" },
+  });
+
+  const [loaded, transformed, id] = await Promise.all([
+    container.load("virtual:entry"),
+    container.transform("module", "/entry.ts"),
+    container.resolveId("virtual:entry", "/entry.ts"),
+  ]);
+
+  assert.equal(loaded, 'export default "serve:staging:/preview/";');
+  assert.equal(transformed, "module:1");
+  assert.equal(id, "/synthetic-app/virtual:entry");
+  assert.equal(initializations, 1);
 });
