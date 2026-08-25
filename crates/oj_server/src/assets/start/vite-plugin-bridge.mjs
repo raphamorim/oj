@@ -271,10 +271,12 @@ export async function loadPluginContainer(app, opts = {}) {
   for (const plugin of all) {
     const handler = hookHandler(plugin.config);
     if (!handler || !applyMatches(plugin, command, mode)) continue;
-    const partial = await handler.call(plugin, config, { command, mode });
-    if (partial) config = typeof vite.mergeConfig === "function"
-      ? vite.mergeConfig(config, partial)
-      : mergeConfigValues(config, partial);
+    try {
+      const partial = await handler.call(plugin, config, { command, mode });
+      if (partial) config = typeof vite.mergeConfig === "function"
+        ? vite.mergeConfig(config, partial)
+        : mergeConfigValues(config, partial);
+    } catch {}
   }
   if (loaded) loaded.config = config;
   const container = createPluginContainer(vite, all, opts);
