@@ -714,3 +714,41 @@ test("production Start builds close both environment plugin containers", () => {
   assert.match(source, /await clientContainer\?\.closeBundle\(\)/);
   assert.match(source, /await serverContainer\?\.closeBundle\(\)/);
 });
+
+// PR #85
+test("buildEnd runs completion-only plugins in their matching environment", async () => {
+  const completed = [];
+  const failure = new Error("synthetic build failure");
+  const plugin = {
+    name: "synthetic-build-completion",
+    applyToEnvironment: (environment) => environment.name === "ssr",
+    buildEnd(error) { completed.push({ environment: this.environment.name, error }); },
+  };
+
+  const client = createPluginContainer({}, [plugin], { command: "build", environment: "client" });
+  const server = createPluginContainer({}, [plugin], { command: "build", environment: "ssr" });
+
+  assert.equal(server.pluginCount, 1);
+  await client.buildEnd();
+  await server.buildEnd(failure);
+
+  assert.deepEqual(completed, [{ environment: "ssr", error: failure }]);
+});
+
+test("buildEnd supports object-form hooks and continues past failed callbacks", async () => {
+  const completed = [];
+  const container = createPluginContainer({}, [
+    {
+      name: "synthetic-failed-completion",
+      buildEnd() { throw new Error("synthetic completion failure"); },
+    },
+    {
+      name: "synthetic-object-completion",
+      buildEnd: { handler(error) { completed.push({ consumer: this.environment.config.consumer, error }); } },
+    },
+  ], { command: "build", environment: "client" });
+
+  await container.buildEnd();
+
+  assert.deepEqual(completed, [{ consumer: "client", error: undefined }]);
+});

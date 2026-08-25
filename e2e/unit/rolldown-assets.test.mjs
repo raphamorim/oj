@@ -10,6 +10,7 @@ import {
   workspaceRoot,
   pnpmStorePaths,
   contentHashEmitter,
+  makeVitePlugins,
 } from "../../crates/oj_server/src/assets/start/rolldown-assets.mjs";
 
 const tmp = (p) => mkdtempSync(join(tmpdir(), "oj-assets-" + p + "-"));
@@ -145,4 +146,17 @@ test("emit does not compile plain CSS (no markers)", async () => {
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
+});
+
+test("the Rolldown adapter forwards build completion only to its active container", async () => {
+  const completed = [];
+  const failure = new Error("synthetic bundle failure");
+  const adapter = makeVitePlugins({
+    container: { buildEnd(error) { completed.push({ environment: "active", error }); } },
+    fallback: { buildEnd(error) { completed.push({ environment: "fallback", error }); } },
+  });
+
+  await adapter.buildEnd(failure);
+
+  assert.deepEqual(completed, [{ environment: "active", error: failure }]);
 });
