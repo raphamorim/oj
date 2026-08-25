@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -108,4 +108,41 @@ test("hookHandler / hookFilter: function form and object form", () => {
 
   assert.equal(hookHandler(undefined), null);
   assert.equal(hookHandler({ handler: "not-a-fn" }), null);
+});
+
+test("buildEnd runs completion-only plugins in their matching environment", async () => {
+  const completed = [];
+  const failure = new Error("synthetic build failure");
+  const plugin = {
+    name: "synthetic-build-completion",
+    applyToEnvironment: (environment) => environment.name === "ssr",
+    buildEnd(error) { completed.push({ environment: this.environment.name, error }); },
+  };
+
+  const client = createPluginContainer({}, [plugin], { command: "build", environment: "client" });
+  const server = createPluginContainer({}, [plugin], { command: "build", environment: "ssr" });
+
+  assert.equal(server.pluginCount, 1);
+  await client.buildEnd();
+  await server.buildEnd(failure);
+
+  assert.deepEqual(completed, [{ environment: "ssr", error: failure }]);
+});
+
+test("buildEnd supports object-form hooks and continues past failed callbacks", async () => {
+  const completed = [];
+  const container = createPluginContainer({}, [
+    {
+      name: "synthetic-failed-completion",
+      buildEnd() { throw new Error("synthetic completion failure"); },
+    },
+    {
+      name: "synthetic-object-completion",
+      buildEnd: { handler(error) { completed.push({ consumer: this.environment.config.consumer, error }); } },
+    },
+  ], { command: "build", environment: "client" });
+
+  await container.buildEnd();
+
+  assert.deepEqual(completed, [{ consumer: "client", error: undefined }]);
 });
