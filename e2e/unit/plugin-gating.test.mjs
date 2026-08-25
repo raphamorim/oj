@@ -6,7 +6,7 @@ import { __test, createPluginContainer, findConfig, loadPluginContainer } from "
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
+const { matchOne, idAllowed, codeAllowed, byHook, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
 test("matchOne: RegExp tests, string is a picomatch-style glob (Vite pluginFilter)", () => {
   assert.ok(matchOne(/\.mdx$/, "/a/b.mdx"));
@@ -494,4 +494,36 @@ test("plugin config hooks initialize state and merge nested configuration", asyn
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("codeAllowed: string code filters are substrings, RegExps reset, never path globs", () => {
+  assert.ok(codeAllowed({ code: "import.meta.glob" }, 'const m = import.meta.glob("./x");'));
+  assert.ok(!codeAllowed({ code: "import.meta.glob" }, "plain();"));
+  assert.ok(codeAllowed({ code: { include: [/@enabled/], exclude: "@disabled" } }, "/* @enabled */"));
+  assert.ok(!codeAllowed({ code: { include: [/@enabled/], exclude: "@disabled" } }, "/* @enabled @disabled */"));
+  const sticky = /marker/y;
+  assert.ok(codeAllowed({ code: sticky }, "marker one") && codeAllowed({ code: sticky }, "marker two"));
+  assert.ok(codeAllowed({ id: /x/ }, "anything"), "no code filter admits any source");
+});
+
+test("per-hook order applies to resolveId and load, not only transform", async () => {
+  const seen = [];
+  const plugin = (name, order) => ({
+    name,
+    resolveId: { ...(order ? { order } : {}), handler(id) { seen.push(`resolve:${name}`); return null; } },
+    load: { ...(order ? { order } : {}), handler() { seen.push(`load:${name}`); return null; } },
+  });
+  const container = createPluginContainer({}, [plugin("post", "post"), plugin("normal"), plugin("pre", "pre")]);
+  await container.resolveId("virtual:x", "/app.ts");
+  await container.load("virtual:x");
+  assert.deepEqual(seen, ["resolve:pre", "resolve:normal", "resolve:post", "load:pre", "load:normal", "load:post"]);
+});
+
+test("module info carries meta and moduleParsed sees the same record", async () => {
+  let parsed;
+  const container = createPluginContainer({}, [
+    { name: "observer", moduleParsed(info) { parsed = info; }, transform() { return "changed();"; } },
+  ]);
+  await container.transform("orig();", "/app.ts");
+  assert.deepEqual(parsed, { id: "/app.ts", code: "changed();", importedIds: [], meta: {} });
 });
