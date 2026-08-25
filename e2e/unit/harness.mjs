@@ -104,6 +104,9 @@ export function rpcSidecar(sidecarRel, { args = [], env, cwd } = {}) {
   child.stderr.on("data", (d) => {
     stderr += d.toString();
   });
+  // If the sidecar dies mid-test, a write to its stdin would emit EPIPE; absorb
+  // it so the pending send's timeout reports the failure instead of crashing.
+  child.stdin.on("error", () => {});
 
   const nextLine = (ms) =>
     new Promise((res, rej) => {

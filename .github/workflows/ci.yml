@@ -19,6 +19,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      # The optimizer + sidecar-harness unit tests shell out to a real esbuild
+      # from the start-app fixture; install it so they run instead of skipping.
+      - name: install start-app fixture (esbuild for optimizer tests)
+        run: npm ci --prefix e2e/fixtures/start-app
       - name: js unit tests (adapter helpers)
         run: node --test e2e/unit/*.test.mjs
       - name: fuzz targets still build
