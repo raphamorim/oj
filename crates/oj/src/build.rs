@@ -1037,6 +1037,21 @@ fn serialize_bundle(bundle: &[rolldown_common::Output]) -> String {
     for out in bundle {
         match out {
             Output::Chunk(c) => {
+                // Rollup's `chunk.modules` is `{ [id]: RenderedModule }`; plugins
+                // like @crxjs walk its keys (module ids) and read renderedExports.
+                let mut modules = serde_json::Map::new();
+                for (id, rm) in c.modules.keys.iter().zip(c.modules.values.iter()) {
+                    modules.insert(
+                        id.as_str().to_string(),
+                        serde_json::json!({
+                            "renderedExports": rm
+                                .rendered_exports
+                                .iter()
+                                .map(|e| e.to_string())
+                                .collect::<Vec<_>>(),
+                        }),
+                    );
+                }
                 map.insert(
                     c.filename.to_string(),
                     serde_json::json!({
@@ -1044,7 +1059,16 @@ fn serialize_bundle(bundle: &[rolldown_common::Output]) -> String {
                         "fileName": c.filename.to_string(),
                         "name": c.name.to_string(),
                         "isEntry": c.is_entry,
+                        "isDynamicEntry": c.is_dynamic_entry,
+                        "facadeModuleId": c.facade_module_id.as_ref().map(|f| f.as_str().to_string()),
+                        "moduleIds": c.module_ids.iter().map(|m| m.as_str().to_string()).collect::<Vec<_>>(),
+                        "modules": serde_json::Value::Object(modules),
+                        "imports": c.imports.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+                        "dynamicImports": c.dynamic_imports.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+                        "exports": c.exports.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
                         "code": c.code,
+                        "map": serde_json::Value::Null,
+                        "sourcemapFileName": c.sourcemap_filename,
                     }),
                 );
             }
@@ -1058,6 +1082,8 @@ fn serialize_bundle(bundle: &[rolldown_common::Output]) -> String {
                     serde_json::json!({
                         "type": "asset",
                         "fileName": a.filename.to_string(),
+                        "name": a.names.first(),
+                        "names": a.names,
                         "source": source,
                     }),
                 );
@@ -1067,32 +1093,52 @@ fn serialize_bundle(bundle: &[rolldown_common::Output]) -> String {
     serde_json::Value::Object(map).to_string()
 }
 
-fn apply_bundle_mutations(bundle: &mut [rolldown_common::Output], json: &str) {
+fn apply_bundle_mutations(bundle: &mut Vec<rolldown_common::Output>, json: &str) {
     use rolldown_common::{Output, StrOrBytes};
     let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(json) else {
         return;
     };
+    // A plugin can delete a bundle entry (e.g. @crxjs removes its manifest JS
+    // chunk and the input stub): any output whose filename no longer appears in
+    // the returned bundle was removed.
+    bundle.retain(|out| {
+        let key = match out {
+            Output::Chunk(c) => c.filename.as_str(),
+            Output::Asset(a) => a.filename.as_str(),
+        };
+        map.contains_key(key)
+    });
     for out in bundle.iter_mut() {
         match out {
             Output::Chunk(c) => {
-                if let Some(code) = map
-                    .get(c.filename.as_str())
-                    .and_then(|v| v.get("code"))
-                    .and_then(|x| x.as_str())
-                {
+                let Some(entry) = map.get(c.filename.as_str()) else {
+                    continue;
+                };
+                if let Some(code) = entry.get("code").and_then(|x| x.as_str()) {
                     if c.code != code {
                         Arc::make_mut(c).code = code.to_string();
                     }
                 }
+                // A plugin can rename an output by mutating its `fileName`
+                // (the map key stays the original name).
+                if let Some(fname) = entry.get("fileName").and_then(|x| x.as_str()) {
+                    if c.filename.as_str() != fname {
+                        Arc::make_mut(c).filename = fname.into();
+                    }
+                }
             }
             Output::Asset(a) => {
-                if let Some(src) = map
-                    .get(a.filename.as_str())
-                    .and_then(|v| v.get("source"))
-                    .and_then(|x| x.as_str())
-                {
+                let Some(entry) = map.get(a.filename.as_str()) else {
+                    continue;
+                };
+                if let Some(src) = entry.get("source").and_then(|x| x.as_str()) {
                     if a.source.as_bytes() != src.as_bytes() {
                         Arc::make_mut(a).source = StrOrBytes::Str(src.to_string());
+                    }
+                }
+                if let Some(fname) = entry.get("fileName").and_then(|x| x.as_str()) {
+                    if a.filename.as_str() != fname {
+                        Arc::make_mut(a).filename = fname.into();
                     }
                 }
             }
