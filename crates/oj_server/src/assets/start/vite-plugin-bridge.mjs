@@ -183,7 +183,7 @@ export function createPluginContainer(vite, allPlugins, {
 } = {}) {
   const plugins = ordered(
     allPlugins.filter(
-      (p) => (p.buildStart || p.resolveId || p.load || p.transform || p.moduleParsed || p.generateBundle)
+      (p) => (p.buildStart || p.resolveId || p.load || p.transform || p.moduleParsed || p.generateBundle || p.configResolved)
         && applyMatches(p, command, mode),
     ),
   );
