@@ -183,7 +183,8 @@ export function createPluginContainer(vite, allPlugins, {
 } = {}) {
   const plugins = ordered(
     allPlugins.filter(
-      (p) => (p.buildStart || p.resolveId || p.load || p.transform || p.moduleParsed || p.generateBundle || p.configResolved)
+      (p) => (p.buildStart || p.resolveId || p.load || p.transform || p.moduleParsed || p.generateBundle || p.configResolved || p.renderChunk)
+        && applyMatches(p, command, mode),
         && applyMatches(p, command, mode),
     ),
   );
@@ -344,6 +345,20 @@ export function createPluginContainer(vite, allPlugins, {
     return changed ? current : null;
   }
 
+  async function renderChunk(code, chunk) {
+    let current = code, changed = false;
+    for (const p of plugins) {
+      if (!envAllows(p, environment)) continue;
+      const h = hookHandler(p.renderChunk);
+      if (!h) continue;
+      let result;
+      try { result = await h.call(ctx, current, chunk, { format: "es" }); } catch { continue; }
+      const next = typeof result === "string" ? result : result?.code;
+      if (next != null) { current = next; changed = true; }
+    }
+    return changed ? current : null;
+  }
+
   async function generateBundle(emit) {
     await initializePlugins();
     const genCtx = { ...ctx, emitFile: (f) => (emit(f), "oj-emit-ref") };
@@ -385,7 +400,10 @@ export function createPluginContainer(vite, allPlugins, {
     });
   }
 
-  return { resolveId, load, transform, transformUserCode, buildStart, generateBundle, pluginCount: plugins.length, watchFiles };
+  return {
+    resolveId, load, transform, transformUserCode, buildStart, renderChunk, generateBundle,
+    pluginCount: plugins.length, watchFiles,
+  };
 }
 
 function mergeConfigValues(current, update) {
