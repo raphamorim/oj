@@ -139,6 +139,8 @@ jobs:
         run: node e2e/emit-chunk-buildstart.mjs
       - name: generateBundle fidelity (rich chunk fields, rename, delete)
         run: node e2e/generate-bundle-fidelity.mjs
+      - name: plugin emitFile .html chunk (crx page pattern)
+        run: node e2e/emit-html-chunk.mjs
       - name: library build
         run: |
           mkdir -p /tmp/lib/src
