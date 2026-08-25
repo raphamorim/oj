@@ -4348,6 +4348,59 @@ mod tests {
         assert_eq!(insert_before_head("<body></body>", "<x>"), "<x>\n<body></body>");
     }
 
+    #[tokio::test]
+    async fn copy_public_dir_configuration_controls_production_assets() {
+        for (index, (config_name, config, copied)) in [
+            (
+                "oj.config.json",
+                r#"{"build":{"copyPublicDir":false}}"#,
+                false,
+            ),
+            (
+                "vite.config.mjs",
+                "export default { build: { copyPublicDir: false } };",
+                false,
+            ),
+            (
+                "oj.config.json",
+                r#"{"build":{"copyPublicDir":true}}"#,
+                true,
+            ),
+            ("oj.config.json", "{}", true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let suffix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!("oj-copy-public-dir-{suffix}-{index}"));
+            fs::create_dir_all(root.join("public")).unwrap();
+            fs::write(root.join("package.json"), r#"{"type":"module"}"#).unwrap();
+            fs::write(root.join(config_name), config).unwrap();
+            fs::write(
+                root.join("index.html"),
+                r#"<html><body><script type="module" src="/main.js"></script></body></html>"#,
+            )
+            .unwrap();
+            fs::write(root.join("main.js"), "window.ready = true;").unwrap();
+            fs::write(root.join("public/asset.txt"), "public asset").unwrap();
+
+            build(root.clone(), None, None, Some("production"), false)
+                .await
+                .expect("synthetic public-directory fixture should build");
+
+            assert_eq!(
+                root.join("dist/asset.txt").is_file(),
+                copied,
+                "{config_name}: {config}"
+            );
+            assert!(root.join("dist/index.html").is_file());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[test]
     fn manifest_matches_vite_shape() {
         let mk = |key: &str,
