@@ -569,9 +569,13 @@ impl PluginHost {
         }
     }
 
-    pub async fn transform(&self, code: &str, id: &str) -> Result<(String, Vec<String>), String> {
+    pub async fn transform(
+        &self,
+        code: &str,
+        id: &str,
+    ) -> Result<(String, Vec<String>, Vec<String>), String> {
         let Some(raw) = self.call("transform", &[code, id]).await? else {
-            return Ok((code.to_string(), Vec::new()));
+            return Ok((code.to_string(), Vec::new(), Vec::new()));
         };
         match serde_json::from_str::<serde_json::Value>(&raw) {
             Ok(v) => {
@@ -580,18 +584,19 @@ impl PluginHost {
                     .and_then(|c| c.as_str())
                     .unwrap_or(code)
                     .to_string();
-                let watch = v
-                    .get("watchFiles")
-                    .and_then(|w| w.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|x| x.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                Ok((out, watch))
+                let str_array = |key: &str| {
+                    v.get(key)
+                        .and_then(|w| w.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                Ok((out, str_array("watchFiles"), str_array("maps")))
             }
-            Err(_) => Ok((raw, Vec::new())),
+            Err(_) => Ok((raw, Vec::new(), Vec::new())),
         }
     }
 

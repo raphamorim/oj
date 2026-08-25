@@ -880,7 +880,7 @@ async fn ssr_module(
         Some(host) => host
             .transform(&source, id)
             .await
-            .map(|(code, _)| code)
+            .map(|(code, _, _)| code)
             .unwrap_or(source),
         None => source,
     };
@@ -1914,11 +1914,13 @@ async fn ensure_module(
 
     let is_dep = is_dep_module(url, file);
     let mut plugin_watch_files: Vec<String> = Vec::new();
+    let mut plugin_maps: Vec<String> = Vec::new();
     let source = match &state.plugins {
         Some(host) if !is_dep && state.plugins_have_transform => {
             match host.transform(&source, &file.to_string_lossy()).await {
-                Ok((code, watches)) => {
+                Ok((code, watches, maps)) => {
                     plugin_watch_files = watches;
+                    plugin_maps = maps;
                     code
                 }
                 Err(e) => {
@@ -2127,11 +2129,12 @@ async fn ensure_module(
                 } else {
                     oj_compiler::CompileOptions::dev()
                 };
-                oj_compiler::compile_module(
+                oj_compiler::compile_module_with_maps(
                     &file_owned,
                     interopped.as_deref().unwrap_or(&source),
                     &opts,
                     Some(&mut rewrite),
+                    &plugin_maps,
                 )
             }
             .map_err(|err| format!("compile error:\n{err}"))?;

@@ -861,7 +861,7 @@ impl Plugin for OjUserPlugin {
         let id = args.id.to_string();
         async move {
             match host.transform(&code, &id).await {
-                Ok((out, _)) if out != code => Ok(Some(HookTransformOutput {
+                Ok((out, _, _)) if out != code => Ok(Some(HookTransformOutput {
                     code: Some(out),
                     ..Default::default()
                 })),

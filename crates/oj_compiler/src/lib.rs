@@ -199,7 +199,17 @@ pub fn compile_module(
     path: &Path,
     source_text: &str,
     opts: &CompileOptions,
+    rewriter: Option<&mut ImportRewriter>,
+) -> Result<CompileOutput, CompileError> {
+    compile_module_with_maps(path, source_text, opts, rewriter, &[])
+}
+
+pub fn compile_module_with_maps(
+    path: &Path,
+    source_text: &str,
+    opts: &CompileOptions,
     mut rewriter: Option<&mut ImportRewriter>,
+    input_maps: &[String],
 ) -> Result<CompileOutput, CompileError> {
     let source_type = SourceType::from_path(path)
         .map_err(|_| CompileError::UnsupportedFileType(path.to_path_buf()))?;
@@ -300,13 +310,70 @@ pub fn compile_module(
     let CodegenReturn { code, map, .. } =
         Codegen::new().with_options(codegen_options).build(&program);
 
+    let map_data_url = map.map(|oj_map| {
+        if input_maps.is_empty() {
+            oj_map.to_data_url()
+        } else {
+            compose_input_maps_data_url(&oj_map, input_maps)
+        }
+    });
+
     Ok(CompileOutput {
         code,
-        map_data_url: map.map(|m| m.to_data_url()),
+        map_data_url,
         imports,
         dynamic_imports,
         is_refresh_boundary,
     })
+}
+
+fn compose_input_maps_data_url(oj_map: &oxc_sourcemap::SourceMap, input_maps: &[String]) -> String {
+    let mut acc = oj_map.to_json_string();
+    for pm in input_maps.iter().rev() {
+        let outer = match oxc_sourcemap::SourceMap::from_json_string(&acc) {
+            Ok(m) => m,
+            Err(_) => return oj_map.to_data_url(),
+        };
+        let inner = match oxc_sourcemap::SourceMap::from_json_string(pm) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        acc = compose_two(&outer, &inner).to_json_string();
+    }
+    match oxc_sourcemap::SourceMap::from_json_string(&acc) {
+        Ok(m) => m.to_data_url(),
+        Err(_) => oj_map.to_data_url(),
+    }
+}
+
+fn compose_two<'i>(
+    outer: &oxc_sourcemap::SourceMap,
+    inner: &'i oxc_sourcemap::SourceMap,
+) -> oxc_sourcemap::SourceMap<'i> {
+    let lut = inner.generate_lookup_table();
+    let mut b = oxc_sourcemap::SourceMapBuilder::default();
+    for t in outer.get_tokens() {
+        if t.get_source_id().is_none() {
+            continue;
+        }
+        if let Some(vt) =
+            inner.lookup_source_view_token_approx(&lut, t.get_src_line(), t.get_src_col())
+        {
+            let src_id = vt
+                .get_source()
+                .map(|s| b.add_source_and_content(s, vt.get_source_content().unwrap_or("")));
+            let name_id = vt.get_name().map(|n| b.add_name(n));
+            b.add_token(
+                t.get_dst_line(),
+                t.get_dst_col(),
+                vt.get_src_line(),
+                vt.get_src_col(),
+                src_id,
+                name_id,
+            );
+        }
+    }
+    b.into_sourcemap()
 }
 
 pub(crate) fn rewrite_module_specifiers_pub<'a>(
@@ -376,6 +443,61 @@ impl<'a> oxc_ast_visit::VisitMut<'a> for DynamicImportRewriter<'a, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compose_two_traces_served_position_back_to_original_source() {
+        use oxc_sourcemap::SourceMapBuilder;
+        // inner (plugin map): intermediate (0,0) -> original src.tsx (5,2).
+        let mut ib = SourceMapBuilder::default();
+        let sid = ib.add_source_and_content("src.tsx", "original source");
+        ib.add_token(0, 0, 5, 2, Some(sid), None);
+        let inner = ib.into_sourcemap();
+        // outer (oj/oxc map): served (1,4) -> intermediate (0,0).
+        let mut ob = SourceMapBuilder::default();
+        let iid = ob.add_source_and_content("intermediate.js", "intermediate");
+        ob.add_token(1, 4, 0, 0, Some(iid), None);
+        let outer = ob.into_sourcemap();
+
+        let composed = compose_two(&outer, &inner);
+        let lut = composed.generate_lookup_table();
+        let vt = composed
+            .lookup_source_view_token(&lut, 1, 4)
+            .expect("served (1,4) should map");
+        // The served position now points at the ORIGINAL source, not the intermediate.
+        assert_eq!(vt.get_source(), Some("src.tsx"), "source is the original file");
+        assert_eq!(vt.get_src_line(), 5, "original line preserved through compose");
+        assert_eq!(vt.get_src_col(), 2, "original column preserved through compose");
+    }
+
+    #[test]
+    fn compose_input_maps_data_url_folds_and_degrades_gracefully() {
+        use oxc_sourcemap::{SourceMap, SourceMapBuilder};
+        let mut ib = SourceMapBuilder::default();
+        let sid = ib.add_source_and_content("app.tsx", "let x = 1;");
+        ib.add_token(0, 0, 9, 3, Some(sid), None);
+        let plugin_map = ib.into_sourcemap().to_json_string();
+
+        let mut ob = SourceMapBuilder::default();
+        let iid = ob.add_source_and_content("app.plugin.js", "intermediate");
+        ob.add_token(0, 0, 0, 0, Some(iid), None);
+        let oj_map = ob.into_sourcemap();
+
+        // The fold traces through the plugin map to the original file.
+        let folded =
+            compose_two(&oj_map, &SourceMap::from_json_string(&plugin_map).unwrap()).to_json_string();
+        assert!(folded.contains("app.tsx"), "folded map references the original source: {folded}");
+
+        // The public entry point emits an inline JSON sourcemap data URL and never panics.
+        let url = compose_input_maps_data_url(&oj_map, &[plugin_map]);
+        assert!(
+            url.starts_with("data:application/json") && url.contains("base64,"),
+            "emits an inline data URL: {url}",
+        );
+
+        // Garbage input maps degrade to oj's own map rather than erroring.
+        let fallback = compose_input_maps_data_url(&oj_map, &["not json".to_string()]);
+        assert!(fallback.starts_with("data:application/json") && fallback.contains("base64,"));
+    }
 
     #[test]
     fn defines_apply_after_jsx_transform_without_reference_id_panic() {
