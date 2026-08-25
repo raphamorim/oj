@@ -1713,15 +1713,17 @@ async fn ensure_module(
             }
             if matches!(kind, "worker" | "sharedworker") {
                 let clean = url.split('?').next().unwrap_or(url);
-                let ctor = if kind == "sharedworker" {
-                    "SharedWorker"
+                let shared = kind == "sharedworker";
+                let code = if worker_query_is_inline(url) {
+                    let chunk = Box::pin(build_worker_chunk(state, clean)).await?;
+                    inline_worker_module(&chunk, shared)
                 } else {
-                    "Worker"
+                    let ctor = if shared { "SharedWorker" } else { "Worker" };
+                    format!(
+                        "export default function () {{ return new {ctor}(\"/@oj/worker.js?entry={}\", {{ type: \"module\" }}); }}\n",
+                        hex_encode(clean)
+                    )
                 };
-                let code = format!(
-                    "export default function () {{ return new {ctor}(\"/@oj/worker.js?entry={}\", {{ type: \"module\" }}); }}\n",
-                    hex_encode(clean)
-                );
                 let mut noop = |_: &str| None;
                 let factory = oj_compiler::bundle::compile_factory(file, url, &code, &mut noop)
                     .map_err(|err| format!("worker module error for {url}: {err}"))?;
@@ -2964,12 +2966,23 @@ fn is_bundle_asset_query(url: &str) -> bool {
 
 fn query_asset_kind(query: Option<&str>) -> Option<&'static str> {
     let q = query?;
-    for kind in ["url", "raw", "inline", "worker", "sharedworker", "init"] {
+    for kind in ["url", "raw", "worker", "sharedworker", "inline", "init"] {
         if q.split('&').any(|kv| kv == kind) {
             return Some(kind);
         }
     }
     None
+}
+
+fn worker_query_is_inline(url: &str) -> bool {
+    match url.split_once('?') {
+        Some((_, q)) => {
+            let parts = || q.split('&');
+            parts().any(|kv| kv == "worker" || kv == "sharedworker")
+                && parts().any(|kv| kv == "inline")
+        }
+        None => false,
+    }
 }
 
 async fn asset_module(file: &Path, url: &str, kind: &str) -> Result<String, String> {
@@ -3777,37 +3790,19 @@ async fn serve_patch(State(state): State<Arc<ServerState>>, uri: Uri) -> Respons
         .into_response()
 }
 
-async fn serve_worker_chunk(State(state): State<Arc<ServerState>>, uri: Uri) -> Response {
-    let entry = uri
-        .query()
-        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("entry=")))
-        .and_then(hex_decode)
-        .unwrap_or_default();
-    if entry.is_empty() {
-        return (StatusCode::BAD_REQUEST, "oj: worker: entry required").into_response();
-    }
-
+async fn build_worker_chunk(state: &Arc<ServerState>, entry: &str) -> Result<String, String> {
     let mut chunk = String::from(WORKER_RUNTIME_JS);
     chunk.push('\n');
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut queue = vec![entry.clone()];
+    let mut queue = vec![entry.to_string()];
     while let Some(url) = queue.pop() {
         if url.starts_with("/@oj/") || !seen.insert(url.clone()) {
             continue;
         }
-        let Ok(file) = locate_url(&state, &url) else {
+        let Ok(file) = locate_url(state, &url) else {
             continue;
         };
-        let module = match ensure_module(&state, &file, &url).await {
-            Ok((_, module)) => module,
-            Err(err) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("oj: worker: {err}"),
-                )
-                    .into_response();
-            }
-        };
+        let (_, module) = ensure_module(state, &file, &url).await?;
         chunk.push_str(&render_registration(&url, &module));
         for imp in &module.imports {
             let next = if is_bundle_asset_query(imp) {
@@ -3822,16 +3817,46 @@ async fn serve_worker_chunk(State(state): State<Arc<ServerState>>, uri: Uri) -> 
     }
     chunk.push_str(&format!(
         "__oj_start({});\n",
-        serde_json::Value::String(entry)
+        serde_json::Value::String(entry.to_string())
     ));
-    (
-        [
-            (header::CONTENT_TYPE, "text/javascript"),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        chunk,
-    )
-        .into_response()
+    Ok(chunk)
+}
+
+fn inline_worker_module(chunk: &str, shared: bool) -> String {
+    let js = serde_json::Value::String(chunk.to_string()).to_string();
+    let ctor = if shared { "SharedWorker" } else { "Worker" };
+    let opts = "{ type: \"module\", name: options?.name }";
+    if shared {
+        format!(
+            "const jsContent = {js};\nexport default function WorkerWrapper(options) {{\n  return new {ctor}(\"data:text/javascript;charset=utf-8,\" + encodeURIComponent(jsContent), {opts});\n}}\n"
+        )
+    } else {
+        format!(
+            "const jsContent = {js};\nconst blob = typeof self !== \"undefined\" && self.Blob && new Blob([\"URL.revokeObjectURL(import.meta.url);\", jsContent], {{ type: \"text/javascript;charset=utf-8\" }});\nexport default function WorkerWrapper(options) {{\n  let objURL;\n  try {{\n    objURL = blob && (self.URL || self.webkitURL).createObjectURL(blob);\n    if (!objURL) throw \"\";\n    const worker = new {ctor}(objURL, {opts});\n    worker.addEventListener(\"error\", () => {{\n      (self.URL || self.webkitURL).revokeObjectURL(objURL);\n    }});\n    return worker;\n  }} catch (e) {{\n    return new {ctor}(\"data:text/javascript;charset=utf-8,\" + encodeURIComponent(jsContent), {opts});\n  }}\n}}\n"
+        )
+    }
+}
+
+async fn serve_worker_chunk(State(state): State<Arc<ServerState>>, uri: Uri) -> Response {
+    let entry = uri
+        .query()
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("entry=")))
+        .and_then(hex_decode)
+        .unwrap_or_default();
+    if entry.is_empty() {
+        return (StatusCode::BAD_REQUEST, "oj: worker: entry required").into_response();
+    }
+    match build_worker_chunk(&state, &entry).await {
+        Ok(chunk) => (
+            [
+                (header::CONTENT_TYPE, "text/javascript"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            chunk,
+        )
+            .into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: worker: {err}")).into_response(),
+    }
 }
 
 fn locate_url(state: &ServerState, url: &str) -> Result<PathBuf, String> {
@@ -5155,6 +5180,54 @@ mod adapter_tests {
         assert!(!is_worker_query("/w.ts?x=worker"));
         assert!(!is_worker_query("/w.ts"));
         assert!(!is_worker_query(""));
+    }
+
+    #[test]
+    fn worker_beats_inline_in_asset_kind_classification() {
+        // ?worker&inline must classify as a worker (inline is a modifier), not as
+        // a generic inline asset that would 404 as a base64 data URI of the file.
+        assert_eq!(query_asset_kind(Some("worker&inline")), Some("worker"));
+        assert_eq!(query_asset_kind(Some("sharedworker&inline")), Some("sharedworker"));
+        assert_eq!(query_asset_kind(Some("inline")), Some("inline"));
+        assert_eq!(query_asset_kind(Some("worker")), Some("worker"));
+    }
+
+    #[test]
+    fn worker_query_is_inline_needs_both_flags() {
+        assert!(worker_query_is_inline("/w.js?worker&inline"));
+        assert!(worker_query_is_inline("/w.js?sharedworker&inline"));
+        assert!(!worker_query_is_inline("/w.js?worker"));
+        assert!(!worker_query_is_inline("/w.js?inline"));
+        assert!(!worker_query_is_inline("/w.js"));
+    }
+
+    #[test]
+    fn inline_worker_module_wraps_worker_and_sharedworker() {
+        let chunk = "self.onmessage = () => {};\n";
+
+        // Worker: Blob + createObjectURL primary, data:+encodeURIComponent
+        // fallback, the module self-revoke prelude, and the chunk embedded.
+        let w = inline_worker_module(chunk, false);
+        assert!(w.contains("new Blob("), "uses a Blob: {w}");
+        assert!(w.contains("createObjectURL(blob)"), "creates an object URL: {w}");
+        assert!(
+            w.contains("URL.revokeObjectURL(import.meta.url);"),
+            "module self-revoke prelude: {w}",
+        );
+        assert!(w.contains("new Worker(objURL"), "constructs a Worker from the blob url: {w}");
+        assert!(
+            w.contains("encodeURIComponent(jsContent)") && w.contains("data:text/javascript"),
+            "data: URI fallback via encodeURIComponent: {w}",
+        );
+        assert!(w.contains("type: \"module\""), "module worker: {w}");
+        assert!(w.contains("self.onmessage"), "embeds the bundled chunk: {w}");
+        assert!(!w.contains("new SharedWorker"), "not a SharedWorker: {w}");
+
+        // SharedWorker: data-URI only, no Blob (a Blob URL yields duplicate instances).
+        let s = inline_worker_module(chunk, true);
+        assert!(s.contains("new SharedWorker("), "constructs a SharedWorker: {s}");
+        assert!(s.contains("encodeURIComponent(jsContent)"), "data: via encodeURIComponent: {s}");
+        assert!(!s.contains("new Blob("), "SharedWorker must not use a Blob: {s}");
     }
 
     #[test]
