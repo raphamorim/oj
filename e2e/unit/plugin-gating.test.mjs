@@ -2,7 +2,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { readFileSync } from "node:fs";
+import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -108,4 +109,50 @@ test("hookHandler / hookFilter: function form and object form", () => {
 
   assert.equal(hookHandler(undefined), null);
   assert.equal(hookHandler({ handler: "not-a-fn" }), null);
+});
+
+test("closeBundle runs finalizer-only plugins in their matching environment", async () => {
+  const finalized = [];
+  const plugin = {
+    name: "synthetic-build-finalizer",
+    applyToEnvironment: (environment) => environment.name === "client",
+    closeBundle() { finalized.push(this.environment.name); },
+  };
+
+  const client = createPluginContainer({}, [plugin], { command: "build", environment: "client" });
+  const server = createPluginContainer({}, [plugin], { command: "build", environment: "ssr" });
+
+  assert.equal(client.pluginCount, 1);
+  await client.closeBundle();
+  await server.closeBundle();
+
+  assert.deepEqual(finalized, ["client"]);
+});
+
+test("closeBundle supports object-form finalizers and continues past failed hooks", async () => {
+  const finalized = [];
+  const container = createPluginContainer({}, [
+    {
+      name: "synthetic-failed-finalizer",
+      closeBundle() { throw new Error("synthetic finalizer failure"); },
+    },
+    {
+      name: "synthetic-object-finalizer",
+      closeBundle: { handler() { finalized.push(this.environment.config.consumer); } },
+    },
+  ], { command: "build", environment: "ssr" });
+
+  await container.closeBundle();
+
+  assert.deepEqual(finalized, ["server"]);
+});
+
+test("production Start builds close both environment plugin containers", () => {
+  const source = readFileSync(
+    new URL("../../crates/oj_server/src/assets/start/build.mjs", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(source, /await clientContainer\?\.closeBundle\(\)/);
+  assert.match(source, /await serverContainer\?\.closeBundle\(\)/);
 });
