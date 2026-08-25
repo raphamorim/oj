@@ -1111,7 +1111,9 @@ pub async fn build(
 
     let base = normalize_base(config.base.as_deref().unwrap_or("/"));
 
-    let _ = fs::remove_dir_all(&out_dir);
+    if build_cfg.empty_out_dir.unwrap_or(true) {
+        let _ = fs::remove_dir_all(&out_dir);
+    }
     fs::create_dir_all(&out_dir)?;
 
     let started = Instant::now();

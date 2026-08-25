@@ -202,6 +202,7 @@ if (isMainRun) try {
       rollupOptions: c.build?.rolldownOptions ?? c.build?.rollupOptions ?? null,
       assetsInlineLimit:
         typeof c.build?.assetsInlineLimit === "number" ? c.build.assetsInlineLimit : null,
+      emptyOutDir: typeof c.build?.emptyOutDir === "boolean" ? c.build.emptyOutDir : null,
       dedupe: Array.isArray(c.resolve?.dedupe)
         ? c.resolve.dedupe.filter((x) => typeof x === "string")
         : null,

@@ -166,6 +166,7 @@ pub struct ViteValues {
     pub headers: Option<serde_json::Map<String, serde_json::Value>>,
     pub rollup_options: Option<serde_json::Value>,
     pub assets_inline_limit: Option<u64>,
+    pub empty_out_dir: Option<bool>,
     pub proxy: Option<serde_json::Value>,
     pub dedupe: Option<Vec<String>>,
     pub optimize_deps: Option<serde_json::Value>,
@@ -262,6 +263,7 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
         headers: json.get("headers").and_then(|v| v.as_object()).cloned(),
         rollup_options: json.get("rollupOptions").filter(|v| !v.is_null()).cloned(),
         assets_inline_limit: json.get("assetsInlineLimit").and_then(|v| v.as_u64()),
+        empty_out_dir: json.get("emptyOutDir").and_then(|v| v.as_bool()),
         proxy: json.get("proxy").filter(|v| !v.is_null()).cloned(),
         dedupe: json.get("dedupe").and_then(|v| v.as_array()).map(|a| {
             a.iter()
@@ -342,6 +344,10 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
     if let Some(limit) = v.assets_inline_limit {
         let build = config.build.get_or_insert_with(Default::default);
         build.assets_inline_limit.get_or_insert(limit);
+    }
+    if let Some(empty_out_dir) = v.empty_out_dir {
+        let build = config.build.get_or_insert_with(Default::default);
+        build.empty_out_dir.get_or_insert(empty_out_dir);
     }
     if let Some(proxy) = v.proxy {
         let sc = config.server.get_or_insert_with(Default::default);
@@ -891,6 +897,7 @@ mod vite_values_tests {
             headers: None,
             rollup_options: None,
             assets_inline_limit: None,
+            empty_out_dir: None,
             proxy: None,
             dedupe: None,
             optimize_deps: None,
@@ -917,6 +924,7 @@ mod vite_values_tests {
             headers: None,
             rollup_options: None,
             assets_inline_limit: None,
+            empty_out_dir: None,
             proxy: None,
             dedupe: None,
             optimize_deps: None,

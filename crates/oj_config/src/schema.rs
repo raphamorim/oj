@@ -137,6 +137,7 @@ pub struct ResolveConfig {
 #[serde(default, rename_all = "camelCase")]
 pub struct BuildConfig {
     pub out_dir: Option<String>,
+    pub empty_out_dir: Option<bool>,
     pub target: Option<String>,
     pub minify: Option<bool>,
     pub sourcemap: Option<bool>,
