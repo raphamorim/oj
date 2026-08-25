@@ -794,6 +794,22 @@ async function runLifecycle(hook) {
   return null;
 }
 
+async function runBuildStart() {
+  const chunkBucket = [];
+  // Rollup passes NormalizedInputOptions; plugins such as @crxjs read
+  // `options.input` to decide whether to emit their root chunk, so it must be
+  // present. Chunks emitted here are drained to Rust as rolldown build roots.
+  const options = {
+    input: resolvedConfig?.build?.rollupOptions?.input ?? "index.html",
+  };
+  await transformEmitStore.run(chunkBucket, async () => {
+    for (const p of plugins) {
+      if (typeof p.buildStart === "function") await p.buildStart.call(ctx, options);
+    }
+  });
+  return JSON.stringify({ emittedChunks: chunkBucket });
+}
+
 async function generateBundle(bundleJson, isWrite) {
   const bundle = JSON.parse(bundleJson || "{}");
   const outputOptions = environment.config?.build ?? {};
@@ -842,7 +858,8 @@ async function run(hook, args) {
   if (hook === "load") return load(args[0]);
   if (hook === "handleHotUpdate") return handleHotUpdate(args[0], args[1], args[2], args[3]);
   if (hook === "transformIndexHtml") return transformIndexHtml(args[0]);
-  if (hook === "buildStart" || hook === "buildEnd" || hook === "renderStart" || hook === "closeBundle") {
+  if (hook === "buildStart") return runBuildStart();
+  if (hook === "buildEnd" || hook === "renderStart" || hook === "closeBundle") {
     return runLifecycle(hook);
   }
   if (hook === "watchChange") return watchChange(args[0], args[1]);

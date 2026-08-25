@@ -673,8 +673,19 @@ impl PluginHost {
     }
 
     #[inline]
-    pub async fn build_start(&self) -> Result<(), String> {
-        self.call("buildStart", &[]).await.map(|_| ())
+    pub async fn build_start(&self) -> Result<Vec<ChunkEmit>, String> {
+        let Some(raw) = self.call("buildStart", &[]).await? else {
+            return Ok(Vec::new());
+        };
+        let chunks = serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|v| {
+                v.get("emittedChunks")
+                    .and_then(|c| c.as_array())
+                    .map(|a| a.iter().filter_map(ChunkEmit::from_value).collect())
+            })
+            .unwrap_or_default();
+        Ok(chunks)
     }
 
     #[inline]

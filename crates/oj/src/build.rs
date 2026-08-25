@@ -799,6 +799,32 @@ impl OjUserPlugin {
             emitted_chunk_refs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
+
+}
+
+// Forward chunks a plugin emitted (in buildStart or transform) to rolldown as
+// build roots, remembering the plugin ref id -> rolldown ref id mapping so
+// getFileName can be answered later.
+fn forward_emitted_chunks(
+    ctx: &PluginContext,
+    chunks: &[oj_server::plugins::ChunkEmit],
+    refs: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+) {
+    if chunks.is_empty() {
+        return;
+    }
+    let mut refs = refs.lock().unwrap();
+    for c in chunks {
+        let emitted = rolldown_common::EmittedChunk {
+            id: c.id.clone(),
+            name: c.name.clone().map(Into::into),
+            file_name: c.file_name.clone().map(Into::into),
+            ..Default::default()
+        };
+        if let Ok(rd_ref) = ctx.emit_chunk(emitted) {
+            refs.insert(c.ref_id.clone(), rd_ref.to_string());
+        }
+    }
 }
 
 impl Plugin for OjUserPlugin {
@@ -807,7 +833,8 @@ impl Plugin for OjUserPlugin {
     }
 
     fn register_hook_usage(&self) -> rolldown_plugin::HookUsage {
-        rolldown_plugin::HookUsage::ResolveId
+        rolldown_plugin::HookUsage::BuildStart
+            | rolldown_plugin::HookUsage::ResolveId
             | rolldown_plugin::HookUsage::Load
             | rolldown_plugin::HookUsage::Transform
             | rolldown_plugin::HookUsage::GenerateBundle
@@ -815,6 +842,18 @@ impl Plugin for OjUserPlugin {
             | rolldown_plugin::HookUsage::WriteBundle
             | rolldown_plugin::HookUsage::RenderStart
             | rolldown_plugin::HookUsage::CloseBundle
+    }
+
+    async fn build_start(
+        &self,
+        ctx: &PluginContext,
+        _args: &rolldown_plugin::HookBuildStartArgs<'_>,
+    ) -> rolldown_plugin::HookNoopReturn {
+        match self.host.build_start().await {
+            Ok(chunks) => forward_emitted_chunks(ctx, &chunks, &self.emitted_chunk_refs),
+            Err(e) => eprintln!("oj build: plugin buildStart failed: {e}"),
+        }
+        Ok(())
     }
 
     fn resolve_id(
@@ -868,19 +907,7 @@ impl Plugin for OjUserPlugin {
         async move {
             match host.transform(&code, &id).await {
                 Ok((out, _, _, chunks)) => {
-                    for c in &chunks {
-                        let emitted = rolldown_common::EmittedChunk {
-                            id: c.id.clone(),
-                            name: c.name.clone().map(Into::into),
-                            file_name: c.file_name.clone().map(Into::into),
-                            ..Default::default()
-                        };
-                        if let Ok(rd_ref) = ctx.inner.emit_chunk(emitted) {
-                            refs.lock()
-                                .unwrap()
-                                .insert(c.ref_id.clone(), rd_ref.to_string());
-                        }
-                    }
+                    forward_emitted_chunks(&ctx.inner, &chunks, &refs);
                     if out != code {
                         Ok(Some(HookTransformOutput {
                             code: Some(out),
@@ -1262,9 +1289,6 @@ pub async fn build(
     .await;
     let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
     if let Some(host) = &plugin_host {
-        if let Err(e) = host.build_start().await {
-            eprintln!("oj build: plugin buildStart failed: {e}");
-        }
         oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host))));
     }
     oj_plugins.push(Arc::new(OjCssPlugin {
@@ -1715,9 +1739,6 @@ pub(crate) async fn build_ssr(
 
     let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
     if let Some(host) = &plugin_host {
-        if let Err(e) = host.build_start().await {
-            eprintln!("oj build (ssr): plugin buildStart failed: {e}");
-        }
         oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host))));
     }
     oj_plugins.push(Arc::new(OjCssPlugin {
@@ -2213,9 +2234,6 @@ async fn build_client_entry(
     .await;
     let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
     if let Some(host) = &plugin_host {
-        if let Err(e) = host.build_start().await {
-            eprintln!("oj build (client): plugin buildStart failed: {e}");
-        }
         oj_plugins.push(Arc::new(OjUserPlugin::new(Arc::clone(host))));
     }
     oj_plugins.push(Arc::new(OjCssPlugin {

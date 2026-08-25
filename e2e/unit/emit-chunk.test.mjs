@@ -69,6 +69,38 @@ test("plugin-host forwards emitFile chunk requests and resolves getFileName afte
   }
 });
 
+// Chunks emitted from buildStart (how @crxjs emits its manifest root) are
+// reported back too, and buildStart receives an options object with `input`.
+test("plugin-host reports chunks emitted from buildStart", async () => {
+  const fx = tmpProject({ prefix: "oj-chunk-" });
+  fx.write(
+    "oj.plugins.mjs",
+    `export default [{
+       name: "bs-emitter",
+       buildStart(options) {
+         if (typeof options.input !== "undefined") {
+           this.emitFile({ type: "chunk", id: "/src/background.js", name: "background" });
+         }
+       },
+     }];\n`,
+  );
+  const host = rpcSidecar("plugin-host.mjs", {
+    args: [path.join(fx.root, "oj.plugins.mjs"), JSON.stringify({ root: fx.root })],
+    env: { OJ_CACHE_ROOT: fx.root },
+    cwd: fx.root,
+  });
+  try {
+    const res = await host.send({ id: 1, hook: "buildStart", args: [] });
+    const out = JSON.parse(res.result);
+    assert.equal(out.emittedChunks.length, 1, "the buildStart-emitted chunk is reported");
+    assert.equal(out.emittedChunks[0].id, "/src/background.js");
+    assert.equal(out.emittedChunks[0].name, "background");
+  } finally {
+    host.close();
+    fx.cleanup();
+  }
+});
+
 // emitFile still rejects an unknown descriptor type, and an asset emit keeps
 // working (returns a reference id resolvable by getFileName).
 test("plugin-host still supports asset emits and rejects unknown emit types", async () => {
