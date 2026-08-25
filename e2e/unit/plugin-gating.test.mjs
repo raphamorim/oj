@@ -616,3 +616,54 @@ test("renderChunk retains chunk-only plugins and chains applicable hooks", async
   assert.equal(await container.renderChunk(entry.code, entry), "/*client*/entry();/*post*/");
   assert.equal(await container.renderChunk("chunk();", { ...entry, isEntry: false }), null);
 });
+
+// PR #78
+test("writeBundle observes emitted chunks after generation in the client environment", async () => {
+  const lifecycle = [];
+  const bundle = {
+    "assets/entry.js": { type: "chunk", fileName: "assets/entry.js", isEntry: true, code: "entry();" },
+    "assets/chunk.js": { type: "chunk", fileName: "assets/chunk.js", isEntry: false, code: "chunk();" },
+  };
+  const plugins = [
+    {
+      name: "synthetic-post-writer",
+      enforce: "post",
+      writeBundle: {
+        handler(options, output, isWrite) {
+          lifecycle.push(`post:${options.format}:${Object.keys(output).sort().join(",")}:${isWrite}`);
+        },
+      },
+    },
+    {
+      name: "synthetic-server-writer",
+      applyToEnvironment: (environment) => environment.config.consumer === "server",
+      writeBundle() {
+        lifecycle.push("server");
+      },
+    },
+    {
+      name: "synthetic-pre-writer",
+      enforce: "pre",
+      writeBundle(_options, output) {
+        lifecycle.push(`pre:${this.environment.config.consumer}:${output["assets/entry.js"].code}`);
+      },
+    },
+    {
+      name: "synthetic-generator",
+      generateBundle() {
+        lifecycle.push("generate");
+      },
+    },
+  ];
+  const container = createPluginContainer({}, plugins, { command: "build", environment: "client" });
+
+  assert.equal(container.pluginCount, 4);
+  await container.generateBundle(() => {});
+  await container.writeBundle(bundle);
+
+  assert.deepEqual(lifecycle, [
+    "generate",
+    "pre:client:entry();",
+    "post:es:assets/chunk.js,assets/entry.js:true",
+  ]);
+});
