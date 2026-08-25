@@ -2706,13 +2706,87 @@ mod tests {
     #[test]
     fn base_normalization_and_application() {
         assert_eq!(normalize_base("/"), "/");
-        assert_eq!(normalize_base(""), "/");
-        assert_eq!(normalize_base("./"), "/");
+        assert_eq!(normalize_base(""), "./");
+        assert_eq!(normalize_base("./"), "./");
         assert_eq!(normalize_base("app"), "/app/");
         assert_eq!(normalize_base("/app"), "/app/");
         assert_eq!(normalize_base("/app/"), "/app/");
+        assert_eq!(normalize_base("https://cdn.example.com/app"), "https://cdn.example.com/app/");
         assert_eq!(with_base("assets/x-h.js", "/"), "/assets/x-h.js");
         assert_eq!(with_base("assets/x-h.js", "/app/"), "/app/assets/x-h.js");
+        assert_eq!(with_base("assets/x-h.js", "./"), "./assets/x-h.js");
+        assert_eq!(
+            with_base("assets/x-h.js", "https://cdn.example.com/app/"),
+            "https://cdn.example.com/app/assets/x-h.js"
+        );
+    }
+
+    #[tokio::test]
+    async fn relative_base_production_assets_are_relative_to_their_output_files() {
+        for configured_base in ["./", ""] {
+            let suffix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!("oj-relative-base-{suffix}"));
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join("oj.config.json"),
+                format!(r#"{{"base":"{configured_base}"}}"#),
+            )
+            .unwrap();
+            fs::write(
+                root.join("index.html"),
+                r#"<html><head></head><body>
+                    <script type="module" src="/main.js"></script>
+                    <script type="module" src="/secondary.js"></script>
+                </body></html>"#,
+            )
+            .unwrap();
+            fs::write(
+                root.join("main.js"),
+                r#"import "./style.css"; import { shared } from "./shared.js";
+                   window.__RELATIVE_BASE__ = import.meta.env.BASE_URL;
+                   window.__PRIMARY_VALUE__ = shared;"#,
+            )
+            .unwrap();
+            fs::write(
+                root.join("secondary.js"),
+                r#"import { shared } from "./shared.js"; window.__SECONDARY_VALUE__ = shared;"#,
+            )
+            .unwrap();
+            fs::write(root.join("shared.js"), r#"export const shared = "shared-value";"#)
+                .unwrap();
+            fs::write(root.join("style.css"), r#".logo { background: url("./icon.svg"); }"#)
+                .unwrap();
+            fs::write(root.join("icon.svg"), "<svg><rect/></svg>").unwrap();
+
+            build(root.clone(), None, None, "production")
+                .await
+                .expect("relative-base production fixture should build");
+
+            let html = fs::read_to_string(root.join("dist/index.html")).unwrap();
+            assert_eq!(html.matches("src=\"./assets/").count(), 2, "{html}");
+            assert!(html.contains("rel=\"stylesheet\" href=\"./assets/"), "{html}");
+            assert!(html.contains("rel=\"modulepreload\" href=\"./assets/"), "{html}");
+            assert!(!html.contains("src=\"/assets/"), "{html}");
+
+            let mut scripts = String::new();
+            let mut styles = String::new();
+            for entry in fs::read_dir(root.join("dist/assets")).unwrap() {
+                let path = entry.unwrap().path();
+                match path.extension().and_then(|extension| extension.to_str()) {
+                    Some("js") => scripts.push_str(&fs::read_to_string(path).unwrap()),
+                    Some("css") => styles.push_str(&fs::read_to_string(path).unwrap()),
+                    _ => {}
+                }
+            }
+            assert!(scripts.contains("__RELATIVE_BASE__"), "{scripts}");
+            assert!(scripts.contains("\"./\""), "{scripts}");
+            assert!(styles.contains("url(\"./icon-"), "{styles}");
+            assert!(!styles.contains("./assets/"), "{styles}");
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
