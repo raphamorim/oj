@@ -136,10 +136,8 @@ pub async fn start_dev(
         start_route,
     ));
 
-    let addr = std::net::SocketAddr::from((built.host, built.port));
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| anyhow::anyhow!("cannot bind {addr}: {e}"))?;
+    let (listener, port) =
+        oj_server::bind_dev_listener(built.host, built.port, built.strict_port).await?;
     oj_server::boot_phase("listening");
     {
         let root = root.clone();
@@ -150,7 +148,7 @@ pub async fn start_dev(
         });
     }
     println!("  {} dev (tanstack start)", oj_server::oj_brand());
-    let url = format!("http://localhost:{}/", built.port);
+    let url = format!("http://localhost:{}/", port);
     println!("  {}", oj_server::link(&url, &oj_server::cell(&url)));
     axum::serve(listener, app).await?;
     Ok(())

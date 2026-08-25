@@ -41,6 +41,14 @@ pub fn rolldown_options(config: &OjConfig) -> Option<&serde_json::Value> {
         .or(build.rollup_options.as_ref())
 }
 
+pub fn server_strict_port(config: &OjConfig) -> bool {
+    config
+        .server
+        .as_ref()
+        .and_then(|s| s.strict_port)
+        .unwrap_or(false)
+}
+
 pub fn env_prefixes(config: &OjConfig) -> Vec<String> {
     config
         .env_prefix
@@ -531,6 +539,17 @@ mod tests {
         // Absent server / fs / deny is an empty list (defaults applied elsewhere).
         let empty: OjConfig = serde_json::from_str("{}").unwrap();
         assert!(server_fs_deny(&empty).is_empty());
+    }
+
+    #[test]
+    fn server_strict_port_accessor_defaults_false() {
+        let on: OjConfig = serde_json::from_str(r#"{"server":{"strictPort":true}}"#).unwrap();
+        assert!(server_strict_port(&on));
+        // Vite's default is false (auto-increment) when unset.
+        let off: OjConfig = serde_json::from_str(r#"{"server":{"port":3000}}"#).unwrap();
+        assert!(!server_strict_port(&off));
+        let empty: OjConfig = serde_json::from_str("{}").unwrap();
+        assert!(!server_strict_port(&empty));
     }
 
     #[test]

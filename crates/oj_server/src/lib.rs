@@ -277,6 +277,7 @@ pub struct BuiltApp {
     pub router: Router,
     pub host: std::net::IpAddr,
     pub port: u16,
+    pub strict_port: bool,
     pub proxy_prefixes: Vec<String>,
     pub plugin_mw_port: Option<u16>,
     pub root: PathBuf,
@@ -286,16 +287,39 @@ pub struct BuiltApp {
     pub reload_tx: broadcast::Sender<String>,
 }
 
+pub async fn bind_dev_listener(
+    host: std::net::IpAddr,
+    preferred: u16,
+    strict: bool,
+) -> anyhow::Result<(tokio::net::TcpListener, u16)> {
+    for port in preferred..=u16::MAX {
+        let addr = SocketAddr::from((host, port));
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                let bound = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+                return Ok((listener, bound));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                if strict {
+                    return Err(anyhow::anyhow!("Port {port} is already in use"));
+                }
+                eprintln!("Port {port} is in use, trying another one...");
+            }
+            Err(e) => return Err(e).with_context(|| format!("cannot bind {addr}")),
+        }
+    }
+    Err(anyhow::anyhow!(
+        "no available port found between {preferred} and 65535"
+    ))
+}
+
 impl DevServer {
     pub async fn run(self) -> anyhow::Result<()> {
         let built = self.build_app().await?;
-        let addr = SocketAddr::from((built.host, built.port));
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("cannot bind {addr}"))?;
+        let (listener, port) = bind_dev_listener(built.host, built.port, built.strict_port).await?;
         println!("  {} dev server", oj_brand());
         println!("  root: {}", built.root.display());
-        let url = format!("http://localhost:{}/", built.port);
+        let url = format!("http://localhost:{}/", port);
         println!("  {}", link(&url, &cell(&url)));
         if !built.proxy_prefixes.is_empty() {
             println!("  proxy: {}", built.proxy_prefixes.join(", "));
@@ -377,6 +401,7 @@ impl DevServer {
 
         let server_cfg = config.server.clone().unwrap_or_default();
         let port = self.port.or(server_cfg.port).unwrap_or(5199);
+        let strict_port = oj_config::server_strict_port(&config);
         let bundle = self.bundle || config.bundle.unwrap_or(false);
         // The on-disk module cache is experimental and off by default. Opt in
         // with `oj dev --enable-cache` (or OJ_ENABLE_CACHE=1); `--no-cache`
@@ -727,6 +752,7 @@ impl DevServer {
             router: app,
             host,
             port,
+            strict_port,
             proxy_prefixes,
             plugin_mw_port,
             root,
@@ -953,10 +979,7 @@ pub async fn preview(
         .collect();
     let state = Arc::new((dir.clone(), base, headers));
     let app = Router::new().fallback(get(preview_serve)).with_state(state);
-    let addr = SocketAddr::from((resolve_host(host.as_deref()), port));
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("cannot bind {addr}"))?;
+    let (listener, port) = bind_dev_listener(resolve_host(host.as_deref()), port, false).await?;
     println!("  {} preview", oj_brand());
     println!("  serving: {}", dir.display());
     let url = format!("http://localhost:{port}/");
@@ -4562,6 +4585,26 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bind_dev_listener_increments_unless_strict() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let host = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        // Hold an ephemeral port so the preferred one is busy.
+        let occupied = tokio::net::TcpListener::bind((host, 0)).await.unwrap();
+        let taken = occupied.local_addr().unwrap().port();
+
+        // strict: a busy preferred port is a hard error, never moved.
+        assert!(
+            bind_dev_listener(host, taken, true).await.is_err(),
+            "strict must reject a busy port",
+        );
+
+        // non-strict (Vite default): hop to the next free port.
+        let (listener, port) = bind_dev_listener(host, taken, false).await.unwrap();
+        assert_ne!(port, taken, "non-strict must pick a different port");
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+    }
 
     #[tokio::test]
     async fn css_inline_returns_compiled_css_not_a_data_uri() {
