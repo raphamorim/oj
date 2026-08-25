@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -108,4 +108,21 @@ test("hookHandler / hookFilter: function form and object form", () => {
 
   assert.equal(hookHandler(undefined), null);
   assert.equal(hookHandler({ handler: "not-a-fn" }), null);
+});
+
+test("retains configResolved-only plugins alongside operational consumers", () => {
+  const initializer = {
+    name: "synthetic-lifecycle-initializer",
+    configResolved() {},
+  };
+  const consumer = {
+    name: "synthetic-lifecycle-consumer",
+    load(id) {
+      return id === "virtual:synthetic" ? "export default true" : null;
+    },
+  };
+
+  const container = createPluginContainer({}, [initializer, consumer]);
+
+  assert.equal(container.pluginCount, 2);
 });
