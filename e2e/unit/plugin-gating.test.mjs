@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -108,4 +108,36 @@ test("hookHandler / hookFilter: function form and object form", () => {
 
   assert.equal(hookHandler(undefined), null);
   assert.equal(hookHandler({ handler: "not-a-fn" }), null);
+});
+
+test("renderChunk retains chunk-only plugins and chains applicable hooks", async () => {
+  const plugins = [
+    {
+      name: "synthetic-server-only",
+      applyToEnvironment: (environment) => environment.config.consumer === "server",
+      renderChunk: () => "incorrect server chunk",
+    },
+    {
+      name: "synthetic-post-chunk",
+      enforce: "post",
+      renderChunk: {
+        handler(code, chunk) {
+          return chunk.isEntry ? { code: `${code}/*post*/` } : null;
+        },
+      },
+    },
+    {
+      name: "synthetic-pre-chunk",
+      enforce: "pre",
+      renderChunk(code, chunk) {
+        return chunk.isEntry ? `/*${this.environment.config.consumer}*/${code}` : null;
+      },
+    },
+  ];
+  const container = createPluginContainer({}, plugins, { command: "build", environment: "client" });
+  const entry = { type: "chunk", fileName: "assets/entry.js", isEntry: true, code: "entry();" };
+
+  assert.equal(container.pluginCount, 3);
+  assert.equal(await container.renderChunk(entry.code, entry), "/*client*/entry();/*post*/");
+  assert.equal(await container.renderChunk("chunk();", { ...entry, isEntry: false }), null);
 });
