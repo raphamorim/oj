@@ -98,7 +98,7 @@ proptest! {
         // Secret names deliberately avoid the prefix.
         loaded.extend(secret.iter().map(|(k, v)| (format!("SECRET_{k}"), v.clone())));
 
-        let defines = import_meta_env_defines(&loaded, "production", false, "/", "VITE_");
+        let defines = import_meta_env_defines(&loaded, "production", false, "/", &["VITE_"]);
         let blob: String = defines.iter().map(|(k, v)| format!("{k}={v};")).collect();
         for (k, v) in &secret {
             prop_assert!(!blob.contains(&format!("SECRET_{k}")), "leaked key in {blob}");
@@ -119,7 +119,7 @@ proptest! {
         dev in any::<bool>(),
     ) {
         let vars: Vec<(String, String)> = vars.into_iter().collect();
-        let defines = import_meta_env_defines(&vars, if dev { "development" } else { "production" }, dev, "/b/", "VITE_");
+        let defines = import_meta_env_defines(&vars, if dev { "development" } else { "production" }, dev, "/b/", &["VITE_"]);
         let object = defines.iter().find(|(k, _)| k == "import.meta.env").unwrap();
         let json: serde_json::Value = serde_json::from_str(&object.1).unwrap();
         let obj = json.as_object().unwrap();
@@ -147,7 +147,7 @@ proptest! {
         vars in proptest::collection::btree_map("VITE_[A-Z]{1,6}", ".{0,12}", 0..6),
     ) {
         let vars: Vec<(String, String)> = vars.into_iter().collect();
-        let defines = import_meta_env_defines(&vars, "development", true, "/", "VITE_");
+        let defines = import_meta_env_defines(&vars, "development", true, "/", &["VITE_"]);
         let env = html_env_map(&defines);
         for (k, v) in &vars {
             prop_assert_eq!(env.get(k.as_str()), Some(v));
