@@ -1440,7 +1440,9 @@ pub async fn build(
         .as_ref()
         .map(|p| root.join(p))
         .unwrap_or_else(|| root.join("public"));
-    copy_public_dir(&public_dir, &out_dir)?;
+    if build_cfg.copy_public_dir.unwrap_or(true) {
+        copy_public_dir(&public_dir, &out_dir)?;
+    }
 
     println!(
         "{} build: {} in {:?}",
