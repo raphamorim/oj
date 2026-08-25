@@ -105,7 +105,9 @@ export function findConfig(app) {
   return null;
 }
 
-export function createPluginContainer(vite, allPlugins, { command = "serve", mode = "development", environment = "client" } = {}) {
+export function createPluginContainer(vite, allPlugins, {
+  command = "serve", mode = command === "build" ? "production" : "development", environment = "client", config = {},
+} = {}) {
   const plugins = ordered(
     allPlugins.filter(
       (p) => (p.resolveId || p.load || p.transform || p.generateBundle) && applyMatches(p, command, mode),
@@ -124,11 +126,29 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
   // import. Mirror Vite's shape so those plugins take their intended branch.
   const consumer = environment === "client" ? "client" : "server";
   const watchFiles = new Set();
+  const resolvedConfig = {
+    root: process.cwd(),
+    base: "/",
+    build: {},
+    server: {},
+    resolve: {},
+    define: {},
+    optimizeDeps: {},
+    ssr: {},
+    env: {},
+    experimental: {},
+    environments: { client: {}, ssr: {} },
+    ...config,
+    command,
+    mode,
+    plugins: allPlugins,
+    isProduction: mode === "production",
+  };
   const ctx = {
     environment: {
       name: environment,
       mode: command === "build" ? "build" : "dev",
-      config: { command, consumer, mode: command === "build" ? "production" : "development" },
+      config: { ...resolvedConfig, consumer },
     },
     meta: { rollupVersion: "4.0.0", watchMode: command !== "build", framework: "oj" },
     warn() {}, info() {}, debug() {},
@@ -141,7 +161,23 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
     parse,
   };
 
+  let initialization;
+  function initializePlugins() {
+    initialization ??= (async () => {
+      for (const plugin of plugins) {
+        const hook = hookHandler(plugin.configResolved);
+        if (!hook) continue;
+        try { await hook.call(ctx, resolvedConfig); }
+        catch (error) {
+          process.stderr.write(`oj: plugin "${plugin.name || "?"}" configResolved failed (skipped): ${error?.message ?? error}\n`);
+        }
+      }
+    })();
+    return initialization;
+  }
+
   async function resolveId(id, importer) {
+    await initializePlugins();
     for (const p of plugins) {
       if (!envAllows(p, environment)) continue;
       const h = hookHandler(p.resolveId);
@@ -154,6 +190,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
   }
 
   async function load(id) {
+    await initializePlugins();
     for (const p of plugins) {
       if (!envAllows(p, environment)) continue;
       const h = hookHandler(p.load);
@@ -166,6 +203,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
   }
 
   async function transform(code, id) {
+    await initializePlugins();
     let current = code, changed = false;
     for (const p of plugins) {
       if (!envAllows(p, environment)) continue;
@@ -180,6 +218,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
   }
 
   async function transformUserCode(code, id) {
+    await initializePlugins();
     const ssr = environment === "ssr";
     let current = code, changed = false;
     for (const p of plugins) {
@@ -195,6 +234,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
   }
 
   async function generateBundle(emit) {
+    await initializePlugins();
     const genCtx = { ...ctx, emitFile: (f) => (emit(f), "oj-emit-ref") };
     for (const p of plugins) {
       const h = hookHandler(p.generateBundle);
@@ -217,6 +257,8 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
   // handles don't newly execute a hook they never ran under oj before.
   let buildStarted = false;
   async function buildStart() {
+    if (buildStarted) return;
+    await initializePlugins();
     if (buildStarted) return;
     buildStarted = true;
     await withBuildStartLock(async () => {
@@ -255,7 +297,10 @@ export async function loadPluginContainer(app, opts = {}) {
     return null;
   }
   const all = (loaded?.config?.plugins ?? []).flat(Infinity).filter(Boolean);
-  const container = createPluginContainer(vite, all, opts);
+  const container = createPluginContainer(vite, all, {
+    ...opts,
+    config: { ...loaded?.config, root: loaded?.config?.root ?? app },
+  });
   const publicDir = typeof loaded?.config?.publicDir === "string" ? loaded.config.publicDir : null;
   const configDependencies = [configFile, ...(loaded?.dependencies ?? [])];
   return { ...container, publicDir, configDependencies };
