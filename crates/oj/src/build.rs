@@ -2327,7 +2327,7 @@ pub async fn build(
                 preloads.insert(dep);
             }
         }
-        if !preloads.is_empty() {
+        if !preloads.is_empty() && oj_config::module_preload_links(&config) {
             let links = preloads
                 .iter()
                 .map(|f| {
@@ -4206,7 +4206,11 @@ mod tests {
     #[tokio::test]
     async fn module_preload_configuration_controls_production_links() {
         for (index, (config_name, config, expected)) in [
-            ("oj.config.json", r#"{"build":{"modulePreload":false}}"#, false),
+            (
+                "oj.config.json",
+                r#"{"build":{"modulePreload":false}}"#,
+                false,
+            ),
             (
                 "vite.config.mjs",
                 "export default { build: { modulePreload: false } };",
@@ -4250,7 +4254,7 @@ mod tests {
             .unwrap();
             fs::write(root.join("shared.js"), r#"export const shared = "ready";"#).unwrap();
 
-            build(root.clone(), None, None, "production")
+            build(root.clone(), None, None, Some("production"), false)
                 .await
                 .expect("synthetic shared-chunk fixture should build");
 

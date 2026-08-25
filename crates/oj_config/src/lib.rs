@@ -93,6 +93,15 @@ pub fn build_targets(config: &OjConfig) -> Vec<String> {
     out
 }
 
+/// Whether pages get `<link rel="modulepreload">` for their entry chunks' static
+/// imports: on unless `build.modulePreload` is `false` (Vite's html plugin).
+pub fn module_preload_links(config: &OjConfig) -> bool {
+    !matches!(
+        config.build.as_ref().and_then(|b| b.module_preload.as_ref()),
+        Some(serde_json::Value::Bool(false))
+    )
+}
+
 /// Whether page entries get Vite's modulepreload polyfill: on unless
 /// `build.modulePreload` is `false` or `{ polyfill: false }`.
 pub fn module_preload_polyfill(config: &OjConfig) -> bool {
@@ -1354,6 +1363,9 @@ mod build_option_tests {
         assert!(!module_preload_polyfill(&cfg(r#"{"build":{"modulePreload":false}}"#)));
         assert!(!module_preload_polyfill(&cfg(r#"{"build":{"modulePreload":{"polyfill":false}}}"#)));
         assert!(module_preload_polyfill(&cfg(r#"{"build":{"modulePreload":{"polyfill":true}}}"#)));
+        assert!(module_preload_links(&cfg("{}")));
+        assert!(!module_preload_links(&cfg(r#"{"build":{"modulePreload":false}}"#)));
+        assert!(module_preload_links(&cfg(r#"{"build":{"modulePreload":{"polyfill":false}}}"#)), "polyfill off still links");
     }
 
     #[test]
