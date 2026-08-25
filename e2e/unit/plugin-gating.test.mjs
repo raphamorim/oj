@@ -395,3 +395,43 @@ test("transform hooks honor per-hook pre and post ordering", async () => {
   assert.equal(await container.transform("", "/app.ts"), "pre;normal;post;");
   assert.equal(await container.transformUserCode("", "/app.ts"), "pre;normal;post;");
 });
+
+// PR #68
+test("configResolved initializes plugin state once before concurrent module hooks", async () => {
+  let resolved;
+  let initializations = 0;
+  const plugin = {
+    name: "synthetic-config-initialized-loader",
+    async configResolved(config) {
+      initializations++;
+      await Promise.resolve();
+      resolved = config;
+    },
+    resolveId(source) {
+      return `${resolved.root}/${source}`;
+    },
+    load() {
+      return `export default ${JSON.stringify(`${resolved.command}:${resolved.mode}:${resolved.base}`)};`;
+    },
+    transform(code) {
+      return `${code}:${resolved.plugins.length}`;
+    },
+  };
+  const container = createPluginContainer({}, [plugin], {
+    command: "serve",
+    mode: "staging",
+    environment: "ssr",
+    config: { root: "/synthetic-app", base: "/preview/" },
+  });
+
+  const [loaded, transformed, id] = await Promise.all([
+    container.load("virtual:entry"),
+    container.transform("module", "/entry.ts"),
+    container.resolveId("virtual:entry", "/entry.ts"),
+  ]);
+
+  assert.equal(loaded, 'export default "serve:staging:/preview/";');
+  assert.equal(transformed, "module:1");
+  assert.equal(id, "/synthetic-app/virtual:entry");
+  assert.equal(initializations, 1);
+});
