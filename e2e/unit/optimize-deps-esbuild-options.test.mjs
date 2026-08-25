@@ -81,3 +81,35 @@ itEsbuild("optimize-deps keeps its NODE_ENV define when the user adds their own"
     fx.cleanup();
   }
 });
+
+itEsbuild("optimize-deps drops non-esbuild option keys instead of crashing the pre-bundle", () => {
+  const fx = tmpProject({ prefix: "oj-esbopts3-", linkEsbuild: true });
+  try {
+    fx.pkg("mixdep", "index.js", { "index.js": `export const v = __MIX__;\n` });
+    fx.write("entry.js", `import { v } from "mixdep";\nexport const out = v;\n`);
+
+    const outDir = path.join(fx.root, ".oj-cache", "deps");
+    // oj forwards optimizeDeps.rolldownOptions under the same key as
+    // esbuildOptions. Its rolldown-shaped fields (output/resolve/transform/input)
+    // are NOT valid esbuild options and would throw if spread into esbuild.build;
+    // they must be filtered out while a valid esbuild `define` still applies.
+    const { metadata } = runSidecar("optimize-deps.mjs", {
+      root: fx.root,
+      outDir,
+      entries: [path.join(fx.root, "entry.js")],
+      include: ["mixdep"],
+      esbuildOptions: {
+        output: { format: "cjs" },
+        resolve: { conditionNames: ["x"] },
+        transform: { define: { nope: "1" } },
+        input: "should-be-ignored",
+        define: { __MIX__: JSON.stringify("mixed-ok") },
+      },
+    });
+
+    assert.deepEqual(Object.keys(metadata), ["mixdep"], "dep still pre-bundled despite foreign option keys");
+    assert.match(emittedBundleText(outDir), /mixed-ok/, "the valid esbuild define still applied");
+  } finally {
+    fx.cleanup();
+  }
+});

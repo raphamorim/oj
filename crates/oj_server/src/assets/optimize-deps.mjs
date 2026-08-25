@@ -7,7 +7,19 @@ import { mkdirSync, rmSync, readFileSync, writeFileSync, renameSync, existsSync,
 import path from "node:path";
 import builtinModules from "node:module";
 
-const { root, outDir, entries, include = [], exclude = [], dedupe = [], alias = [], autoDiscover = false, esbuildOptions = {} } = JSON.parse(process.argv[2]);
+const { root, outDir, entries, include = [], exclude = [], dedupe = [], alias = [], autoDiscover = false, esbuildOptions: rawEsbuildOptions = {} } = JSON.parse(process.argv[2]);
+
+const ESBUILD_OPTION_KEYS = new Set([
+  "define", "target", "supported", "loader", "jsx", "jsxDev", "jsxSideEffects",
+  "jsxFactory", "jsxFragment", "jsxImportSource", "mainFields", "conditions",
+  "resolveExtensions", "preserveSymlinks", "keepNames", "minify", "minifyWhitespace",
+  "minifyIdentifiers", "minifySyntax", "treeShaking", "platform", "external", "banner",
+  "footer", "inject", "alias", "drop", "pure", "charset", "legalComments", "tsconfig",
+  "tsconfigRaw", "ignoreAnnotations",
+]);
+const esbuildOptions = Object.fromEntries(
+  Object.entries(rawEsbuildOptions ?? {}).filter(([k]) => ESBUILD_OPTION_KEYS.has(k)),
+);
 
 const DEDUPE = new Set([
   "react",
