@@ -2917,8 +2917,23 @@ async fn asset_module(file: &Path, url: &str, kind: &str) -> Result<String, Stri
             Ok(format!("export default {};\n", serde_json::Value::String(text)))
         }
         "inline" => {
-            let bytes = tokio::fs::read(file).await.map_err(|e| format!("read: {e}"))?;
             let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if is_style_ext(ext) {
+                let raw = tokio::fs::read_to_string(file)
+                    .await
+                    .map_err(|e| format!("read {}: {e}", file.display()))?;
+                let css_src = if oj_css::is_sass(clean_url) {
+                    oj_css::compile_sass(&raw, file.parent())?
+                } else {
+                    raw
+                };
+                let output = oj_css::compile_css(clean_url, &css_src, false)?;
+                return Ok(format!(
+                    "export default {};\n",
+                    serde_json::Value::String(output.css)
+                ));
+            }
+            let bytes = tokio::fs::read(file).await.map_err(|e| format!("read: {e}"))?;
             let mime = content_type(ext).split(';').next().unwrap_or("application/octet-stream");
             let data_uri = format!("data:{mime};base64,{}", base64_encode(&bytes));
             Ok(format!("export default {data_uri:?};\n"))
@@ -4504,6 +4519,44 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn css_inline_returns_compiled_css_not_a_data_uri() {
+        // `import css from './x.css?inline'` yields the compiled CSS string,
+        // not a base64 data: URI (Vite parity).
+        let dir = tempfile::tempdir().unwrap();
+        let css = dir.path().join("styles.css");
+        std::fs::write(&css, ".a { color: red; }").unwrap();
+        let out = asset_module(&css, "/styles.css?inline", "inline")
+            .await
+            .unwrap();
+        assert!(out.starts_with("export default \""), "string export: {out}");
+        assert!(out.contains("color"), "carries the CSS text: {out}");
+        assert!(!out.contains("data:"), "must not be a data URI: {out}");
+    }
+
+    #[tokio::test]
+    async fn scss_inline_is_compiled_through_sass() {
+        let dir = tempfile::tempdir().unwrap();
+        let scss = dir.path().join("styles.scss");
+        std::fs::write(&scss, "$c: red;\n.a { color: $c; }").unwrap();
+        let out = asset_module(&scss, "/styles.scss?inline", "inline")
+            .await
+            .unwrap();
+        assert!(out.contains("red"), "sass variable compiled: {out}");
+        assert!(!out.contains("$c"), "sass compiled away: {out}");
+    }
+
+    #[tokio::test]
+    async fn non_css_inline_stays_a_data_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("pixel.png");
+        std::fs::write(&png, [0u8, 1, 2, 3]).unwrap();
+        let out = asset_module(&png, "/pixel.png?inline", "inline")
+            .await
+            .unwrap();
+        assert!(out.contains("data:"), "binary asset stays a data URI: {out}");
+    }
 
     #[test]
     fn bare_specifier_classification_routes_plugin_virtuals_to_the_fallback() {
