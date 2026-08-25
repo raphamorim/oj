@@ -1926,6 +1926,7 @@ dependencies = [
  "anyhow",
  "axum",
  "blake3",
+ "glob",
  "libc",
  "notify",
  "oj_cache",

@@ -59,6 +59,16 @@ pub fn css_additional_data(config: &OjConfig, lang: &str) -> Option<String> {
         .and_then(|e| e.additional_data.clone())
 }
 
+pub fn server_fs_deny(config: &OjConfig) -> Vec<String> {
+    config
+        .server
+        .as_ref()
+        .and_then(|s| s.fs.as_ref())
+        .and_then(|f| f.deny.as_ref())
+        .cloned()
+        .unwrap_or_default()
+}
+
 pub fn config_defines(config: &OjConfig) -> Vec<(String, String)> {
     config
         .define
@@ -508,6 +518,19 @@ mod tests {
         assert!(css_additional_data(&cfg, "less").is_none());
         let empty: OjConfig = serde_json::from_str("{}").unwrap();
         assert!(css_additional_data(&empty, "scss").is_none());
+    }
+
+    #[test]
+    fn server_fs_deny_accessor() {
+        let json = r#"{"server":{"fs":{"deny":["secrets/**","*.key"]}}}"#;
+        let cfg: OjConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            server_fs_deny(&cfg),
+            vec!["secrets/**".to_string(), "*.key".to_string()]
+        );
+        // Absent server / fs / deny is an empty list (defaults applied elsewhere).
+        let empty: OjConfig = serde_json::from_str("{}").unwrap();
+        assert!(server_fs_deny(&empty).is_empty());
     }
 
     #[test]
