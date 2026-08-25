@@ -2732,6 +2732,83 @@ mod tests {
         assert_eq!(module_script_srcs(html2), vec!["./app/main.ts"]);
     }
 
+    #[tokio::test]
+    async fn build_bundles_inline_module_entries_and_preserves_base_and_attributes() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("oj-inline-module-{suffix}"));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("oj.config.json"), r#"{"base":"/preview/"}"#).unwrap();
+        fs::write(root.join("message.js"), r#"export const message = "inline-ready";"#).unwrap();
+        fs::write(
+            root.join("index.html"),
+            r#"<html><head></head><body>
+              <script type="module" data-label="first">import { message } from "./message.js"; window.__INLINE_FIRST__ = message;</script>
+              <script type="module" data-label="second">window.__INLINE_SECOND__ = "second-ready";</script>
+            </body></html>"#,
+        )
+        .unwrap();
+
+        build(root.clone(), None, None, "production")
+            .await
+            .expect("valid inline module scripts should build");
+
+        let html = fs::read_to_string(root.join("dist/index.html")).unwrap();
+        assert_eq!(html.matches("src=\"/preview/assets/").count(), 2, "{html}");
+        assert!(html.contains("data-label=\"first\""), "{html}");
+        assert!(html.contains("data-label=\"second\""), "{html}");
+        assert!(!html.contains("import { message }"), "{html}");
+
+        let chunks = fs::read_dir(root.join("dist/assets"))
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(chunks.contains("__INLINE_FIRST__"), "{chunks}");
+        assert!(chunks.contains("__INLINE_SECOND__"), "{chunks}");
+        assert!(chunks.contains("inline-ready"), "{chunks}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn build_preserves_external_module_entries_alongside_inline_modules() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("oj-mixed-inline-modules-{suffix}"));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("external.js"), "window.__EXTERNAL_MODULE__ = true;").unwrap();
+        fs::write(
+            root.join("index.html"),
+            r#"<html><head></head><body>
+              <script type="module" src="/external.js"></script>
+              <script type="module" nonce="synthetic">window.__INLINE_MODULE__ = true;</script>
+            </body></html>"#,
+        )
+        .unwrap();
+
+        build(root.clone(), None, None, "production")
+            .await
+            .expect("mixed external and inline module scripts should build");
+
+        let html = fs::read_to_string(root.join("dist/index.html")).unwrap();
+        assert_eq!(html.matches("src=\"/assets/").count(), 2, "{html}");
+        assert!(html.contains("nonce=\"synthetic\""), "{html}");
+        assert!(!html.contains("window.__INLINE_MODULE__"), "{html}");
+
+        let chunks = fs::read_dir(root.join("dist/assets"))
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(chunks.contains("__EXTERNAL_MODULE__"), "{chunks}");
+        assert!(chunks.contains("__INLINE_MODULE__"), "{chunks}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn is_server_module_path_matches_server_suffixes() {
         for yes in [
