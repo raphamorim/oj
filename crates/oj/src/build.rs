@@ -1325,7 +1325,13 @@ pub async fn build(
             preloads.insert(dep);
         }
     }
-    if !preloads.is_empty() {
+    if !preloads.is_empty()
+        && build_cfg
+            .module_preload
+            .as_ref()
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+    {
         let links = preloads
             .iter()
             .map(|f| {
@@ -2602,7 +2608,11 @@ mod tests {
     #[tokio::test]
     async fn module_preload_configuration_controls_production_links() {
         for (index, (config_name, config, expected)) in [
-            ("oj.config.json", r#"{"build":{"modulePreload":false}}"#, false),
+            (
+                "oj.config.json",
+                r#"{"build":{"modulePreload":false}}"#,
+                false,
+            ),
             (
                 "vite.config.mjs",
                 "export default { build: { modulePreload: false } };",
