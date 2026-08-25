@@ -2599,6 +2599,67 @@ fn build_manifest(entries: &[ManifestEntry]) -> serde_json::Value {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn module_preload_configuration_controls_production_links() {
+        for (index, (config_name, config, expected)) in [
+            ("oj.config.json", r#"{"build":{"modulePreload":false}}"#, false),
+            (
+                "vite.config.mjs",
+                "export default { build: { modulePreload: false } };",
+                false,
+            ),
+            (
+                "oj.config.json",
+                r#"{"build":{"modulePreload":{"polyfill":false}}}"#,
+                true,
+            ),
+            ("oj.config.json", "{}", true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let suffix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!("oj-module-preload-{suffix}-{index}"));
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("package.json"), r#"{"type":"module"}"#).unwrap();
+            fs::write(root.join(config_name), config).unwrap();
+            fs::write(
+                root.join("index.html"),
+                r#"<html><head></head><body>
+                    <script type="module" src="/first.js"></script>
+                    <script type="module" src="/second.js"></script>
+                </body></html>"#,
+            )
+            .unwrap();
+            fs::write(
+                root.join("first.js"),
+                r#"import { shared } from "./shared.js"; window.first = shared;"#,
+            )
+            .unwrap();
+            fs::write(
+                root.join("second.js"),
+                r#"import { shared } from "./shared.js"; window.second = shared;"#,
+            )
+            .unwrap();
+            fs::write(root.join("shared.js"), r#"export const shared = "ready";"#).unwrap();
+
+            build(root.clone(), None, None, "production")
+                .await
+                .expect("synthetic shared-chunk fixture should build");
+
+            let html = fs::read_to_string(root.join("dist/index.html")).unwrap();
+            assert_eq!(
+                html.contains("rel=\"modulepreload\""),
+                expected,
+                "{config_name}: {config}\n{html}"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[test]
     fn manifest_matches_vite_shape() {
         let mk = |key: &str,
