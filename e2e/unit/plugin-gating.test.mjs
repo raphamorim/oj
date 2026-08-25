@@ -2,7 +2,10 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -108,4 +111,60 @@ test("hookHandler / hookFilter: function form and object form", () => {
 
   assert.equal(hookHandler(undefined), null);
   assert.equal(hookHandler({ handler: "not-a-fn" }), null);
+});
+
+test("plugin environment exposes a resolver for aliases, configured extensions, and packages", async () => {
+  const root = mkdtempSync(join(tmpdir(), "oj-plugin-create-resolver-"));
+  try {
+    const source = join(root, "src");
+    const components = join(source, "components");
+    const packageDirectory = join(root, "node_modules", "synthetic-package");
+    mkdirSync(components, { recursive: true });
+    mkdirSync(packageDirectory, { recursive: true });
+    writeFileSync(join(root, "package.json"), '{"name":"synthetic-app"}');
+    writeFileSync(join(components, "card.tsx"), "export default 1;");
+    writeFileSync(join(source, "theme.widget"), "export default 2;");
+    writeFileSync(join(packageDirectory, "package.json"), '{"name":"synthetic-package","main":"index.js"}');
+    writeFileSync(join(packageDirectory, "index.js"), "module.exports = 3;");
+
+    const container = createPluginContainer({}, [{
+      name: "synthetic-config-resolver",
+      async transform() {
+        const resolve = this.environment.config.createResolver();
+        const importer = join(source, "entry.ts");
+        return JSON.stringify(await Promise.all([
+          resolve("@/components/card", importer),
+          resolve("./theme", importer),
+          resolve("synthetic-package", importer),
+          resolve("./missing", importer),
+        ]));
+      },
+    }], {
+      config: {
+        root,
+        resolve: { alias: { "@": source }, extensions: [".widget", ".tsx", ".js"] },
+      },
+    });
+
+    assert.equal(await container.transform("", join(source, "entry.ts")), JSON.stringify([
+      join(components, "card.tsx"),
+      join(source, "theme.widget"),
+      join(packageDirectory, "index.js"),
+      null,
+    ]));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("plugin environment preserves an existing configured resolver", async () => {
+  const existing = () => async (id) => `/configured/${id}`;
+  const container = createPluginContainer({}, [{
+    name: "synthetic-existing-resolver",
+    async transform() {
+      return this.environment.config.createResolver()("entry");
+    },
+  }], { config: { createResolver: existing } });
+
+  assert.equal(await container.transform("", "/entry.ts"), "/configured/entry");
 });
