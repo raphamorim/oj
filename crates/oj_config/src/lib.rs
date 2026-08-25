@@ -50,6 +50,15 @@ pub fn env_prefixes(config: &OjConfig) -> Vec<String> {
         .unwrap_or_else(|| vec!["VITE_".to_string()])
 }
 
+pub fn css_additional_data(config: &OjConfig, lang: &str) -> Option<String> {
+    config
+        .css
+        .as_ref()
+        .and_then(|c| c.preprocessor_options.as_ref())
+        .and_then(|m| m.get(lang))
+        .and_then(|e| e.additional_data.clone())
+}
+
 pub fn config_defines(config: &OjConfig) -> Vec<(String, String)> {
     config
         .define
@@ -482,6 +491,23 @@ mod tests {
         assert_eq!(env_prefixes(&none), vec!["VITE_".to_string()]);
         let empty: OjConfig = serde_json::from_str(r#"{"envPrefix":[]}"#).unwrap();
         assert_eq!(env_prefixes(&empty), vec!["VITE_".to_string()]);
+    }
+
+    #[test]
+    fn css_additional_data_accessor_reads_per_language() {
+        let json = r#"{"css":{"preprocessorOptions":{
+            "scss":{"additionalData":"@use 'src/vars' as *;"},
+            "sass":{"additionalData":"$x: 1"}}}}"#;
+        let cfg: OjConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            css_additional_data(&cfg, "scss").as_deref(),
+            Some("@use 'src/vars' as *;")
+        );
+        assert_eq!(css_additional_data(&cfg, "sass").as_deref(), Some("$x: 1"));
+        // A language without an entry, and an absent css config, are both None.
+        assert!(css_additional_data(&cfg, "less").is_none());
+        let empty: OjConfig = serde_json::from_str("{}").unwrap();
+        assert!(css_additional_data(&empty, "scss").is_none());
     }
 
     #[test]
