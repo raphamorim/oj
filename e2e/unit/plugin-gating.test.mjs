@@ -794,3 +794,28 @@ test("renderStart supports object-form hooks and continues past failed initializ
 
   assert.deepEqual(rendered, [{ consumer: "client", output }]);
 });
+
+// PR #71
+test("generateBundle receives and can mutate actual emitted chunks", async () => {
+  const emitted = [];
+  const bundle = {
+    "assets/entry.js": { type: "chunk", fileName: "assets/entry.js", isEntry: true, code: "entry();" },
+    "assets/chunk.js": { type: "chunk", fileName: "assets/chunk.js", isEntry: false, code: "chunk();" },
+  };
+  const plugin = {
+    name: "synthetic-bundle-reporter",
+    generateBundle(_options, output) {
+      const chunks = Object.values(output).filter((entry) => entry.type === "chunk");
+      this.emitFile({ type: "asset", fileName: "report.txt", source: `chunks:${chunks.length}` });
+      for (const chunk of chunks) {
+        if (chunk.isEntry) chunk.code = `/* generated */${chunk.code}`;
+      }
+    },
+  };
+
+  await createPluginContainer({}, [plugin], { command: "build" })
+    .generateBundle((asset) => emitted.push(asset), bundle);
+
+  assert.deepEqual(emitted, [{ type: "asset", fileName: "report.txt", source: "chunks:2" }]);
+  assert.equal(bundle["assets/entry.js"].code, "/* generated */entry();");
+});

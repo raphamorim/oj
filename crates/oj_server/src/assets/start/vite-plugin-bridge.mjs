@@ -183,7 +183,7 @@ export function createPluginContainer(vite, allPlugins, {
 } = {}) {
   const plugins = ordered(
     allPlugins.filter(
-      (p) => (p.buildStart || p.resolveId || p.load || p.transform || p.moduleParsed || p.generateBundle || p.configResolved || p.renderChunk || p.writeBundle || p.closeBundle || p.buildEnd)
+      (p) => (p.buildStart || p.resolveId || p.load || p.transform || p.moduleParsed || p.generateBundle || p.configResolved || p.renderChunk || p.writeBundle || p.closeBundle || p.buildEnd || p.renderStart)
         && applyMatches(p, command, mode),
     ),
   );
@@ -395,6 +395,15 @@ export function createPluginContainer(vite, allPlugins, {
     }
   }
 
+  async function renderStart(outputOptions, inputOptions) {
+    for (const plugin of plugins) {
+      if (!envAllows(plugin, environment)) continue;
+      const hook = hookHandler(plugin.renderStart);
+      if (!hook) continue;
+      try { await hook.call(ctx, outputOptions, inputOptions); } catch {}
+    }
+  }
+
   // Vite runs buildStart once before any module loads; plugins that compile
   // sources (e.g. i18n message compilers) populate their state here and serve
   // it from load(). oj's SSR loader is a separate process with its own plugin
@@ -427,7 +436,7 @@ export function createPluginContainer(vite, allPlugins, {
   }
 
   return {
-    resolveId, load, transform, transformUserCode, buildStart, renderChunk, generateBundle, pluginCount: plugins.length, watchFiles, writeBundle, closeBundle, buildEnd,
+    resolveId, load, transform, transformUserCode, buildStart, renderChunk, generateBundle, pluginCount: plugins.length, watchFiles, writeBundle, closeBundle, buildEnd, renderStart,
   };
 }
 
