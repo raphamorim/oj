@@ -583,3 +583,36 @@ test("retains configResolved-only plugins alongside operational consumers", () =
 
   assert.equal(container.pluginCount, 2);
 });
+
+// PR #76
+test("renderChunk retains chunk-only plugins and chains applicable hooks", async () => {
+  const plugins = [
+    {
+      name: "synthetic-server-only",
+      applyToEnvironment: (environment) => environment.config.consumer === "server",
+      renderChunk: () => "incorrect server chunk",
+    },
+    {
+      name: "synthetic-post-chunk",
+      enforce: "post",
+      renderChunk: {
+        handler(code, chunk) {
+          return chunk.isEntry ? { code: `${code}/*post*/` } : null;
+        },
+      },
+    },
+    {
+      name: "synthetic-pre-chunk",
+      enforce: "pre",
+      renderChunk(code, chunk) {
+        return chunk.isEntry ? `/*${this.environment.config.consumer}*/${code}` : null;
+      },
+    },
+  ];
+  const container = createPluginContainer({}, plugins, { command: "build", environment: "client" });
+  const entry = { type: "chunk", fileName: "assets/entry.js", isEntry: true, code: "entry();" };
+
+  assert.equal(container.pluginCount, 3);
+  assert.equal(await container.renderChunk(entry.code, entry), "/*client*/entry();/*post*/");
+  assert.equal(await container.renderChunk("chunk();", { ...entry, isEntry: false }), null);
+});
