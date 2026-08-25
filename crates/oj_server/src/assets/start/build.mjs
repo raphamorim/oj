@@ -269,4 +269,7 @@ if (prerender.length) {
   process.stderr.write(`${OJ}${_ojTTY ? "" : ":"} prerendered ${prerender.length} route(s)\n`);
 }
 
+await clientContainer?.closeBundle();
+await serverContainer?.closeBundle();
+
 process.stderr.write(`${OJ}${_ojTTY ? "" : ":"} built dist (client ${clientUrl})\n`);
