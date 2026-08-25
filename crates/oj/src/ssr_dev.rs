@@ -67,17 +67,15 @@ pub async fn ssr_dev(
         ssr_route,
     ));
 
-    let addr = std::net::SocketAddr::from((built.host, built.port));
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| anyhow::anyhow!("cannot bind {addr}: {e}"))?;
+    let (listener, port) =
+        oj_server::bind_dev_listener(built.host, built.port, built.strict_port).await?;
     println!("  {} dev (ssr + module runner)", oj_server::oj_brand());
     println!("  entry:  {entry}");
     match &client_url {
         Some(u) => println!("  client: {u} (hydration + hmr on)"),
         None => println!("  client: none (SSR only; add a *-client entry to hydrate)"),
     }
-    let url = format!("http://localhost:{}/", built.port);
+    let url = format!("http://localhost:{}/", port);
     println!("  {}", oj_server::link(&url, &oj_server::cell(&url)));
     axum::serve(listener, app).await?;
     Ok(())
