@@ -7,7 +7,19 @@ import { mkdirSync, rmSync, readFileSync, writeFileSync, renameSync, existsSync,
 import path from "node:path";
 import builtinModules from "node:module";
 
-const { root, outDir, entries, include = [], exclude = [], dedupe = [], alias = [], autoDiscover = false } = JSON.parse(process.argv[2]);
+const { root, outDir, entries, include = [], exclude = [], dedupe = [], alias = [], autoDiscover = false, esbuildOptions: rawEsbuildOptions = {} } = JSON.parse(process.argv[2]);
+
+const ESBUILD_OPTION_KEYS = new Set([
+  "define", "target", "supported", "loader", "jsx", "jsxDev", "jsxSideEffects",
+  "jsxFactory", "jsxFragment", "jsxImportSource", "mainFields", "conditions",
+  "resolveExtensions", "preserveSymlinks", "keepNames", "minify", "minifyWhitespace",
+  "minifyIdentifiers", "minifySyntax", "treeShaking", "platform", "external", "banner",
+  "footer", "inject", "alias", "drop", "pure", "charset", "legalComments", "tsconfig",
+  "tsconfigRaw", "ignoreAnnotations",
+]);
+const esbuildOptions = Object.fromEntries(
+  Object.entries(rawEsbuildOptions ?? {}).filter(([k]) => ESBUILD_OPTION_KEYS.has(k)),
+);
 
 const DEDUPE = new Set([
   "react",
@@ -182,14 +194,15 @@ async function scan() {
   };
   try {
     await esbuild.build({
+      jsx: "automatic",
+      ...esbuildOptions,
       entryPoints: entryList,
       bundle: true,
       write: false,
       logLevel: "silent",
-      platform: "browser",
-      loader: { ".js": "jsx", ".ts": "ts", ".tsx": "tsx", ".jsx": "jsx" },
-      jsx: "automatic",
-      plugins: [externalizeNonJs, collector],
+      platform: esbuildOptions.platform ?? "browser",
+      loader: { ".js": "jsx", ".ts": "ts", ".tsx": "tsx", ".jsx": "jsx", ...(esbuildOptions.loader ?? {}) },
+      plugins: [...(esbuildOptions.plugins ?? []), externalizeNonJs, collector],
       metafile: false,
     });
   } catch {}
@@ -257,6 +270,10 @@ mkdirSync(outDir, { recursive: true });
 const metadata = {};
 if (Object.keys(entryPoints).length) {
   const result = await esbuild.build({
+    mainFields: ["browser", "module", "main"],
+    conditions: ["browser", "module", "import", "development"],
+    target: "esnext",
+    ...esbuildOptions,
     entryPoints,
     absWorkingDir: root,
     bundle: true,
@@ -264,17 +281,14 @@ if (Object.keys(entryPoints).length) {
     format: "esm",
     outdir: outDir,
     outExtension: { ".js": ".mjs" },
-    platform: "browser",
-    define: { "process.env.NODE_ENV": JSON.stringify("development") },
-    mainFields: ["browser", "module", "main"],
-    conditions: ["browser", "module", "import", "development"],
-    target: "esnext",
+    platform: esbuildOptions.platform ?? "browser",
+    define: { "process.env.NODE_ENV": JSON.stringify("development"), ...(esbuildOptions.define ?? {}) },
     // A node-oriented dep (e.g. @react-pdf/renderer, cosmiconfig) may import a
     // node builtin; externalize them so one such dep can't fail the whole
     // pre-bundle. The import stays in the output and oj serves a browser stub,
     // matching Vite's esbuildDepPlugin, which also externalizes builtins.
-    external: [...NODE_BUILTINS],
-    plugins: [externalizeNonJs],
+    external: [...NODE_BUILTINS, ...(esbuildOptions.external ?? [])],
+    plugins: [...(esbuildOptions.plugins ?? []), externalizeNonJs],
     logLevel: "silent",
     metafile: true,
     write: true,
