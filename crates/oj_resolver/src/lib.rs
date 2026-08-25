@@ -41,6 +41,16 @@ pub struct ResolveFailure {
     pub ignored: bool,
 }
 
+#[derive(Clone, Default)]
+pub struct ResolveSettings {
+    pub conditions: Vec<String>,
+    pub alias: Vec<(String, String)>,
+    pub dedupe: Vec<String>,
+    pub extensions: Option<Vec<String>>,
+    pub main_fields: Option<Vec<String>>,
+    pub preserve_symlinks: bool,
+}
+
 impl OjResolver {
     pub fn new(root: &Path) -> Self {
         Self::with_conditions(
@@ -59,8 +69,21 @@ impl OjResolver {
         alias: &[(String, String)],
         dedupe: &[String],
     ) -> Self {
+        Self::with_settings(
+            root,
+            ResolveSettings {
+                conditions: conditions.to_vec(),
+                alias: alias.to_vec(),
+                dedupe: dedupe.to_vec(),
+                ..ResolveSettings::default()
+            },
+        )
+    }
+
+    pub fn with_settings(root: &Path, settings: ResolveSettings) -> Self {
         let tsconfig = root.join("tsconfig.json");
-        let alias = alias
+        let alias = settings
+            .alias
             .iter()
             .map(|(find, replacement)| {
                 let target = if replacement.starts_with('.') {
@@ -71,23 +94,26 @@ impl OjResolver {
                 (find.clone(), vec![AliasValue::Path(target)])
             })
             .collect();
+        let default_extensions = [".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs", ".json"]
+            .map(String::from)
+            .to_vec();
+        // Package entry resolution for legacy deps without an `exports` map
+        // (with one, condition_names decides and this is unused). `module`
+        // leads so a dep shipping both an ESM build and a `browser` STRING
+        // that points at a UMD/CJS bundle (e.g. transliteration) serves its
+        // ESM — real named exports, no CJS-interop guessing. The `browser`
+        // OBJECT remap (node-shim swaps) is unaffected: it runs through
+        // alias_fields below, not here.
+        let default_main_fields = ["module", "browser", "jsnext:main", "jsnext", "main"]
+            .map(String::from)
+            .to_vec();
         let options = ResolveOptions {
-            extensions: [".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs", ".json"]
-                .map(String::from)
-                .to_vec(),
-            // Package entry resolution for legacy deps without an `exports` map
-            // (with one, condition_names decides and this is unused). `module`
-            // leads so a dep shipping both an ESM build and a `browser` STRING
-            // that points at a UMD/CJS bundle (e.g. transliteration) serves its
-            // ESM — real named exports, no CJS-interop guessing. The `browser`
-            // OBJECT remap (node-shim swaps) is unaffected: it runs through
-            // alias_fields below, not here.
-            main_fields: ["module", "browser", "jsnext:main", "jsnext", "main"]
-                .map(String::from)
-                .to_vec(),
+            extensions: settings.extensions.unwrap_or(default_extensions),
+            main_fields: settings.main_fields.unwrap_or(default_main_fields),
             alias_fields: vec![vec!["browser".to_string()]],
-            condition_names: conditions.to_vec(),
+            condition_names: settings.conditions,
             alias,
+            symlinks: !settings.preserve_symlinks,
             tsconfig: tsconfig.is_file().then(|| {
                 TsconfigDiscovery::Manual(TsconfigOptions {
                     config_file: tsconfig,
@@ -99,7 +125,7 @@ impl OjResolver {
         Self {
             inner: Resolver::new(options),
             root: root.to_path_buf(),
-            dedupe: dedupe.to_vec(),
+            dedupe: settings.dedupe,
         }
     }
 
@@ -291,6 +317,105 @@ mod tests {
                 .unwrap()
                 .ends_with("Counter.module.css"),
             "exact-path .css should resolve",
+        );
+    }
+
+    #[test]
+    fn honors_custom_resolve_extensions() {
+        // resolve.extensions replaces the default probe list (Vite semantics):
+        // a `.vue` file is only reachable once the caller supplies the extension.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/extensions");
+        let default = OjResolver::new(&dir);
+        assert!(
+            default.resolve(&dir, "./Widget").is_err(),
+            "default extensions must not resolve a .vue file",
+        );
+        let custom = OjResolver::with_settings(
+            &dir,
+            ResolveSettings {
+                conditions: ["import", "default"].map(String::from).to_vec(),
+                extensions: Some(vec![".vue".to_string()]),
+                ..ResolveSettings::default()
+            },
+        );
+        assert!(
+            custom
+                .resolve(&dir, "./Widget")
+                .unwrap()
+                .ends_with("Widget.vue"),
+            "custom .vue extension should resolve",
+        );
+    }
+
+    #[test]
+    fn honors_main_fields_override() {
+        // mf-pkg ships both `module` (esm.js) and `main` (cjs.js). The default
+        // ordering prefers module; forcing mainFields:["main"] must pick main.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/mainfields");
+        let default = OjResolver::new(&dir);
+        assert!(
+            default.resolve(&dir, "mf-pkg").unwrap().ends_with("esm.js"),
+            "default mainFields prefers module",
+        );
+        let main_first = OjResolver::with_settings(
+            &dir,
+            ResolveSettings {
+                conditions: ["import", "default"].map(String::from).to_vec(),
+                main_fields: Some(vec!["main".to_string()]),
+                ..ResolveSettings::default()
+            },
+        );
+        assert!(
+            main_first
+                .resolve(&dir, "mf-pkg")
+                .unwrap()
+                .ends_with("cjs.js"),
+            "mainFields:[main] must pick the main entry",
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn preserve_symlinks_controls_realpath() {
+        use std::os::unix::fs::symlink;
+        // A linked package dir: real files at `real/`, imported through `link/`.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("index.js"), "export default 1;\n").unwrap();
+        symlink(&real, root.join("link")).unwrap();
+        let conds = ["import", "default"].map(String::from).to_vec();
+
+        // Default follows symlinks: the resolved path lands in the real dir.
+        let resolved = OjResolver::with_settings(
+            root,
+            ResolveSettings {
+                conditions: conds.clone(),
+                ..ResolveSettings::default()
+            },
+        )
+        .resolve(root, "./link/index.js")
+        .unwrap();
+        assert!(
+            resolved.starts_with(std::fs::canonicalize(&real).unwrap()),
+            "default realpaths through the symlink: {resolved:?}",
+        );
+
+        // preserveSymlinks keeps the symlink location instead of realpathing.
+        let preserved = OjResolver::with_settings(
+            root,
+            ResolveSettings {
+                conditions: conds,
+                preserve_symlinks: true,
+                ..ResolveSettings::default()
+            },
+        )
+        .resolve(root, "./link/index.js")
+        .unwrap();
+        assert!(
+            preserved.to_string_lossy().contains("link"),
+            "preserveSymlinks keeps the symlink path: {preserved:?}",
         );
     }
 }

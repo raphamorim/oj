@@ -95,6 +95,22 @@ pub fn resolve_dedupe(config: &OjConfig) -> Vec<String> {
         .unwrap_or_default()
 }
 
+pub fn resolve_extensions(config: &OjConfig) -> Option<Vec<String>> {
+    config.resolve.as_ref().and_then(|r| r.extensions.clone())
+}
+
+pub fn resolve_main_fields(config: &OjConfig) -> Option<Vec<String>> {
+    config.resolve.as_ref().and_then(|r| r.main_fields.clone())
+}
+
+pub fn resolve_preserve_symlinks(config: &OjConfig) -> bool {
+    config
+        .resolve
+        .as_ref()
+        .and_then(|r| r.preserve_symlinks)
+        .unwrap_or(false)
+}
+
 pub fn optimize_deps_lists(config: &OjConfig) -> (Vec<String>, Vec<String>, Vec<String>) {
     let od = config.optimize_deps.as_ref();
     let take = |f: Option<&Vec<String>>| f.cloned().unwrap_or_default();
@@ -411,6 +427,33 @@ mod tests {
         assert_eq!(inc, vec!["cjs-dep".to_string()]);
         assert_eq!(exc, vec!["big-esm".to_string()]);
         assert_eq!(ent, vec!["src/main.tsx".to_string()]);
+    }
+
+    #[test]
+    fn resolve_extensions_main_fields_and_preserve_symlinks_accessors() {
+        let json = r#"{"resolve":{
+            "extensions":[".vue",".ts",".js"],
+            "mainFields":["main","module"],
+            "preserveSymlinks":true}}"#;
+        let cfg: OjConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            resolve_extensions(&cfg),
+            Some(vec![
+                ".vue".to_string(),
+                ".ts".to_string(),
+                ".js".to_string()
+            ])
+        );
+        assert_eq!(
+            resolve_main_fields(&cfg),
+            Some(vec!["main".to_string(), "module".to_string()])
+        );
+        assert!(resolve_preserve_symlinks(&cfg));
+        // Absent resolve.* leaves extensions/mainFields unset, symlinks followed.
+        let empty: OjConfig = serde_json::from_str("{}").unwrap();
+        assert!(resolve_extensions(&empty).is_none());
+        assert!(resolve_main_fields(&empty).is_none());
+        assert!(!resolve_preserve_symlinks(&empty));
     }
 
     #[test]
