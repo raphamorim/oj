@@ -3,6 +3,7 @@
 
 import http from "node:http";
 import { createReadStream, existsSync, fstatSync, openSync, statSync, write as fsWrite, writeFileSync } from "node:fs";
+import { readFile, stat as fsStat } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, isAbsolute, join, resolve as pathResolve } from "node:path";
@@ -649,15 +650,47 @@ async function load(id) {
   return null;
 }
 
-async function handleHotUpdate(file, timestamp) {
-  let suppress = false;
+async function readModifiedFile(file) {
+  const content = await readFile(file, "utf8");
+  if (content) return content;
+  const mtime = (await fsStat(file)).mtimeMs;
+  for (let n = 0; n < 10; n++) {
+    await new Promise((r) => setTimeout(r, 10));
+    const newMtime = (await fsStat(file)).mtimeMs;
+    if (newMtime !== mtime) break;
+  }
+  return readFile(file, "utf8");
+}
+
+async function handleHotUpdate(file, timestamp, type, modulesJson) {
+  let modules;
+  try {
+    modules = modulesJson ? JSON.parse(modulesJson) : [];
+  } catch {
+    modules = [];
+  }
+  const hmrContext = {
+    file,
+    timestamp: Number(timestamp),
+    type: type || "update",
+    modules,
+    read: () => readModifiedFile(file),
+  };
+  let filtered = null;
   for (const p of plugins) {
     if (typeof p.handleHotUpdate !== "function") continue;
-    const r = await p.handleHotUpdate.call(ctx, { file, timestamp: Number(timestamp) });
+    const r = await p.handleHotUpdate.call(ctx, hmrContext);
     if (r === "full-reload") return "full-reload";
-    if (Array.isArray(r) && r.length === 0) suppress = true;
+    if (Array.isArray(r)) {
+      hmrContext.modules = r;
+      filtered = r
+        .map((m) => (typeof m === "string" ? m : m && (m.url ?? m.id)))
+        .filter((u) => typeof u === "string" && u.length > 0);
+    }
   }
-  return suppress ? "skip" : null;
+  if (filtered === null) return null;
+  if (filtered.length === 0) return "skip";
+  return JSON.stringify({ action: "filter", modules: filtered });
 }
 
 function escapeAttr(v) {
@@ -763,7 +796,7 @@ async function run(hook, args) {
   if (hook === "transform") return transform(args[0], args[1]);
   if (hook === "resolveId") return resolveId(args[0], args[1]);
   if (hook === "load") return load(args[0]);
-  if (hook === "handleHotUpdate") return handleHotUpdate(args[0], args[1]);
+  if (hook === "handleHotUpdate") return handleHotUpdate(args[0], args[1], args[2], args[3]);
   if (hook === "transformIndexHtml") return transformIndexHtml(args[0]);
   if (hook === "buildStart" || hook === "buildEnd" || hook === "renderStart" || hook === "closeBundle") {
     return runLifecycle(hook);

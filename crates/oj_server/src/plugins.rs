@@ -625,9 +625,14 @@ impl PluginHost {
         &self,
         file: &str,
         timestamp: u64,
+        change_type: &str,
+        modules_json: &str,
     ) -> Result<Option<String>, String> {
-        self.call("handleHotUpdate", &[file, &timestamp.to_string()])
-            .await
+        self.call(
+            "handleHotUpdate",
+            &[file, &timestamp.to_string(), change_type, modules_json],
+        )
+        .await
     }
 
     #[inline]
