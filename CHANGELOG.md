@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `css.preprocessorOptions.scss.additionalData` (and `sass`) injects a preamble before Sass compilation.
 - `server.strictPort` is honored; by default the dev and preview servers move to the next free port when the chosen one is busy (Vite parity), and error only when `strictPort` is set.
 - `optimizeDeps.esbuildOptions` (`define`, `target`, `loader`, `jsx*`, `mainFields`, `conditions`, `keepNames`, ...) is now applied to dependency pre-bundling instead of being ignored.
+- `?worker&inline` emits an inline Blob worker (with a `data:` URI fallback) in bundle mode, matching Vite; in dev it serves a working module worker instead of a broken data URI.
 
 ### Changed
 - CSS imported with `?inline` returns the compiled CSS string instead of a base64 `data:` URI.
