@@ -1987,7 +1987,7 @@ async fn ensure_module(
             } else {
                 source.clone()
             };
-            let output = oj_css::compile_css(&url_owned, &css_src, false)?;
+            let output = oj_css::compile_css_rebased(&url_owned, &css_src, false)?;
             return Ok(CachedModule {
                 is_boundary: true,
                 kind: "css".into(),
