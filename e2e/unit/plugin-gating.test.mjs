@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -108,4 +108,28 @@ test("hookHandler / hookFilter: function form and object form", () => {
 
   assert.equal(hookHandler(undefined), null);
   assert.equal(hookHandler({ handler: "not-a-fn" }), null);
+});
+
+test("generateBundle receives and can mutate actual emitted chunks", async () => {
+  const emitted = [];
+  const bundle = {
+    "assets/entry.js": { type: "chunk", fileName: "assets/entry.js", isEntry: true, code: "entry();" },
+    "assets/chunk.js": { type: "chunk", fileName: "assets/chunk.js", isEntry: false, code: "chunk();" },
+  };
+  const plugin = {
+    name: "synthetic-bundle-reporter",
+    generateBundle(_options, output) {
+      const chunks = Object.values(output).filter((entry) => entry.type === "chunk");
+      this.emitFile({ type: "asset", fileName: "report.txt", source: `chunks:${chunks.length}` });
+      for (const chunk of chunks) {
+        if (chunk.isEntry) chunk.code = `/* generated */${chunk.code}`;
+      }
+    },
+  };
+
+  await createPluginContainer({}, [plugin], { command: "build" })
+    .generateBundle((asset) => emitted.push(asset), bundle);
+
+  assert.deepEqual(emitted, [{ type: "asset", fileName: "report.txt", source: "chunks:2" }]);
+  assert.equal(bundle["assets/entry.js"].code, "/* generated */entry();");
 });
