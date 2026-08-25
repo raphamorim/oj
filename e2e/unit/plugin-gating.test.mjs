@@ -130,6 +130,12 @@ test("plugin config hooks initialize state and merge nested configuration", asyn
             resolve: { alias: ["initial"] },
             plugins: [
               {
+                name: "synthetic-unsupported-config",
+                config(config) {
+                  return config.build.rollupOptions;
+                },
+              },
+              {
                 name: "synthetic-config-producer",
                 async config(_config, environment) {
                   return {
