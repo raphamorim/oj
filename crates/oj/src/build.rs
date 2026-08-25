@@ -2273,10 +2273,10 @@ fn lib_format(fmt: &str) -> Option<(&'static str, bool)> {
 
 fn normalize_base(base: &str) -> String {
     if base.is_empty() || base == "./" {
-        return "/".to_string();
+        return "./".to_string();
     }
     let mut b = base.to_string();
-    if !b.starts_with('/') {
+    if !b.starts_with('/') && !b.starts_with("http://") && !b.starts_with("https://") {
         b.insert(0, '/');
     }
     if !b.ends_with('/') {
@@ -2286,7 +2286,34 @@ fn normalize_base(base: &str) -> String {
 }
 
 fn with_base(filename: &str, base: &str) -> String {
-    format!("{base}{}", filename.trim_start_matches('/'))
+    with_base_from(filename, base, "index.html")
+}
+
+fn with_base_from(filename: &str, base: &str, from: &str) -> String {
+    if base != "./" {
+        return format!("{base}{}", filename.trim_start_matches('/'));
+    }
+    let target: Vec<_> = filename.trim_start_matches('/').split('/').collect();
+    let source: Vec<_> = Path::new(from)
+        .parent()
+        .into_iter()
+        .flat_map(Path::components)
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => part.to_str(),
+            _ => None,
+        })
+        .collect();
+    let common = source
+        .iter()
+        .zip(&target)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let prefix = "../".repeat(source.len() - common);
+    let remainder = target[common..].join("/");
+    if prefix.is_empty() {
+        return format!("./{remainder}");
+    }
+    format!("{prefix}{remainder}")
 }
 
 /// All chunks reachable from `entry` via static imports (excludes `entry`).
@@ -2363,7 +2390,7 @@ fn emit_css_url(
     }
     std::fs::write(&dest, &data).ok()?;
     emitted.push((name.clone(), data.len()));
-    let url = with_base(&name, base);
+    let url = with_base_from(&name, base, "assets/style.css");
     seen.insert(abs, url.clone());
     Some(format!("{url}{suffix}"))
 }
@@ -2525,7 +2552,14 @@ fn emit_split_css(
         let Ok(code) = fs::read_to_string(&path) else {
             continue;
         };
-        let href = serde_json::Value::String(with_base(css_name, base));
+        let href = if base == "./" {
+            format!(
+                "new URL({}, import.meta.url).href",
+                serde_json::Value::String(with_base_from(css_name, base, chunk_file))
+            )
+        } else {
+            serde_json::Value::String(with_base(css_name, base)).to_string()
+        };
         let inject = format!(
             "(function(){{var u={href};if(!document.querySelector('link[rel=\"stylesheet\"][href=\"'+u+'\"]')){{var l=document.createElement('link');l.rel='stylesheet';l.href=u;document.head.appendChild(l);}}}})();\n"
         );
@@ -2711,10 +2745,21 @@ mod tests {
         assert_eq!(normalize_base("app"), "/app/");
         assert_eq!(normalize_base("/app"), "/app/");
         assert_eq!(normalize_base("/app/"), "/app/");
-        assert_eq!(normalize_base("https://cdn.example.com/app"), "https://cdn.example.com/app/");
+        assert_eq!(
+            normalize_base("https://cdn.example.com/app"),
+            "https://cdn.example.com/app/"
+        );
         assert_eq!(with_base("assets/x-h.js", "/"), "/assets/x-h.js");
         assert_eq!(with_base("assets/x-h.js", "/app/"), "/app/assets/x-h.js");
         assert_eq!(with_base("assets/x-h.js", "./"), "./assets/x-h.js");
+        assert_eq!(
+            with_base_from("assets/x-h.js", "./", "nested/about/index.html"),
+            "../../assets/x-h.js"
+        );
+        assert_eq!(
+            with_base_from("assets/icon.svg", "./", "assets/style.css"),
+            "./icon.svg"
+        );
         assert_eq!(
             with_base("assets/x-h.js", "https://cdn.example.com/app/"),
             "https://cdn.example.com/app/assets/x-h.js"
@@ -2747,7 +2792,7 @@ mod tests {
                 root.join("main.js"),
                 r#"import "./style.css"; import { shared } from "./shared.js";
                    window.__RELATIVE_BASE__ = import.meta.env.BASE_URL;
-                   window.__PRIMARY_VALUE__ = shared;"#,
+                   window.__PRIMARY_VALUE__ = shared; import("./lazy.js");"#,
             )
             .unwrap();
             fs::write(
@@ -2755,10 +2800,22 @@ mod tests {
                 r#"import { shared } from "./shared.js"; window.__SECONDARY_VALUE__ = shared;"#,
             )
             .unwrap();
-            fs::write(root.join("shared.js"), r#"export const shared = "shared-value";"#)
-                .unwrap();
-            fs::write(root.join("style.css"), r#".logo { background: url("./icon.svg"); }"#)
-                .unwrap();
+            fs::write(
+                root.join("shared.js"),
+                r#"export const shared = "shared-value";"#,
+            )
+            .unwrap();
+            fs::write(
+                root.join("style.css"),
+                r#".logo { background: url("./icon.svg"); }"#,
+            )
+            .unwrap();
+            fs::write(
+                root.join("lazy.js"),
+                r#"import "./lazy.css"; window.__LAZY__ = true;"#,
+            )
+            .unwrap();
+            fs::write(root.join("lazy.css"), ".lazy { color: red; }").unwrap();
             fs::write(root.join("icon.svg"), "<svg><rect/></svg>").unwrap();
 
             build(root.clone(), None, None, "production")
@@ -2767,8 +2824,14 @@ mod tests {
 
             let html = fs::read_to_string(root.join("dist/index.html")).unwrap();
             assert_eq!(html.matches("src=\"./assets/").count(), 2, "{html}");
-            assert!(html.contains("rel=\"stylesheet\" href=\"./assets/"), "{html}");
-            assert!(html.contains("rel=\"modulepreload\" href=\"./assets/"), "{html}");
+            assert!(
+                html.contains("rel=\"stylesheet\" href=\"./assets/"),
+                "{html}"
+            );
+            assert!(
+                html.contains("rel=\"modulepreload\" href=\"./assets/"),
+                "{html}"
+            );
             assert!(!html.contains("src=\"/assets/"), "{html}");
 
             let mut scripts = String::new();
@@ -2782,7 +2845,13 @@ mod tests {
                 }
             }
             assert!(scripts.contains("__RELATIVE_BASE__"), "{scripts}");
-            assert!(scripts.contains("\"./\""), "{scripts}");
+            assert!(
+                scripts.contains("__RELATIVE_BASE__=`./`")
+                    || scripts.contains("__RELATIVE_BASE__=\"./\""),
+                "{scripts}"
+            );
+            assert!(scripts.contains("new URL(\"./"), "{scripts}");
+            assert!(scripts.contains("import.meta.url"), "{scripts}");
             assert!(styles.contains("url(\"./icon-"), "{styles}");
             assert!(!styles.contains("./assets/"), "{styles}");
             fs::remove_dir_all(root).unwrap();
