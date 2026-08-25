@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -108,4 +108,76 @@ test("hookHandler / hookFilter: function form and object form", () => {
 
   assert.equal(hookHandler(undefined), null);
   assert.equal(hookHandler({ handler: "not-a-fn" }), null);
+});
+
+test("plugin hooks inspect environment modules by ID, URL, and shared source file", async () => {
+  const file = "/synthetic/dependency.ts";
+  const first = `${file}?first`;
+  const second = `${file}?second`;
+  const container = createPluginContainer({}, [
+    {
+      name: "synthetic-environment-module-source",
+      load(id) {
+        return id.startsWith(file) ? `export default ${JSON.stringify(id)};` : null;
+      },
+    },
+    {
+      name: "synthetic-environment-module-inspector",
+      async transform(code, id) {
+        const graph = this.environment.moduleGraph;
+        const byId = graph.getModuleById(first);
+        const byUrl = await graph.getModuleByUrl(first);
+        const byFile = graph.getModulesByFile(file);
+        const current = graph.getModuleById(id);
+        return JSON.stringify({
+          sameModule: byId === byUrl,
+          environment: byId.environment,
+          file: byId.file,
+          loadedCode: byId.transformResult.code,
+          fileVariants: byFile.size,
+          includesBoth: byFile.has(byId) && byFile.has(graph.getModuleById(second)),
+          currentCode: current.transformResult.code,
+          missingId: graph.getModuleById("/missing.ts") === undefined,
+          missingFile: graph.getModulesByFile("/missing.ts") === undefined,
+        });
+      },
+    },
+  ]);
+
+  await container.load(first);
+  await container.load(second);
+
+  assert.equal(await container.transform("export default 1;", "/synthetic/entry.ts"), JSON.stringify({
+    sameModule: true,
+    environment: "client",
+    file,
+    loadedCode: `export default ${JSON.stringify(first)};`,
+    fileVariants: 2,
+    includesBoth: true,
+    currentCode: "export default 1;",
+    missingId: true,
+    missingFile: true,
+  }));
+});
+
+test("client and SSR plugin environments maintain independent module graphs", async () => {
+  const observed = [];
+  const plugin = {
+    name: "synthetic-environment-isolation",
+    transform(code, id) {
+      const graph = this.environment.moduleGraph;
+      observed.push({ environment: this.environment.name, graph, code: graph.getModuleById(id).transformResult.code });
+      return `${this.environment.name}:${code}`;
+    },
+  };
+  const client = createPluginContainer({}, [plugin], { environment: "client" });
+  const ssr = createPluginContainer({}, [plugin], { environment: "ssr" });
+
+  assert.equal(await client.transform("browser", "/shared.ts"), "client:browser");
+  assert.equal(await ssr.transformUserCode("server", "/shared.ts"), "ssr:server");
+  assert.deepEqual(observed.map(({ environment, code }) => ({ environment, code })), [
+    { environment: "client", code: "browser" },
+    { environment: "ssr", code: "server" },
+  ]);
+  assert.notEqual(observed[0].graph, observed[1].graph);
 });
