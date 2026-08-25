@@ -588,11 +588,17 @@ async function transform(code, id) {
   return transformWatchStore.run(bucket, async () => {
     if (id) seenIds.add(id);
     let current = code;
+    const maps = [];
     for (const p of plugins) {
       if (typeof p.transform !== "function") continue;
       const r = await p.transform.call(ctx, current, id);
       if (r == null) continue;
-      current = typeof r === "string" ? r : (r.code ?? current);
+      if (typeof r === "string") {
+        current = r;
+        continue;
+      }
+      if (r.code != null) current = r.code;
+      if (r.map != null) maps.push(typeof r.map === "string" ? r.map : JSON.stringify(r.map));
     }
     const info = { id, code: current, importedIds: [] };
     moduleInfoCache.set(id, info);
@@ -600,7 +606,7 @@ async function transform(code, id) {
     for (const p of plugins) {
       if (typeof p.moduleParsed === "function") await p.moduleParsed.call(ctx, info);
     }
-    return JSON.stringify({ code: current, watchFiles: [...bucket] });
+    return JSON.stringify({ code: current, watchFiles: [...bucket], maps });
   });
 }
 
