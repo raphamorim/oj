@@ -131,6 +131,8 @@ jobs:
           # config define + client-environment define applied to the client build
           grep -rq 'global-define|client-define' playground/dist/assets/*.js
           ! grep -rq __OJ_DEFINE_ playground/dist/assets/*.js
+      - name: explicit build inputs (multi-page, no root index.html)
+        run: node e2e/multi-html-input.mjs
       - name: library build
         run: |
           mkdir -p /tmp/lib/src
