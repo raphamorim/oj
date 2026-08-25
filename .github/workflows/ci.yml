@@ -133,6 +133,8 @@ jobs:
           ! grep -rq __OJ_DEFINE_ playground/dist/assets/*.js
       - name: explicit build inputs (multi-page, no root index.html)
         run: node e2e/multi-html-input.mjs
+      - name: plugin emitFile chunk spine (getFileName resolves hashed name)
+        run: node e2e/emit-chunk-build.mjs
       - name: library build
         run: |
           mkdir -p /tmp/lib/src

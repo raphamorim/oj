@@ -785,6 +785,10 @@ fn copy_public_dir(src: &Path, dest: &Path) -> anyhow::Result<()> {
 struct OjUserPlugin {
     host: Arc<PluginHost>,
     render_chunk_enabled: Arc<tokio::sync::OnceCell<bool>>,
+    // Maps a plugin-facing chunk reference id (`oj-chunk-N`, minted in the
+    // sidecar) to rolldown's own reference id, so `this.getFileName(refId)` can
+    // be answered with the final hashed name once chunks are generated.
+    emitted_chunk_refs: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
 }
 
 impl OjUserPlugin {
@@ -792,6 +796,7 @@ impl OjUserPlugin {
         Self {
             host,
             render_chunk_enabled: Arc::new(tokio::sync::OnceCell::new()),
+            emitted_chunk_refs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 }
@@ -853,18 +858,38 @@ impl Plugin for OjUserPlugin {
 
     fn transform(
         &self,
-        _ctx: SharedTransformPluginContext,
+        ctx: SharedTransformPluginContext,
         args: &HookTransformArgs<'_>,
     ) -> impl std::future::Future<Output = HookTransformReturn> + Send {
         let host = Arc::clone(&self.host);
+        let refs = Arc::clone(&self.emitted_chunk_refs);
         let code = args.code.to_string();
         let id = args.id.to_string();
         async move {
             match host.transform(&code, &id).await {
-                Ok((out, _, _)) if out != code => Ok(Some(HookTransformOutput {
-                    code: Some(out),
-                    ..Default::default()
-                })),
+                Ok((out, _, _, chunks)) => {
+                    for c in &chunks {
+                        let emitted = rolldown_common::EmittedChunk {
+                            id: c.id.clone(),
+                            name: c.name.clone().map(Into::into),
+                            file_name: c.file_name.clone().map(Into::into),
+                            ..Default::default()
+                        };
+                        if let Ok(rd_ref) = ctx.inner.emit_chunk(emitted) {
+                            refs.lock()
+                                .unwrap()
+                                .insert(c.ref_id.clone(), rd_ref.to_string());
+                        }
+                    }
+                    if out != code {
+                        Ok(Some(HookTransformOutput {
+                            code: Some(out),
+                            ..Default::default()
+                        }))
+                    } else {
+                        Ok(None)
+                    }
+                }
                 _ => Ok(None),
             }
         }
@@ -872,9 +897,33 @@ impl Plugin for OjUserPlugin {
 
     async fn generate_bundle(
         &self,
-        _ctx: &PluginContext,
+        ctx: &PluginContext,
         args: &mut rolldown_plugin::HookGenerateBundleArgs<'_>,
     ) -> rolldown_plugin::HookNoopReturn {
+        // Resolve the final hashed name of every chunk the plugin emitted and
+        // seed them into the sidecar so `this.getFileName(refId)` (read here in
+        // generateBundle) returns the real output filename.
+        let refs: Vec<(String, String)> = self
+            .emitted_chunk_refs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(a, b)| (a.clone(), b.clone()))
+            .collect();
+        if !refs.is_empty() {
+            let mut map = serde_json::Map::new();
+            for (oj_ref, rd_ref) in refs {
+                if let Ok(name) = ctx.get_file_name(&rd_ref) {
+                    map.insert(oj_ref, serde_json::Value::String(name.to_string()));
+                }
+            }
+            if !map.is_empty() {
+                let _ = self
+                    .host
+                    .seed_chunk_names(&serde_json::Value::Object(map).to_string())
+                    .await;
+            }
+        }
         if !self.host.has_generate_bundle().await {
             return Ok(());
         }

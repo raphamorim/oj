@@ -880,7 +880,7 @@ async fn ssr_module(
         Some(host) => host
             .transform(&source, id)
             .await
-            .map(|(code, _, _)| code)
+            .map(|(code, _, _, _)| code)
             .unwrap_or(source),
         None => source,
     };
@@ -1918,7 +1918,7 @@ async fn ensure_module(
     let source = match &state.plugins {
         Some(host) if !is_dep && state.plugins_have_transform => {
             match host.transform(&source, &file.to_string_lossy()).await {
-                Ok((code, watches, maps)) => {
+                Ok((code, watches, maps, _)) => {
                     plugin_watch_files = watches;
                     plugin_maps = maps;
                     code
