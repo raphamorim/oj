@@ -10,6 +10,7 @@ import {
   workspaceRoot,
   pnpmStorePaths,
   contentHashEmitter,
+  makeVitePlugins,
 } from "../../crates/oj_server/src/assets/start/rolldown-assets.mjs";
 
 const tmp = (p) => mkdtempSync(join(tmpdir(), "oj-assets-" + p + "-"));
@@ -145,4 +146,18 @@ test("emit does not compile plain CSS (no markers)", async () => {
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
+});
+
+test("the Rolldown adapter forwards render initialization only to its active container", async () => {
+  const rendered = [];
+  const output = { format: "es" };
+  const input = { input: "/synthetic/entry.ts" };
+  const adapter = makeVitePlugins({
+    container: { renderStart(...options) { rendered.push({ environment: "active", options }); } },
+    fallback: { renderStart(...options) { rendered.push({ environment: "fallback", options }); } },
+  });
+
+  await adapter.renderStart(output, input);
+
+  assert.deepEqual(rendered, [{ environment: "active", options: [output, input] }]);
 });
