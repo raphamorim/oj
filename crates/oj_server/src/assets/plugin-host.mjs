@@ -330,20 +330,8 @@ try {
       throw e;
     }
   });
-  plugins = plugins.filter((p) => {
-    if (typeof p.applyToEnvironment !== "function") return true;
-    try {
-      return !!p.applyToEnvironment(environment);
-    } catch (e) {
-      if (ojStartMode) return true;
-      throw e;
-    }
-  });
   const rank = (p) => (p.enforce === "pre" ? -1 : p.enforce === "post" ? 1 : 0);
   plugins.sort((a, b) => rank(a) - rank(b));
-  process.stderr.write(
-    `${OJ} plugin host: ${plugins.length} plugin(s) active for ${env.command}: ${plugins.map((p) => `${p.name}[${p.enforce ?? "-"}]`).join(",")}\n`,
-  );
 } catch (e) {
   process.stderr.write(`${OJ} plugin host: failed to load ${pluginsPath}: ${(e && e.stack) || e}\n`);
 }
@@ -459,6 +447,21 @@ async function runConfigHooks() {
   }
 }
 await runConfigHooks();
+
+plugins = plugins.filter((p) => {
+  if (typeof p.applyToEnvironment !== "function") return true;
+  try {
+    return !!p.applyToEnvironment(environment);
+  } catch (e) {
+    process.stderr.write(
+      `${OJ} plugin host: applyToEnvironment(${p.name ?? "?"}) threw; keeping the plugin active: ${(e && e.message) || e}\n`,
+    );
+    return true;
+  }
+});
+process.stderr.write(
+  `${OJ} plugin host: ${plugins.length} plugin(s) active for ${env.command}: ${plugins.map((p) => `${p.name}[${p.enforce ?? "-"}]`).join(",")}\n`,
+);
 
 const wsListeners = new Map();
 function ojWsSend(event, data) {

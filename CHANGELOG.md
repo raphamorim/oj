@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CSS imported with `?inline` returns the compiled CSS string instead of a base64 `data:` URI.
 - Dev-served CSS rewrites relative `url()` and `@import` references to server-absolute paths so injected styles resolve them.
 
+### Fixed
+- Plugin `configResolved` now runs before `applyToEnvironment`, matching Vite; plugins that populate state in `configResolved` and read it from `applyToEnvironment` (for example `@tanstack/router-plugin`) no longer crash the plugin host, and a throwing `applyToEnvironment` keeps the plugin active instead of failing config load ([#37](https://github.com/raphamorim/oj/issues/37)).
+
 ### Security
 - `server.fs.deny` is enforced, and oj blocks `.env`, `.env.*`, `*.crt`, `*.pem`, and `**/.git/**` by default (Vite parity).
 
