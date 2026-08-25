@@ -752,3 +752,45 @@ test("buildEnd supports object-form hooks and continues past failed callbacks", 
 
   assert.deepEqual(completed, [{ consumer: "client", error: undefined }]);
 });
+
+// PR #87
+test("renderStart runs output-only plugins with their environment and bundle options", async () => {
+  const rendered = [];
+  const output = { format: "es", dir: "/synthetic/dist" };
+  const input = { input: "/synthetic/entry.ts" };
+  const plugin = {
+    name: "synthetic-render-initializer",
+    applyToEnvironment: (environment) => environment.name === "ssr",
+    renderStart(outputOptions, inputOptions) {
+      rendered.push({ environment: this.environment.name, outputOptions, inputOptions });
+    },
+  };
+
+  const client = createPluginContainer({}, [plugin], { command: "build", environment: "client" });
+  const server = createPluginContainer({}, [plugin], { command: "build", environment: "ssr" });
+
+  assert.equal(server.pluginCount, 1);
+  await client.renderStart(output, input);
+  await server.renderStart(output, input);
+
+  assert.deepEqual(rendered, [{ environment: "ssr", outputOptions: output, inputOptions: input }]);
+});
+
+test("renderStart supports object-form hooks and continues past failed initializers", async () => {
+  const rendered = [];
+  const container = createPluginContainer({}, [
+    {
+      name: "synthetic-failed-render",
+      renderStart() { throw new Error("synthetic render failure"); },
+    },
+    {
+      name: "synthetic-object-render",
+      renderStart: { handler(output) { rendered.push({ consumer: this.environment.config.consumer, output }); } },
+    },
+  ], { command: "build", environment: "client" });
+  const output = { format: "es" };
+
+  await container.renderStart(output, {});
+
+  assert.deepEqual(rendered, [{ consumer: "client", output }]);
+});

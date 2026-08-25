@@ -160,3 +160,17 @@ test("the Rolldown adapter forwards build completion only to its active containe
 
   assert.deepEqual(completed, [{ environment: "active", error: failure }]);
 });
+
+test("the Rolldown adapter forwards render initialization only to its active container", async () => {
+  const rendered = [];
+  const output = { format: "es" };
+  const input = { input: "/synthetic/entry.ts" };
+  const adapter = makeVitePlugins({
+    container: { renderStart(...options) { rendered.push({ environment: "active", options }); } },
+    fallback: { renderStart(...options) { rendered.push({ environment: "fallback", options }); } },
+  });
+
+  await adapter.renderStart(output, input);
+
+  assert.deepEqual(rendered, [{ environment: "active", options: [output, input] }]);
+});
