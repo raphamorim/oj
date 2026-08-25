@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -108,4 +108,54 @@ test("hookHandler / hookFilter: function form and object form", () => {
 
   assert.equal(hookHandler(undefined), null);
   assert.equal(hookHandler({ handler: "not-a-fn" }), null);
+});
+
+test("writeBundle observes emitted chunks after generation in the client environment", async () => {
+  const lifecycle = [];
+  const bundle = {
+    "assets/entry.js": { type: "chunk", fileName: "assets/entry.js", isEntry: true, code: "entry();" },
+    "assets/chunk.js": { type: "chunk", fileName: "assets/chunk.js", isEntry: false, code: "chunk();" },
+  };
+  const plugins = [
+    {
+      name: "synthetic-post-writer",
+      enforce: "post",
+      writeBundle: {
+        handler(options, output, isWrite) {
+          lifecycle.push(`post:${options.format}:${Object.keys(output).sort().join(",")}:${isWrite}`);
+        },
+      },
+    },
+    {
+      name: "synthetic-server-writer",
+      applyToEnvironment: (environment) => environment.config.consumer === "server",
+      writeBundle() {
+        lifecycle.push("server");
+      },
+    },
+    {
+      name: "synthetic-pre-writer",
+      enforce: "pre",
+      writeBundle(_options, output) {
+        lifecycle.push(`pre:${this.environment.config.consumer}:${output["assets/entry.js"].code}`);
+      },
+    },
+    {
+      name: "synthetic-generator",
+      generateBundle() {
+        lifecycle.push("generate");
+      },
+    },
+  ];
+  const container = createPluginContainer({}, plugins, { command: "build", environment: "client" });
+
+  assert.equal(container.pluginCount, 4);
+  await container.generateBundle(() => {});
+  await container.writeBundle(bundle);
+
+  assert.deepEqual(lifecycle, [
+    "generate",
+    "pre:client:entry();",
+    "post:es:assets/chunk.js,assets/entry.js:true",
+  ]);
 });
