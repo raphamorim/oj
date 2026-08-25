@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { __test, createPluginContainer, findConfig, loadPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, realpathSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 const { matchOne, idAllowed, codeAllowed, byHook, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
@@ -566,6 +566,88 @@ test("config hooks see the command's default mode when none is given", async () 
   }
 });
 
+// PR #71
+test("generateBundle receives and can mutate actual emitted chunks", async () => {
+  const emitted = [];
+  const bundle = {
+    "assets/entry.js": { type: "chunk", fileName: "assets/entry.js", isEntry: true, code: "entry();" },
+    "assets/chunk.js": { type: "chunk", fileName: "assets/chunk.js", isEntry: false, code: "chunk();" },
+  };
+  const plugin = {
+    name: "synthetic-bundle-reporter",
+    generateBundle(_options, output) {
+      const chunks = Object.values(output).filter((entry) => entry.type === "chunk");
+      this.emitFile({ type: "asset", fileName: "report.txt", source: `chunks:${chunks.length}` });
+      for (const chunk of chunks) {
+        if (chunk.isEntry) chunk.code = `/* generated */${chunk.code}`;
+      }
+    },
+  };
+
+  await createPluginContainer({}, [plugin], { command: "build" })
+    .generateBundle((asset) => emitted.push(asset), bundle);
+
+  assert.deepEqual(emitted, [{ type: "asset", fileName: "report.txt", source: "chunks:2" }]);
+  assert.equal(bundle["assets/entry.js"].code, "/* generated */entry();");
+});
+
+// PR #72
+test("plugin environment exposes a resolver for aliases, configured extensions, and packages", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "oj-plugin-create-resolver-")));
+  try {
+    const source = join(root, "src");
+    const components = join(source, "components");
+    const packageDirectory = join(root, "node_modules", "synthetic-package");
+    mkdirSync(components, { recursive: true });
+    mkdirSync(packageDirectory, { recursive: true });
+    writeFileSync(join(root, "package.json"), '{"name":"synthetic-app"}');
+    writeFileSync(join(components, "card.tsx"), "export default 1;");
+    writeFileSync(join(source, "theme.widget"), "export default 2;");
+    writeFileSync(join(packageDirectory, "package.json"), '{"name":"synthetic-package","main":"index.js"}');
+    writeFileSync(join(packageDirectory, "index.js"), "module.exports = 3;");
+
+    const container = createPluginContainer({}, [{
+      name: "synthetic-config-resolver",
+      async transform() {
+        const resolve = this.environment.config.createResolver();
+        const importer = join(source, "entry.ts");
+        return JSON.stringify(await Promise.all([
+          resolve("@/components/card", importer),
+          resolve("./theme", importer),
+          resolve("synthetic-package", importer),
+          resolve("./missing", importer),
+        ]));
+      },
+    }], {
+      config: {
+        root,
+        resolve: { alias: { "@": source }, extensions: [".widget", ".tsx", ".js"] },
+      },
+    });
+
+    assert.equal(await container.transform("", join(source, "entry.ts")), JSON.stringify([
+      join(components, "card.tsx"),
+      join(source, "theme.widget"),
+      join(packageDirectory, "index.js"),
+      null,
+    ]));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("plugin environment preserves an existing configured resolver", async () => {
+  const existing = () => async (id) => `/configured/${id}`;
+  const container = createPluginContainer({}, [{
+    name: "synthetic-existing-resolver",
+    async transform() {
+      return this.environment.config.createResolver()("entry");
+    },
+  }], { config: { createResolver: existing } });
+
+  assert.equal(await container.transform("", "/entry.ts"), "/configured/entry");
+});
+
 // PR #73
 test("retains configResolved-only plugins alongside operational consumers", () => {
   const initializer = {
@@ -666,6 +748,79 @@ test("writeBundle observes emitted chunks after generation in the client environ
     "pre:client:entry();",
     "post:es:assets/chunk.js,assets/entry.js:true",
   ]);
+});
+
+// PR #79
+test("plugin hooks inspect environment modules by ID, URL, and shared source file", async () => {
+  const file = "/synthetic/dependency.ts";
+  const first = `${file}?first`;
+  const second = `${file}?second`;
+  const container = createPluginContainer({}, [
+    {
+      name: "synthetic-environment-module-source",
+      load(id) {
+        return id.startsWith(file) ? `export default ${JSON.stringify(id)};` : null;
+      },
+    },
+    {
+      name: "synthetic-environment-module-inspector",
+      async transform(code, id) {
+        const graph = this.environment.moduleGraph;
+        const byId = graph.getModuleById(first);
+        const byUrl = await graph.getModuleByUrl(first);
+        const byFile = graph.getModulesByFile(file);
+        const current = graph.getModuleById(id);
+        return JSON.stringify({
+          sameModule: byId === byUrl,
+          environment: byId.environment,
+          file: byId.file,
+          loadedCode: byId.transformResult.code,
+          fileVariants: byFile.size,
+          includesBoth: byFile.has(byId) && byFile.has(graph.getModuleById(second)),
+          currentCode: current.transformResult.code,
+          missingId: graph.getModuleById("/missing.ts") === undefined,
+          missingFile: graph.getModulesByFile("/missing.ts") === undefined,
+        });
+      },
+    },
+  ]);
+
+  await container.load(first);
+  await container.load(second);
+
+  assert.equal(await container.transform("export default 1;", "/synthetic/entry.ts"), JSON.stringify({
+    sameModule: true,
+    environment: "client",
+    file,
+    loadedCode: `export default ${JSON.stringify(first)};`,
+    fileVariants: 2,
+    includesBoth: true,
+    currentCode: "export default 1;",
+    missingId: true,
+    missingFile: true,
+  }));
+});
+
+test("client and SSR plugin environments maintain independent module graphs", async () => {
+  const observed = [];
+  const plugin = {
+    name: "synthetic-environment-isolation",
+    transform(code, id) {
+      const graph = this.environment.moduleGraph;
+      observed.push({ environment: this.environment.name, graph, code: graph.getModuleById(id).transformResult.code });
+      return `${this.environment.name}:${code}`;
+    },
+  };
+  const client = createPluginContainer({}, [plugin], { environment: "client" });
+  const ssr = createPluginContainer({}, [plugin], { environment: "ssr" });
+
+  assert.equal(await client.transform("browser", "/shared.ts"), "client:browser");
+  assert.equal(await ssr.transformUserCode("server", "/shared.ts"), "ssr:server");
+  assert.deepEqual(observed.map(({ environment, code }) => ({ environment, code })), [
+    { environment: "client", code: "browser" },
+    { environment: "ssr", code: "server" },
+  ]);
+  assert.notEqual(observed[0].graph, observed[1].graph);
 });
 
 // PR #83
@@ -793,159 +948,4 @@ test("renderStart supports object-form hooks and continues past failed initializ
   await container.renderStart(output, {});
 
   assert.deepEqual(rendered, [{ consumer: "client", output }]);
-});
-
-// PR #71
-test("generateBundle receives and can mutate actual emitted chunks", async () => {
-  const emitted = [];
-  const bundle = {
-    "assets/entry.js": { type: "chunk", fileName: "assets/entry.js", isEntry: true, code: "entry();" },
-    "assets/chunk.js": { type: "chunk", fileName: "assets/chunk.js", isEntry: false, code: "chunk();" },
-  };
-  const plugin = {
-    name: "synthetic-bundle-reporter",
-    generateBundle(_options, output) {
-      const chunks = Object.values(output).filter((entry) => entry.type === "chunk");
-      this.emitFile({ type: "asset", fileName: "report.txt", source: `chunks:${chunks.length}` });
-      for (const chunk of chunks) {
-        if (chunk.isEntry) chunk.code = `/* generated */${chunk.code}`;
-      }
-    },
-  };
-
-  await createPluginContainer({}, [plugin], { command: "build" })
-    .generateBundle((asset) => emitted.push(asset), bundle);
-
-  assert.deepEqual(emitted, [{ type: "asset", fileName: "report.txt", source: "chunks:2" }]);
-  assert.equal(bundle["assets/entry.js"].code, "/* generated */entry();");
-});
-
-// PR #79
-test("plugin hooks inspect environment modules by ID, URL, and shared source file", async () => {
-  const file = "/synthetic/dependency.ts";
-  const first = `${file}?first`;
-  const second = `${file}?second`;
-  const container = createPluginContainer({}, [
-    {
-      name: "synthetic-environment-module-source",
-      load(id) {
-        return id.startsWith(file) ? `export default ${JSON.stringify(id)};` : null;
-      },
-    },
-    {
-      name: "synthetic-environment-module-inspector",
-      async transform(code, id) {
-        const graph = this.environment.moduleGraph;
-        const byId = graph.getModuleById(first);
-        const byUrl = await graph.getModuleByUrl(first);
-        const byFile = graph.getModulesByFile(file);
-        const current = graph.getModuleById(id);
-        return JSON.stringify({
-          sameModule: byId === byUrl,
-          environment: byId.environment,
-          file: byId.file,
-          loadedCode: byId.transformResult.code,
-          fileVariants: byFile.size,
-          includesBoth: byFile.has(byId) && byFile.has(graph.getModuleById(second)),
-          currentCode: current.transformResult.code,
-          missingId: graph.getModuleById("/missing.ts") === undefined,
-          missingFile: graph.getModulesByFile("/missing.ts") === undefined,
-        });
-      },
-    },
-  ]);
-
-  await container.load(first);
-  await container.load(second);
-
-  assert.equal(await container.transform("export default 1;", "/synthetic/entry.ts"), JSON.stringify({
-    sameModule: true,
-    environment: "client",
-    file,
-    loadedCode: `export default ${JSON.stringify(first)};`,
-    fileVariants: 2,
-    includesBoth: true,
-    currentCode: "export default 1;",
-    missingId: true,
-    missingFile: true,
-  }));
-});
-
-test("client and SSR plugin environments maintain independent module graphs", async () => {
-  const observed = [];
-  const plugin = {
-    name: "synthetic-environment-isolation",
-    transform(code, id) {
-      const graph = this.environment.moduleGraph;
-      observed.push({ environment: this.environment.name, graph, code: graph.getModuleById(id).transformResult.code });
-      return `${this.environment.name}:${code}`;
-    },
-  };
-  const client = createPluginContainer({}, [plugin], { environment: "client" });
-  const ssr = createPluginContainer({}, [plugin], { environment: "ssr" });
-
-  assert.equal(await client.transform("browser", "/shared.ts"), "client:browser");
-  assert.equal(await ssr.transformUserCode("server", "/shared.ts"), "ssr:server");
-  assert.deepEqual(observed.map(({ environment, code }) => ({ environment, code })), [
-    { environment: "client", code: "browser" },
-    { environment: "ssr", code: "server" },
-  ]);
-  assert.notEqual(observed[0].graph, observed[1].graph);
-});
-
-// PR #72
-test("plugin environment exposes a resolver for aliases, configured extensions, and packages", async () => {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "oj-plugin-create-resolver-")));
-  try {
-    const source = join(root, "src");
-    const components = join(source, "components");
-    const packageDirectory = join(root, "node_modules", "synthetic-package");
-    mkdirSync(components, { recursive: true });
-    mkdirSync(packageDirectory, { recursive: true });
-    writeFileSync(join(root, "package.json"), '{"name":"synthetic-app"}');
-    writeFileSync(join(components, "card.tsx"), "export default 1;");
-    writeFileSync(join(source, "theme.widget"), "export default 2;");
-    writeFileSync(join(packageDirectory, "package.json"), '{"name":"synthetic-package","main":"index.js"}');
-    writeFileSync(join(packageDirectory, "index.js"), "module.exports = 3;");
-
-    const container = createPluginContainer({}, [{
-      name: "synthetic-config-resolver",
-      async transform() {
-        const resolve = this.environment.config.createResolver();
-        const importer = join(source, "entry.ts");
-        return JSON.stringify(await Promise.all([
-          resolve("@/components/card", importer),
-          resolve("./theme", importer),
-          resolve("synthetic-package", importer),
-          resolve("./missing", importer),
-        ]));
-      },
-    }], {
-      config: {
-        root,
-        resolve: { alias: { "@": source }, extensions: [".widget", ".tsx", ".js"] },
-      },
-    });
-
-    assert.equal(await container.transform("", join(source, "entry.ts")), JSON.stringify([
-      join(components, "card.tsx"),
-      join(source, "theme.widget"),
-      join(packageDirectory, "index.js"),
-      null,
-    ]));
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("plugin environment preserves an existing configured resolver", async () => {
-  const existing = () => async (id) => `/configured/${id}`;
-  const container = createPluginContainer({}, [{
-    name: "synthetic-existing-resolver",
-    async transform() {
-      return this.environment.config.createResolver()("entry");
-    },
-  }], { config: { createResolver: existing } });
-
-  assert.equal(await container.transform("", "/entry.ts"), "/configured/entry");
 });

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-import { importPkg } from "./resolve-pkg.mjs";
+import { importPkg, makeResolver } from "./resolve-pkg.mjs";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 process.env.VITE_CONFIG_NATIVE_IGNORE_WARNING ??= "true";
@@ -148,6 +148,50 @@ function ordered(plugins) {
   return [...pre, ...normal, ...post];
 }
 
+function makeConfigResolver(config) {
+  const root = config.root ?? process.cwd();
+  const aliases = Array.isArray(config.resolve?.alias)
+    ? config.resolve.alias.map(({ find, replacement }) => [find, replacement])
+    : Object.entries(config.resolve?.alias ?? {});
+  const extensions = Array.isArray(config.resolve?.extensions) && config.resolve.extensions.length
+    ? config.resolve.extensions
+    : [".mjs", ".js", ".mts", ".ts", ".jsx", ".tsx", ".cjs", ".cts", ".json"];
+  const resolvePackage = makeResolver(root);
+
+  return () => async (id, importer) => {
+    if (!id || id.startsWith("\0") || id.startsWith("/@")) return undefined;
+    let specifier = id.split("?", 1)[0];
+    for (const [find, replacement] of aliases) {
+      if (typeof replacement !== "string") continue;
+      if (find instanceof RegExp) {
+        find.lastIndex = 0;
+        if (find.test(specifier)) { specifier = specifier.replace(find, replacement); break; }
+      } else if (typeof find === "string") {
+        const prefix = find.endsWith("/") ? find.slice(0, -1) : find;
+        if (specifier === prefix) { specifier = replacement; break; }
+        if (specifier.startsWith(`${prefix}/`)) {
+          specifier = join(replacement, specifier.slice(prefix.length + 1));
+          break;
+        }
+      }
+    }
+
+    if (specifier.startsWith(".") || isAbsolute(specifier)) {
+      const base = importer ? dirname(importer.startsWith("file://") ? fileURLToPath(importer) : importer) : root;
+      const path = isAbsolute(specifier) ? specifier : pathResolve(base, specifier);
+      const stat = statSync(path, { throwIfNoEntry: false });
+      if (stat?.isFile()) return path;
+      for (const extension of extensions) {
+        const candidate = stat?.isDirectory() ? join(path, `index${extension}`) : `${path}${extension}`;
+        if (statSync(candidate, { throwIfNoEntry: false })?.isFile()) return candidate;
+      }
+      return undefined;
+    }
+
+    try { return resolvePackage(specifier); } catch { return undefined; }
+  };
+}
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 async function withBuildStartLock(fn) {
@@ -219,6 +263,11 @@ export function createPluginContainer(vite, allPlugins, {
     plugins: allPlugins,
     isProduction: mode === "production",
   };
+  // Vite's config.createResolver, for plugins that resolve through the config
+  // (aliases, extensions, packages) rather than through this.resolve.
+  if (typeof resolvedConfig.createResolver !== "function") {
+    resolvedConfig.createResolver = makeConfigResolver(resolvedConfig);
+  }
   const environmentModules = new Map();
   const modulesByUrl = new Map();
   const modulesByFile = new Map();
