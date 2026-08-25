@@ -4,6 +4,7 @@ import module, { createRequire } from "node:module";
 import { existsSync, fstatSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import readline from "node:readline";
+import { importPkg } from "./resolve-pkg.mjs";
 
 const send = process.stdout.write.bind(process.stdout);
 process.stdout.write = process.stderr.write.bind(process.stderr);
@@ -50,8 +51,9 @@ async function loadPostcss() {
 // Tailwind v4 via @tailwindcss/vite: no PostCSS plugin, compile through
 // @tailwindcss/node + scan class candidates with @tailwindcss/oxide.
 async function v4Compile(css, from) {
-  const tw = await import(req.resolve("@tailwindcss/node"));
-  const oxide = await import(req.resolve("@tailwindcss/oxide"));
+  const anchors = ["@tailwindcss/vite", "@tailwindcss/postcss", "tailwindcss"];
+  const tw = await importPkg(APP, "@tailwindcss/node", anchors);
+  const oxide = await importPkg(APP, "@tailwindcss/oxide", anchors);
   const compiler = await tw.compile(css, { base: APP, from, onDependency: () => {} });
   const scanner = new oxide.Scanner({ sources: [{ base: APP, pattern: "**/*", negated: false }] });
   return compiler.build(scanner.scan());
