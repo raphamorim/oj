@@ -52,6 +52,50 @@ struct OjCssPlugin {
     css_code_split: bool,
 }
 
+#[derive(Debug)]
+struct OjInlineModulePlugin {
+    root: PathBuf,
+    modules: std::collections::HashMap<String, String>,
+}
+
+impl Plugin for OjInlineModulePlugin {
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Borrowed("oj:inline-html-modules")
+    }
+
+    fn register_hook_usage(&self) -> rolldown_plugin::HookUsage {
+        rolldown_plugin::HookUsage::ResolveId | rolldown_plugin::HookUsage::Load
+    }
+
+    fn resolve_id(
+        &self,
+        _ctx: &PluginContext,
+        args: &HookResolveIdArgs<'_>,
+    ) -> impl std::future::Future<Output = HookResolveIdReturn> + Send {
+        let path = self
+            .root
+            .join(args.specifier.strip_prefix("./").unwrap_or(args.specifier));
+        let id = path.to_string_lossy().into_owned();
+        let resolved = self.modules.contains_key(&id).then_some(id);
+        async move { Ok(resolved.map(HookResolveIdOutput::from_id)) }
+    }
+
+    fn load(
+        &self,
+        _ctx: SharedLoadPluginContext,
+        args: &HookLoadArgs<'_>,
+    ) -> impl std::future::Future<Output = HookLoadReturn> + Send {
+        let source = self.modules.get(args.id).cloned();
+        async move {
+            Ok(source.map(|code| HookLoadOutput {
+                code: arcstr::ArcStr::from(code),
+                module_type: Some(rolldown_common::ModuleType::Js),
+                ..Default::default()
+            }))
+        }
+    }
+}
+
 fn assets_inline_limit_of(config: &oj_config::OjConfig) -> u64 {
     config
         .build
@@ -1104,9 +1148,11 @@ pub async fn build(
     let html = fs::read_to_string(&html_path)
         .with_context(|| format!("no index.html in {}", root.display()))?;
 
-    let entries = module_script_srcs(&html);
+    let inline_entries = inline_module_entries(&html);
+    let mut entries = module_script_srcs(&html);
+    entries.extend(inline_entries.iter().map(|entry| entry.id.clone()));
     if entries.is_empty() {
-        bail!("index.html has no <script type=\"module\" src=...> entry");
+        bail!("index.html has no <script type=\"module\"> entry");
     }
 
     let base = normalize_base(config.base.as_deref().unwrap_or("/"));
@@ -1145,6 +1191,23 @@ pub async fn build(
     )
     .await;
     let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
+    if !inline_entries.is_empty() {
+        let modules = inline_entries
+            .iter()
+            .map(|entry| {
+                (
+                    root.join(entry.id.trim_start_matches('/'))
+                        .to_string_lossy()
+                        .into_owned(),
+                    entry.source.clone(),
+                )
+            })
+            .collect();
+        oj_plugins.push(Arc::new(OjInlineModulePlugin {
+            root: root.clone(),
+            modules,
+        }));
+    }
     if let Some(host) = &plugin_host {
         if let Err(e) = host.build_start().await {
             eprintln!("oj build: plugin buildStart failed: {e}");
@@ -1305,8 +1368,20 @@ pub async fn build(
                             oj_server::html_entry_src(entry).unwrap_or_else(|| entry.clone());
                         let entry_abs = root.join(resolved.trim_start_matches('/'));
                         if Path::new(facade.as_ref()) == entry_abs.as_path() {
-                            rewritten_html = rewritten_html
-                                .replace(entry.as_str(), &with_base(&filename, &base));
+                            if let Some(inline) =
+                                inline_entries.iter().find(|inline| &inline.id == entry)
+                            {
+                                let replacement = format!(
+                                    "{} src=\"{}\"></script>",
+                                    inline.opening,
+                                    with_base(&filename, &base)
+                                );
+                                rewritten_html =
+                                    rewritten_html.replacen(&inline.element, &replacement, 1);
+                            } else {
+                                rewritten_html = rewritten_html
+                                    .replace(entry.as_str(), &with_base(&filename, &base));
+                            }
                         }
                     }
                 }
@@ -1466,6 +1541,41 @@ fn human_bytes(bytes: usize) -> String {
     } else {
         format!("{bytes}B")
     }
+}
+
+struct InlineModuleEntry {
+    id: String,
+    source: String,
+    opening: String,
+    element: String,
+}
+
+fn inline_module_entries(html: &str) -> Vec<InlineModuleEntry> {
+    let mut entries = Vec::new();
+    for (start, _) in html.match_indices("<script") {
+        let Some(opening_end) = html[start..].find('>') else {
+            continue;
+        };
+        let opening_end = start + opening_end;
+        let opening = &html[start..opening_end];
+        if !opening.contains("type=\"module\"")
+            || !scan_attrs(&html[start..=opening_end], "<script", "src=\"").is_empty()
+        {
+            continue;
+        }
+        let source_start = opening_end + 1;
+        let Some(source_length) = html[source_start..].find("</script>") else {
+            continue;
+        };
+        let source_end = source_start + source_length;
+        entries.push(InlineModuleEntry {
+            id: format!("/.oj-inline-module-{}.js", entries.len()),
+            source: html[source_start..source_end].to_string(),
+            opening: opening.to_string(),
+            element: html[start..source_end + "</script>".len()].to_string(),
+        });
+    }
+    entries
 }
 
 fn module_script_srcs(html: &str) -> Vec<String> {
@@ -2741,7 +2851,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("oj-inline-module-{suffix}"));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("oj.config.json"), r#"{"base":"/preview/"}"#).unwrap();
-        fs::write(root.join("message.js"), r#"export const message = "inline-ready";"#).unwrap();
+        fs::write(
+            root.join("message.js"),
+            r#"export const message = "inline-ready";"#,
+        )
+        .unwrap();
         fs::write(
             root.join("index.html"),
             r#"<html><head></head><body>
@@ -2780,7 +2894,11 @@ mod tests {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("oj-mixed-inline-modules-{suffix}"));
         fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("external.js"), "window.__EXTERNAL_MODULE__ = true;").unwrap();
+        fs::write(
+            root.join("external.js"),
+            "window.__EXTERNAL_MODULE__ = true;",
+        )
+        .unwrap();
         fs::write(
             root.join("index.html"),
             r#"<html><head></head><body>
