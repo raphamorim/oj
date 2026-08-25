@@ -2,9 +2,12 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { viteEnvDefine, makeResolver, importPkg } from "../../crates/oj_server/src/assets/start/resolve-pkg.mjs";
 
 test("viteEnvDefine builds import.meta.env with the standard flags", () => {
@@ -171,6 +174,56 @@ test("importPkg reaches a transitive dep through a preferred anchor", async () =
     });
     const mod = await importPkg(root, "dep", ["anchor"]);
     assert.equal(mod.ok, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CSS host resolves Tailwind v4 dependencies beneath the Vite plugin", () => {
+  const root = mkdtempSync(join(tmpdir(), "oj-tailwind-strict-layout-"));
+  try {
+    writeFileSync(join(root, "package.json"), JSON.stringify({
+      name: "synthetic-app",
+      dependencies: { "@tailwindcss/vite": "1.0.0" },
+    }));
+    writePkg(root, "@tailwindcss/vite", {
+      "package.json": JSON.stringify({
+        name: "@tailwindcss/vite",
+        main: "index.js",
+        dependencies: { "@tailwindcss/node": "1.0.0", "@tailwindcss/oxide": "1.0.0" },
+      }),
+      "index.js": "module.exports = {};",
+    });
+    const anchor = join(root, "node_modules", "@tailwindcss", "vite");
+    writePkg(anchor, "@tailwindcss/node", {
+      "package.json": '{"name":"@tailwindcss/node","type":"module","main":"index.mjs"}',
+      "index.mjs": "export async function compile(source) { return { build(tokens) { return source + tokens.join(','); } }; }",
+    });
+    writePkg(anchor, "@tailwindcss/oxide", {
+      "package.json": '{"name":"@tailwindcss/oxide","type":"module","main":"index.mjs"}',
+      "index.mjs": "export class Scanner { scan() { return ['synthetic-tailwind-token']; } }",
+    });
+
+    const requireFromApp = createRequire(join(root, "package.json"));
+    assert.throws(() => requireFromApp.resolve("@tailwindcss/node"), { code: "MODULE_NOT_FOUND" });
+    assert.throws(() => requireFromApp.resolve("@tailwindcss/oxide"), { code: "MODULE_NOT_FOUND" });
+
+    const stylesheet = join(root, "styles.css");
+    writeFileSync(stylesheet, '@import "tailwindcss";');
+    const cssHost = fileURLToPath(new URL("../../crates/oj_server/src/assets/start/css-host.mjs", import.meta.url));
+    const result = spawnSync(process.execPath, [cssHost], {
+      cwd: root,
+      env: { ...process.env, OJ_APP_ROOT: root },
+      input: `${JSON.stringify({ id: 1, path: stylesheet })}\n`,
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout.trim()), {
+      id: 1,
+      css: '@import "tailwindcss";synthetic-tailwind-token',
+    });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
