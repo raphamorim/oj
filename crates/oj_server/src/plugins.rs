@@ -20,6 +20,26 @@ pub struct EmittedFile {
     pub source: String,
 }
 
+/// A chunk a plugin asked oj to emit via `this.emitFile({ type: "chunk" })`.
+#[derive(Debug, Clone)]
+pub struct ChunkEmit {
+    pub ref_id: String,
+    pub id: String,
+    pub name: Option<String>,
+    pub file_name: Option<String>,
+}
+
+impl ChunkEmit {
+    fn from_value(m: &serde_json::Value) -> Option<Self> {
+        Some(Self {
+            ref_id: m.get("referenceId")?.as_str()?.to_string(),
+            id: m.get("id")?.as_str()?.to_string(),
+            name: m.get("name").and_then(|x| x.as_str()).map(str::to_string),
+            file_name: m.get("fileName").and_then(|x| x.as_str()).map(str::to_string),
+        })
+    }
+}
+
 #[inline]
 pub fn plugins_file(root: &Path) -> Option<std::path::PathBuf> {
     ["oj.plugins.mjs", "oj.plugins.js"]
@@ -573,9 +593,9 @@ impl PluginHost {
         &self,
         code: &str,
         id: &str,
-    ) -> Result<(String, Vec<String>, Vec<String>), String> {
+    ) -> Result<(String, Vec<String>, Vec<String>, Vec<ChunkEmit>), String> {
         let Some(raw) = self.call("transform", &[code, id]).await? else {
-            return Ok((code.to_string(), Vec::new(), Vec::new()));
+            return Ok((code.to_string(), Vec::new(), Vec::new(), Vec::new()));
         };
         match serde_json::from_str::<serde_json::Value>(&raw) {
             Ok(v) => {
@@ -594,10 +614,19 @@ impl PluginHost {
                         })
                         .unwrap_or_default()
                 };
-                Ok((out, str_array("watchFiles"), str_array("maps")))
+                let chunks = v
+                    .get("emittedChunks")
+                    .and_then(|c| c.as_array())
+                    .map(|a| a.iter().filter_map(ChunkEmit::from_value).collect())
+                    .unwrap_or_default();
+                Ok((out, str_array("watchFiles"), str_array("maps"), chunks))
             }
-            Err(_) => Ok((raw, Vec::new(), Vec::new())),
+            Err(_) => Ok((raw, Vec::new(), Vec::new(), Vec::new())),
         }
+    }
+
+    pub async fn seed_chunk_names(&self, map_json: &str) -> Result<Option<String>, String> {
+        self.call("seedChunkNames", &[map_json]).await
     }
 
     #[inline]

@@ -348,6 +348,13 @@ function ctxRpc(method, args) {
 
 let emitCounter = 0;
 const emitted = [];
+// Chunks a plugin asks oj to emit via `this.emitFile({ type: "chunk" })`.
+// The reference id is minted here and returned synchronously (Rollup's emitFile
+// is sync); the chunk is forwarded to rolldown as a build root by the Rust side,
+// and its final hashed name is seeded back into `chunkFileNames` before
+// generateBundle so `this.getFileName(refId)` resolves.
+const chunkFileNames = new Map();
+const transformEmitStore = new AsyncLocalStorage();
 
 const moduleInfoCache = new Map();
 
@@ -377,8 +384,26 @@ const ctx = {
     return id == null ? null : { id };
   },
   emitFile(file) {
-    if (file == null || (file.type && file.type !== "asset")) {
-      throw new Error("oj: this.emitFile supports { type: 'asset' } only");
+    if (file == null) {
+      throw new Error("oj: this.emitFile requires a file descriptor");
+    }
+    if (file.type === "chunk") {
+      if (!file.id) {
+        throw new Error("oj: this.emitFile({ type: 'chunk' }) requires an id");
+      }
+      const referenceId = `oj-chunk-${emitCounter++}`;
+      const rec = {
+        referenceId,
+        id: file.id,
+        name: file.name ?? null,
+        fileName: file.fileName ?? null,
+      };
+      const bucket = transformEmitStore.getStore();
+      if (bucket) bucket.push(rec);
+      return referenceId;
+    }
+    if (file.type && file.type !== "asset") {
+      throw new Error("oj: this.emitFile supports { type: 'asset' | 'chunk' }");
     }
     const fileName = file.fileName ?? `assets/${file.name ?? `asset-${emitCounter}`}`;
     const referenceId = `oj-ref-${emitCounter++}`;
@@ -386,6 +411,7 @@ const ctx = {
     return referenceId;
   },
   getFileName(referenceId) {
+    if (chunkFileNames.has(referenceId)) return chunkFileNames.get(referenceId);
     const f = emitted.find((e) => e.referenceId === referenceId);
     if (!f) throw new Error(`oj: unknown emit reference ${referenceId}`);
     return f.fileName;
@@ -589,29 +615,37 @@ if (ssrBridgeDir) {
 
 async function transform(code, id) {
   const bucket = new Set();
-  return transformWatchStore.run(bucket, async () => {
-    if (id) seenIds.add(id);
-    let current = code;
-    const maps = [];
-    for (const p of plugins) {
-      if (typeof p.transform !== "function") continue;
-      const r = await p.transform.call(ctx, current, id);
-      if (r == null) continue;
-      if (typeof r === "string") {
-        current = r;
-        continue;
+  const chunkBucket = [];
+  return transformWatchStore.run(bucket, () =>
+    transformEmitStore.run(chunkBucket, async () => {
+      if (id) seenIds.add(id);
+      let current = code;
+      const maps = [];
+      for (const p of plugins) {
+        if (typeof p.transform !== "function") continue;
+        const r = await p.transform.call(ctx, current, id);
+        if (r == null) continue;
+        if (typeof r === "string") {
+          current = r;
+          continue;
+        }
+        if (r.code != null) current = r.code;
+        if (r.map != null) maps.push(typeof r.map === "string" ? r.map : JSON.stringify(r.map));
       }
-      if (r.code != null) current = r.code;
-      if (r.map != null) maps.push(typeof r.map === "string" ? r.map : JSON.stringify(r.map));
-    }
-    const info = { id, code: current, importedIds: [] };
-    moduleInfoCache.set(id, info);
-    seenIds.add(id);
-    for (const p of plugins) {
-      if (typeof p.moduleParsed === "function") await p.moduleParsed.call(ctx, info);
-    }
-    return JSON.stringify({ code: current, watchFiles: [...bucket], maps });
-  });
+      const info = { id, code: current, importedIds: [] };
+      moduleInfoCache.set(id, info);
+      seenIds.add(id);
+      for (const p of plugins) {
+        if (typeof p.moduleParsed === "function") await p.moduleParsed.call(ctx, info);
+      }
+      return JSON.stringify({
+        code: current,
+        watchFiles: [...bucket],
+        maps,
+        emittedChunks: chunkBucket,
+      });
+    }),
+  );
 }
 
 async function replayModuleParsed(id) {
@@ -796,6 +830,13 @@ async function writeBundle(bundleJson, isWrite) {
 }
 
 async function run(hook, args) {
+  if (hook === "seedChunkNames") {
+    try {
+      const m = JSON.parse(args[0] ?? "{}");
+      for (const [k, v] of Object.entries(m)) chunkFileNames.set(k, v);
+    } catch {}
+    return null;
+  }
   if (hook === "transform") return transform(args[0], args[1]);
   if (hook === "resolveId") return resolveId(args[0], args[1]);
   if (hook === "load") return load(args[0]);
