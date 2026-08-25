@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `?worker&inline` emits an inline Blob worker (with a `data:` URI fallback) in bundle mode, matching Vite; in dev it serves a working module worker instead of a broken data URI.
 
 ### Changed
+- Plugin `transform` sourcemaps are now composed with oj's own transform map, so dev sourcemaps trace back to the original source through plugins that rewrite code.
 - CSS imported with `?inline` returns the compiled CSS string instead of a base64 `data:` URI.
 - Dev-served CSS rewrites relative `url()` and `@import` references to server-absolute paths so injected styles resolve them.
 
