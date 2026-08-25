@@ -5,6 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use lightningcss::css_modules;
+use lightningcss::dependencies::{Dependency, DependencyOptions};
 use lightningcss::printer::PrinterOptions;
 use lightningcss::stylesheet::{MinifyOptions, ParserOptions, StyleSheet};
 use lightningcss::targets::{Browsers, Targets};
@@ -148,6 +149,19 @@ fn default_targets() -> Targets {
 }
 
 pub fn compile_css(url: &str, source: &str, minify: bool) -> Result<CssOutput, String> {
+    compile_css_impl(url, source, minify, false)
+}
+
+pub fn compile_css_rebased(url: &str, source: &str, minify: bool) -> Result<CssOutput, String> {
+    compile_css_impl(url, source, minify, true)
+}
+
+fn compile_css_impl(
+    url: &str,
+    source: &str,
+    minify: bool,
+    rebase: bool,
+) -> Result<CssOutput, String> {
     let is_module = is_css_module(url);
     let options = ParserOptions {
         filename: url.to_string(),
@@ -169,13 +183,27 @@ pub fn compile_css(url: &str, source: &str, minify: bool) -> Result<CssOutput, S
         })
         .map_err(|err| format!("css transform error in {url}: {err}"))?;
 
+    let base = if rebase { css_base_dir(url) } else { None };
     let result = stylesheet
         .to_css(PrinterOptions {
             minify,
             targets,
+            analyze_dependencies: base.as_ref().map(|_| DependencyOptions::default()),
             ..PrinterOptions::default()
         })
         .map_err(|err| format!("css print error in {url}: {err}"))?;
+
+    let mut css = result.code;
+    if let (Some(base), Some(deps)) = (base, result.dependencies) {
+        for dep in deps {
+            let (placeholder, orig) = match dep {
+                Dependency::Url(u) => (u.placeholder, u.url),
+                Dependency::Import(i) => (i.placeholder, i.url),
+            };
+            let replacement = rebase_relative(&orig, &base).unwrap_or(orig);
+            css = css.replace(&placeholder, &replacement);
+        }
+    }
 
     let exports = result.exports.map(|map| {
         let mut pairs: Vec<(String, String)> = map
@@ -186,10 +214,50 @@ pub fn compile_css(url: &str, source: &str, minify: bool) -> Result<CssOutput, S
         pairs
     });
 
-    Ok(CssOutput {
-        css: result.code,
-        exports,
-    })
+    Ok(CssOutput { css, exports })
+}
+
+fn css_base_dir(url: &str) -> Option<String> {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    if !path.starts_with('/') {
+        return None;
+    }
+    match path.rfind('/') {
+        Some(0) => Some("/".to_string()),
+        Some(i) => Some(path[..i].to_string()),
+        None => None,
+    }
+}
+
+fn rebase_relative(spec: &str, base_dir: &str) -> Option<String> {
+    if spec.is_empty()
+        || spec.starts_with('/')
+        || spec.starts_with('#')
+        || spec.starts_with("data:")
+        || spec.starts_with("//")
+        || spec.contains("://")
+    {
+        return None;
+    }
+    let (path, suffix) = match spec.find(['?', '#']) {
+        Some(i) => (&spec[..i], &spec[i..]),
+        None => (spec, ""),
+    };
+    Some(format!("{}{}", posix_join(base_dir, path), suffix))
+}
+
+fn posix_join(base_dir: &str, rel: &str) -> String {
+    let mut segments: Vec<&str> = base_dir.split('/').filter(|s| !s.is_empty()).collect();
+    for part in rel.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+    format!("/{}", segments.join("/"))
 }
 
 #[cfg(test)]
@@ -201,6 +269,49 @@ mod tests {
         let out = compile_css("/styles.css", "body {\n  color: red;\n}\n", true).unwrap();
         assert_eq!(out.css, "body{color:red}");
         assert!(out.exports.is_none());
+    }
+
+    #[test]
+    fn rebases_relative_url_and_import_to_server_root() {
+        // A stylesheet served at /src/app.css: its relative @import and url()
+        // must become server-absolute so an injected <style> resolves them
+        // against the server root, not the page URL.
+        let src = "@import \"./base.css\";\n.a { background: url(./img/bg.png); }";
+        let out = compile_css_rebased("/src/app.css", src, true).unwrap();
+        assert!(out.css.contains("/src/base.css"), "import rebased: {}", out.css);
+        assert!(
+            out.css.contains("/src/img/bg.png"),
+            "url rebased: {}",
+            out.css
+        );
+        assert!(!out.css.contains("./"), "no relative refs remain: {}", out.css);
+    }
+
+    #[test]
+    fn rebase_resolves_parent_segments_and_skips_external_urls() {
+        let src = ".a { background: url(../assets/x.png); }\n\
+                   .b { background: url(https://cdn.test/y.png); }\n\
+                   .c { background: url(data:image/png;base64,AAAA); }";
+        let out = compile_css_rebased("/src/ui/card.css", src, true).unwrap();
+        assert!(out.css.contains("/src/assets/x.png"), "parent rebased: {}", out.css);
+        assert!(out.css.contains("https://cdn.test/y.png"), "external kept: {}", out.css);
+        assert!(
+            out.css.contains("data:image/png;base64,AAAA"),
+            "data URI kept: {}",
+            out.css
+        );
+    }
+
+    #[test]
+    fn plain_compile_does_not_rebase_urls() {
+        // The build/SSR path must be untouched: url() stays relative.
+        let src = ".a { background: url(./bg.png); }";
+        let out = compile_css("/src/app.css", src, true).unwrap();
+        assert!(
+            out.css.contains("./bg.png"),
+            "non-rebased keeps the relative url: {}",
+            out.css
+        );
     }
 
     #[test]
