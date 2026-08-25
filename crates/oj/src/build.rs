@@ -1100,38 +1100,105 @@ pub async fn build(
         return build_library(&root, &out_dir, lib, minify, sourcemap).await;
     }
 
-    let html_path = root.join("index.html");
-    let html = fs::read_to_string(&html_path)
-        .with_context(|| format!("no index.html in {}", root.display()))?;
-
-    let entries = module_script_srcs(&html);
-    if entries.is_empty() {
-        bail!("index.html has no <script type=\"module\" src=...> entry");
-    }
-
     let base = normalize_base(config.base.as_deref().unwrap_or("/"));
 
     let _ = fs::remove_dir_all(&out_dir);
     fs::create_dir_all(&out_dir)?;
 
     let started = Instant::now();
-    let inputs: Vec<InputItem> = entries
-        .iter()
-        .map(|entry| InputItem {
-            name: Some(
-                Path::new(entry)
+
+    // Vite resolves the build entry as `rolldownOptions.input || index.html`,
+    // where input is string | string[] | Record<name, path>. Each `.html`
+    // entry is processed as a page (its `<script type=module>` become JS
+    // inputs and the page is re-emitted); everything else is a direct entry.
+    let ro_input = ro_opts.and_then(|r| r.get("input")).filter(|v| !v.is_null());
+    let named_inputs: Vec<(String, String)> = match ro_input {
+        Some(v) => normalize_input_entries(v),
+        None => vec![("index".to_string(), "index.html".to_string())],
+    };
+    if named_inputs.is_empty() {
+        bail!("build.rollupOptions.input resolved to no entries");
+    }
+
+    let mut html_docs: Vec<HtmlDoc> = Vec::new();
+    let mut inputs: Vec<InputItem> = Vec::new();
+    let mut seen_imports: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut had_html = false;
+    let push_input = |abs: &Path,
+                      name: String,
+                      inputs: &mut Vec<InputItem>,
+                      seen: &mut std::collections::HashSet<String>| {
+        let rel = abs.strip_prefix(&root).unwrap_or(abs);
+        let import = format!("./{}", rel.display().to_string().replace('\\', "/"));
+        if seen.insert(import.clone()) {
+            inputs.push(InputItem {
+                name: Some(name),
+                import,
+                ..Default::default()
+            });
+        }
+    };
+    for (name, rel) in &named_inputs {
+        let rel_path = Path::new(rel);
+        let abs = if rel_path.is_absolute() {
+            rel_path.to_path_buf()
+        } else {
+            root.join(rel)
+        };
+        if rel.ends_with(".html") {
+            let content = match fs::read_to_string(&abs) {
+                Ok(c) => c,
+                Err(_) if ro_input.is_none() => bail!("no index.html in {}", root.display()),
+                Err(e) => {
+                    return Err(anyhow::Error::from(e))
+                        .with_context(|| format!("build input HTML not found: {}", abs.display()));
+                }
+            };
+            had_html = true;
+            let html_dir = abs.parent().unwrap_or(&root).to_path_buf();
+            let scripts: Vec<HtmlScript> = module_script_srcs(&content)
+                .into_iter()
+                .map(|src| {
+                    let abs = resolve_html_ref(&src, &html_dir, &root);
+                    HtmlScript { src, abs }
+                })
+                .collect();
+            for s in &scripts {
+                let stem = s
+                    .abs
                     .file_stem()
-                    .and_then(|s| s.to_str())
+                    .and_then(|x| x.to_str())
                     .unwrap_or("entry")
-                    .to_string(),
-            ),
-            import: format!(
-                ".{}",
-                oj_server::html_entry_src(entry).unwrap_or_else(|| entry.clone())
-            ),
-            ..Default::default()
-        })
-        .collect();
+                    .to_string();
+                push_input(&s.abs, stem, &mut inputs, &mut seen_imports);
+            }
+            let out_rel = if rel_path.is_absolute() {
+                abs.strip_prefix(&root)
+                    .unwrap_or(&abs)
+                    .display()
+                    .to_string()
+                    .replace('\\', "/")
+            } else {
+                rel.replace('\\', "/")
+            };
+            html_docs.push(HtmlDoc {
+                out_rel,
+                src_html: content,
+                scripts,
+            });
+        } else {
+            if !abs.exists() {
+                bail!("build input not found: {}", abs.display());
+            }
+            push_input(&abs, name.clone(), &mut inputs, &mut seen_imports);
+        }
+    }
+    if inputs.is_empty() {
+        if had_html {
+            bail!("index.html has no <script type=\"module\" src=...> entry");
+        }
+        bail!("build.rollupOptions.input resolved to no entries");
+    }
 
     let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let css_split = css_code_split_of(&config);
@@ -1239,20 +1306,21 @@ pub async fn build(
         eprintln!("oj build warning: {warning:?}");
     }
 
-    // %VITE_*% / import.meta.env substitution in index.html (Vite's htmlEnvHook),
-    // before the plugin transformIndexHtml below.
+    // %VITE_*% / import.meta.env substitution (Vite's htmlEnvHook), applied to
+    // each page before the plugin transformIndexHtml below.
     let html_env = {
         let env = oj_env::load(&root, mode);
         let mut defines = oj_env::import_meta_env_defines(&env, mode, false, &base, &["VITE_"]);
         defines.extend(oj_config::config_defines(&config));
         oj_env::html_env_map(&defines)
     };
-    let mut rewritten_html = oj_env::replace_html_env(&html, &html_env);
     let mut emitted: Vec<(String, usize)> = Vec::new();
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
     let mut imports_map: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     let mut entry_files: Vec<String> = Vec::new();
+    let mut facade_to_file: std::collections::HashMap<PathBuf, String> =
+        std::collections::HashMap::new();
     for asset in &output.assets {
         if let rolldown_common::Output::Chunk(chunk) = asset {
             let filename = chunk.filename.to_string();
@@ -1300,15 +1368,7 @@ pub async fn build(
             if chunk.is_entry {
                 entry_files.push(filename.clone());
                 if let Some(facade) = &chunk.facade_module_id {
-                    for entry in &entries {
-                        let resolved =
-                            oj_server::html_entry_src(entry).unwrap_or_else(|| entry.clone());
-                        let entry_abs = root.join(resolved.trim_start_matches('/'));
-                        if Path::new(facade.as_ref()) == entry_abs.as_path() {
-                            rewritten_html = rewritten_html
-                                .replace(entry.as_str(), &with_base(&filename, &base));
-                        }
-                    }
+                    facade_to_file.insert(PathBuf::from(facade.as_ref()), filename.clone());
                 }
             }
         } else if let rolldown_common::Output::Asset(asset) = asset {
@@ -1316,59 +1376,12 @@ pub async fn build(
         }
     }
 
-    // Inject <link rel="modulepreload"> for each entry's transitively-imported
-    // chunks so the browser fetches them in parallel instead of discovering them
-    // one waterfall level at a time.
-    let mut preloads: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for entry in &entry_files {
-        for dep in transitive_imports(entry, &imports_map) {
-            preloads.insert(dep);
-        }
-    }
-    if !preloads.is_empty() {
-        let links = preloads
-            .iter()
-            .map(|f| {
-                format!(
-                    "<link rel=\"modulepreload\" href=\"{}\" />",
-                    with_base(f, &base)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        rewritten_html = match rewritten_html.find("</head>") {
-            Some(i) => format!(
-                "{}{}\n{}",
-                &rewritten_html[..i],
-                links,
-                &rewritten_html[i..]
-            ),
-            None => format!("{links}\n{rewritten_html}"),
-        };
-    }
-
-    for href in link_hrefs(&html) {
-        let src = root.join(href.trim_start_matches('/'));
-        if src.is_file() {
-            let dest = out_dir.join(href.trim_start_matches('/'));
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let source = fs::read_to_string(&src)?;
-            if oj_server::sidecar::is_tailwind_css(&source) {
-                let css = expand_css_via_sidecar(&root, &src)?;
-                let minified = oj_css::compile_css(href.as_str(), &css, true)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                fs::write(&dest, minified.css)?;
-                continue;
-            }
-            fs::copy(&src, &dest)?;
-        }
-    }
-
-    if !css_split {
+    // Non-split CSS is one combined stylesheet linked from every page.
+    let combined_css_link: Option<String> = if !css_split {
         let mut css_entries = collected_css.lock().unwrap().clone();
-        if !css_entries.is_empty() {
+        if css_entries.is_empty() {
+            None
+        } else {
             css_entries.sort();
             fs::create_dir_all(out_dir.join("assets"))?;
             let mut seen_assets: std::collections::HashMap<PathBuf, String> =
@@ -1388,38 +1401,100 @@ pub async fn build(
             let css_name = format!("assets/style-{}.css", &hash[..8]);
             fs::write(out_dir.join(&css_name), &combined)?;
             emitted.push((css_name.clone(), combined.len()));
-            let link = format!(
-                "<link rel=\"stylesheet\" href=\"{}\" />",
-                with_base(&css_name, &base)
-            );
-            rewritten_html = match rewritten_html.find("</head>") {
-                Some(idx) => format!(
-                    "{}{}\n{}",
-                    &rewritten_html[..idx],
-                    link,
-                    &rewritten_html[idx..]
-                ),
-                None => format!("{link}\n{rewritten_html}"),
-            };
             for entry in &mut manifest_entries {
                 if entry.is_entry {
                     entry.css.push(css_name.clone());
                 }
             }
+            Some(format!(
+                "<link rel=\"stylesheet\" href=\"{}\" />",
+                with_base(&css_name, &base)
+            ))
         }
     } else {
-        emit_split_css(
-            &output,
-            &collected_css,
-            &entry_files,
-            &imports_map,
-            &out_dir,
-            &root,
-            &base,
-            &mut emitted,
-            &mut manifest_entries,
-            &mut rewritten_html,
-        )?;
+        None
+    };
+
+    for doc in &html_docs {
+        let mut rewritten_html = oj_env::replace_html_env(&doc.src_html, &html_env);
+        // Rewrite each `<script src>` to its hashed output chunk and collect
+        // this page's own entry chunks (for modulepreload and split CSS).
+        let mut doc_entry_files: Vec<String> = Vec::new();
+        for s in &doc.scripts {
+            if let Some(file) = facade_to_file.get(&s.abs) {
+                rewritten_html = rewritten_html.replace(&s.src, &with_base(file, &base));
+                doc_entry_files.push(file.clone());
+            }
+        }
+
+        // Inject <link rel="modulepreload"> for this page's transitively
+        // imported chunks so the browser fetches them in parallel.
+        let mut preloads: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for entry in &doc_entry_files {
+            for dep in transitive_imports(entry, &imports_map) {
+                preloads.insert(dep);
+            }
+        }
+        if !preloads.is_empty() {
+            let links = preloads
+                .iter()
+                .map(|f| {
+                    format!(
+                        "<link rel=\"modulepreload\" href=\"{}\" />",
+                        with_base(f, &base)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            rewritten_html = insert_before_head(&rewritten_html, &links);
+        }
+
+        for href in link_hrefs(&doc.src_html) {
+            let src = root.join(href.trim_start_matches('/'));
+            if src.is_file() {
+                let dest = out_dir.join(href.trim_start_matches('/'));
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let source = fs::read_to_string(&src)?;
+                if oj_server::sidecar::is_tailwind_css(&source) {
+                    let css = expand_css_via_sidecar(&root, &src)?;
+                    let minified = oj_css::compile_css(href.as_str(), &css, true)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    fs::write(&dest, minified.css)?;
+                    continue;
+                }
+                fs::copy(&src, &dest)?;
+            }
+        }
+
+        if let Some(link) = &combined_css_link {
+            rewritten_html = insert_before_head(&rewritten_html, link);
+        } else if css_split {
+            emit_split_css(
+                &output,
+                &collected_css,
+                &doc_entry_files,
+                &imports_map,
+                &out_dir,
+                &root,
+                &base,
+                &mut emitted,
+                &mut manifest_entries,
+                &mut rewritten_html,
+            )?;
+        }
+
+        if let Some(host) = &plugin_host {
+            if let Ok(out) = host.transform_index_html(&rewritten_html).await {
+                rewritten_html = out;
+            }
+        }
+        let dest = out_dir.join(&doc.out_rel);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&dest, rewritten_html)?;
     }
 
     fs::create_dir_all(out_dir.join(".vite"))?;
@@ -1427,13 +1502,6 @@ pub async fn build(
         out_dir.join(".vite").join("manifest.json"),
         serde_json::to_string_pretty(&build_manifest(&manifest_entries))?,
     )?;
-
-    if let Some(host) = &plugin_host {
-        if let Ok(out) = host.transform_index_html(&rewritten_html).await {
-            rewritten_html = out;
-        }
-    }
-    fs::write(out_dir.join("index.html"), rewritten_html)?;
 
     let public_dir = config
         .public_dir
@@ -1473,6 +1541,56 @@ fn module_script_srcs(html: &str) -> Vec<String> {
         .into_iter()
         .filter(|src| oj_server::html_entry_src(src).is_some())
         .collect()
+}
+
+struct HtmlScript {
+    src: String,
+    abs: PathBuf,
+}
+
+struct HtmlDoc {
+    out_rel: String,
+    src_html: String,
+    scripts: Vec<HtmlScript>,
+}
+
+fn normalize_input_entries(input: &serde_json::Value) -> Vec<(String, String)> {
+    let name_of = |p: &str| {
+        Path::new(p)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("index")
+            .to_string()
+    };
+    match input {
+        serde_json::Value::String(s) => vec![(name_of(s), s.clone())],
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| (name_of(s), s.to_string()))
+            .collect(),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn resolve_html_ref(src: &str, html_dir: &Path, root: &Path) -> PathBuf {
+    let s = src.trim();
+    let s = s.strip_prefix("./").unwrap_or(s);
+    match s.strip_prefix('/') {
+        Some(rest) => root.join(rest),
+        None => html_dir.join(s),
+    }
+}
+
+fn insert_before_head(html: &str, snippet: &str) -> String {
+    match html.find("</head>") {
+        Some(i) => format!("{}{}\n{}", &html[..i], snippet, &html[i..]),
+        None => format!("{snippet}\n{html}"),
+    }
 }
 
 fn link_hrefs(html: &str) -> Vec<String> {
@@ -2598,6 +2716,64 @@ fn build_manifest(entries: &[ManifestEntry]) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_input_entries_covers_string_array_object() {
+        assert_eq!(
+            normalize_input_entries(&serde_json::json!("index.html")),
+            vec![("index".to_string(), "index.html".to_string())]
+        );
+        assert_eq!(
+            normalize_input_entries(&serde_json::json!("src/pages/options/index.html")),
+            vec![(
+                "index".to_string(),
+                "src/pages/options/index.html".to_string()
+            )]
+        );
+        assert_eq!(
+            normalize_input_entries(&serde_json::json!(["a.html", "b.html"])),
+            vec![
+                ("a".to_string(), "a.html".to_string()),
+                ("b".to_string(), "b.html".to_string()),
+            ]
+        );
+        let obj = normalize_input_entries(&serde_json::json!({
+            "admin": "src/admin.html",
+            "app": "src/app.html",
+        }));
+        assert!(obj.contains(&("admin".to_string(), "src/admin.html".to_string())));
+        assert!(obj.contains(&("app".to_string(), "src/app.html".to_string())));
+        assert_eq!(obj.len(), 2);
+    }
+
+    #[test]
+    fn resolve_html_ref_is_relative_to_the_page_or_root() {
+        let root = Path::new("/proj");
+        let page_dir = Path::new("/proj/src/pages/options");
+        // Root-absolute refs resolve against the project root.
+        assert_eq!(
+            resolve_html_ref("/src/main.tsx", page_dir, root),
+            PathBuf::from("/proj/src/main.tsx")
+        );
+        // Relative refs resolve against the HTML file's own directory.
+        assert_eq!(
+            resolve_html_ref("./index.tsx", page_dir, root),
+            PathBuf::from("/proj/src/pages/options/index.tsx")
+        );
+        assert_eq!(
+            resolve_html_ref("main.tsx", page_dir, root),
+            PathBuf::from("/proj/src/pages/options/main.tsx")
+        );
+    }
+
+    #[test]
+    fn insert_before_head_places_snippet_or_prepends() {
+        assert_eq!(
+            insert_before_head("<head></head><body></body>", "<x>"),
+            "<head><x>\n</head><body></body>"
+        );
+        assert_eq!(insert_before_head("<body></body>", "<x>"), "<x>\n<body></body>");
+    }
 
     #[test]
     fn manifest_matches_vite_shape() {
