@@ -108,7 +108,8 @@ export function findConfig(app) {
 export function createPluginContainer(vite, allPlugins, { command = "serve", mode = "development", environment = "client" } = {}) {
   const plugins = ordered(
     allPlugins.filter(
-      (p) => (p.resolveId || p.load || p.transform || p.generateBundle) && applyMatches(p, command, mode),
+      (p) => (p.resolveId || p.load || p.transform || p.renderChunk || p.generateBundle)
+        && applyMatches(p, command, mode),
     ),
   );
 
@@ -194,6 +195,20 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
     return changed ? current : null;
   }
 
+  async function renderChunk(code, chunk) {
+    let current = code, changed = false;
+    for (const p of plugins) {
+      if (!envAllows(p, environment)) continue;
+      const h = hookHandler(p.renderChunk);
+      if (!h) continue;
+      let result;
+      try { result = await h.call(ctx, current, chunk, { format: "es" }); } catch { continue; }
+      const next = typeof result === "string" ? result : result?.code;
+      if (next != null) { current = next; changed = true; }
+    }
+    return changed ? current : null;
+  }
+
   async function generateBundle(emit) {
     const genCtx = { ...ctx, emitFile: (f) => (emit(f), "oj-emit-ref") };
     for (const p of plugins) {
@@ -238,7 +253,10 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
     });
   }
 
-  return { resolveId, load, transform, transformUserCode, buildStart, generateBundle, pluginCount: plugins.length, watchFiles };
+  return {
+    resolveId, load, transform, transformUserCode, buildStart, renderChunk, generateBundle,
+    pluginCount: plugins.length, watchFiles,
+  };
 }
 
 export async function loadPluginContainer(app, opts = {}) {

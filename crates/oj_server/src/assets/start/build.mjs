@@ -172,6 +172,10 @@ const client = await build({
   resolve: { conditionNames: ["browser", "module", "import"], alias: clientAlias },
   plugins: [
     makeVitePlugins({ container: clientContainer, appRoot: APP, mode: "prod", emit }),
+    {
+      name: "oj-client-render-chunk",
+      renderChunk: (code, chunk) => clientContainer?.renderChunk(code, chunk) ?? null,
+    },
     clientFnPlugin,
     assetsPlugin({ mode: "prod", server: false, emit }),
     nodeBuiltinShims,
