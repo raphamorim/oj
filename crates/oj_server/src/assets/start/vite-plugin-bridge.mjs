@@ -367,6 +367,18 @@ export function createPluginContainer(vite, allPlugins, {
   return { resolveId, load, transform, transformUserCode, buildStart, generateBundle, pluginCount: plugins.length, watchFiles };
 }
 
+function mergeConfigValues(current, update) {
+  if (Array.isArray(current) && Array.isArray(update)) return [...current, ...update];
+  if (current && update && typeof current === "object" && typeof update === "object") {
+    const merged = { ...current };
+    for (const key of Object.keys(update)) {
+      merged[key] = key in current ? mergeConfigValues(current[key], update[key]) : update[key];
+    }
+    return merged;
+  }
+  return update === undefined ? current : update;
+}
+
 export async function loadPluginContainer(app, opts = {}) {
   const { command = "serve", mode = "development" } = opts;
   const configFile = findConfig(app);
@@ -380,14 +392,31 @@ export async function loadPluginContainer(app, opts = {}) {
   } catch {
     return null;
   }
-  const all = (loaded?.config?.plugins ?? []).flat(Infinity).filter(Boolean);
+  // Vite runs every plugin's `config` hook (in order, async, gated by `apply`)
+  // and merges the returned partials before resolving; the Start loader has its
+  // own plugin instances, so it must do the same for them.
+  let config = loaded?.config ?? {};
+  const all = (config.plugins ?? []).flat(Infinity).filter(Boolean);
+  for (const plugin of all) {
+    const handler = hookHandler(plugin.config);
+    if (!handler || !applyMatches(plugin, command, mode)) continue;
+    try {
+      const partial = await handler.call(plugin, config, { command, mode });
+      if (partial) config = typeof vite.mergeConfig === "function"
+        ? vite.mergeConfig(config, partial)
+        : mergeConfigValues(config, partial);
+    } catch (e) {
+      process.stderr.write(`oj: plugin "${plugin.name || "?"}" config hook failed (skipped): ${e?.message ?? e}\n`);
+    }
+  }
+  if (loaded) loaded.config = config;
   const container = createPluginContainer(vite, all, {
     ...opts,
-    config: { ...loaded?.config, root: loaded?.config?.root ?? app },
+    config: { ...config, root: config.root ?? app },
   });
-  const publicDir = loaded?.config?.publicDir === false
+  const publicDir = config.publicDir === false
     ? false
-    : typeof loaded?.config?.publicDir === "string" ? loaded.config.publicDir : null;
+    : typeof config.publicDir === "string" ? config.publicDir : null;
   const configDependencies = [configFile, ...(loaded?.dependencies ?? [])];
   return { ...container, publicDir, configDependencies };
 }
