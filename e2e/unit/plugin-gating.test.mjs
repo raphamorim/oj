@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
@@ -114,7 +114,7 @@ test("hookHandler / hookFilter: function form and object form", () => {
 });
 
 test("plugin environment exposes a resolver for aliases, configured extensions, and packages", async () => {
-  const root = mkdtempSync(join(tmpdir(), "oj-plugin-create-resolver-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "oj-plugin-create-resolver-")));
   try {
     const source = join(root, "src");
     const components = join(source, "components");

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-import { importPkg } from "./resolve-pkg.mjs";
+import { importPkg, makeResolver } from "./resolve-pkg.mjs";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 process.env.VITE_CONFIG_NATIVE_IGNORE_WARNING ??= "true";
@@ -75,6 +75,50 @@ function ordered(plugins) {
   return [...pre, ...normal, ...post];
 }
 
+function makeConfigResolver(config) {
+  const root = config.root ?? process.cwd();
+  const aliases = Array.isArray(config.resolve?.alias)
+    ? config.resolve.alias.map(({ find, replacement }) => [find, replacement])
+    : Object.entries(config.resolve?.alias ?? {});
+  const extensions = Array.isArray(config.resolve?.extensions) && config.resolve.extensions.length
+    ? config.resolve.extensions
+    : [".mjs", ".js", ".mts", ".ts", ".jsx", ".tsx", ".cjs", ".cts", ".json"];
+  const resolvePackage = makeResolver(root);
+
+  return () => async (id, importer) => {
+    if (!id || id.startsWith("\0") || id.startsWith("/@")) return undefined;
+    let specifier = id.split("?", 1)[0];
+    for (const [find, replacement] of aliases) {
+      if (typeof replacement !== "string") continue;
+      if (find instanceof RegExp) {
+        find.lastIndex = 0;
+        if (find.test(specifier)) { specifier = specifier.replace(find, replacement); break; }
+      } else if (typeof find === "string") {
+        const prefix = find.endsWith("/") ? find.slice(0, -1) : find;
+        if (specifier === prefix) { specifier = replacement; break; }
+        if (specifier.startsWith(`${prefix}/`)) {
+          specifier = join(replacement, specifier.slice(prefix.length + 1));
+          break;
+        }
+      }
+    }
+
+    if (specifier.startsWith(".") || isAbsolute(specifier)) {
+      const base = importer ? dirname(importer.startsWith("file://") ? fileURLToPath(importer) : importer) : root;
+      const path = isAbsolute(specifier) ? specifier : pathResolve(base, specifier);
+      const stat = statSync(path, { throwIfNoEntry: false });
+      if (stat?.isFile()) return path;
+      for (const extension of extensions) {
+        const candidate = stat?.isDirectory() ? join(path, `index${extension}`) : `${path}${extension}`;
+        if (statSync(candidate, { throwIfNoEntry: false })?.isFile()) return candidate;
+      }
+      return undefined;
+    }
+
+    try { return resolvePackage(specifier); } catch { return undefined; }
+  };
+}
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 async function withBuildStartLock(fn) {
@@ -105,7 +149,9 @@ export function findConfig(app) {
   return null;
 }
 
-export function createPluginContainer(vite, allPlugins, { command = "serve", mode = "development", environment = "client" } = {}) {
+export function createPluginContainer(vite, allPlugins, {
+  command = "serve", mode = "development", environment = "client", config = {},
+} = {}) {
   const plugins = ordered(
     allPlugins.filter(
       (p) => (p.resolveId || p.load || p.transform || p.generateBundle) && applyMatches(p, command, mode),
@@ -123,12 +169,22 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
   // and oj serves an export-less stub — surfacing downstream as an undefined
   // import. Mirror Vite's shape so those plugins take their intended branch.
   const consumer = environment === "client" ? "client" : "server";
+  const resolvedConfig = {
+    ...config,
+    root: config.root ?? process.cwd(),
+    command,
+    consumer,
+    mode: command === "build" ? "production" : "development",
+  };
+  if (typeof resolvedConfig.createResolver !== "function") {
+    resolvedConfig.createResolver = makeConfigResolver(resolvedConfig);
+  }
   const watchFiles = new Set();
   const ctx = {
     environment: {
       name: environment,
       mode: command === "build" ? "build" : "dev",
-      config: { command, consumer, mode: command === "build" ? "production" : "development" },
+      config: resolvedConfig,
     },
     meta: { rollupVersion: "4.0.0", watchMode: command !== "build", framework: "oj" },
     warn() {}, info() {}, debug() {},
@@ -255,7 +311,10 @@ export async function loadPluginContainer(app, opts = {}) {
     return null;
   }
   const all = (loaded?.config?.plugins ?? []).flat(Infinity).filter(Boolean);
-  const container = createPluginContainer(vite, all, opts);
+  const container = createPluginContainer(vite, all, {
+    ...opts,
+    config: { ...loaded.config, root: loaded.config.root ?? app },
+  });
   const publicDir = typeof loaded?.config?.publicDir === "string" ? loaded.config.publicDir : null;
   const configDependencies = [configFile, ...(loaded?.dependencies ?? [])];
   return { ...container, publicDir, configDependencies };
