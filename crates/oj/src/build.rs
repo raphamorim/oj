@@ -2599,6 +2599,59 @@ fn build_manifest(entries: &[ManifestEntry]) -> serde_json::Value {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn empty_out_dir_configuration_controls_existing_output() {
+        for (index, (config_name, config, retained)) in [
+            (
+                "oj.config.json",
+                r#"{"build":{"emptyOutDir":false}}"#,
+                true,
+            ),
+            (
+                "vite.config.mjs",
+                "export default { build: { emptyOutDir: false } };",
+                true,
+            ),
+            (
+                "oj.config.json",
+                r#"{"build":{"emptyOutDir":true}}"#,
+                false,
+            ),
+            ("oj.config.json", "{}", false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let suffix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!("oj-empty-out-dir-{suffix}-{index}"));
+            fs::create_dir_all(root.join("dist")).unwrap();
+            fs::write(root.join("package.json"), r#"{"type":"module"}"#).unwrap();
+            fs::write(root.join(config_name), config).unwrap();
+            fs::write(
+                root.join("index.html"),
+                r#"<html><body><script type="module" src="/main.js"></script></body></html>"#,
+            )
+            .unwrap();
+            fs::write(root.join("main.js"), "window.ready = true;").unwrap();
+            fs::write(root.join("dist/previous-output.txt"), "preserve me").unwrap();
+
+            build(root.clone(), None, None, "production")
+                .await
+                .expect("synthetic production fixture should build");
+
+            assert_eq!(
+                root.join("dist/previous-output.txt").exists(),
+                retained,
+                "{config_name}: {config}"
+            );
+            assert!(root.join("dist/index.html").is_file());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[test]
     fn manifest_matches_vite_shape() {
         let mk = |key: &str,
