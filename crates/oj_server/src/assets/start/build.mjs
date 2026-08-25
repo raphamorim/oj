@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, cpSync, rmSync } from "node:fs";
-import { createRequire } from "node:module";
 import { dirname, join, resolve, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { importPkg, viteEnvDefine, jsxTransformOptions } from "./resolve-pkg.mjs";
@@ -137,7 +136,6 @@ rmSync(DIST, { recursive: true, force: true });
 mkdirSync(CLIENT, { recursive: true });
 
 const compileCss = await (async () => {
-  const req = createRequire(APP + "/package.json");
   try {
     const postcss = (await importPkg(APP, "postcss", [])).default ?? (await importPkg(APP, "postcss", []));
     const twMod = await importPkg(APP, "@tailwindcss/postcss", ["tailwindcss"]);
@@ -145,8 +143,9 @@ const compileCss = await (async () => {
     return async (from, src) => (await postcss([tailwind()]).process(src, { from })).css;
   } catch {}
   try {
-    const tw = await import(req.resolve("@tailwindcss/node"));
-    const oxide = await import(req.resolve("@tailwindcss/oxide"));
+    const anchors = ["@tailwindcss/vite", "@tailwindcss/postcss", "tailwindcss"];
+    const tw = await importPkg(APP, "@tailwindcss/node", anchors);
+    const oxide = await importPkg(APP, "@tailwindcss/oxide", anchors);
     return async (from, src) => {
       const compiler = await tw.compile(src, { base: APP, from, onDependency: () => {} });
       const scanner = new oxide.Scanner({ sources: [{ base: APP, pattern: "**/*", negated: false }] });
