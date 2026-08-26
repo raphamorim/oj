@@ -147,6 +147,8 @@ jobs:
         run: node e2e/css-plugin-transform.mjs
       - name: vite:css-post shim routes plugin CSS into output (UnoCSS pattern)
         run: node e2e/vite-css-post-shim.mjs
+      - name: .vite/manifest.json is present in the generateBundle bundle
+        run: node e2e/vite-build-manifest-in-bundle.mjs
       - name: library build
         run: |
           mkdir -p /tmp/lib/src

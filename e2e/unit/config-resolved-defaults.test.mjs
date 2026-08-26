@@ -26,6 +26,7 @@ test("config and configResolved expose config.plugins and build defaults", async
            seen.assetsDir = config.build.assetsDir;
            seen.hasRollupOptions = config.build.rollupOptions !== undefined;
            seen.resolvedPlugins = Array.isArray(config.plugins) ? config.plugins.length : -1;
+           seen.names = (config.plugins || []).map((p) => p && p.name);
          },
          transform(code, id) {
            if (id.endsWith("probe.js")) return "export default " + JSON.stringify(seen) + ";";
@@ -34,10 +35,22 @@ test("config and configResolved expose config.plugins and build defaults", async
        },
        { name: "sibling-a" },
        { name: "sibling-b" },
+       // A serve-only plugin must not appear in the build's config.plugins.
+       { name: "dev-only", apply: "serve" },
+       // A config hook returning a partial with its own plugins must not
+       // accumulate into config.plugins across the config-hook merge.
+       { name: "adds-config", config() { return { define: { X: "1" } }; } },
      ];\n`,
   );
   const host = rpcSidecar("plugin-host.mjs", {
-    args: [path.join(fx.root, "oj.plugins.mjs"), JSON.stringify({ root: fx.root })],
+    args: [
+      path.join(fx.root, "oj.plugins.mjs"),
+      JSON.stringify({
+        config: { root: fx.root },
+        env: { command: "build", mode: "production" },
+        environment: { name: "client" },
+      }),
+    ],
     env: { OJ_CACHE_ROOT: fx.root },
     cwd: fx.root,
   });
@@ -48,12 +61,19 @@ test("config and configResolved expose config.plugins and build defaults", async
       args: ["", path.join(fx.root, "probe.js")],
     });
     const seen = JSON.parse(JSON.parse(res.result).code.replace(/^export default /, "").replace(/;$/, ""));
-    // The 3 user plugins are visible (oj also injects a vite:css-post shim, so >= 3).
+    // The build-applicable plugins are visible (oj also injects a vite:css-post shim).
     assert.ok(seen.configPlugins >= 3, "the config hook sees the flat plugin array");
     assert.ok(seen.resolvedPlugins >= 3, "configResolved sees the plugin array too");
     assert.equal(seen.outDir, "dist", "build.outDir defaults to dist");
     assert.equal(seen.assetsDir, "assets", "build.assetsDir defaults to assets");
     assert.equal(seen.hasRollupOptions, true, "build.rollupOptions is present");
+    // A serve-only plugin is excluded from the build's config.plugins.
+    assert.ok(!seen.names.includes("dev-only"), "serve-only plugin excluded from build config.plugins");
+    // The vite:css-post shim is present.
+    assert.ok(seen.names.includes("vite:css-post"), "vite:css-post shim injected");
+    // No duplicates: config.plugins is pinned across config-hook merges.
+    const dupes = seen.names.filter((n, i) => n && seen.names.indexOf(n) !== i);
+    assert.deepEqual(dupes, [], "config.plugins has no duplicate entries");
   } finally {
     host.close();
     fx.cleanup();

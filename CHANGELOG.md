@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - oj provides a `vite:css-post` plugin shim during the build. Plugins that look one up in `config.plugins` and hand it their generated CSS in `renderChunk` (UnoCSS, and similar) now have that CSS folded into the build's stylesheet output. `renderChunk` hooks also receive the full chunk shape (`modules`, `moduleIds`, `facadeModuleId`, ...) and a `NormalizedOutputOptions`-style `options` with a resolved `dir`, and a plugin-served virtual `.css` module is kept in the graph as a side-effect stub so those hooks can find it.
+- The Vite build manifest is now present in the `generateBundle` bundle as a `.vite/manifest.json` asset, so plugins that read it there (for example `@crxjs`'s web-accessible-resources) can find it.
 
 ### Changed
 - Plugin `transform` hooks now run on CSS and preprocessor (`.css`/`.scss`/`.less`/`.stylus`) sources during the build before oj compiles them, matching Vite where CSS is a real module in the graph. This lets directive transformers such as UnoCSS's `@apply`/`@unocss-include` resolve before Sass/lightningcss run.
@@ -30,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dev-served CSS rewrites relative `url()` and `@import` references to server-absolute paths so injected styles resolve them.
 
 ### Fixed
+- The `config`/`configResolved` hooks now see only the command-applicable plugins in `config.plugins` (serve-only plugins are excluded from a build, matching Vite), and `config.plugins` is no longer duplicated by config hooks that return their own `plugins` (the array is pinned across the config-hook merge). A plugin's `generateBundle` error is now surfaced instead of silently swallowed. Together these let `@crxjs`'s build-time manifest plugins (`transformCrxManifest`/`renderCrxManifest` fan-outs) run once and without a serve-only `crx:hmr` crashing them.
 - Sass now resolves a relative dotted `@use`/`@forward`/`@import` (e.g. `@use 'colors.module.scss'`) made from inside another dotted `.module.scss` stylesheet: the nested import resolves against the imported file's real directory instead of the phantom directory grass sees a dotted basename through, so cross-directory CSS-modules stylesheets compile.
 - Plugin `configResolved` now runs before `applyToEnvironment`, matching Vite; plugins that populate state in `configResolved` and read it from `applyToEnvironment` (for example `@tanstack/router-plugin`) no longer crash the plugin host, and a throwing `applyToEnvironment` keeps the plugin active instead of failing config load ([#37](https://github.com/raphamorim/oj/issues/37)).
 - The `config` and `configResolved` hooks now receive `config.plugins` (the flat plugin array) and a defaulted `config.build` (`outDir`, `assetsDir`, `rollupOptions`, ...), matching Vite's resolved config. Plugins that read these in their config hooks (`@crxjs/vite-plugin` reads `config.plugins`; UnoCSS resolves `config.build.outDir`) no longer throw and get skipped.
