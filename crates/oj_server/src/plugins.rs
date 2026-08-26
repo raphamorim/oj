@@ -847,6 +847,28 @@ impl PluginHost {
             })
             .collect())
     }
+
+    /// CSS that plugins (e.g. UnoCSS) routed through oj's `vite:css-post` shim.
+    /// Returned as `(source_id, css)` pairs.
+    pub async fn get_plugin_css(&self) -> Vec<(String, String)> {
+        let Some(json) = self.call("getPluginCss", &[]).await.ok().flatten() else {
+            return Vec::new();
+        };
+        serde_json::from_str::<serde_json::Value>(&json)
+            .ok()
+            .and_then(|v| {
+                v.as_array().map(|a| {
+                    a.iter()
+                        .filter_map(|e| {
+                            let css = e.get("css")?.as_str()?.to_string();
+                            let id = e.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                            Some((id, css))
+                        })
+                        .collect()
+                })
+            })
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]

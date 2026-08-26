@@ -370,6 +370,24 @@ const emitted = [];
 const chunkFileNames = new Map();
 const transformEmitStore = new AsyncLocalStorage();
 
+// A minimal stand-in for Vite's `vite:css-post` plugin. UnoCSS (and similar)
+// look up a plugin named "vite:css-post" in `config.plugins` during their build
+// hook and call its `transform` with the CSS they generate, to route it into
+// the output. oj collects that CSS here and folds it into the build stylesheet
+// (see getPluginCss). Only relevant fields are implemented.
+const ojPluginCss = [];
+const cssPostShim = {
+  name: "vite:css-post",
+  transform: {
+    handler(code, id) {
+      if (typeof code === "string" && code.length > 0) {
+        ojPluginCss.push({ id: typeof id === "string" ? id : "", css: code });
+      }
+      return null;
+    },
+  },
+};
+
 const moduleInfoCache = new Map();
 
 const watchedFiles = new Set();
@@ -468,7 +486,10 @@ async function runConfigHooks() {
   // Vite hands the config hook the user config, whose `plugins` is the flat
   // plugin array; plugins like @crxjs read `config.plugins` to find sibling
   // plugins. oj keeps the loaded set in `allPlugins`.
-  if (!Array.isArray(config.plugins)) config.plugins = allPlugins;
+  if (!Array.isArray(config.plugins)) config.plugins = allPlugins.slice();
+  if (!config.plugins.some((p) => p && p.name === "vite:css-post")) {
+    config.plugins.push(cssPostShim);
+  }
   for (const p of plugins) {
     if (typeof p.config !== "function") continue;
     try {
@@ -480,7 +501,7 @@ async function runConfigHooks() {
     }
   }
   resolvedConfig = withResolvedDefaults(config);
-  if (!Array.isArray(resolvedConfig.plugins)) resolvedConfig.plugins = allPlugins;
+  if (!Array.isArray(resolvedConfig.plugins)) resolvedConfig.plugins = config.plugins;
   for (const p of plugins) {
     if (typeof p.configResolved !== "function") continue;
     try {
@@ -842,11 +863,17 @@ async function generateBundle(bundleJson, isWrite) {
 
 async function renderChunk(code, chunkJson) {
   const chunk = JSON.parse(chunkJson || "{}");
+  // Rollup passes NormalizedOutputOptions as the 3rd arg; renderChunk hooks such
+  // as UnoCSS's read `options.dir` (the resolved output dir) to key their
+  // vite:css-post lookup, so provide it resolved against the root.
+  const outDir = resolvedConfig?.build?.outDir ?? "dist";
+  const root = resolvedConfig?.root ?? initial.config?.root ?? process.cwd();
+  const options = { dir: pathResolve(root, outDir), format: "es" };
   let current = code;
   for (const p of plugins) {
     const fn = typeof p.renderChunk === "function" ? p.renderChunk : p.renderChunk?.handler;
     if (typeof fn !== "function") continue;
-    const r = await fn.call(ctx, current, chunk);
+    const r = await fn.call(ctx, current, chunk, options);
     if (r == null) continue;
     current = typeof r === "string" ? r : (r.code ?? current);
   }
@@ -885,6 +912,7 @@ async function run(hook, args) {
   if (hook === "getEmittedFiles") {
     return JSON.stringify(emitted.map(({ fileName, source }) => ({ fileName, source })));
   }
+  if (hook === "getPluginCss") return JSON.stringify(ojPluginCss);
   if (hook === "getWatchFiles") return JSON.stringify([...watchedFiles]);
   if (hook === "hasModuleParsed") return String(anyModuleParsed());
   if (hook === "replayModuleParsed") return replayModuleParsed(args[0]);
