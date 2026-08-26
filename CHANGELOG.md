@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A plugin emitting an HTML page as a chunk (`this.emitFile({ type: "chunk", id: "...page.html" })`) now gets the Vite HTML treatment: the page's `<script type=module>` are bundled as entries, the processed page is written at its root-relative output path, and `getFileName(referenceId)` resolves to that page path (how CRXJS emits the extension's popup/options pages from its manifest).
 
 ### Changed
+- Plugin `transform` hooks now run on CSS and preprocessor (`.css`/`.scss`/`.less`/`.stylus`) sources during the build before oj compiles them, matching Vite where CSS is a real module in the graph. This lets directive transformers such as UnoCSS's `@apply`/`@unocss-include` resolve before Sass/lightningcss run.
 - Plugin `transform` sourcemaps are now composed with oj's own transform map, so dev sourcemaps trace back to the original source through plugins that rewrite code.
 - CSS imported with `?inline` returns the compiled CSS string instead of a base64 `data:` URI.
 - Dev-served CSS rewrites relative `url()` and `@import` references to server-absolute paths so injected styles resolve them.
