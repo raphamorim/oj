@@ -12,7 +12,7 @@ use axum::{
     body::Body,
     extract::{ws::Message, Query, State, WebSocketUpgrade},
     http::{header, HeaderMap, Method, StatusCode, Uri},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
     Router,
 };
@@ -3145,6 +3145,29 @@ async fn resolve_jsx_overrides(
     overrides
 }
 
+// Rollup's contract, which the rest of this host follows: `resolveId` returning a
+// path means that file IS the module, and a `load` returning nothing means read it
+// from disk. Only the second half was implemented, so a plugin that maps a
+// specifier to a path without also serving its bytes -- which is what a resolver
+// plugin is -- got a 404 for every module it resolved correctly.
+//
+// Redirecting to the file's normal dep URL rather than reading it here keeps every
+// downstream behaviour identical to any other dependency: the fs.allow check,
+// partial bundling, and the specifier rewriting applied inside the served file.
+fn serve_resolved_from_disk(state: &Arc<ServerState>, id: &str) -> Option<Response> {
+    let resolved = Path::new(id);
+    if !resolved.is_absolute() || !resolved.is_file() {
+        return None;
+    }
+    state
+        .fs_allow
+        .lock()
+        .unwrap()
+        .insert(package_root(resolved));
+    let url = dep_serve_url(resolved, &state.root);
+    Some(Redirect::temporary(&url).into_response())
+}
+
 async fn serve_plugin_resolve(state: &Arc<ServerState>, id: &str) -> Response {
     let Some(host) = &state.plugins else {
         return (StatusCode::NOT_FOUND, "oj: no plugin host").into_response();
@@ -3152,7 +3175,10 @@ async fn serve_plugin_resolve(state: &Arc<ServerState>, id: &str) -> Response {
     let source = match host.load(id).await {
         Ok(Some(src)) => src,
         Ok(None) => {
-            return (StatusCode::NOT_FOUND, format!("oj: no plugin loaded {id}")).into_response()
+            if let Some(response) = serve_resolved_from_disk(state, id) {
+                return response;
+            }
+            return (StatusCode::NOT_FOUND, format!("oj: no plugin loaded {id}")).into_response();
         }
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
@@ -3245,6 +3271,9 @@ async fn serve_plugin_id(state: &Arc<ServerState>, spec: &str, importer: &str) -
     let source = match host.load(&id).await {
         Ok(Some(src)) => src,
         Ok(None) => {
+            if let Some(response) = serve_resolved_from_disk(state, &id) {
+                return response;
+            }
             return (StatusCode::NOT_FOUND, format!("oj: no plugin loaded {id}")).into_response();
         }
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
