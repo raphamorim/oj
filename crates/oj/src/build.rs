@@ -1102,7 +1102,7 @@ impl Plugin for OjUserPlugin {
         if !self.host.has_generate_bundle().await {
             return Ok(());
         }
-        let bundle_json = serialize_bundle(args.bundle);
+        let bundle_json = serialize_bundle_with_vite_manifest(args.bundle, &self.emit.root);
         if let Ok(Some(mutated)) = self.host.generate_bundle(&bundle_json, args.is_write).await {
             apply_bundle_mutations(args.bundle, &mutated);
         }
@@ -2991,6 +2991,75 @@ struct ManifestEntry {
     imports: Vec<String>,
     dynamic_imports: Vec<String>,
     css: Vec<String>,
+}
+
+// Build Vite-manifest entries directly from a bundle (chunks only; CSS is added
+// later in the output stage). Used to expose `.vite/manifest.json` inside the
+// generateBundle bundle for plugins that read it (e.g. @crxjs).
+fn manifest_entries_from_bundle(
+    bundle: &[rolldown_common::Output],
+    root: &Path,
+) -> Vec<ManifestEntry> {
+    use rolldown_common::Output;
+    let mut entries = Vec::new();
+    for out in bundle {
+        let Output::Chunk(chunk) = out else { continue };
+        let filename = chunk.filename.to_string();
+        let src = if chunk.is_entry {
+            chunk.facade_module_id.as_ref().and_then(|f| {
+                Path::new(f.as_ref())
+                    .strip_prefix(root)
+                    .ok()
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+            })
+        } else {
+            None
+        };
+        let key = src.clone().unwrap_or_else(|| {
+            format!(
+                "_{}",
+                Path::new(&filename)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&filename)
+            )
+        });
+        entries.push(ManifestEntry {
+            key,
+            name: chunk.name.to_string(),
+            file: filename,
+            src,
+            is_entry: chunk.is_entry,
+            is_dynamic_entry: chunk.is_dynamic_entry,
+            imports: chunk.imports.iter().map(|i| i.to_string()).collect(),
+            dynamic_imports: chunk.dynamic_imports.iter().map(|i| i.to_string()).collect(),
+            css: Vec::new(),
+        });
+    }
+    entries
+}
+
+// serialize_bundle plus a synthetic `.vite/manifest.json` asset, so a plugin's
+// generateBundle can read the Vite build manifest from the bundle the way it
+// would under Vite (with build.manifest enabled).
+fn serialize_bundle_with_vite_manifest(bundle: &[rolldown_common::Output], root: &Path) -> String {
+    let base = serialize_bundle(bundle);
+    let entries = manifest_entries_from_bundle(bundle, root);
+    let manifest = build_manifest(&entries).to_string();
+    let mut val: serde_json::Value =
+        serde_json::from_str(&base).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert(
+            ".vite/manifest.json".to_string(),
+            serde_json::json!({
+                "type": "asset",
+                "fileName": ".vite/manifest.json",
+                "name": "manifest.json",
+                "source": manifest,
+            }),
+        );
+    }
+    val.to_string()
 }
 
 fn build_manifest(entries: &[ManifestEntry]) -> serde_json::Value {

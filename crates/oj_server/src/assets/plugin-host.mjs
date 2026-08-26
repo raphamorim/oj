@@ -485,11 +485,18 @@ async function runConfigHooks() {
   let config = initial.config ?? {};
   // Vite hands the config hook the user config, whose `plugins` is the flat
   // plugin array; plugins like @crxjs read `config.plugins` to find sibling
-  // plugins. oj keeps the loaded set in `allPlugins`.
-  if (!Array.isArray(config.plugins)) config.plugins = allPlugins.slice();
-  if (!config.plugins.some((p) => p && p.name === "vite:css-post")) {
-    config.plugins.push(cssPostShim);
+  // plugins. Use the apply-filtered active set (not allPlugins) so command-
+  // inappropriate plugins are absent, matching Vite's resolved config — e.g.
+  // `@crxjs`'s serve-only `crx:hmr` must not appear during a build, or crx calls
+  // its `transformCrxManifest` (which reads an unset `config`) and throws.
+  // The exposed plugin array: the apply-filtered active set plus the css-post
+  // shim. Pinned across the config-hook merges below so deepMerge (which
+  // concatenates arrays) can't accumulate it into duplicates.
+  const configPlugins = plugins.slice();
+  if (!configPlugins.some((p) => p && p.name === "vite:css-post")) {
+    configPlugins.push(cssPostShim);
   }
+  config.plugins = configPlugins;
   for (const p of plugins) {
     if (typeof p.config !== "function") continue;
     try {
@@ -499,9 +506,11 @@ async function runConfigHooks() {
       if (!ojStartMode) throw e;
       process.stderr.write(`${OJ} plugin host: config(${p.name ?? "?"}) skipped: ${(e && e.message) || e}\n`);
     }
+    // Keep the plugin array stable regardless of what a config hook returned.
+    config.plugins = configPlugins;
   }
   resolvedConfig = withResolvedDefaults(config);
-  if (!Array.isArray(resolvedConfig.plugins)) resolvedConfig.plugins = config.plugins;
+  resolvedConfig.plugins = configPlugins;
   for (const p of plugins) {
     if (typeof p.configResolved !== "function") continue;
     try {
@@ -856,7 +865,13 @@ async function generateBundle(bundleJson, isWrite) {
   for (const p of plugins) {
     const fn = typeof p.generateBundle === "function" ? p.generateBundle : p.generateBundle?.handler;
     if (typeof fn !== "function") continue;
-    await fn.call(ctx, outputOptions, bundle, isWrite);
+    try {
+      await fn.call(ctx, outputOptions, bundle, isWrite);
+    } catch (e) {
+      process.stderr.write(
+        `${OJ} plugin host: generateBundle(${p.name ?? "?"}) failed: ${(e && (e.stack || e.message)) || e}\n`,
+      );
+    }
   }
   return JSON.stringify(bundle);
 }
