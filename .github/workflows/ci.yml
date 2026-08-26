@@ -68,6 +68,9 @@ jobs:
       - name: request paths (encoded filenames, traversal containment)
         if: matrix.mode == 'unbundled'
         run: node e2e/awkward-paths.mjs
+      - name: plugin resolveId without a load hook serves from disk
+        if: matrix.mode == 'unbundled'
+        run: node e2e/plugin-resolve-no-load.mjs
 
   # i need to fix this or automate
   build:
