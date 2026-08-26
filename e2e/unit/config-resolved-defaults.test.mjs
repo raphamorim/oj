@@ -27,6 +27,7 @@ test("config and configResolved expose config.plugins and build defaults", async
            seen.hasRollupOptions = config.build.rollupOptions !== undefined;
            seen.resolvedPlugins = Array.isArray(config.plugins) ? config.plugins.length : -1;
            seen.names = (config.plugins || []).map((p) => p && p.name);
+           seen.publicDir = config.publicDir;
          },
          transform(code, id) {
            if (id.endsWith("probe.js")) return "export default " + JSON.stringify(seen) + ";";
@@ -67,6 +68,9 @@ test("config and configResolved expose config.plugins and build defaults", async
     assert.equal(seen.outDir, "dist", "build.outDir defaults to dist");
     assert.equal(seen.assetsDir, "assets", "build.assetsDir defaults to assets");
     assert.equal(seen.hasRollupOptions, true, "build.rollupOptions is present");
+    // publicDir defaults to an absolute <root>/public (Vite parity); plugins
+    // like @crxjs read it to locate manifest assets.
+    assert.equal(seen.publicDir, path.join(fx.root, "public"), "publicDir defaults to absolute <root>/public");
     // A serve-only plugin is excluded from the build's config.plugins.
     assert.ok(!seen.names.includes("dev-only"), "serve-only plugin excluded from build config.plugins");
     // The vite:css-post shim is present.
