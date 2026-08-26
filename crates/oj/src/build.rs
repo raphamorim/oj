@@ -1000,14 +1000,32 @@ impl Plugin for OjUserPlugin {
                 .await
                 .ok()
                 .flatten()
-                .map(|code| HookLoadOutput {
-                    code: arcstr::ArcStr::from(code),
-                    // Infer the type from the id so a plugin-served virtual
-                    // module keeps its JSX/TS semantics (e.g. unplugin-icons'
-                    // `~icons/*.jsx`); a hardcoded Js made oxc parse the JSX as
-                    // plain JS and fail.
-                    module_type: Some(module_type_for_id(&id)),
-                    ..Default::default()
+                .map(|code| {
+                    let path = id.split(['?', '#']).next().unwrap_or(&id);
+                    if path.ends_with(".css") {
+                        // A plugin-served virtual CSS module (e.g. UnoCSS's layer
+                        // placeholder): its real CSS is routed through the
+                        // `vite:css-post` shim, so keep an empty side-effect stub
+                        // in the graph (so the plugin's build hook still sees the
+                        // module) rather than parsing CSS as JS.
+                        return HookLoadOutput {
+                            code: arcstr::ArcStr::from("export {};\n"),
+                            module_type: Some(rolldown_common::ModuleType::Js),
+                            side_effects: Some(
+                                rolldown_common::side_effects::HookSideEffects::NoTreeshake,
+                            ),
+                            ..Default::default()
+                        };
+                    }
+                    HookLoadOutput {
+                        code: arcstr::ArcStr::from(code),
+                        // Infer the type from the id so a plugin-served virtual
+                        // module keeps its JSX/TS semantics (e.g. unplugin-icons'
+                        // `~icons/*.jsx`); a hardcoded Js made oxc parse the JSX
+                        // as plain JS and fail.
+                        module_type: Some(module_type_for_id(&id)),
+                        ..Default::default()
+                    }
                 }))
         }
     }
@@ -1150,13 +1168,33 @@ impl Plugin for OjUserPlugin {
 }
 
 fn serialize_rendered_chunk(chunk: &rolldown_common::RollupRenderedChunk) -> String {
+    // `chunk.modules` (keyed by module id) is read by renderChunk hooks such as
+    // UnoCSS's `unocss:global:build:generate` to find their virtual layer module.
+    let mut modules = serde_json::Map::new();
+    for (id, rm) in chunk.modules.keys.iter().zip(chunk.modules.values.iter()) {
+        modules.insert(
+            id.as_str().to_string(),
+            serde_json::json!({
+                "renderedExports": rm
+                    .rendered_exports
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>(),
+            }),
+        );
+    }
     serde_json::json!({
         "type": "chunk",
         "fileName": chunk.filename.to_string(),
         "name": chunk.name.to_string(),
         "isEntry": chunk.is_entry,
         "isDynamicEntry": chunk.is_dynamic_entry,
+        "facadeModuleId": chunk.facade_module_id.as_ref().map(|f| f.as_str().to_string()),
+        "moduleIds": chunk.module_ids.iter().map(|m| m.as_str().to_string()).collect::<Vec<_>>(),
+        "modules": serde_json::Value::Object(modules),
         "imports": chunk.imports.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+        "dynamicImports": chunk.dynamic_imports.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+        "exports": chunk.exports.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
     })
     .to_string()
 }
@@ -1544,6 +1582,16 @@ pub async fn build(
     if let Some(host) = &plugin_host {
         if let Err(e) = host.build_end().await {
             eprintln!("oj build: plugin buildEnd failed: {e}");
+        }
+        // CSS a plugin routed through the vite:css-post shim (e.g. UnoCSS's
+        // generated utilities) joins the build's stylesheet output.
+        for (id, css) in host.get_plugin_css().await {
+            let src = if id.is_empty() {
+                root.join("__plugin_css__").display().to_string()
+            } else {
+                id.split(['?', '#']).next().unwrap_or(&id).to_string()
+            };
+            collected_css.lock().unwrap().push((src, css));
         }
         match host.emitted_files().await {
             Ok(files) => {
