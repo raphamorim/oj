@@ -28,16 +28,55 @@ pub fn is_sass(url: &str) -> bool {
     f.ends_with(".scss") || f.ends_with(".sass")
 }
 
+fn with_ext(p: &Path, ext: &str) -> PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(".");
+    s.push(ext);
+    PathBuf::from(s)
+}
+
+// A dotted-basename stylesheet (`x.module.scss`) is presented to grass as a
+// directory `x.module/` whose index is that file (see index_target). A relative
+// import made from inside such a file then carries that phantom directory
+// segment (grass resolves `@use 'sibling'` against `.../x.module/`). Collapse
+// any intermediate segment `seg` for which `<...>/seg.scss` (or `.sass`) is a
+// real file, since `seg` is really that file, not a directory. Returns a new
+// path only when something was collapsed.
+fn collapse_phantom_dirs(p: &Path) -> Option<PathBuf> {
+    let comps: Vec<_> = p.components().collect();
+    let mut out = PathBuf::new();
+    let mut changed = false;
+    for (i, comp) in comps.iter().enumerate() {
+        let candidate = out.join(comp);
+        let is_last = i + 1 == comps.len();
+        if !is_last
+            && (with_ext(&candidate, "scss").is_file() || with_ext(&candidate, "sass").is_file())
+        {
+            // `candidate` names a dotted stylesheet file, so it is a phantom
+            // directory: drop it and resolve siblings against its real parent.
+            changed = true;
+            continue;
+        }
+        out = candidate;
+    }
+    changed.then_some(out)
+}
+
 // If `p.scss`/`p.sass` exists as a real file, return it. Used to treat a
 // dotted-basename stylesheet as resolvable.
 fn dotted_stylesheet(p: &Path) -> Option<PathBuf> {
     for ext in ["scss", "sass"] {
-        let mut s = p.as_os_str().to_owned();
-        s.push(".");
-        s.push(ext);
-        let c = PathBuf::from(s);
+        let c = with_ext(p, ext);
         if c.is_file() {
             return Some(c);
+        }
+    }
+    if let Some(collapsed) = collapse_phantom_dirs(p) {
+        for ext in ["scss", "sass"] {
+            let c = with_ext(&collapsed, ext);
+            if c.is_file() {
+                return Some(c);
+            }
         }
     }
     None
@@ -54,10 +93,15 @@ fn index_target(p: &Path) -> Option<PathBuf> {
         "index.sass" | "_index.sass" => "sass",
         _ => return None,
     };
-    let mut s = p.parent()?.as_os_str().to_owned();
-    s.push(".");
-    s.push(ext);
-    let c = PathBuf::from(s);
+    let parent = p.parent()?;
+    let c = with_ext(parent, ext);
+    if c.is_file() {
+        return Some(c);
+    }
+    // The dotted-basename file may sit behind a phantom directory carried in
+    // from a relative import (see collapse_phantom_dirs).
+    let collapsed = collapse_phantom_dirs(parent)?;
+    let c = with_ext(&collapsed, ext);
     c.is_file().then_some(c)
 }
 
@@ -79,12 +123,21 @@ impl grass::Fs for DottedFs {
         p.is_file() || index_target(p).is_some()
     }
     fn read(&self, p: &Path) -> io::Result<Vec<u8>> {
-        if p.is_file() {
-            return std::fs::read(p);
-        }
-        match index_target(p) {
-            Some(real) => std::fs::read(real),
-            None => std::fs::read(p),
+        let bytes = if p.is_file() {
+            std::fs::read(p)?
+        } else {
+            match index_target(p) {
+                Some(real) => std::fs::read(real)?,
+                None => std::fs::read(p)?,
+            }
+        };
+        // Nested `@use`/`@forward`/`@import` in read files need the same
+        // extension stripping the entry gets, so a dotted specifier like
+        // `@use 'colors.module.scss'` inside an imported stylesheet resolves
+        // through DottedFs instead of grass probing the raw dotted+ext path.
+        match String::from_utf8(bytes) {
+            Ok(text) => Ok(strip_sass_import_ext(&text).into_bytes()),
+            Err(e) => Ok(e.into_bytes()),
         }
     }
 }
@@ -403,6 +456,31 @@ mod tests {
             assert!(css.contains("color: red") || css.contains("#f00"), "{spec}: {css}");
             assert!(css.contains("margin: 2px"), "{spec}: {css}");
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // A dotted `.module.scss` that `@use`s another dotted module which itself
+    // `@use`s a relative dotted sibling: the nested relative import must resolve
+    // against the imported file's real directory, not the phantom `x.module/`
+    // directory grass sees it through. (The CSS-modules pattern in the wild.)
+    #[test]
+    fn sass_resolves_nested_relative_dotted_import() {
+        let base = std::env::temp_dir().join(format!("oj-css-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("comp")).unwrap();
+        std::fs::create_dir_all(base.join("shared")).unwrap();
+        std::fs::write(base.join("shared/colors.module.scss"), "$c: #0f0;").unwrap();
+        // base.module.scss imports a relative dotted sibling (colors.module).
+        std::fs::write(
+            base.join("shared/base.module.scss"),
+            "@use \"colors.module\" as c;\n.base { color: c.$c; }",
+        )
+        .unwrap();
+        // The entry (in comp/) imports base via a dir-relative path.
+        let src = "@use \"../shared/base.module.scss\";\n.x { display: block; }";
+        let css = compile_sass(src, Some(&base.join("comp")))
+            .unwrap_or_else(|e| panic!("nested dotted @use should resolve: {e}"));
+        assert!(css.contains("color: #0f0") || css.contains("color: green"), "{css}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
