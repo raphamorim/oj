@@ -824,6 +824,21 @@ impl OjUserPlugin {
     }
 }
 
+// The rolldown module type a plugin-loaded id should parse as, from its
+// extension (query stripped). Defaults to Js, matching Rollup/Vite treating an
+// extensionless virtual id as JavaScript.
+fn module_type_for_id(id: &str) -> rolldown_common::ModuleType {
+    use rolldown_common::ModuleType;
+    let path = id.split(['?', '#']).next().unwrap_or(id);
+    match Path::new(path).extension().and_then(|e| e.to_str()) {
+        Some("jsx") => ModuleType::Jsx,
+        Some("tsx") => ModuleType::Tsx,
+        Some("ts" | "mts" | "cts") => ModuleType::Ts,
+        Some("json") => ModuleType::Json,
+        _ => ModuleType::Js,
+    }
+}
+
 // Forward chunks a plugin emitted (in buildStart or transform) to rolldown as
 // build roots. A `.html` id is not a JS module: its `<script type=module>` are
 // emitted as JS entries instead and the page is queued for rendering, with the
@@ -967,7 +982,11 @@ impl Plugin for OjUserPlugin {
                 .flatten()
                 .map(|code| HookLoadOutput {
                     code: arcstr::ArcStr::from(code),
-                    module_type: Some(rolldown_common::ModuleType::Js),
+                    // Infer the type from the id so a plugin-served virtual
+                    // module keeps its JSX/TS semantics (e.g. unplugin-icons'
+                    // `~icons/*.jsx`); a hardcoded Js made oxc parse the JSX as
+                    // plain JS and fail.
+                    module_type: Some(module_type_for_id(&id)),
                     ..Default::default()
                 }))
         }
@@ -1486,10 +1505,15 @@ pub async fn build(
         .build()
         .map_err(|errs| anyhow::anyhow!("rolldown init failed: {errs:?}"))?;
 
-    let output = bundler
-        .write()
-        .await
-        .map_err(|errs| anyhow::anyhow!("build failed:\n{errs:?}"))?;
+    let output = bundler.write().await.map_err(|errs| {
+        let detail = errs
+            .into_vec()
+            .iter()
+            .map(|e| e.to_diagnostic().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        anyhow::anyhow!("build failed:\n{detail}")
+    })?;
     bundler
         .close()
         .await
@@ -2941,6 +2965,23 @@ fn build_manifest(entries: &[ManifestEntry]) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn module_type_for_id_infers_from_extension() {
+        use rolldown_common::ModuleType;
+        // Vite derives the transform lang from the id's extension (query
+        // stripped); oj mirrors it for plugin-loaded/virtual modules.
+        assert!(matches!(module_type_for_id("~icons/ph/x.jsx"), ModuleType::Jsx));
+        assert!(matches!(module_type_for_id("/v/comp.tsx?used"), ModuleType::Tsx));
+        assert!(matches!(module_type_for_id("virtual:mod.ts"), ModuleType::Ts));
+        assert!(matches!(module_type_for_id("a.mts"), ModuleType::Ts));
+        assert!(matches!(module_type_for_id("a.cts"), ModuleType::Ts));
+        assert!(matches!(module_type_for_id("data.json#x"), ModuleType::Json));
+        assert!(matches!(module_type_for_id("mod.mjs"), ModuleType::Js));
+        assert!(matches!(module_type_for_id("plain.js"), ModuleType::Js));
+        // Extensionless virtual ids default to JavaScript.
+        assert!(matches!(module_type_for_id("\0virtual:store"), ModuleType::Js));
+    }
 
     #[test]
     fn normalize_input_entries_covers_string_array_object() {
