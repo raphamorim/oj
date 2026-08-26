@@ -201,7 +201,21 @@ function withResolvedDefaults(config) {
       base: "/",
       isProduction: env.mode === "production",
       experimental: {},
-      build: {},
+      // Vite's resolved `build` carries defaults plugins read in configResolved
+      // (e.g. UnoCSS resolves `config.build.outDir` and reads
+      // `config.build.rollupOptions.output`). User config overrides these.
+      build: {
+        target: "modules",
+        outDir: "dist",
+        assetsDir: "assets",
+        assetsInlineLimit: 4096,
+        cssCodeSplit: true,
+        sourcemap: false,
+        rollupOptions: {},
+        minify: "esbuild",
+        reportCompressedSize: true,
+        chunkSizeWarningLimit: 500,
+      },
       server: {},
       define: {},
       resolve: {},
@@ -451,6 +465,10 @@ function deepMerge(a, b) {
 
 async function runConfigHooks() {
   let config = initial.config ?? {};
+  // Vite hands the config hook the user config, whose `plugins` is the flat
+  // plugin array; plugins like @crxjs read `config.plugins` to find sibling
+  // plugins. oj keeps the loaded set in `allPlugins`.
+  if (!Array.isArray(config.plugins)) config.plugins = allPlugins;
   for (const p of plugins) {
     if (typeof p.config !== "function") continue;
     try {
@@ -462,6 +480,7 @@ async function runConfigHooks() {
     }
   }
   resolvedConfig = withResolvedDefaults(config);
+  if (!Array.isArray(resolvedConfig.plugins)) resolvedConfig.plugins = allPlugins;
   for (const p of plugins) {
     if (typeof p.configResolved !== "function") continue;
     try {

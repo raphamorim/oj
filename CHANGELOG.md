@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Plugin `configResolved` now runs before `applyToEnvironment`, matching Vite; plugins that populate state in `configResolved` and read it from `applyToEnvironment` (for example `@tanstack/router-plugin`) no longer crash the plugin host, and a throwing `applyToEnvironment` keeps the plugin active instead of failing config load ([#37](https://github.com/raphamorim/oj/issues/37)).
+- The `config` and `configResolved` hooks now receive `config.plugins` (the flat plugin array) and a defaulted `config.build` (`outDir`, `assetsDir`, `rollupOptions`, ...), matching Vite's resolved config. Plugins that read these in their config hooks (`@crxjs/vite-plugin` reads `config.plugins`; UnoCSS resolves `config.build.outDir`) no longer throw and get skipped.
 
 ### Security
 - `server.fs.deny` is enforced, and oj blocks `.env`, `.env.*`, `*.crt`, `*.pem`, and `**/.git/**` by default (Vite parity).
