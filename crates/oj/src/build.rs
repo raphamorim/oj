@@ -50,6 +50,11 @@ struct OjCssPlugin {
     client: bool,
     inline_limit: u64,
     css_code_split: bool,
+    // The user plugin host, so CSS sources pass through the plugin `transform`
+    // chain (e.g. UnoCSS's directive transformer resolving `@apply`) before oj
+    // preprocesses/compiles them, matching Vite where CSS is a real module.
+    host: Option<Arc<PluginHost>>,
+    css_transform_enabled: Arc<tokio::sync::OnceCell<bool>>,
 }
 
 fn assets_inline_limit_of(config: &oj_config::OjConfig) -> u64 {
@@ -385,6 +390,8 @@ impl Plugin for OjCssPlugin {
         let routes_id = root.join("oj-routes.tsx").to_string_lossy().into_owned();
         let client = self.client;
         let inline_limit = self.inline_limit;
+        let host = self.host.clone();
+        let css_transform_enabled = Arc::clone(&self.css_transform_enabled);
         async move {
             if let Some(file) = id.strip_suffix("?url") {
                 let bytes =
@@ -542,6 +549,19 @@ impl Plugin for OjCssPlugin {
             }
             let mut source = std::fs::read_to_string(path)
                 .map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+            // Run the plugin transform chain on the raw CSS source first, so
+            // directive transformers (UnoCSS `@apply`/`@unocss-include`, etc.)
+            // resolve before oj preprocesses and compiles it.
+            if let Some(host) = &host {
+                let on = *css_transform_enabled
+                    .get_or_init(|| async { host.has_transform().await })
+                    .await;
+                if on {
+                    if let Ok((out, _, _, _)) = host.transform(&source, &id).await {
+                        source = out;
+                    }
+                }
+            }
             if oj_css::is_sass(path) {
                 let dir = std::path::Path::new(path).parent();
                 source = oj_css::compile_sass(&source, dir).map_err(|e| anyhow::anyhow!(e))?;
@@ -1458,6 +1478,8 @@ pub async fn build(
         inline_limit: assets_inline_limit_of(&config),
         client: true,
         css_code_split: css_split,
+        host: plugin_host.clone(),
+        css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
     }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
@@ -1926,6 +1948,8 @@ pub(crate) async fn build_ssr(
         inline_limit: assets_inline_limit_of(&config),
         client: false,
         css_code_split: false,
+        host: plugin_host.clone(),
+        css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
     }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
@@ -2062,6 +2086,8 @@ async fn build_server_fns(root: &Path, out_dir: &Path) -> anyhow::Result<()> {
                 inline_limit: 4096,
                 client: false,
                 css_code_split: false,
+                host: None,
+                css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
             })])
             .with_options(BundlerOptions {
                 input: Some(vec![InputItem {
@@ -2425,6 +2451,8 @@ async fn build_client_entry(
         inline_limit: assets_inline_limit_of(&config),
         client: true,
         css_code_split: false,
+        host: plugin_host.clone(),
+        css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
     }));
 
     let mut bundler = BundlerBuilder::default()
@@ -2565,6 +2593,8 @@ async fn build_library(
                 inline_limit: 4096,
                 client: true,
                 css_code_split: false,
+                host: None,
+                css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
             })])
             .with_options(BundlerOptions {
                 input: Some(vec![InputItem {
