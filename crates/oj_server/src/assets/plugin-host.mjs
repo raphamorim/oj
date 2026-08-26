@@ -232,6 +232,13 @@ function withResolvedDefaults(config) {
     c,
   );
   if (typeof merged.createResolver !== "function") merged.createResolver = makeCreateResolver(merged);
+  // Vite resolves `publicDir` to an absolute path (default `<root>/public`);
+  // plugins like @crxjs read it directly to locate manifest assets (icons,
+  // locales). `false` disables it, matching Vite.
+  if (merged.publicDir !== false) {
+    const pd = typeof merged.publicDir === "string" && merged.publicDir.length > 0 ? merged.publicDir : "public";
+    merged.publicDir = isAbsolute(pd) ? pd : pathResolve(merged.root, pd);
+  }
   return merged;
 }
 
