@@ -62,6 +62,8 @@ enum Command {
         ssr: Option<String>,
         #[arg(long)]
         mode: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     Preview {
         root: Option<PathBuf>,
@@ -139,6 +141,7 @@ async fn run() -> anyhow::Result<()> {
             out,
             ssr,
             mode,
+            config,
         } => {
             let root = root.unwrap_or_else(|| {
                 let playground = PathBuf::from("playground");
@@ -152,7 +155,7 @@ async fn run() -> anyhow::Result<()> {
             if oj_server::is_tanstack_start_app(&root) {
                 start_dev::start_build(root).await
             } else {
-                build::build(root, out, ssr, &mode).await
+                build::build(root, out, ssr, &mode, config).await
             }
         }
         Command::Preview {

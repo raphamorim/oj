@@ -124,7 +124,7 @@ node e2e/plugin-ws.mjs                             # plugin server.ws custom eve
 node e2e/plugin-ws-execute.mjs                     # post -> ws broadcast -> client reply -> collect (bridge execute)
 node e2e/plugin-middleware.mjs                     # configureServer post body forwarding + transformIndexHtml
 node e2e/hmr-gate.mjs                              # hmr gate holds updates until POST /__hmr_flush
-node e2e/config-flag.mjs                           # oj dev --config <path> loads an override config
+node e2e/config-flag.mjs                           # oj dev/build --config <path> loads an override config
 node e2e/config-wrapper.mjs                        # vite.config that calls an external defineConfig wrapper
 node e2e/awkward-paths.mjs                         # percent-encoded filenames served, traversal contained
 node bench/generate.mjs 1000                      # generate a benchmark app (then npm i inside it)

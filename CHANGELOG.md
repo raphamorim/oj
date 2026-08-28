@@ -5,6 +5,11 @@ All notable changes to oj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `oj build --config <path>` names the config to build with, the same flag `oj dev` already takes. Without it the config could only be found by convention relative to the positional root, so a config generated outside the app tree was unreachable.
+
 ## [0.1.6] - 2026-08-26
 
 ### Fixed

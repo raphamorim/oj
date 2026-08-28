@@ -1353,10 +1353,20 @@ pub async fn build(
     out: Option<PathBuf>,
     ssr: Option<String>,
     mode: &str,
+    config_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let root = root
         .canonicalize()
         .with_context(|| format!("app root not found: {}", root.display()))?;
+
+    if let Some(cfg) = &config_path {
+        let cfg = if cfg.is_absolute() {
+            cfg.clone()
+        } else {
+            root.join(cfg)
+        };
+        oj_server::plugins::set_vite_config_override(cfg);
+    }
 
     let mut config =
         oj_config::load_with(&root, "build", mode).map_err(|e| anyhow::anyhow!("{e}"))?;

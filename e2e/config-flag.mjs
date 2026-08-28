@@ -51,6 +51,13 @@ async function htmlWith(args, port) {
   }
 }
 
+function buildHtmlWith(args) {
+  fs.rmSync(path.join(app, "dist"), { recursive: true, force: true });
+  fs.rmSync(path.join(app, ".oj-cache"), { recursive: true, force: true });
+  execSync([oj, ...args].join(" "), { cwd: app, stdio: "ignore" });
+  return fs.readFileSync(path.join(app, "dist", "index.html"), "utf8");
+}
+
 let failed = false;
 try {
   const base = await htmlWith(["dev", app, "--port", "5491"], 5491);
@@ -61,6 +68,16 @@ try {
     5492,
   );
   assert.match(overridden, /window\.__OVR = 1/, "--config loads plugins from the override config");
+
+  const builtBase = buildHtmlWith(["build", app]);
+  assert.ok(!/window\.__OVR = 1/.test(builtBase), "build with the root config has no override plugin");
+
+  const builtOverridden = buildHtmlWith(["build", app, "--config", ".lovable/vite.config.mjs"]);
+  assert.match(
+    builtOverridden,
+    /window\.__OVR = 1/,
+    "build --config loads plugins from the override config",
+  );
 
   console.log("CONFIG-FLAG E2E PASSED");
 } catch (err) {
