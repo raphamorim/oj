@@ -569,6 +569,7 @@ let middlewarePort = null;
 async function setupConfigureServer() {
   const stack = [];
   const middlewares = {
+    stack,
     use(a, b) {
       if (typeof a === "function") stack.push({ path: null, fn: a });
       else stack.push({ path: a, fn: b });
@@ -578,12 +579,13 @@ async function setupConfigureServer() {
   const server = {
     config: resolvedConfig,
     middlewares,
-    httpServer: null,
+    httpServer: { on: noop, once: noop, address: () => null },
     ws: wsApi,
     hot: wsApi,
     watcher: { on: noop, off: noop, add: noop, unwatch: noop, close: noop, emit: () => true, removeAllListeners: noop },
     moduleGraph: { getModuleById: () => null, getModulesByFile: () => null, invalidateModule: noop, onFileChange: noop },
     restart: async () => {},
+    close: async () => {},
     transformRequest: async () => null,
     ssrLoadModule: async () => {
       throw new Error("oj: server.ssrLoadModule is not available in configureServer");
