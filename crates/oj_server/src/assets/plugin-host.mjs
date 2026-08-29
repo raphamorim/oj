@@ -216,7 +216,7 @@ function withResolvedDefaults(config) {
         reportCompressedSize: true,
         chunkSizeWarningLimit: 500,
       },
-      server: {},
+      server: { headers: {} },
       define: {},
       resolve: {},
       optimizeDeps: {},
