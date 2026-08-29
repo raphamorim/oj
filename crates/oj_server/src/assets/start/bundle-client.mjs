@@ -63,9 +63,9 @@ const closureRecorder = {
 const serverFnClient = {
   name: "server-fn-client",
   transform: {
-    filter: { id: { include: /\.(ts|tsx)$/, exclude: [/\/node_modules\//, /^\0/] } },
+    filter: { id: { include: /\.(tsx?|jsx?|mjs)$/, exclude: [/\/node_modules\//, /^\0/] } },
     async handler(code, id) {
-      if (id.includes("/node_modules/") || id.startsWith("\0") || !/\.(ts|tsx)$/.test(id)) return null;
+      if (id.includes("/node_modules/") || id.startsWith("\0") || !/\.(tsx?|jsx?|mjs)$/.test(id)) return null;
       let out = code;
       if (container) {
         const t = await container.transformUserCode(out, id);

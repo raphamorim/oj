@@ -86,7 +86,7 @@ function serverFns(code) {
   return out;
 }
 
-const userTs = (id) => !id.includes("/node_modules/") && !id.startsWith("\0") && /\.(ts|tsx)$/.test(id);
+const userTs = (id) => !id.includes("/node_modules/") && !id.startsWith("\0") && /\.(tsx?|jsx?|mjs)$/.test(id);
 
 const clientFnPlugin = {
   name: "server-fn-client",

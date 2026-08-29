@@ -24,6 +24,11 @@ import { buildTag } from "virtual:build-info";
 // export `m.freshMsg_cta()` survives oj's transform/bundle (the reported crash).
 import * as gen from "../generated/stale.js";
 
+// import.meta.glob in a .jsx file and in an unclaimed plain .js file: both must
+// be expanded by the start SSR loader (the .tsx path already is).
+import { GlobWidget } from "../widgets/glob-widget.jsx";
+import { plainGlobTitles } from "../generated/glob-plain.js";
+
 // svgr: a bare .svg import yields a React component (exportType "default")...
 import Logo from "../logo.svg";
 // ...and the explicit `?react` query yields one regardless of exportType.
@@ -66,6 +71,8 @@ function Index() {
       <p data-testid="fresh-module">{gen.LABEL}</p>
       <p data-testid="fresh-fn">{gen.freshMsg_cta()}</p>
       <p data-testid="glob">{titles}</p>
+      <p data-testid="glob-jsx"><GlobWidget /></p>
+      <p data-testid="glob-js">{plainGlobTitles}</p>
       <p data-testid="raw">{notes.trim()}</p>
       <img data-testid="url" src={heroUrl} alt="hero" />
       <span data-testid="svg"><Logo /></span>

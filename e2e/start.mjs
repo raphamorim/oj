@@ -64,6 +64,8 @@ async function assertApp(port, label) {
     ["plugin virtual module", "fixture-virtual-ok"],
     ["plugin load override + buildStart + this.environment.config.consumer", "FRESH_via_buildStart_ssr-server"],
     ["import.meta.glob", "Alpha Widget, Beta Widget"],
+    ["import.meta.glob in .jsx", "jsxglob:Alpha Widget|Beta Widget"],
+    ["import.meta.glob in unclaimed .js", "jsglob:Alpha Widget|Beta Widget"],
     ["?raw import", "raw-notes-marker"],
     ["svgr bare .svg component", "<rect"],
     ["svgr ?react component", "<polygon"],
