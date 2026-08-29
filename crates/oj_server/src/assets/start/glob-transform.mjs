@@ -3,7 +3,27 @@
 import { readdirSync, statSync } from "node:fs";
 import { resolve, dirname, relative, sep } from "node:path";
 
-const GLOB_CALL = /import\.meta\.glob\s*(?:<[^>]*>)?\s*\(/g;
+const GLOB_HEAD = /import\.meta\.glob\b/g;
+
+// Skip whitespace, then an optional balanced TypeScript type argument
+// (`<...>`, nesting- and string-aware, e.g. `<Record<string, unknown>>`), then
+// require `(`. Returns the index just past `(`, or -1 if this is not a call.
+function callArgsStart(code, from) {
+  let i = from;
+  while (i < code.length && /\s/.test(code[i])) i++;
+  if (code[i] === "<") {
+    let depth = 0, str = "";
+    for (; i < code.length; i++) {
+      const c = code[i];
+      if (str) { if (c === "\\") i++; else if (c === str) str = ""; continue; }
+      if (c === '"' || c === "'" || c === "`") str = c;
+      else if (c === "<") depth++;
+      else if (c === ">") { depth--; if (depth === 0) { i++; break; } }
+    }
+    while (i < code.length && /\s/.test(code[i])) i++;
+  }
+  return code[i] === "(" ? i + 1 : -1;
+}
 
 function globToRegExp(absGlob) {
   let re = "";
@@ -64,9 +84,11 @@ export function transformGlob(code, filePath) {
   const fileDir = dirname(filePath);
   const prelude = [];
   let g = 0, out = "", last = 0, m;
-  GLOB_CALL.lastIndex = 0;
-  while ((m = GLOB_CALL.exec(code))) {
-    let i = GLOB_CALL.lastIndex, depth = 1, str = "";
+  GLOB_HEAD.lastIndex = 0;
+  while ((m = GLOB_HEAD.exec(code))) {
+    const argsStart = callArgsStart(code, GLOB_HEAD.lastIndex);
+    if (argsStart === -1) continue;
+    let i = argsStart, depth = 1, str = "";
     for (; i < code.length && depth > 0; i++) {
       const c = code[i];
       if (str) { if (c === "\\") i++; else if (c === str) str = ""; continue; }
@@ -74,9 +96,10 @@ export function transformGlob(code, filePath) {
       else if (c === "(") depth++;
       else if (c === ")") depth--;
     }
-    const argsSrc = code.slice(GLOB_CALL.lastIndex, i - 1);
+    const argsSrc = code.slice(argsStart, i - 1);
     let args;
     try { args = new Function("return [" + argsSrc + "]")(); } catch { continue; }
+    GLOB_HEAD.lastIndex = i;
     const patterns = (Array.isArray(args[0]) ? args[0] : [args[0]]).filter((p) => typeof p === "string");
     const opts = args[1] && typeof args[1] === "object" ? args[1] : {};
     const includes = patterns.filter((p) => !p.startsWith("!"));

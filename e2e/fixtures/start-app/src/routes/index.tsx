@@ -28,6 +28,7 @@ import * as gen from "../generated/stale.js";
 // be expanded by the start SSR loader (the .tsx path already is).
 import { GlobWidget } from "../widgets/glob-widget.jsx";
 import { plainGlobTitles } from "../generated/glob-plain.js";
+import { genericGlobTitles } from "../generated/glob-generic";
 
 // svgr: a bare .svg import yields a React component (exportType "default")...
 import Logo from "../logo.svg";
@@ -73,6 +74,7 @@ function Index() {
       <p data-testid="glob">{titles}</p>
       <p data-testid="glob-jsx"><GlobWidget /></p>
       <p data-testid="glob-js">{plainGlobTitles}</p>
+      <p data-testid="glob-ts-generic">{genericGlobTitles}</p>
       <p data-testid="raw">{notes.trim()}</p>
       <img data-testid="url" src={heroUrl} alt="hero" />
       <span data-testid="svg"><Logo /></span>

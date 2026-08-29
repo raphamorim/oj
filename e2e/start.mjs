@@ -66,6 +66,7 @@ async function assertApp(port, label) {
     ["import.meta.glob", "Alpha Widget, Beta Widget"],
     ["import.meta.glob in .jsx", "jsxglob:Alpha Widget|Beta Widget"],
     ["import.meta.glob in unclaimed .js", "jsglob:Alpha Widget|Beta Widget"],
+    ["import.meta.glob nested generic (.ts)", "tsglob:Alpha Widget|Beta Widget"],
     ["?raw import", "raw-notes-marker"],
     ["svgr bare .svg component", "<rect"],
     ["svgr ?react component", "<polygon"],

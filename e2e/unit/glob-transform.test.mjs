@@ -50,6 +50,68 @@ test("handles the <T> type argument and a single-star segment", () => {
   }
 });
 
+// Mirrors web/shared/pulse/components/data.ts, which broke oj's start SSR: a
+// nested generic argument the old <[^>]*> regex could not skip.
+test("handles a nested generic type argument (Record<string, unknown>)", () => {
+  const dir = fixture();
+  try {
+    const out = transformGlob(
+      'const m = import.meta.glob<Record<string, unknown>>(["./content/*.md"]);',
+      join(dir, "index.ts"),
+    );
+    assert.match(out, /"\.\/content\/a\.md":/);
+    assert.doesNotMatch(out, /import\.meta\.glob/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("handles an object-literal generic type argument", () => {
+  const dir = fixture();
+  try {
+    const out = transformGlob(
+      'const m = import.meta.glob<{ default: string }>("./content/*.md", { eager: true });',
+      join(dir, "index.ts"),
+    );
+    assert.match(out, /^import\s+\*\s+as\s+\w+\s+from\s+"\.\/content\/a\.md";/m);
+    assert.doesNotMatch(out, /import\.meta\.glob/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("expands every call when a module has several generic globs at module scope", () => {
+  const dir = fixture();
+  try {
+    const code = [
+      'const a = import.meta.glob<{ default: Foo }>("./content/*.json");',
+      'const b = import.meta.glob<SidecarModule>("./pages/**/*.tsx");',
+      'const c = import.meta.glob<Record<string, unknown>>(["./content/*.md"]);',
+    ].join("\n");
+    const out = transformGlob(code, join(dir, "index.ts"));
+    assert.doesNotMatch(out, /import\.meta\.glob/);
+    assert.match(out, /"\.\/pages\/home\/page\.tsx":/);
+    assert.match(out, /"\.\/content\/a\.md":/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("expands a pattern that climbs above the importer directory", () => {
+  const dir = fixture();
+  try {
+    mkdirSync(join(dir, "app", "deep"), { recursive: true });
+    const out = transformGlob(
+      'const m = import.meta.glob<Record<string, unknown>>("../../content/*.md");',
+      join(dir, "app", "deep", "index.ts"),
+    );
+    assert.match(out, /"\.\.\/\.\.\/content\/a\.md":/);
+    assert.doesNotMatch(out, /import\.meta\.glob/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("eager + query + import:default produces static imports of the ?query", () => {
   const dir = fixture();
   try {
