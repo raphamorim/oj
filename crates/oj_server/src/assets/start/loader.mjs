@@ -648,7 +648,7 @@ export function load(url, context, next) {
   if (clean.endsWith(".json")) {
     return { format: "module", source: `export default ${readFileSync(fileURLToPath(clean), "utf8")};`, shortCircuit: true };
   }
-  if (clean.endsWith(".tsx") || clean.endsWith(".ts")) {
+  if (clean.endsWith(".tsx") || clean.endsWith(".ts") || clean.endsWith(".jsx")) {
     const path = fileURLToPath(clean);
     const userFile = container && !path.includes("/node_modules/");
     let diskRaw = null;
@@ -680,7 +680,7 @@ export function load(url, context, next) {
     }
     const src = transformServerFns(transformGlob(raw, path), path);
     const out = transformSync(path, src, {
-      lang: clean.endsWith("tsx") ? "tsx" : "ts",
+      lang: clean.endsWith("tsx") ? "tsx" : clean.endsWith("jsx") ? "jsx" : "ts",
       jsx: { runtime: "automatic" },
       define: DEFINE,
     });
@@ -727,6 +727,9 @@ export function load(url, context, next) {
       const loaded = container.load(path);
       if (loaded != null) {
         return { format: "module", source: transformGlob(loaded, path), shortCircuit: true };
+      }
+      if (diskRaw != null && diskRaw.includes("import.meta.glob")) {
+        return { format: "module", source: transformGlob(diskRaw, path), shortCircuit: true };
       }
       cachePut(key, "1");
     }

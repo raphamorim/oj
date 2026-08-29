@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `server.hmr: false` disables HMR, matching Vite: file edits stop broadcasting reloads (the page holds until a manual refresh) while the dev server and plugin WebSocket keep running. Honored from both a `vite.config` and an `oj.config`.
 
 ### Fixed
+- `import.meta.glob` is now expanded in `.jsx` and plain `.js`/`.mjs` modules in the TanStack Start SSR path, not only `.ts`/`.tsx`. Previously a `.jsx` route/component (or an unclaimed on-disk `.js`) that used `import.meta.glob` reached the SSR runtime untransformed and threw `TypeError: (intermediate value).glob is not a function`, 500ing the route. The dev SSR loader and both the SSR-server and client production builds now run the glob transform for the full JS/TS family.
 - oj now accepts the Vite HMR WebSocket. A Vite HMR client dials the origin root with the `vite-hmr` subprotocol, but oj served its HMR socket only at `/__ws`, so that dial never upgraded and the client could not connect. oj now intercepts a `vite-hmr` upgrade on any path (matching Vite's subprotocol-based dispatch), echoes the subprotocol, and sends `{ "type": "connected" }` first, so the client connects and receives oj's existing Vite-shaped reload frames. The `vite-ping` liveness-probe subprotocol is accepted and closed immediately, as Vite does. This runs entirely on oj's native Rust WebSocket path, with no Node plugin host on the HMR path.
 
 ## [0.1.6] - 2026-08-26
