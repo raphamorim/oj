@@ -192,6 +192,7 @@ if (isMainRun) try {
       publicDir: typeof c.publicDir === "string" ? c.publicDir : null,
       port: typeof c.server?.port === "number" ? c.server.port : null,
       host: typeof c.server?.host === "string" ? c.server.host : null,
+      hmr: c.server?.hmr === false ? false : null,
       fsAllow: Array.isArray(c.server?.fs?.allow)
         ? c.server.fs.allow.filter((x) => typeof x === "string")
         : null,

@@ -180,6 +180,7 @@ pub struct ViteValues {
     pub public_dir: Option<String>,
     pub port: Option<u16>,
     pub host: Option<String>,
+    pub hmr_disabled: bool,
     pub fs_allow: Option<Vec<String>>,
     pub define: Option<serde_json::Map<String, serde_json::Value>>,
     pub alias: Option<serde_json::Map<String, serde_json::Value>>,
@@ -272,6 +273,7 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
             .get("host")
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        hmr_disabled: json.get("hmr").and_then(|v| v.as_bool()) == Some(false),
         fs_allow: json.get("fsAllow").and_then(|v| v.as_array()).map(|a| {
             a.iter()
                 .filter_map(|x| x.as_str().map(str::to_string))
@@ -311,6 +313,12 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
         let def = config.define.get_or_insert_with(Default::default);
         for (k, val) in vdef {
             def.entry(k).or_insert(val);
+        }
+    }
+    if v.hmr_disabled {
+        let sc = config.server.get_or_insert_with(Default::default);
+        if sc.hmr.is_none() {
+            sc.hmr = Some(oj_config::HmrConfig::Toggle(false));
         }
     }
     if v.port.is_some() || v.host.is_some() || v.headers.is_some() || v.fs_allow.is_some() {

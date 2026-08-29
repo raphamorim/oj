@@ -86,12 +86,34 @@ pub struct ServerConfig {
     pub strict_port: Option<bool>,
     pub open: Option<bool>,
     pub cors: Option<bool>,
+    pub hmr: Option<HmrConfig>,
     pub hmr_gate: Option<bool>,
     pub allowed_hosts: Option<Vec<String>>,
     pub headers: Option<BTreeMap<String, String>>,
     pub proxy: Option<BTreeMap<String, ProxyEntry>>,
     pub fs: Option<FsConfig>,
     pub warmup: Option<WarmupConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum HmrConfig {
+    Toggle(bool),
+    Options(HmrOptions),
+}
+
+impl HmrConfig {
+    pub fn is_disabled(&self) -> bool {
+        matches!(self, HmrConfig::Toggle(false))
+    }
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct HmrOptions {
+    pub path: Option<String>,
+    pub port: Option<u16>,
+    pub overlay: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]

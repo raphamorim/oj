@@ -64,6 +64,28 @@ try {
 
   assert.deepEqual(pong, { echo: { hello: "world" } }, "plugin ws.on -> ws.send round-trips to the client");
   ws.close();
+
+  // the same relay must work for a client on the vite-hmr socket (origin root)
+  const vws = new WebSocket(`ws://localhost:${port}/`, ["vite-hmr"]);
+  await new Promise((res, rej) => {
+    vws.addEventListener("open", res);
+    vws.addEventListener("error", () => rej(new Error("vite-hmr socket open failed")));
+  });
+  const pong2 = await new Promise((res, rej) => {
+    const timer = setTimeout(() => rej(new Error("timed out waiting for server:pong over vite-hmr")), 8000);
+    vws.addEventListener("message", (e) => {
+      let m;
+      try { m = JSON.parse(e.data); } catch { return; }
+      if (m.type === "custom" && m.event === "server:pong") {
+        clearTimeout(timer);
+        res(m.data);
+      }
+    });
+    vws.send(JSON.stringify({ type: "custom", event: "client:ping", data: { hello: "vite" } }));
+  });
+  assert.deepEqual(pong2, { echo: { hello: "vite" } }, "plugin ws relay round-trips over the vite-hmr socket");
+  vws.close();
+
   console.log("PLUGIN-WS E2E PASSED");
 } catch (err) {
   failed = true;

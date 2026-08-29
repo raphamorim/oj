@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use axum::{
     body::Body,
-    extract::{ws::Message, Query, State, WebSocketUpgrade},
+    extract::{ws::Message, FromRequestParts, Query, State, WebSocketUpgrade},
     http::{header, HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -257,6 +257,7 @@ struct ServerState {
     virtual_modules: std::collections::BTreeMap<String, String>,
     jsx_overrides: std::collections::BTreeMap<String, String>,
     hmr_gate: Option<Arc<HmrGate>>,
+    hmr_enabled: bool,
     plugins: Option<std::sync::Arc<PluginHost>>,
     plugin_mw_port: Option<u16>,
     plugins_ssr: tokio::sync::OnceCell<Option<std::sync::Arc<PluginHost>>>,
@@ -555,6 +556,15 @@ impl DevServer {
             }
         };
 
+        let hmr_enabled = server_cfg
+            .hmr
+            .as_ref()
+            .map(|h| !h.is_disabled())
+            .unwrap_or(true);
+        if !hmr_enabled {
+            println!("  hmr: disabled (server.hmr: false)");
+        }
+
         let started = Instant::now();
         let (reload_tx, _) = broadcast::channel::<String>(64);
         let (crawl_tx, crawl_rx) = tokio::sync::watch::channel(false);
@@ -637,6 +647,7 @@ impl DevServer {
             virtual_modules: config.virtual_modules.clone().unwrap_or_default(),
             jsx_overrides,
             hmr_gate,
+            hmr_enabled,
             plugins: plugin_host,
             plugin_mw_port,
             plugins_ssr: tokio::sync::OnceCell::new(),
@@ -723,6 +734,10 @@ impl DevServer {
             .route("/__hmr_flush", post(hmr_flush))
             .route("/__hmr_gate", get(hmr_gate_status))
             .fallback(serve_fallback);
+        app = app.layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            vite_hmr_upgrade,
+        ));
         let extra_headers: Vec<(header::HeaderName, header::HeaderValue)> = config
             .server
             .as_ref()
@@ -1112,9 +1127,59 @@ pub fn update_progress_frame(
 async fn ws_upgrade(
     State(state): State<Arc<ServerState>>,
     upgrade: WebSocketUpgrade,
-) -> impl IntoResponse {
+) -> Response {
+    hmr_socket(upgrade, state, false)
+}
+
+fn vite_ws_subprotocol(h: &HeaderMap) -> Option<&'static str> {
+    let is_ws = h
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+    if !is_ws {
+        return None;
+    }
+    let raw = h.get(header::SEC_WEBSOCKET_PROTOCOL)?.to_str().ok()?;
+    raw.split(',').map(|p| p.trim()).find_map(|p| match p {
+        "vite-hmr" => Some("vite-hmr"),
+        "vite-ping" => Some("vite-ping"),
+        _ => None,
+    })
+}
+
+async fn vite_hmr_upgrade(
+    State(state): State<Arc<ServerState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Some(proto) = vite_ws_subprotocol(req.headers()) else {
+        return next.run(req).await;
+    };
+    let (mut parts, body) = req.into_parts();
+    match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
+        Ok(upgrade) if proto == "vite-ping" => upgrade
+            .protocols(["vite-ping"])
+            .on_upgrade(|mut socket| async move {
+                let _ = socket.send(Message::Close(None)).await;
+            }),
+        Ok(upgrade) => hmr_socket(upgrade, state, true),
+        Err(_) => next.run(axum::extract::Request::from_parts(parts, body)).await,
+    }
+}
+
+fn hmr_socket(upgrade: WebSocketUpgrade, state: Arc<ServerState>, vite: bool) -> Response {
+    let upgrade = if vite {
+        upgrade.protocols(["vite-hmr"])
+    } else {
+        upgrade
+    };
     upgrade.on_upgrade(move |mut socket| async move {
         let mut rx = state.reload_tx.subscribe();
+        if vite {
+            let connected = serde_json::json!({ "type": "connected" }).to_string();
+            let _ = socket.send(Message::Text(connected.into())).await;
+        }
         if state.hmr_gate.is_some() {
             let mode = serde_json::json!({
                 "type": "custom",
@@ -4430,6 +4495,9 @@ fn spawn_watcher(state: Arc<ServerState>) {
             if paths.iter().any(|p| is_restart_trigger(p)) {
                 restart_process();
             }
+            if !state.hmr_enabled {
+                continue;
+            }
             if let Some(gate) = &state.hmr_gate {
                 if gate.hold(&state, &paths) {
                     continue;
@@ -4465,6 +4533,9 @@ fn parse_hmr_filter(raw: &str) -> Option<Vec<PathBuf>> {
 }
 
 async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
+    if !state.hmr_enabled {
+        return Vec::new();
+    }
     let mut messages: Vec<String> = Vec::new();
     let mut updates: Vec<serde_json::Value> = Vec::new();
 

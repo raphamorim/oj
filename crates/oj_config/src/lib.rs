@@ -542,6 +542,18 @@ mod tests {
     }
 
     #[test]
+    fn server_hmr_false_parses_as_disabled() {
+        let off: OjConfig = serde_json::from_str(r#"{"server":{"hmr":false}}"#).unwrap();
+        assert!(off.server.unwrap().hmr.unwrap().is_disabled());
+        let on: OjConfig = serde_json::from_str(r#"{"server":{"hmr":true}}"#).unwrap();
+        assert!(!on.server.unwrap().hmr.unwrap().is_disabled());
+        let obj: OjConfig = serde_json::from_str(r#"{"server":{"hmr":{"overlay":false}}}"#).unwrap();
+        assert!(!obj.server.unwrap().hmr.unwrap().is_disabled());
+        let empty: OjConfig = serde_json::from_str(r#"{"server":{"port":3000}}"#).unwrap();
+        assert!(empty.server.unwrap().hmr.is_none());
+    }
+
+    #[test]
     fn server_strict_port_accessor_defaults_false() {
         let on: OjConfig = serde_json::from_str(r#"{"server":{"strictPort":true}}"#).unwrap();
         assert!(server_strict_port(&on));
