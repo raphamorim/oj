@@ -5,7 +5,7 @@ All notable changes to oj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.8] - 2026-08-29
 
 ### Fixed
 - `import.meta.glob` with a TypeScript type argument is now expanded in the TanStack Start SSR path even when the type argument is nested (`import.meta.glob<Record<string, unknown>>(...)`) or an object literal (`import.meta.glob<{ default: T }>(...)`). The Start transform located the call with a regex that stopped at the first `>`, so a nested generic slipped through unrewritten and reached the SSR runtime as a real `import.meta.glob(...)` call, throwing `TypeError: (intermediate value).glob is not a function` and 500ing the route. The detector now skips a balanced, string-aware type argument before the call, matching the AST-based compiler path.
