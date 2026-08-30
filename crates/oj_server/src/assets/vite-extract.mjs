@@ -4,7 +4,7 @@
 import { createRequire } from "node:module";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
-import { writeFileSync, readFileSync } from "node:fs";
+import { writeFileSync, readFileSync, realpathSync } from "node:fs";
 
 const configPath = process.argv[2];
 const appRoot = process.argv[3];
@@ -177,7 +177,25 @@ function warnUnsupported(c) {
   }
 }
 
-const isMainRun = import.meta.url === pathToFileURL(process.argv[1] || "").href;
+// Whether this module is the entry, compared on the real path rather than the
+// spelling. Node canonicalizes the entry module, so import.meta.url is always
+// symlink-free while argv[1] is whatever the caller typed -- on macOS a path
+// under /var reaches us as /private/var, and the two never match. Getting this
+// wrong is silent: the body below is skipped, nothing is written, and the
+// process exits 0 as though the config simply had nothing in it.
+const isMainRun = (() => {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  const self = fileURLToPath(import.meta.url);
+  const real = (p) => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return resolve(p);
+    }
+  };
+  return real(self) === real(entry);
+})();
 export { extractAlias };
 
 if (isMainRun) try {
