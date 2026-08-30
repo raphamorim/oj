@@ -557,6 +557,7 @@ const ALIASES = {
   "#tanstack-start-plugin-adapters": pathResolve(HERE, "plugin-adapters.ts"),
   "#tanstack-start-server-fn-resolver": pathResolve(HERE, "server-fn-resolver.mjs"),
   "tanstack-start-manifest:v": pathResolve(HERE, "manifest-dev.ts"),
+  "tanstack-start-injected-head-scripts:v": pathResolve(HERE, "injected-head-scripts.ts"),
   "@cloudflare/vite-plugin/server": pathResolve(HERE, "cf-server.mjs"),
 };
 

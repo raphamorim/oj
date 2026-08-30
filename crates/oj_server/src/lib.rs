@@ -96,6 +96,10 @@ const COMPILABLE: &[&str] = &["tsx", "ts", "jsx", "js", "mjs", "svelte"];
 
 const START_ASSETS: &[(&str, &str)] = &[
     (
+        "injected-head-scripts.ts",
+        include_str!("assets/start/injected-head-scripts.ts"),
+    ),
+    (
         "resolve-pkg.mjs",
         include_str!("assets/start/resolve-pkg.mjs"),
     ),
@@ -6845,6 +6849,39 @@ mod adapter_tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    // The framework seam, from the consumer's side. start-server-core imports
+    // these by bare specifier and expects the bundler to answer; one the loader
+    // does not map reaches Node's ESM loader as an unknown URL scheme, and every
+    // document request then fails with ERR_UNSUPPORTED_ESM_URL_SCHEME. The two
+    // scheme-shaped ones are imported unconditionally under TSS_DEV_SERVER,
+    // which runner.mjs sets, so this is the ordinary dev path.
+    #[test]
+    fn the_loader_maps_every_framework_virtual_module() {
+        let loader = include_str!("assets/start/loader.mjs");
+        for spec in [
+            "tanstack-start-manifest:v",
+            "tanstack-start-injected-head-scripts:v",
+            "#tanstack-router-entry",
+            "#tanstack-start-entry",
+            "#tanstack-start-plugin-adapters",
+            "#tanstack-start-server-fn-resolver",
+        ] {
+            assert!(
+                loader.contains(&format!("\"{spec}\":")),
+                "the SSR loader has no alias for {spec}",
+            );
+        }
+    }
+
+    #[test]
+    fn write_start_assets_writes_every_module_the_loader_aliases() {
+        let dir = tmp("assets");
+        write_start_assets(&dir).unwrap();
+        for name in ["injected-head-scripts.ts", "manifest-dev.ts", "loader.mjs"] {
+            assert!(dir.join(name).is_file(), "{name} was not written");
+        }
     }
 
     #[test]
