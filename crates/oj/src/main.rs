@@ -106,7 +106,7 @@ async fn run() -> anyhow::Result<()> {
             if let Some(entry) = ssr {
                 ssr_dev::ssr_dev(root, entry, port, host).await
             } else if oj_server::is_tanstack_start_app(&root) {
-                start_dev::start_dev(root, port, host).await
+                start_dev::start_dev(root, port, host, config).await
             } else {
                 oj_server::DevServer {
                     root,
