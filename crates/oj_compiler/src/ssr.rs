@@ -265,6 +265,10 @@ pub fn ssr_transform(source: &str, path: &Path) -> String {
                 }
             },
             Statement::ExportAllDeclaration(exp) => {
+                if exp.export_kind.is_type() {
+                    edits.push(Edit { start: exp.span.start, end: exp.span.end, text: String::new() });
+                    continue;
+                }
                 let cur = uid;
                 hoisted.push(import_const(cur, exp.source.value.as_str(), &[]));
                 uid += 1;
@@ -534,6 +538,14 @@ mod tests {
     fn type_only_export_from_is_dropped() {
         let o = tts("export type { T } from './t';\nexport const v = 1;");
         assert!(!o.contains("__vite_ssr_import__"), "type re-export emitted a runtime import: {o}");
+        assert!(o.contains(r#"__vite_ssr_exportName__("v""#), "{o}");
+    }
+
+    #[test]
+    fn type_only_export_star_is_dropped() {
+        let o = tts("export type * from './t';\nexport const v = 1;");
+        assert!(!o.contains("__vite_ssr_import__"), "type export* emitted a runtime import: {o}");
+        assert!(!o.contains("__vite_ssr_exportAll__"), "{o}");
         assert!(o.contains(r#"__vite_ssr_exportName__("v""#), "{o}");
     }
 
