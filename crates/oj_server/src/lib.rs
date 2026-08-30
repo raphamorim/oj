@@ -183,7 +183,7 @@ pub fn node_compile_cache_opt_in(root: &Path) -> Option<std::ffi::OsString> {
 }
 
 pub fn prepare_cache_root(root: &Path) {
-    let dir = root.join(".oj-cache");
+    let dir = oj_cache::cache_base(root);
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
