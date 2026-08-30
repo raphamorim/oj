@@ -105,3 +105,40 @@ fn ssr_output_executes_with_live_bindings_and_reexports() {
     assert_eq!(result["dynDefault"], 42, "dynamic import default");
     assert_eq!(result["meta"], "./main.js", "import.meta.url");
 }
+
+#[test]
+fn ssr_output_handles_extends_import_and_this_stripping() {
+    if !node_available() {
+        eprintln!("SKIP ssr_exec: node not available");
+        return;
+    }
+    // Base has a method that relies on `this`; a free-function export that would
+    // bind `this` wrongly if not stripped; and a subclass extending the import.
+    let dep = transform(
+        "export class Base { who() { return this.kind } constructor() { this.kind = 'base' } }\
+         export function raw() { return this === undefined || this === globalThis ? 'unbound' : 'bound' }",
+    );
+    let main = transform(
+        "import { Base, raw } from './dep.js';\
+         class Derived extends Base { who() { return 'derived:' + super.who() } }\
+         export function run() { return { sub: new Derived().who(), thisMode: raw() }; }",
+    );
+    let codes = serde_json::json!([["./dep.js", dep], ["./main.js", main]]);
+
+    let mut codes_file = tempfile::NamedTempFile::new().unwrap();
+    codes_file.write_all(codes.to_string().as_bytes()).unwrap();
+    let mut harness = tempfile::Builder::new().suffix(".cjs").tempfile().unwrap();
+    harness.write_all(HARNESS.as_bytes()).unwrap();
+
+    let out = Command::new("node")
+        .arg(harness.path())
+        .arg(codes_file.path())
+        .output()
+        .expect("run node harness");
+    assert!(out.status.success(), "harness failed: {}\n--- main ---\n{main}", String::from_utf8_lossy(&out.stderr));
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|_| panic!("bad json: {}", String::from_utf8_lossy(&out.stdout)));
+
+    assert_eq!(result["sub"], "derived:base", "subclass extending an imported class + super()");
+    assert_eq!(result["thisMode"], "unbound", "(0, import.fn)() strips `this` at call sites");
+}
