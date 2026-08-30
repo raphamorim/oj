@@ -576,8 +576,33 @@ async function setupConfigureServer() {
     },
   };
   const noop = () => {};
+  const makeHot = () => ({
+    on(e, cb) { wsApi.on(e, cb); },
+    off(e, cb) { wsApi.off(e, cb); },
+    send(a, b) { wsApi.send(a, b); },
+    listen: noop,
+    close: noop,
+    setInvokeHandler: noop,
+    async handleInvoke() {
+      return { error: { name: "Error", message: "oj: handleInvoke not yet wired" } };
+    },
+  });
+  const environments = {};
+  for (const name of Object.keys(resolvedConfig.environments ?? {})) {
+    environments[name] = {
+      name,
+      config: resolvedConfig,
+      mode: "dev",
+      bundledDev: false,
+      hot: makeHot(),
+      depsOptimizer: { init: noop, async registerMissingImport() {} },
+      initRunner() { return { import: async () => ({}) }; },
+      async fetchWorkerExportTypes() { return {}; },
+    };
+  }
   const server = {
     config: resolvedConfig,
+    environments,
     middlewares,
     httpServer: { on: noop, once: noop, address: () => null },
     ws: wsApi,
