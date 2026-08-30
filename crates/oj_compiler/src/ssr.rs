@@ -171,11 +171,16 @@ pub fn ssr_transform(source: &str, path: &Path) -> String {
     for stmt in &program.body {
         match stmt {
             Statement::ImportDeclaration(imp) => {
+                if imp.import_kind.is_type() {
+                    edits.push(Edit { start: imp.span.start, end: imp.span.end, text: String::new() });
+                    continue;
+                }
                 let src = imp.source.value.as_str();
                 let mut names: Vec<String> = Vec::new();
                 if let Some(specs) = &imp.specifiers {
                     for spec in specs {
                         match spec {
+                            ImportDeclarationSpecifier::ImportSpecifier(s) if s.import_kind.is_type() => {}
                             ImportDeclarationSpecifier::ImportSpecifier(s) => {
                                 let name = men_name(&s.imported);
                                 names.push(name.clone());
@@ -209,11 +214,17 @@ pub fn ssr_transform(source: &str, path: &Path) -> String {
                 edits.push(Edit { start: exp.span.start, end: decl_start, text: String::new() });
             }
             Statement::ExportFromDeclaration(exp) => {
-                let names: Vec<String> = exp.specifiers.iter().map(|s| men_name(&s.local)).collect();
+                let value_specs: Vec<&ExportSpecifier> =
+                    exp.specifiers.iter().filter(|s| !s.export_kind.is_type()).collect();
+                if exp.export_kind.is_type() || value_specs.is_empty() {
+                    edits.push(Edit { start: exp.span.start, end: exp.span.end, text: String::new() });
+                    continue;
+                }
+                let names: Vec<String> = value_specs.iter().map(|s| men_name(&s.local)).collect();
                 let cur = uid;
                 hoisted.push(import_const(cur, exp.source.value.as_str(), &names));
                 uid += 1;
-                for s in &exp.specifiers {
+                for s in &value_specs {
                     let local = men_name(&s.local);
                     let exported = men_name(&s.exported);
                     hoisted.push(export_name(&exported, &member(cur, &local)));
@@ -221,12 +232,14 @@ pub fn ssr_transform(source: &str, path: &Path) -> String {
                 edits.push(Edit { start: exp.span.start, end: exp.span.end, text: String::new() });
             }
             Statement::ExportNamedDeclaration(exp) => {
-                for s in &exp.specifiers {
-                    let exported = men_name(&s.exported);
-                    let local_expr = resolve_local_symbol(&scoping, s)
-                        .and_then(|sym| imports.get(&sym).cloned())
-                        .unwrap_or_else(|| men_name(&s.local));
-                    hoisted.push(export_name(&exported, &local_expr));
+                if !exp.export_kind.is_type() {
+                    for s in exp.specifiers.iter().filter(|s| !s.export_kind.is_type()) {
+                        let exported = men_name(&s.exported);
+                        let local_expr = resolve_local_symbol(&scoping, s)
+                            .and_then(|sym| imports.get(&sym).cloned())
+                            .unwrap_or_else(|| men_name(&s.local));
+                        hoisted.push(export_name(&exported, &local_expr));
+                    }
                 }
                 edits.push(Edit { start: exp.span.start, end: exp.span.end, text: String::new() });
             }
@@ -252,6 +265,10 @@ pub fn ssr_transform(source: &str, path: &Path) -> String {
                 }
             },
             Statement::ExportAllDeclaration(exp) => {
+                if exp.export_kind.is_type() {
+                    edits.push(Edit { start: exp.span.start, end: exp.span.end, text: String::new() });
+                    continue;
+                }
                 let cur = uid;
                 hoisted.push(import_const(cur, exp.source.value.as_str(), &[]));
                 uid += 1;
@@ -376,6 +393,10 @@ mod tests {
         ssr_transform(src, Path::new("m.js"))
     }
 
+    fn tts(src: &str) -> String {
+        ssr_transform(src, Path::new("m.ts"))
+    }
+
     #[test]
     fn default_import() {
         let o = t("import foo from 'vue';console.log(foo.bar)");
@@ -496,6 +517,43 @@ mod tests {
     fn method_key_not_rewritten_call_is() {
         let o = t("import { fn } from 'vue';class A { fn() { fn() } }");
         assert!(o.contains("fn() { (0, __vite_ssr_import_0__.fn)() }"), "{o}");
+    }
+
+    #[test]
+    fn type_only_import_is_dropped() {
+        let o = tts("import type { X } from './t';\nconst y = 1;");
+        assert!(!o.contains("__vite_ssr_import__"), "type import emitted a runtime import: {o}");
+        assert!(!o.contains("import type"), "{o}");
+    }
+
+    #[test]
+    fn inline_type_specifier_is_skipped() {
+        let o = tts("import { a, type B } from './m';\nconsole.log(a)");
+        assert!(o.contains(r#"{"importedNames":["a"]}"#), "type spec leaked into importedNames: {o}");
+        assert!(o.contains("(0, __vite_ssr_import_0__.a)"), "{o}");
+        assert!(!o.contains("__vite_ssr_import_0__.B"), "type spec was referenced: {o}");
+    }
+
+    #[test]
+    fn type_only_export_from_is_dropped() {
+        let o = tts("export type { T } from './t';\nexport const v = 1;");
+        assert!(!o.contains("__vite_ssr_import__"), "type re-export emitted a runtime import: {o}");
+        assert!(o.contains(r#"__vite_ssr_exportName__("v""#), "{o}");
+    }
+
+    #[test]
+    fn type_only_export_star_is_dropped() {
+        let o = tts("export type * from './t';\nexport const v = 1;");
+        assert!(!o.contains("__vite_ssr_import__"), "type export* emitted a runtime import: {o}");
+        assert!(!o.contains("__vite_ssr_exportAll__"), "{o}");
+        assert!(o.contains(r#"__vite_ssr_exportName__("v""#), "{o}");
+    }
+
+    #[test]
+    fn inline_type_export_specifier_is_skipped() {
+        let o = tts("const a = 1; export { a, type T }");
+        assert!(o.contains(r#"__vite_ssr_exportName__("a""#), "{o}");
+        assert!(!o.contains(r#"__vite_ssr_exportName__("T""#), "type export spec leaked: {o}");
     }
 
     #[test]
