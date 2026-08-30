@@ -41,14 +41,29 @@ struct StartState {
     css_host: Option<Arc<tokio::sync::Mutex<Runner>>>,
 }
 
+// A --config path is resolved against the app root, the way `build` resolves
+// it, so `oj dev --config vite.config.mjs app` and `oj build --config ... app`
+// mean the same file. An absolute path is already the answer.
+fn config_path(root: &Path, config: Option<PathBuf>) -> Option<PathBuf> {
+    config.map(|c| if c.is_absolute() { c } else { root.join(c) })
+}
+
 pub async fn start_dev(
     root: PathBuf,
     port: Option<u16>,
     host: Option<String>,
+    config: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let root = root
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("app root not found: {}: {e}", root.display()))?;
+
+    // Same order `build` uses: pin the override before anything reads a config,
+    // so the Rust side and the plugin host agree on which file is the config.
+    let config = config_path(&root, config);
+    if let Some(cfg) = &config {
+        oj_server::plugins::set_vite_config_override(cfg.clone());
+    }
     let cache = oj_cache::cache_root(&root).join("start");
     oj_server::prepare_cache_root(&root);
     oj_server::write_start_assets(&cache)?;
@@ -61,7 +76,7 @@ pub async fn start_dev(
             port,
             bundle: false,
             host,
-            config: None,
+            config,
             enable_cache: false,
             no_cache: false,
             lazy: false,
@@ -1355,5 +1370,19 @@ mod tests {
             !out.iter().any(|(k, _)| k == "x-bin"),
             "non-utf8 value dropped: {out:?}"
         );
+    }
+
+    #[test]
+    fn a_relative_config_path_resolves_against_the_app_root() {
+        let root = Path::new("/srv/app");
+        assert_eq!(
+            config_path(root, Some(PathBuf::from("build/vite.config.mjs"))),
+            Some(PathBuf::from("/srv/app/build/vite.config.mjs")),
+        );
+        assert_eq!(
+            config_path(root, Some(PathBuf::from("/out/vite.config.mjs"))),
+            Some(PathBuf::from("/out/vite.config.mjs")),
+        );
+        assert_eq!(config_path(root, None), None);
     }
 }
