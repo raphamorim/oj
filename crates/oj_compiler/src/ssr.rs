@@ -279,6 +279,15 @@ pub fn ssr_transform(source: &str, path: &Path) -> String {
     apply(source, edits, &hoisted)
 }
 
+pub fn ssr_transform_module(
+    path: &Path,
+    source: &str,
+    opts: &crate::CompileOptions,
+) -> Result<String, crate::CompileError> {
+    let compiled = crate::compile(path, source, opts)?;
+    Ok(ssr_transform(&compiled.code, path))
+}
+
 fn resolve_local_symbol(scoping: &Scoping, s: &ExportSpecifier) -> Option<SymbolId> {
     if let ModuleExportName::IdentifierReference(r) = &s.local {
         let rid = r.reference_id.get()?;
@@ -487,5 +496,32 @@ mod tests {
     fn method_key_not_rewritten_call_is() {
         let o = t("import { fn } from 'vue';class A { fn() { fn() } }");
         assert!(o.contains("fn() { (0, __vite_ssr_import_0__.fn)() }"), "{o}");
+    }
+
+    #[test]
+    fn composes_ts_strip_then_ssr_transform() {
+        use super::ssr_transform_module;
+        use crate::CompileOptions;
+        let src = "import { helper } from './u';\nexport const x: number = helper(1);\nexport default 2;";
+        let o = ssr_transform_module(Path::new("c.ts"), src, &CompileOptions::prod()).unwrap();
+        assert!(!o.contains("import { helper"), "import survived: {o}");
+        assert!(o.contains(r#"await __vite_ssr_import__("./u""#), "{o}");
+        assert!(o.contains(".helper)("), "ref rewritten to member call: {o}");
+        assert!(o.contains(r#"__vite_ssr_exportName__("x""#), "{o}");
+        assert!(o.contains(r#"__vite_ssr_exportName__("default""#), "{o}");
+        assert!(!o.contains(": number"), "TS type survived: {o}");
+    }
+
+    #[test]
+    fn composes_jsx_strip_then_ssr_transform() {
+        use super::ssr_transform_module;
+        use crate::CompileOptions;
+        let src = "import { wrap } from './ui';\nexport const C = () => wrap(<div className=\"x\">hi</div>);";
+        let o = ssr_transform_module(Path::new("c.tsx"), src, &CompileOptions::prod()).unwrap();
+        assert!(!o.contains("<div"), "JSX survived: {o}");
+        assert!(o.contains(r#"await __vite_ssr_import__("./ui""#), "user import transformed: {o}");
+        assert!(o.contains(".wrap)("), "user import ref rewritten: {o}");
+        assert!(o.contains(r#"__vite_ssr_exportName__("C""#), "{o}");
+        assert!(!o.contains("\nimport "), "an import statement survived: {o}");
     }
 }
