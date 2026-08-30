@@ -218,6 +218,25 @@ pub struct ViteValues {
     pub allowed_hosts: Option<serde_json::Value>,
 }
 
+/// Why a run of the extractor produced nothing usable, or None when it did.
+///
+/// Kept separate from the reporting so the classification can be tested: the
+/// interesting cases are a subprocess that wrote nothing at all and one that
+/// wrote something that is not JSON, and reproducing either through a real
+/// `node` is harder than it is worth.
+fn extraction_failure(status: std::process::ExitStatus, stdout: &[u8], parse: Option<&str>) -> Option<String> {
+    match parse {
+        None => None,
+        Some(_) if stdout.is_empty() => Some(format!(
+            "wrote nothing at all and exited with {status}"
+        )),
+        Some(e) => Some(format!(
+            "wrote {} bytes that are not JSON ({e}) and exited with {status}",
+            stdout.len()
+        )),
+    }
+}
+
 /// Evaluate the app's `vite.config` for `command` ("serve" | "build") and `mode`.
 /// A config exported as a function (`defineConfig(({ command, mode }) => ...)`)
 /// branches on both, so a build must be extracted as a build: evaluating it as
@@ -284,7 +303,12 @@ fn extract_vite_values_with(
     if !stderr.is_empty() {
         eprint!("{stderr}");
     }
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let parsed = serde_json::from_slice::<serde_json::Value>(&out.stdout);
+    let parse_err = parsed.as_ref().err().map(|e| e.to_string());
+    if let Some(why) = extraction_failure(out.status, &out.stdout, parse_err.as_deref()) {
+        eprintln!("oj: extracting {} {why}", vite.display());
+    }
+    let json: serde_json::Value = parsed.ok()?;
     // The extractor reports a config that failed to evaluate as `__ok: false`
     // (having printed the cause to stderr above). That is not a config with no
     // values, so never parse it into an empty ViteValues: return None and let the
@@ -399,6 +423,14 @@ pub fn adopt_vite_config_values(
         // the app never asked for. An explicit oj.plugins file takes precedence over
         // vite.config (the extractor skips it then), so only the vite path is an
         // error. The extractor has already printed the underlying cause to stderr.
+        if let Some(named) = VITE_CONFIG_OVERRIDE.get() {
+            if !named.is_file() {
+                return Err(format!(
+                    "failed to load config from {}: --config names a file that does not exist",
+                    named.display()
+                ));
+            }
+        }
         if plugins_file(root).is_none() {
             if let Some(path) = vite_config_file(root) {
                 return Err(format!("failed to load config from {}", path.display()));
@@ -422,6 +454,14 @@ pub fn adopt_vite_config_values_default_mode(
     let Some(v) = extract_vite_values_with(root, command, mode, false) else {
         // Same rule as `adopt_vite_config_values`: a present vite.config that
         // failed to evaluate is an error, a missing one is nothing to adopt.
+        if let Some(named) = VITE_CONFIG_OVERRIDE.get() {
+            if !named.is_file() {
+                return Err(format!(
+                    "failed to load config from {}: --config names a file that does not exist",
+                    named.display()
+                ));
+            }
+        }
         if plugins_file(root).is_none() {
             if let Some(path) = vite_config_file(root) {
                 return Err(format!("failed to load config from {}", path.display()));
@@ -1238,6 +1278,42 @@ mod ssr_bridge_tests {
         cleanup_ssr_bridge(&root);
         assert!(!dir.exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod extraction_failure_tests {
+    use super::extraction_failure;
+
+    // A status is only constructible by running something, and `true`/`false`
+    // are the two the classification cares about.
+    fn status(ok: bool) -> std::process::ExitStatus {
+        std::process::Command::new(if ok { "true" } else { "false" })
+            .status()
+            .expect("a shell builtin binary")
+    }
+
+    #[test]
+    fn valid_json_is_not_a_failure() {
+        assert_eq!(extraction_failure(status(true), b"{}", None), None);
+    }
+
+    // The one that hid a real bug: the extractor skipped its own body and
+    // exited 0, which is indistinguishable from a config with nothing in it
+    // unless somebody says so.
+    #[test]
+    fn a_silent_successful_run_is_a_failure() {
+        let why = extraction_failure(status(true), b"", Some("EOF while parsing a value"))
+            .expect("nothing on stdout is not a config");
+        assert!(why.contains("wrote nothing at all"), "{why}");
+    }
+
+    #[test]
+    fn unparseable_output_reports_its_size_and_the_parse_error() {
+        let why = extraction_failure(status(false), b"not json", Some("expected value"))
+            .expect("output that is not JSON is not a config");
+        assert!(why.contains("8 bytes"), "{why}");
+        assert!(why.contains("expected value"), "{why}");
     }
 }
 
