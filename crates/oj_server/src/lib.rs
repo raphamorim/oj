@@ -115,6 +115,10 @@ const START_ASSETS: &[(&str, &str)] = &[
         "glob-transform.mjs",
         include_str!("assets/start/glob-transform.mjs"),
     ),
+    (
+        "ssr-fetch-module.mjs",
+        include_str!("assets/start/ssr-fetch-module.mjs"),
+    ),
     ("cf-server.mjs", include_str!("assets/start/cf-server.mjs")),
     ("css-host.mjs", include_str!("assets/start/css-host.mjs")),
     ("loader.mjs", include_str!("assets/start/loader.mjs")),
@@ -904,6 +908,16 @@ async fn ssr_module(
     } else {
         path
     };
+    if q.get("runner").map(|v| v == "1").unwrap_or(false) {
+        return match oj_compiler::ssr::ssr_transform_module(
+            &compile_path,
+            &source,
+            &oj_compiler::CompileOptions::prod(),
+        ) {
+            Ok(code) => js(code),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+        };
+    }
     match oj_compiler::compile(&compile_path, &source, &oj_compiler::CompileOptions::prod()) {
         Ok(out) => js(out.code),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),

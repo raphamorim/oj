@@ -5,6 +5,7 @@ pub mod bundle;
 pub mod cjs;
 pub mod glob;
 pub mod interop;
+pub mod ssr;
 pub mod json;
 pub mod pkgbundle;
 
