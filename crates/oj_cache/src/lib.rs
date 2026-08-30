@@ -17,10 +17,30 @@ pub const CACHE_FORMAT: u32 = 5;
 
 pub const CACHE_ROOT_VERSION: u32 = 1;
 
+/// Where everything oj caches for an app goes.
+///
+/// `<app>/.oj-cache` by default, and `OJ_CACHE_DIR` when the caller has
+/// somewhere else for it. A build system serving a source tree it does not own
+/// -- read-only, shared between concurrent builds, or checked for cleanliness
+/// afterwards -- needs the writes to land outside it, and `OJ_SSR_BRIDGE_DIR`
+/// already works this way for the SSR bridge.
+///
+/// The version segment is appended either way: it is what makes an older
+/// layout inert rather than misread, and a caller pointing at one directory for
+/// several apps still gets that.
 pub fn cache_root(app_root: &Path) -> PathBuf {
-    app_root
-        .join(".oj-cache")
-        .join(format!("v{CACHE_ROOT_VERSION}"))
+    cache_base(app_root).join(format!("v{CACHE_ROOT_VERSION}"))
+}
+
+/// The directory `cache_root` versions inside. Callers that manage the cache
+/// area itself -- creating it, marking it ignored, healing an older layout --
+/// want this rather than the versioned path, and they have to agree with
+/// `cache_root` about where it is.
+pub fn cache_base(app_root: &Path) -> PathBuf {
+    match std::env::var_os("OJ_CACHE_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => app_root.join(".oj-cache"),
+    }
 }
 
 const LEGACY_TOP_LEVEL: &[&str] = &[
@@ -47,7 +67,7 @@ const LEGACY_TOP_LEVEL: &[&str] = &[
 ];
 
 pub fn heal_legacy_layout(app_root: &Path) {
-    let root = app_root.join(".oj-cache");
+    let root = cache_base(app_root);
     for name in LEGACY_TOP_LEVEL {
         let path = root.join(name);
         if path.is_dir() {
@@ -325,5 +345,43 @@ mod tests {
         assert!(cache.join(".gitignore").exists());
         assert!(cache_root(&app).join("start").exists());
         assert!(cache.join("user-stuff").exists(), "unknown dirs are left alone");
+    }
+
+    #[test]
+    fn cache_root_is_relocatable_and_stays_versioned() {
+        let app = Path::new("/srv/app");
+        let versioned = format!("v{CACHE_ROOT_VERSION}");
+
+        temp_env_var("OJ_CACHE_DIR", None, || {
+            assert_eq!(cache_root(app), app.join(".oj-cache").join(&versioned));
+        });
+        temp_env_var("OJ_CACHE_DIR", Some("/out/oj"), || {
+            assert_eq!(cache_root(app), Path::new("/out/oj").join(&versioned));
+        });
+        // An empty value is not a directory; it must not put the cache at "/v1".
+        temp_env_var("OJ_CACHE_DIR", Some(""), || {
+            assert_eq!(cache_root(app), app.join(".oj-cache").join(&versioned));
+        });
+        // Whoever creates and marks the cache area has to land in the same
+        // place, or a relocated cache still leaves a directory in the app.
+        temp_env_var("OJ_CACHE_DIR", Some("/out/oj"), || {
+            assert_eq!(cache_base(app), Path::new("/out/oj"));
+            assert!(cache_root(app).starts_with(cache_base(app)));
+        });
+    }
+
+    // The env is process-wide; this keeps the case above from leaking into any
+    // other test that reads it.
+    fn temp_env_var(key: &str, value: Option<&str>, f: impl FnOnce()) {
+        let previous = std::env::var_os(key);
+        match value {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        f();
+        match previous {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
     }
 }
