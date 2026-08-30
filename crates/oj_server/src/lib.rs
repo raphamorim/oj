@@ -115,6 +115,10 @@ const START_ASSETS: &[(&str, &str)] = &[
         "glob-transform.mjs",
         include_str!("assets/start/glob-transform.mjs"),
     ),
+    (
+        "ssr-fetch-module.mjs",
+        include_str!("assets/start/ssr-fetch-module.mjs"),
+    ),
     ("cf-server.mjs", include_str!("assets/start/cf-server.mjs")),
     ("css-host.mjs", include_str!("assets/start/css-host.mjs")),
     ("loader.mjs", include_str!("assets/start/loader.mjs")),
