@@ -42,6 +42,12 @@ process.on("unhandledRejection", (e) => {
 // of aborting the load, keeping the editor middleware (dev-server bridge) alive.
 const ojStartMode = initial.ojStartMode === true;
 
+// Experimental: run Cloudflare (@cloudflare/vite-plugin) SSR in workerd via the
+// plugin's dev integration. Off by default; when off, plugin-host behaves as if
+// none of the workerd shims exist (the plugin's configureServer skips as before,
+// no Miniflare boots). See issue #122.
+const cfWorkerd = ojStartMode && process.env.OJ_CF_WORKERD === "1";
+
 const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
 const OJ = _ojTTY ? "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m" : "oj";
 
@@ -216,7 +222,7 @@ function withResolvedDefaults(config) {
         reportCompressedSize: true,
         chunkSizeWarningLimit: 500,
       },
-      server: { headers: {} },
+      server: cfWorkerd ? { headers: {} } : {},
       define: {},
       resolve: {},
       optimizeDeps: {},
@@ -569,13 +575,32 @@ let middlewarePort = null;
 async function setupConfigureServer() {
   const stack = [];
   const middlewares = {
-    stack,
     use(a, b) {
       if (typeof a === "function") stack.push({ path: null, fn: a });
       else stack.push({ path: a, fn: b });
     },
   };
   const noop = () => {};
+  let cfHandleInvoke = null;
+  if (cfWorkerd) {
+    const ojBase = `http://127.0.0.1:${resolvedConfig.server?.port ?? 5199}`;
+    const { createInvokeHandler } = await import("./start/ssr-fetch-module.mjs");
+    cfHandleInvoke = createInvokeHandler({
+      resolveId: async (url, importer) => {
+        const q = new URLSearchParams({ spec: url, importer: importer || "", noExternal: "1" });
+        const rr = await fetch(`${ojBase}/@ssr-resolve?${q}`);
+        if (!rr.ok) return null;
+        const j = await rr.json();
+        return j.external ? { id: j.spec || url, external: true, type: "module" } : { id: j.id, file: j.id };
+      },
+      load: async (id) => {
+        const mr = await fetch(`${ojBase}/@ssr-module?${new URLSearchParams({ id, runner: "1" })}`);
+        if (!mr.ok) throw new Error(`fetchModule ${id}: ${mr.status}`);
+        return await mr.text();
+      },
+      transform: (code) => code,
+    });
+  }
   const makeHot = () => ({
     on(e, cb) { wsApi.on(e, cb); },
     off(e, cb) { wsApi.off(e, cb); },
@@ -583,18 +608,17 @@ async function setupConfigureServer() {
     listen: noop,
     close: noop,
     setInvokeHandler: noop,
-    async handleInvoke() {
-      return { error: { name: "Error", message: "oj: handleInvoke not yet wired" } };
-    },
+    handleInvoke: cfHandleInvoke ?? (async () => ({ error: { name: "Error", message: "oj: cf workerd disabled" } })),
   });
   const environments = {};
-  for (const name of Object.keys(resolvedConfig.environments ?? {})) {
+  for (const name of cfWorkerd ? Object.keys(resolvedConfig.environments ?? {}) : []) {
     environments[name] = {
       name,
       config: resolvedConfig,
       mode: "dev",
       bundledDev: false,
       hot: makeHot(),
+      pluginContainer: { buildStart: async () => {}, buildEnd: async () => {}, close: async () => {} },
       depsOptimizer: { init: noop, async registerMissingImport() {} },
       initRunner() { return { import: async () => ({}) }; },
       async fetchWorkerExportTypes() { return {}; },
@@ -602,20 +626,24 @@ async function setupConfigureServer() {
   }
   const server = {
     config: resolvedConfig,
-    environments,
     middlewares,
-    httpServer: { on: noop, once: noop, address: () => null },
+    httpServer: null,
     ws: wsApi,
     hot: wsApi,
     watcher: { on: noop, off: noop, add: noop, unwatch: noop, close: noop, emit: () => true, removeAllListeners: noop },
     moduleGraph: { getModuleById: () => null, getModulesByFile: () => null, invalidateModule: noop, onFileChange: noop },
     restart: async () => {},
-    close: async () => {},
     transformRequest: async () => null,
     ssrLoadModule: async () => {
       throw new Error("oj: server.ssrLoadModule is not available in configureServer");
     },
   };
+  if (cfWorkerd) {
+    server.environments = environments;
+    server.httpServer = { on: noop, once: noop, address: () => null };
+    server.close = async () => {};
+    middlewares.stack = stack;
+  }
   const post = [];
   for (const p of plugins) {
     if (typeof p.configureServer !== "function") continue;

@@ -792,11 +792,12 @@ async fn ssr_resolve(
     let (Some(importer), Some(spec)) = (q.get("importer"), q.get("spec")) else {
         return (StatusCode::BAD_REQUEST, "importer and spec required").into_response();
     };
+    let no_external = q.get("noExternal").map(|v| v == "1").unwrap_or(false);
     let importer_dir = Path::new(importer).parent().unwrap_or(&state.root);
     match state.ssr_resolver.resolve(importer_dir, spec) {
         Ok(p) => {
             let s = p.to_string_lossy();
-            let body = if s.contains("/node_modules/") {
+            let body = if !no_external && s.contains("/node_modules/") {
                 serde_json::json!({ "external": true, "spec": spec })
             } else {
                 serde_json::json!({ "id": s })
