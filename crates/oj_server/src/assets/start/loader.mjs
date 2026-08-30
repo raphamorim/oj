@@ -670,12 +670,15 @@ function resolveSpec(clean, context, next) {
       if (hit) return { abs: hit, via: "local" };
     }
   } else {
-    if (ALIASES[clean]) {
-      const hit = probe(ALIASES[clean]);
-      if (hit) return { abs: hit, via: "local" };
-    }
+    // The app's own package.json "imports" first: ALIASES is a set of
+    // conventions for the framework seam (the router entry, the manifest), and a
+    // declaration must win over a convention.
     if (clean.startsWith("#")) {
       const hit = resolveImports(clean);
+      if (hit) return { abs: hit, via: "local" };
+    }
+    if (ALIASES[clean]) {
+      const hit = probe(ALIASES[clean]);
       if (hit) return { abs: hit, via: "local" };
     }
     if (clean.startsWith("/")) {

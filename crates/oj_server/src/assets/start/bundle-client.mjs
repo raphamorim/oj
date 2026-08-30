@@ -39,7 +39,24 @@ function rewriteServerFns(code, id) {
   return `import { createClientRpc } from "@tanstack/react-start/client-rpc";\n${out}`;
 }
 
+// The app's package.json "imports" wins over the src/router convention, the
+// way it does in the SSR loader: the framework makes this path configurable
+// (`router.entry`), and an app that moved it has to be able to say so.
+function declaredRouterEntry() {
+  try {
+    const target = JSON.parse(readFileSync(resolve(APP, "package.json"), "utf8"))
+      .imports?.["#tanstack-router-entry"];
+    if (typeof target !== "string") return null;
+    const p = resolve(APP, target);
+    return existsSync(p) ? p : null;
+  } catch {
+    return null;
+  }
+}
+
 function routerEntry() {
+  const declared = declaredRouterEntry();
+  if (declared) return declared;
   for (const ext of [".tsx", ".ts", ".jsx", ".js"]) {
     const p = resolve(APP, "src/router" + ext);
     if (existsSync(p)) return p;
