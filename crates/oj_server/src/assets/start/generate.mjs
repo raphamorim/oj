@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MIT
 
+import { readFileSync } from "node:fs";
+import { join as pathJoin } from "node:path";
+
 import { importPkg } from "./resolve-pkg.mjs";
 
 const root = process.env.OJ_APP_ROOT ?? process.cwd();
@@ -34,13 +37,30 @@ const { Generator, getConfig } = await importPkg(root, "@tanstack/router-generat
   "@tanstack/react-start",
 ]);
 
+// getConfig merges as { ...tsr.config.json, ...inline }, so anything passed
+// inline cannot be configured by the app. Only `target` is genuinely ours to
+// decide; the rest are the generator's own documented settings, and an app that
+// keeps its route tree somewhere other than src/routeTree.gen.ts has to be able
+// to say so. Pass them as defaults under the file rather than overrides above it.
+const OJ_DEFAULTS = {
+  routesDirectory: "./src/routes",
+  generatedRouteTree: "./src/routeTree.gen.ts",
+  autoCodeSplitting: false,
+  routeFileIgnorePattern: "\\.(test|spec|stories|bench)\\.|\\.d\\.ts$",
+};
+const configured = (() => {
+  try {
+    return JSON.parse(readFileSync(pathJoin(root, "tsr.config.json"), "utf8"));
+  } catch {
+    return {};
+  }
+})();
 const config = getConfig(
   {
+    ...Object.fromEntries(
+      Object.entries(OJ_DEFAULTS).filter(([k]) => !(k in configured)),
+    ),
     target: "react",
-    routesDirectory: "./src/routes",
-    generatedRouteTree: "./src/routeTree.gen.ts",
-    autoCodeSplitting: false,
-    routeFileIgnorePattern: "\\.(test|spec|stories|bench)\\.|\\.d\\.ts$",
   },
   root,
 );
