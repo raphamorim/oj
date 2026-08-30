@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-import { readFileSync } from "node:fs";
-import { join as pathJoin } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join as pathJoin, relative as pathRelative, resolve as pathResolve, sep } from "node:path";
 
 import { importPkg } from "./resolve-pkg.mjs";
 
@@ -55,12 +55,56 @@ const configured = (() => {
     return {};
   }
 })();
+
+// The tree the app configured (tsr.config.json) or oj's default; the footer's
+// import is written relative to wherever that file lives.
+const GENERATED_ROUTE_TREE = configured.generatedRouteTree ?? OJ_DEFAULTS.generatedRouteTree;
+
+// The framework's own Vite plugin appends a `declare module` block naming the
+// router entry; the app's Register interface, and so every typed route, is
+// keyed off it. Without the same block the tree written here is a different
+// file from the one the framework's tooling produces.
+function routerEntry() {
+  try {
+    const declared = JSON.parse(readFileSync(pathJoin(root, "package.json"), "utf8"))
+      .imports?.["#tanstack-router-entry"];
+    if (typeof declared === "string") {
+      const p = pathResolve(root, declared);
+      if (existsSync(p)) return p;
+    }
+  } catch {}
+  for (const ext of [".tsx", ".ts", ".jsx", ".js"]) {
+    const p = pathResolve(root, "src/router" + ext);
+    if (existsSync(p)) return p;
+  }
+  return pathResolve(root, "src/router.tsx");
+}
+
+function moduleDeclaration() {
+  let rel = pathRelative(dirname(pathResolve(root, GENERATED_ROUTE_TREE)), routerEntry());
+  if (!rel.startsWith(".")) rel = "./" + rel;
+  rel = rel.split(sep).join("/");
+  return [
+    `import type { getRouter } from '${rel}'`,
+    "import type { createStart } from '@tanstack/react-start'",
+    "declare module '@tanstack/react-start' {",
+    "  interface Register {",
+    "    ssr: true",
+    "    router: Awaited<ReturnType<typeof getRouter>>",
+    "  }",
+    "}",
+  ].join("\n");
+}
+
 const config = getConfig(
   {
     ...Object.fromEntries(
       Object.entries(OJ_DEFAULTS).filter(([k]) => !(k in configured)),
     ),
     target: "react",
+    // The declare-module footer the framework's plugin writes; an app that sets
+    // routeTreeFileFooter itself keeps its own.
+    ...("routeTreeFileFooter" in configured ? {} : { routeTreeFileFooter: [moduleDeclaration()] }),
   },
   root,
 );
