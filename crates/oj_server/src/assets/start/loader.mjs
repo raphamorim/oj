@@ -553,10 +553,10 @@ function resolveUncached(spec, context, next) {
     let abs = null;
     if (clean.startsWith(".") && context.parentURL) {
       abs = probe(pathResolve(dirname(fileURLToPath(context.parentURL)), clean));
-    } else if (ALIASES[clean]) {
-      abs = probe(ALIASES[clean]);
+    } else if (clean.startsWith("#")) {
+      abs = resolveImports(clean);
     }
-    if (!abs && clean.startsWith("#")) abs = resolveImports(clean);
+    if (!abs && ALIASES[clean]) abs = probe(ALIASES[clean]);
     if (!abs) {
       try { abs = fileURLToPath(stripQ(next(clean, context).url)); } catch {}
     }
@@ -577,12 +577,15 @@ function resolveUncached(spec, context, next) {
     }
     if (abs) return { url: pathToFileURL(abs).href + "?ojsvg=react", shortCircuit: true };
   }
-  if (ALIASES[spec]) {
-    const hit = probe(ALIASES[spec]);
-    if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true, _ojv: true };
-  }
+  // The app's own package.json "imports" first: ALIASES below is a set of
+  // conventions for the framework seam, and a convention must not overrule a
+  // declaration.
   if (spec.startsWith("#")) {
     const hit = resolveImports(spec);
+    if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true, _ojv: true };
+  }
+  if (ALIASES[spec]) {
+    const hit = probe(ALIASES[spec]);
     if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true, _ojv: true };
   }
   if (!spec.startsWith(".") && !spec.startsWith("/")) {
