@@ -162,11 +162,34 @@ fn spec_to_file(root: &Path, specifier: &str) -> Option<PathBuf> {
     resolve_file(&root.join(specifier.trim_start_matches('/')))
 }
 
-pub fn fallback_module(root: &Path, specifier: &str) -> Option<(String, String)> {
+pub fn fallback_module(
+    root: &Path,
+    resolver: &OjResolver,
+    specifier: &str,
+) -> Option<(String, String)> {
     let file = spec_to_file(root, specifier)?;
     let source = std::fs::read_to_string(&file).ok()?;
+    let name = specifier.trim_start_matches('/').to_string();
+    let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let is_cjs = match ext {
+        "cjs" => true,
+        "js" => !oj_compiler::cjs::has_module_syntax_pub(&file, &source),
+        _ => false,
+    };
+    if is_cjs {
+        let dir = file.parent()?.to_path_buf();
+        let url = file.to_string_lossy().into_owned();
+        let mut resolve = |spec: &str| -> Option<String> {
+            if crate::is_node_builtin(spec) {
+                return Some(format!("node:{}", spec.strip_prefix("node:").unwrap_or(spec)));
+            }
+            resolver.resolve(&dir, spec).ok().map(|p| p.to_string_lossy().into_owned())
+        };
+        let out = oj_compiler::cjs::wrap_cjs(&file, &url, &source, &mut resolve).ok()?;
+        return Some((name, out.code));
+    }
     let out = oj_compiler::compile(&file, &source, &oj_compiler::CompileOptions::prod()).ok()?;
-    Some((specifier.trim_start_matches('/').to_string(), out.code))
+    Some((name, out.code))
 }
 
 pub enum Fallback {
@@ -201,7 +224,7 @@ pub fn resolve_fallback(
     raw_specifier: &str,
     referrer: &str,
 ) -> Fallback {
-    if let Some((name, mut code)) = fallback_module(root, specifier) {
+    if let Some((name, mut code)) = fallback_module(root, resolver, specifier) {
         rewrite_hash_aliases(&mut code, aliases);
         return Fallback::Module { name, code };
     }
@@ -265,7 +288,7 @@ mod tests {
             "export const hi: string = \"x\";\n",
         )
         .unwrap();
-        let (name, code) = fallback_module(dir.path(), "/src/dep.ts").unwrap();
+        let (name, code) = fallback_module(dir.path(), &resolver(dir.path()), "/src/dep.ts").unwrap();
         assert_eq!(name, "src/dep.ts", "name must drop the leading slash");
         assert!(code.contains("export const hi"), "{code}");
         assert!(!code.contains(": string"), "TS type survived: {code}");
@@ -282,7 +305,7 @@ mod tests {
     #[test]
     fn fallback_module_404s_missing() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(fallback_module(dir.path(), "/nope.ts").is_none());
+        assert!(fallback_module(dir.path(), &resolver(dir.path()), "/nope.ts").is_none());
     }
 
     fn resolver(root: &Path) -> OjResolver {
@@ -349,6 +372,27 @@ mod tests {
             }
             _ => panic!("expected a redirect for the bare import"),
         }
+    }
+
+    #[test]
+    fn fallback_wraps_a_cjs_node_modules_module_as_esm() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("node_modules/cjsdep");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("package.json"), r#"{"name":"cjsdep","main":"index.js"}"#).unwrap();
+        std::fs::write(
+            pkg.join("index.js"),
+            "const os = require(\"os\");\nmodule.exports = function greet() { return \"cjs-ok\"; };\n",
+        )
+        .unwrap();
+        let r = resolver(dir.path());
+        let spec = pkg.join("index.js");
+        let (_, code) =
+            fallback_module(dir.path(), &r, &format!("/{}", spec.display())).unwrap();
+        assert!(code.contains("export default"), "no ESM default export: {code}");
+        assert!(code.contains("module.exports"), "cjs body not wrapped: {code}");
+        // a node builtin require() is mapped to a node: import for nodejs_compat
+        assert!(code.contains("\"node:os\""), "node builtin not mapped: {code}");
     }
 
     #[test]

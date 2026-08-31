@@ -2617,7 +2617,7 @@ fn is_importable_asset_ext(ext: &str) -> bool {
 // Node core modules. When one reaches the browser graph (usually via config-time
 // tooling a dep drags along), Vite serves a browser-externalized stub rather than
 // 404ing the whole module chain; oj does the same so the app still mounts.
-fn is_node_builtin(spec: &str) -> bool {
+pub(crate) fn is_node_builtin(spec: &str) -> bool {
     let name = spec.strip_prefix("node:").unwrap_or(spec);
     let base = name.split('/').next().unwrap_or(name);
     matches!(
