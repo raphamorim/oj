@@ -24,6 +24,18 @@ fn worker_conditions() -> Vec<String> {
 struct FallbackState {
     root: PathBuf,
     resolver: OjResolver,
+    aliases: Vec<(String, PathBuf)>,
+}
+
+pub fn start_aliases(app_root: &Path, assets_dir: &Path) -> Vec<(String, PathBuf)> {
+    vec![
+        ("#tanstack-router-entry".into(), app_root.join("src/router")),
+        ("#tanstack-start-entry".into(), assets_dir.join("start-entry.ts")),
+        ("#tanstack-start-plugin-adapters".into(), assets_dir.join("plugin-adapters.ts")),
+        ("#tanstack-start-server-fn-resolver".into(), assets_dir.join("server-fn-resolver.mjs")),
+        ("tanstack-start-manifest:v".into(), assets_dir.join("manifest-dev.ts")),
+        ("@cloudflare/vite-plugin/server".into(), assets_dir.join("cf-server.mjs")),
+    ]
 }
 
 pub struct WorkerdSpawn {
@@ -74,6 +86,7 @@ pub async fn spawn(
     root: &Path,
     workerd_bin: &Path,
     config_dir: &Path,
+    aliases: Vec<(String, PathBuf)>,
     opts: WorkerdSpawn,
 ) -> std::io::Result<WorkerdSession> {
     let fb = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -81,6 +94,7 @@ pub async fn spawn(
     let state = Arc::new(FallbackState {
         root: root.to_path_buf(),
         resolver: OjResolver::with_conditions(root, &worker_conditions()),
+        aliases,
     });
     tokio::spawn(async move {
         let app = Router::new().route("/", get(fallback_handler)).with_state(state);
@@ -123,7 +137,7 @@ async fn fallback_handler(
     };
     let raw = get("rawSpecifier").unwrap_or("");
     let referrer = get("referrer").unwrap_or("");
-    match resolve_fallback(&state.root, &state.resolver, specifier, raw, referrer) {
+    match resolve_fallback(&state.root, &state.resolver, &state.aliases, specifier, raw, referrer) {
         Fallback::Module { name, code } => {
             let body = serde_json::json!({ "name": name, "esModule": code }).to_string();
             ([(axum::http::header::CONTENT_TYPE, "application/json")], body).into_response()

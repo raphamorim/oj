@@ -48,6 +48,7 @@ async fn native_workerd_renders_a_typescript_route() {
         &root,
         &workerd,
         &root.join(".oj-cache"),
+        vec![],
         WorkerdSpawn {
             compat_date: "2024-11-01".into(),
             compat_flags: vec![],
@@ -74,5 +75,71 @@ async fn native_workerd_renders_a_typescript_route() {
     assert!(
         body.contains("rendered by real workerd [ts-stripped] +node_modules"),
         "workerd did not render the TS route (with its node_modules import) through the orchestration.\n--- body ---\n{body}",
+    );
+}
+
+#[tokio::test]
+async fn native_workerd_resolves_a_colon_scheme_alias() {
+    let app = tempfile::tempdir().unwrap();
+    let root = app.path().to_path_buf();
+
+    let Some(workerd) = find_workerd(&root) else {
+        eprintln!("SKIP workerd_native alias: workerd binary not found (set OJ_WORKERD_BIN)");
+        return;
+    };
+
+    let assets = root.join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(
+        assets.join("manifest-dev.ts"),
+        "export const manifest: string = \" +manifest-alias\";\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/entry.tsx"),
+        "import { manifest } from \"tanstack-start-manifest:v\";\n\
+         export default {\n\
+           fetch(): Response {\n\
+             return new Response(\"aliased\" + manifest);\n\
+           },\n\
+         };\n",
+    )
+    .unwrap();
+
+    let aliases =
+        vec![("tanstack-start-manifest:v".to_string(), assets.join("manifest-dev.ts"))];
+
+    let session = spawn(
+        &root,
+        &workerd,
+        &root.join(".oj-cache"),
+        aliases,
+        WorkerdSpawn {
+            compat_date: "2024-11-01".into(),
+            compat_flags: vec![],
+            entry_specifier: "/src/entry.tsx".into(),
+            vars: vec![],
+            service_bindings: vec![],
+        },
+    )
+    .await
+    .expect("spawn workerd session");
+
+    let mut body = String::new();
+    let client = reqwest::Client::new();
+    for _ in 0..60 {
+        if let Ok(resp) = client.get(session.worker_url()).send().await {
+            if resp.status().is_success() {
+                body = resp.text().await.unwrap_or_default();
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    assert!(
+        body.contains("aliased +manifest-alias"),
+        "workerd did not resolve the colon-scheme alias through the fallback.\n--- body ---\n{body}",
     );
 }

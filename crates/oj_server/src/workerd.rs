@@ -178,12 +178,23 @@ pub enum Fallback {
 pub fn resolve_fallback(
     root: &Path,
     resolver: &OjResolver,
+    aliases: &[(String, PathBuf)],
     specifier: &str,
     raw_specifier: &str,
     referrer: &str,
 ) -> Fallback {
     if let Some((name, code)) = fallback_module(root, specifier) {
         return Fallback::Module { name, code };
+    }
+    let key = if raw_specifier.is_empty() {
+        specifier.trim_start_matches('/')
+    } else {
+        raw_specifier
+    };
+    if let Some((_, target)) = aliases.iter().find(|(k, _)| k == key) {
+        if let Some(file) = resolve_file(target) {
+            return Fallback::Redirect { location: file.to_string_lossy().into_owned() };
+        }
     }
     if !raw_specifier.is_empty()
         && !raw_specifier.starts_with('.')
@@ -265,12 +276,36 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/dep.ts"), "export const x = 1;\n").unwrap();
         let r = resolver(dir.path());
-        match resolve_fallback(dir.path(), &r, "/src/dep.ts", "./dep.ts", "/src/entry.tsx") {
+        match resolve_fallback(dir.path(), &r, &[], "/src/dep.ts", "./dep.ts", "/src/entry.tsx") {
             Fallback::Module { name, code } => {
                 assert_eq!(name, "src/dep.ts");
                 assert!(code.contains("export const x"), "{code}");
             }
             _ => panic!("expected a served module"),
+        }
+    }
+
+    #[test]
+    fn resolve_fallback_redirects_a_start_alias_to_its_target_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let assets = dir.path().join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(assets.join("manifest-dev.ts"), "export const m = 1;\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/router.tsx"), "export const router = 1;\n").unwrap();
+        let aliases = vec![
+            ("tanstack-start-manifest:v".to_string(), assets.join("manifest-dev.ts")),
+            ("#tanstack-router-entry".to_string(), dir.path().join("src/router")),
+        ];
+        let r = resolver(dir.path());
+        match resolve_fallback(dir.path(), &r, &aliases, "/tanstack-start-manifest:v", "tanstack-start-manifest:v", "/e") {
+            Fallback::Redirect { location } => assert!(location.ends_with("manifest-dev.ts"), "{location}"),
+            _ => panic!("expected an alias redirect"),
+        }
+        // an extensionless alias target resolves through the extension probe
+        match resolve_fallback(dir.path(), &r, &aliases, "/#tanstack-router-entry", "#tanstack-router-entry", "/e") {
+            Fallback::Redirect { location } => assert!(location.ends_with("src/router.tsx"), "{location}"),
+            _ => panic!("expected the router alias to resolve to router.tsx"),
         }
     }
 
@@ -283,13 +318,13 @@ mod tests {
         std::fs::write(pkg.join("index.js"), "export const foo = 1;\n").unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         let r = resolver(dir.path());
-        match resolve_fallback(dir.path(), &r, "/foo", "foo", "/src/entry.tsx") {
+        match resolve_fallback(dir.path(), &r, &[], "/foo", "foo", "/src/entry.tsx") {
             Fallback::Redirect { location } => {
                 assert!(location.ends_with("node_modules/foo/index.js"), "{location}");
                 assert!(PathBuf::from(&location).is_absolute(), "{location}");
                 // the redirect target then maps to a real file
                 assert!(matches!(
-                    resolve_fallback(dir.path(), &r, &location, "foo", "/src/entry.tsx"),
+                    resolve_fallback(dir.path(), &r, &[], &location, "foo", "/src/entry.tsx"),
                     Fallback::Module { .. }
                 ));
             }
@@ -302,7 +337,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let r = resolver(dir.path());
         assert!(matches!(
-            resolve_fallback(dir.path(), &r, "/ghost", "ghost", "/src/entry.tsx"),
+            resolve_fallback(dir.path(), &r, &[], "/ghost", "ghost", "/src/entry.tsx"),
             Fallback::NotFound
         ));
     }
