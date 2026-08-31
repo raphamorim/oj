@@ -3,7 +3,7 @@
 
 import http from "node:http";
 import { resolve as pathResolve } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 import { loadPluginContainer } from "./vite-plugin-bridge.mjs";
 
@@ -37,6 +37,21 @@ try {
 const server = http.createServer(async (req, res) => {
   try {
     const u = new URL(req.url, "http://loader");
+    if (u.pathname === "/transform") {
+      const file = u.searchParams.get("file") ?? "";
+      let raw;
+      try {
+        raw = readFileSync(file, "utf8");
+      } catch {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+      const out = (await container.transformUserCode(raw, file)) ?? raw;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ code: out }));
+      return;
+    }
     const specifier =
       u.searchParams.get("rawSpecifier") || u.searchParams.get("specifier") || "";
     const referrer = u.searchParams.get("referrer") ?? "";

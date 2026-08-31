@@ -151,6 +151,7 @@ async fn fallback_handler(
         let kind = match &outcome {
             Fallback::Module { .. } => "module".to_string(),
             Fallback::Redirect { location } => format!("redirect->{location}"),
+            Fallback::TransformFile { .. } => "transform".to_string(),
             Fallback::NotFound => "404".to_string(),
         };
         eprintln!("wd-fb spec={specifier} raw={raw} ref={referrer} => {kind}");
@@ -162,6 +163,26 @@ async fn fallback_handler(
             [(axum::http::header::LOCATION, location)],
         )
             .into_response(),
+        Fallback::TransformFile { file, name } => {
+            let transformed = match &state.plugin_loader {
+                Some(loader) => proxy_transform(&state.http, loader, &file).await,
+                None => None,
+            };
+            let source = match transformed {
+                Some(s) => s,
+                None => std::fs::read_to_string(&file).unwrap_or_default(),
+            };
+            match crate::workerd::compile_transformed(
+                &file,
+                &name,
+                &source,
+                &state.resolver,
+                &state.aliases,
+            ) {
+                Some((n, code)) => module_response(&n, &code),
+                None => axum::http::StatusCode::NOT_FOUND.into_response(),
+            }
+        }
         Fallback::NotFound => {
             if let Some(loader) = &state.plugin_loader {
                 if let Some(code) = proxy_plugin_loader(&state.http, loader, specifier, raw, referrer).await {
@@ -187,6 +208,21 @@ fn compile_proxied(root: &Path, code: &str) -> String {
 fn module_response(name: &str, code: &str) -> Response {
     let body = serde_json::json!({ "name": name, "esModule": code }).to_string();
     ([(axum::http::header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+async fn proxy_transform(http: &reqwest::Client, loader: &str, file: &Path) -> Option<String> {
+    let url = reqwest::Url::parse_with_params(
+        &format!("{loader}transform"),
+        &[("file", file.to_string_lossy().as_ref())],
+    )
+    .ok()?;
+    let resp = http.get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let text = resp.text().await.ok()?;
+    let body: serde_json::Value = serde_json::from_str(&text).ok()?;
+    body.get("code").and_then(|c| c.as_str()).map(str::to_string)
 }
 
 async fn proxy_plugin_loader(

@@ -294,7 +294,76 @@ fn serve_resolved(
 pub enum Fallback {
     Module { name: String, code: String },
     Redirect { location: String },
+    TransformFile { file: PathBuf, name: String },
     NotFound,
+}
+
+fn needs_plugin_transform(file: &Path) -> bool {
+    let p = file.to_string_lossy();
+    if p.contains("/node_modules/") {
+        return false;
+    }
+    if !matches!(
+        file.extension().and_then(|e| e.to_str()),
+        Some("ts" | "tsx" | "js" | "jsx" | "mjs")
+    ) {
+        return false;
+    }
+    if p.contains("/routes/") {
+        return true;
+    }
+    std::fs::read_to_string(file)
+        .map(|s| {
+            s.contains("createServerFn")
+                || s.contains("createMiddleware")
+                || s.contains("createServerFileRoute")
+                || s.contains("createServerRoute")
+                || s.contains("createIsomorphicFn")
+        })
+        .unwrap_or(false)
+}
+
+fn serve_file(
+    file: &Path,
+    specifier: &str,
+    resolver: &OjResolver,
+    aliases: &[(String, PathBuf)],
+) -> Fallback {
+    if needs_plugin_transform(file) {
+        return Fallback::TransformFile {
+            file: file.to_path_buf(),
+            name: specifier.trim_start_matches('/').to_string(),
+        };
+    }
+    match serve_resolved(file, specifier, resolver, aliases) {
+        Some((name, mut code)) => {
+            rewrite_hash_aliases(&mut code, aliases);
+            Fallback::Module { name, code }
+        }
+        None => Fallback::NotFound,
+    }
+}
+
+pub fn compile_transformed(
+    file: &Path,
+    name: &str,
+    source: &str,
+    resolver: &OjResolver,
+    aliases: &[(String, PathBuf)],
+) -> Option<(String, String)> {
+    let dir = file.parent()?.to_path_buf();
+    let mut rewrite = |spec: &str| -> Option<String> {
+        if crate::is_node_builtin(spec) {
+            return Some(format!("node:{}", spec.strip_prefix("node:").unwrap_or(spec)));
+        }
+        resolve_import(&dir, spec, resolver, aliases).map(|p| p.to_string_lossy().into_owned())
+    };
+    let mut opts = oj_compiler::CompileOptions::prod();
+    opts.ssr = true;
+    let out = oj_compiler::compile_module(file, source, &opts, Some(&mut rewrite)).ok()?;
+    let mut code = out.code;
+    rewrite_hash_aliases(&mut code, aliases);
+    Some((name.to_string(), code))
 }
 
 fn rewrite_hash_aliases(code: &mut String, aliases: &[(String, PathBuf)]) {
@@ -382,10 +451,7 @@ pub fn resolve_fallback(
         if resolved_index && !spec_index {
             return Fallback::Redirect { location: file.to_string_lossy().into_owned() };
         }
-        if let Some((name, mut code)) = serve_resolved(&file, specifier, resolver, aliases) {
-            rewrite_hash_aliases(&mut code, aliases);
-            return Fallback::Module { name, code };
-        }
+        return serve_file(&file, specifier, resolver, aliases);
     }
     Fallback::NotFound
 }
@@ -398,11 +464,7 @@ fn serve_or_redirect(
 ) -> Fallback {
     let canonical = file.to_string_lossy();
     if specifier.trim_start_matches('/') == canonical.trim_start_matches('/') {
-        if let Some((name, mut code)) = serve_resolved(file, specifier, resolver, aliases) {
-            rewrite_hash_aliases(&mut code, aliases);
-            return Fallback::Module { name, code };
-        }
-        return Fallback::NotFound;
+        return serve_file(file, specifier, resolver, aliases);
     }
     Fallback::Redirect { location: canonical.into_owned() }
 }
@@ -620,6 +682,38 @@ mod tests {
         assert!(matches!(
             resolve_fallback(dir.path(), &r, &[], "/ghost", "ghost", "/src/entry.tsx"),
             Fallback::NotFound
+        ));
+    }
+
+    #[test]
+    fn server_fn_and_route_files_route_to_the_plugin_transform() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/routes")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src/lib")).unwrap();
+        // a server-fn file (by content) and a route file (by path) both transform
+        std::fs::write(
+            dir.path().join("src/lib/x.functions.ts"),
+            "export const f = createServerFn().handler(async () => 1);\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/routes/index.tsx"), "export const x = 1;\n").unwrap();
+        // a plain module (no markers, not a route) is served directly
+        std::fs::write(dir.path().join("src/lib/plain.ts"), "export const y = 2;\n").unwrap();
+        let r = resolver(dir.path());
+        let sf = format!("/{}", dir.path().join("src/lib/x.functions.ts").display());
+        assert!(matches!(
+            resolve_fallback(dir.path(), &r, &[], &sf, &sf, "/e"),
+            Fallback::TransformFile { .. }
+        ));
+        let route = format!("/{}", dir.path().join("src/routes/index.tsx").display());
+        assert!(matches!(
+            resolve_fallback(dir.path(), &r, &[], &route, &route, "/e"),
+            Fallback::TransformFile { .. }
+        ));
+        let plain = format!("/{}", dir.path().join("src/lib/plain.ts").display());
+        assert!(matches!(
+            resolve_fallback(dir.path(), &r, &[], &plain, &plain, "/e"),
+            Fallback::Module { .. }
         ));
     }
 
