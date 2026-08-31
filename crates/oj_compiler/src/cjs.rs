@@ -29,6 +29,7 @@ pub fn compile_dep(
             dev: true,
             refresh: false,
             sourcemap: false,
+            ssr: false,
         };
         crate::compile_module(path, source_text, &opts, Some(resolve))
     } else {

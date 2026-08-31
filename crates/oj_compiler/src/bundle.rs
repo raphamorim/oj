@@ -215,7 +215,7 @@ fn compile_esm_factory_from_parsed<'a>(
             .build(&program)
             .semantic
             .into_scoping();
-        let defines = crate::import_meta_env_defines(true);
+        let defines = crate::import_meta_env_defines(true, false);
         if let Ok(config) = ReplaceGlobalDefinesConfig::new(&defines) {
             let _ = ReplaceGlobalDefines::new(allocator, config).build(scoping, &mut program);
         }
