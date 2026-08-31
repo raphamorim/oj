@@ -175,6 +175,24 @@ pub enum Fallback {
     NotFound,
 }
 
+fn rewrite_hash_aliases(code: &mut String, aliases: &[(String, PathBuf)]) {
+    for (key, target) in aliases {
+        if !key.starts_with('#') {
+            continue;
+        }
+        let Some(file) = resolve_file(target) else {
+            continue;
+        };
+        let abs = file.to_string_lossy();
+        for quote in ['"', '\''] {
+            let from = format!("{quote}{key}{quote}");
+            if code.contains(&from) {
+                *code = code.replace(&from, &format!("{quote}{abs}{quote}"));
+            }
+        }
+    }
+}
+
 pub fn resolve_fallback(
     root: &Path,
     resolver: &OjResolver,
@@ -183,7 +201,8 @@ pub fn resolve_fallback(
     raw_specifier: &str,
     referrer: &str,
 ) -> Fallback {
-    if let Some((name, code)) = fallback_module(root, specifier) {
+    if let Some((name, mut code)) = fallback_module(root, specifier) {
+        rewrite_hash_aliases(&mut code, aliases);
         return Fallback::Module { name, code };
     }
     let key = if raw_specifier.is_empty() {
@@ -329,6 +348,28 @@ mod tests {
                 ));
             }
             _ => panic!("expected a redirect for the bare import"),
+        }
+    }
+
+    #[test]
+    fn resolve_fallback_rewrites_a_hash_alias_import_to_an_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/router.tsx"), "export const router = 1;\n").unwrap();
+        std::fs::write(
+            dir.path().join("src/entry.tsx"),
+            "import { router } from \"#tanstack-router-entry\";\nexport default router;\n",
+        )
+        .unwrap();
+        let aliases =
+            vec![("#tanstack-router-entry".to_string(), dir.path().join("src/router"))];
+        let r = resolver(dir.path());
+        match resolve_fallback(dir.path(), &r, &aliases, "/src/entry.tsx", "./entry", "/e") {
+            Fallback::Module { code, .. } => {
+                assert!(!code.contains("#tanstack-router-entry"), "hash alias survived: {code}");
+                assert!(code.contains("src/router.tsx"), "not rewritten to target: {code}");
+            }
+            _ => panic!("expected the entry module served"),
         }
     }
 

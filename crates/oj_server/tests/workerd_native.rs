@@ -143,3 +143,69 @@ async fn native_workerd_resolves_a_colon_scheme_alias() {
         "workerd did not resolve the colon-scheme alias through the fallback.\n--- body ---\n{body}",
     );
 }
+
+#[tokio::test]
+async fn native_workerd_rewrites_a_hash_alias_import() {
+    let app = tempfile::tempdir().unwrap();
+    let root = app.path().to_path_buf();
+
+    let Some(workerd) = find_workerd(&root) else {
+        eprintln!("SKIP workerd_native hash-alias: workerd binary not found (set OJ_WORKERD_BIN)");
+        return;
+    };
+
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/router.tsx"),
+        "export const router: string = \" +from-router\";\n",
+    )
+    .unwrap();
+    // workerd never sends a "#" subpath import to the module fallback, so this
+    // route can only render if the fallback rewrote the specifier to a path.
+    std::fs::write(
+        root.join("src/entry.tsx"),
+        "import { router } from \"#tanstack-router-entry\";\n\
+         export default {\n\
+           fetch(): Response {\n\
+             return new Response(\"hash-alias\" + router);\n\
+           },\n\
+         };\n",
+    )
+    .unwrap();
+
+    let aliases =
+        vec![("#tanstack-router-entry".to_string(), root.join("src/router"))];
+
+    let session = spawn(
+        &root,
+        &workerd,
+        &root.join(".oj-cache"),
+        aliases,
+        WorkerdSpawn {
+            compat_date: "2024-11-01".into(),
+            compat_flags: vec![],
+            entry_specifier: "/src/entry.tsx".into(),
+            vars: vec![],
+            service_bindings: vec![],
+        },
+    )
+    .await
+    .expect("spawn workerd session");
+
+    let mut body = String::new();
+    let client = reqwest::Client::new();
+    for _ in 0..60 {
+        if let Ok(resp) = client.get(session.worker_url()).send().await {
+            if resp.status().is_success() {
+                body = resp.text().await.unwrap_or_default();
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    assert!(
+        body.contains("hash-alias +from-router"),
+        "workerd did not render a route whose entry uses a # subpath alias (rewrite failed).\n--- body ---\n{body}",
+    );
+}
