@@ -410,13 +410,22 @@ pub fn resolve_fallback(
             }
             return Fallback::NotFound;
         }
-        if let Some(p) = spec_to_file(root, path_part).or_else(|| spec_to_existing(root, path_part)) {
-            return Fallback::Module {
-                name,
-                code: format!("export default {};\n", js_str(&asset_url(&p))),
-            };
-        }
-        return Fallback::NotFound;
+        let url = match spec_to_file(root, path_part).or_else(|| spec_to_existing(root, path_part)) {
+            Some(p) => asset_url(&p),
+            None => {
+                let abs = PathBuf::from(path_part);
+                let abs = if abs.is_absolute() {
+                    abs
+                } else {
+                    root.join(path_part.trim_start_matches('/'))
+                };
+                format!("/@oj-start/fs{}", abs.to_string_lossy())
+            }
+        };
+        return Fallback::Module {
+            name,
+            code: format!("export default {};\n", js_str(&url)),
+        };
     }
 
     // A bare / `#` / alias import must resolve by its original specifier (its
