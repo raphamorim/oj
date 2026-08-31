@@ -2,10 +2,11 @@
 // Copyright (c) 2026 Raphael Amorim
 
 import http from "node:http";
-import { resolve as pathResolve } from "node:path";
+import { resolve as pathResolve, relative } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 
 import { loadPluginContainer } from "./vite-plugin-bridge.mjs";
+import { rewriteServerFns } from "./loader-util.mjs";
 
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
 const PORT = Number(process.argv[2] || process.env.OJ_LOADER_PORT || 0);
@@ -47,7 +48,8 @@ const server = http.createServer(async (req, res) => {
         res.end();
         return;
       }
-      const out = (await container.transformWorkerd(raw, file)) ?? raw;
+      let out = (await container.transformUserCode(raw, file)) ?? raw;
+      out = rewriteServerFns(out, relative(APP, file));
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ code: out }));
       return;

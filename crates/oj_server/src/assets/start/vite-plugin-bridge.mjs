@@ -194,21 +194,6 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
     return changed ? current : null;
   }
 
-  async function transformWorkerd(code, id) {
-    const ssr = environment === "ssr";
-    let current = code, changed = false;
-    for (const p of plugins) {
-      if ((p.name || "").startsWith("vite:") || !envAllows(p, environment)) continue;
-      const h = hookHandler(p.transform);
-      if (!h || !idAllowed(hookFilter(p.transform), id)) continue;
-      let r;
-      try { r = await h.call(ctx, current, id, { ssr }); } catch { continue; }
-      const next = r == null ? null : typeof r === "string" ? r : r.code;
-      if (next != null) { current = next; changed = true; }
-    }
-    return changed ? current : null;
-  }
-
   async function generateBundle(emit) {
     const genCtx = { ...ctx, emitFile: (f) => (emit(f), "oj-emit-ref") };
     for (const p of plugins) {
@@ -253,7 +238,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
     });
   }
 
-  return { resolveId, load, transform, transformUserCode, transformWorkerd, buildStart, generateBundle, pluginCount: plugins.length, watchFiles };
+  return { resolveId, load, transform, transformUserCode, buildStart, generateBundle, pluginCount: plugins.length, watchFiles };
 }
 
 export async function loadPluginContainer(app, opts = {}) {
