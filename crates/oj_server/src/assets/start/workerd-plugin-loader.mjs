@@ -47,7 +47,7 @@ const server = http.createServer(async (req, res) => {
         res.end();
         return;
       }
-      const out = (await container.transformUserCode(raw, file)) ?? raw;
+      const out = (await container.transformWorkerd(raw, file)) ?? raw;
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ code: out }));
       return;
