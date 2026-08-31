@@ -402,6 +402,21 @@ mod tests {
     }
 
     #[test]
+    fn css_modules_scoped_name_matches_ssr_loader() {
+        // The SSR loader (oj_server assets/start/loader.mjs cssModuleExports)
+        // recomputes these names in JS so server rendering agrees with the
+        // class map the client is served; ssr-loader-css-modules.test.mjs pins
+        // the same literals. If this assertion changes (lightningcss upgrade,
+        // pattern change), the loader must be updated to match.
+        let out = compile_css("/src/Counter.module.css", ".button { color: red; }", false).unwrap();
+        let exports = out.exports.expect("module exports");
+        assert_eq!(
+            exports,
+            vec![("button".to_string(), "Counter-module_button_EjW_Uq".to_string())]
+        );
+    }
+
+    #[test]
     fn sass_nesting_and_variables_compile() {
         let scss = "$pad: 1rem;\n.card { padding: $pad; .title { font-weight: bold; } }";
         let css = compile_sass(scss, None).unwrap();
