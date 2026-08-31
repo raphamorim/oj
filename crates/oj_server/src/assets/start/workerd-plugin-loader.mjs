@@ -41,12 +41,17 @@ const server = http.createServer(async (req, res) => {
     if (u.pathname === "/transform") {
       const file = u.searchParams.get("file") ?? "";
       let raw;
-      try {
-        raw = readFileSync(file, "utf8");
-      } catch {
-        res.writeHead(404);
-        res.end();
-        return;
+      const loaded = await container.load(file);
+      if (loaded != null) {
+        raw = typeof loaded === "string" ? loaded : loaded.code;
+      } else {
+        try {
+          raw = readFileSync(file, "utf8");
+        } catch {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
       }
       let out = (await container.transformUserCode(raw, file)) ?? raw;
       out = rewriteServerFns(out, relative(APP, file));

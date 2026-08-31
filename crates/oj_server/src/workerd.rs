@@ -300,27 +300,13 @@ pub enum Fallback {
 
 fn needs_plugin_transform(file: &Path) -> bool {
     let p = file.to_string_lossy();
-    if p.contains("/node_modules/") {
+    if p.contains("/node_modules/") || p.contains("/.oj-cache/") {
         return false;
     }
-    if !matches!(
+    matches!(
         file.extension().and_then(|e| e.to_str()),
         Some("ts" | "tsx" | "js" | "jsx" | "mjs")
-    ) {
-        return false;
-    }
-    if p.contains("/routes/") {
-        return true;
-    }
-    std::fs::read_to_string(file)
-        .map(|s| {
-            s.contains("createServerFn")
-                || s.contains("createMiddleware")
-                || s.contains("createServerFileRoute")
-                || s.contains("createServerRoute")
-                || s.contains("createIsomorphicFn")
-        })
-        .unwrap_or(false)
+    )
 }
 
 fn serve_file(
@@ -571,18 +557,34 @@ mod tests {
     }
 
     #[test]
-    fn resolve_fallback_serves_an_app_file() {
+    fn resolve_fallback_routes_an_app_file_to_the_plugin_transform() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/dep.ts"), "export const x = 1;\n").unwrap();
         let r = resolver(dir.path());
-        match resolve_fallback(dir.path(), &r, &[], "/src/dep.ts", "./dep.ts", "/src/entry.tsx") {
-            Fallback::Module { name, code } => {
-                assert_eq!(name, "src/dep.ts");
-                assert!(code.contains("export const x"), "{code}");
-            }
-            _ => panic!("expected a served module"),
-        }
+        // user source files go through the plugin transform pipeline (container
+        // load-override + transformUserCode + rewriteServerFns), like loader.mjs
+        assert!(matches!(
+            resolve_fallback(dir.path(), &r, &[], "/src/dep.ts", "./dep.ts", "/src/entry.tsx"),
+            Fallback::TransformFile { .. }
+        ));
+    }
+
+    #[test]
+    fn compile_transformed_strips_types_and_rewrites_hash_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/router.tsx"), "export const router = 1;\n").unwrap();
+        let aliases =
+            vec![("#tanstack-router-entry".to_string(), dir.path().join("src/router"))];
+        let r = resolver(dir.path());
+        let file = dir.path().join("src/entry.tsx");
+        let src = "import { router } from \"#tanstack-router-entry\";\nexport const hi: string = \"x\";\nexport default router;\n";
+        let (name, code) = compile_transformed(&file, "src/entry.tsx", src, &r, &aliases).unwrap();
+        assert_eq!(name, "src/entry.tsx");
+        assert!(!code.contains("#tanstack-router-entry"), "hash alias survived: {code}");
+        assert!(code.contains("src/router.tsx"), "not rewritten: {code}");
+        assert!(!code.contains(": string"), "TS type survived: {code}");
     }
 
     #[test]
@@ -654,28 +656,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_fallback_rewrites_a_hash_alias_import_to_an_absolute_path() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/router.tsx"), "export const router = 1;\n").unwrap();
-        std::fs::write(
-            dir.path().join("src/entry.tsx"),
-            "import { router } from \"#tanstack-router-entry\";\nexport default router;\n",
-        )
-        .unwrap();
-        let aliases =
-            vec![("#tanstack-router-entry".to_string(), dir.path().join("src/router"))];
-        let r = resolver(dir.path());
-        match resolve_fallback(dir.path(), &r, &aliases, "/src/entry.tsx", "./entry", "/e") {
-            Fallback::Module { code, .. } => {
-                assert!(!code.contains("#tanstack-router-entry"), "hash alias survived: {code}");
-                assert!(code.contains("src/router.tsx"), "not rewritten to target: {code}");
-            }
-            _ => panic!("expected the entry module served"),
-        }
-    }
-
-    #[test]
     fn resolve_fallback_404s_an_unresolvable_bare_import() {
         let dir = tempfile::tempdir().unwrap();
         let r = resolver(dir.path());
@@ -686,33 +666,24 @@ mod tests {
     }
 
     #[test]
-    fn server_fn_and_route_files_route_to_the_plugin_transform() {
+    fn user_files_transform_but_node_modules_and_cache_are_served_directly() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("src/routes")).unwrap();
         std::fs::create_dir_all(dir.path().join("src/lib")).unwrap();
-        // a server-fn file (by content) and a route file (by path) both transform
-        std::fs::write(
-            dir.path().join("src/lib/x.functions.ts"),
-            "export const f = createServerFn().handler(async () => 1);\n",
-        )
-        .unwrap();
-        std::fs::write(dir.path().join("src/routes/index.tsx"), "export const x = 1;\n").unwrap();
-        // a plain module (no markers, not a route) is served directly
         std::fs::write(dir.path().join("src/lib/plain.ts"), "export const y = 2;\n").unwrap();
+        let pkg = dir.path().join("node_modules/dep");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("index.js"), "export const z = 3;\n").unwrap();
         let r = resolver(dir.path());
-        let sf = format!("/{}", dir.path().join("src/lib/x.functions.ts").display());
-        assert!(matches!(
-            resolve_fallback(dir.path(), &r, &[], &sf, &sf, "/e"),
-            Fallback::TransformFile { .. }
-        ));
-        let route = format!("/{}", dir.path().join("src/routes/index.tsx").display());
-        assert!(matches!(
-            resolve_fallback(dir.path(), &r, &[], &route, &route, "/e"),
-            Fallback::TransformFile { .. }
-        ));
+        // any user source file goes through the plugin transform pipeline
         let plain = format!("/{}", dir.path().join("src/lib/plain.ts").display());
         assert!(matches!(
             resolve_fallback(dir.path(), &r, &[], &plain, &plain, "/e"),
+            Fallback::TransformFile { .. }
+        ));
+        // a node_modules file is served directly by Rust (no plugin transform)
+        let np = format!("/{}", pkg.join("index.js").display());
+        assert!(matches!(
+            resolve_fallback(dir.path(), &r, &[], &np, &np, "/e"),
             Fallback::Module { .. }
         ));
     }
@@ -720,10 +691,12 @@ mod tests {
     #[test]
     fn manifest_dev_is_served_with_css_inlined_and_no_node_apis() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("manifest-dev.ts"), "import { readFileSync } from \"node:fs\";\n").unwrap();
-        std::fs::write(dir.path().join("css-urls.json"), "[\"/a.css\",\"/b.css\"]").unwrap();
+        let cache = dir.path().join(".oj-cache/v1/start");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("manifest-dev.ts"), "import { readFileSync } from \"node:fs\";\n").unwrap();
+        std::fs::write(cache.join("css-urls.json"), "[\"/a.css\",\"/b.css\"]").unwrap();
         let r = resolver(dir.path());
-        let spec = format!("/{}", dir.path().join("manifest-dev.ts").display());
+        let spec = format!("/{}", cache.join("manifest-dev.ts").display());
         match resolve_fallback(dir.path(), &r, &[], &spec, &spec, "/e") {
             Fallback::Module { code, .. } => {
                 assert!(code.contains("tsrStartManifest"), "{code}");
@@ -772,11 +745,12 @@ mod tests {
             Fallback::Redirect { location } => assert!(location.ends_with("tooltip/index.tsx"), "{location}"),
             _ => panic!("expected a directory-index redirect"),
         }
-        // the redirected index path itself serves inline (no loop)
+        // the redirected index path itself resolves (no loop) — as a user source
+        // file it goes through the transform pipeline
         let idx = format!("/{}", comp.join("index.tsx").display());
         assert!(matches!(
             resolve_fallback(dir.path(), &r, &[], &idx, "./tooltip", "/src/entry.tsx"),
-            Fallback::Module { .. }
+            Fallback::TransformFile { .. }
         ));
     }
 
