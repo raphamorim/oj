@@ -434,6 +434,8 @@ const stripQ = (u) => u.split("?")[0];
 const withV = (u) => (V ? `${stripQ(u)}?ojv=${V}` : stripQ(u));
 const isTanstack = (u) => /\/@tanstack\//.test(u) && /\.(js|mjs)$/.test(stripQ(u));
 const ASSET_SUFFIX = /\?(raw|url|inline)$/;
+// Kept in sync with is_style_ext on the Rust side.
+const STYLE_EXT = /\.(css|scss|sass|less|styl|stylus)$/;
 // Kept in sync with is_importable_asset_ext on the Rust side (the client
 // graph's classifier), plus wasm which only the SSR loader URL-exports; svg is
 // excluded here too, it routes through the svgr path.
@@ -451,6 +453,83 @@ const MIME = {
   wasm: "application/wasm", css: "text/css", json: "application/json", txt: "text/plain",
 };
 const mimeOf = (p) => MIME[p.slice(p.lastIndexOf(".") + 1).toLowerCase()] ?? "application/octet-stream";
+
+// CSS modules: the client serves the real class-name map (css_exports from
+// oj_css::compile_css_rebased, lightningcss pattern "[name]_[local]_[hash]"),
+// so SSR must produce identical names. [hash] is Rust's DefaultHasher
+// (SipHash-1-3, zero keys) over the root-relative URL, truncated to u32,
+// encoded with lightningcss's base64 alphabet. Pinned on both sides:
+// oj_css css_modules_scoped_name_matches_ssr_loader and
+// e2e/unit/ssr-loader-css-modules.test.mjs assert the same literal names; a
+// lightningcss upgrade that changes naming must update this to match.
+const SIP_MASK = 0xffffffffffffffffn;
+const sipRotl = (x, b) => ((x << BigInt(b)) | (x >> BigInt(64 - b))) & SIP_MASK;
+function sipHash13(bytes) {
+  let v0 = 0x736f6d6570736575n, v1 = 0x646f72616e646f6dn;
+  let v2 = 0x6c7967656e657261n, v3 = 0x7465646279746573n;
+  const round = () => {
+    v0 = (v0 + v1) & SIP_MASK; v1 = sipRotl(v1, 13); v1 ^= v0; v0 = sipRotl(v0, 32);
+    v2 = (v2 + v3) & SIP_MASK; v3 = sipRotl(v3, 16); v3 ^= v2;
+    v0 = (v0 + v3) & SIP_MASK; v3 = sipRotl(v3, 21); v3 ^= v0;
+    v2 = (v2 + v1) & SIP_MASK; v1 = sipRotl(v1, 17); v1 ^= v2; v2 = sipRotl(v2, 32);
+  };
+  const len = bytes.length;
+  const end = len - (len % 8);
+  for (let i = 0; i < end; i += 8) {
+    let m = 0n;
+    for (let j = 7; j >= 0; j--) m = (m << 8n) | BigInt(bytes[i + j]);
+    v3 ^= m; round(); v0 ^= m;
+  }
+  let b = (BigInt(len) & 0xffn) << 56n;
+  for (let j = end; j < len; j++) b |= BigInt(bytes[j]) << BigInt(8 * (j - end));
+  v3 ^= b; round(); v0 ^= b;
+  v2 ^= 0xffn;
+  round(); round(); round();
+  return (v0 ^ v1 ^ v2 ^ v3) & SIP_MASK;
+}
+const CSS_MODULE_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890_-";
+function cssModuleHash(rel) {
+  // Rust `Hash for str` feeds the bytes plus a 0xff terminator.
+  const h = sipHash13([...Buffer.from(rel, "utf8"), 0xff]);
+  const u32 = Number(h & 0xffffffffn);
+  const b = [u32 & 0xff, (u32 >>> 8) & 0xff, (u32 >>> 16) & 0xff, (u32 >>> 24) & 0xff];
+  let out = "", acc = 0, nbits = 0;
+  for (const byte of b) {
+    acc = (acc << 8) | byte; nbits += 8;
+    while (nbits >= 6) { out += CSS_MODULE_ALPHABET[(acc >>> (nbits - 6)) & 63]; nbits -= 6; }
+  }
+  if (nbits > 0) out += CSS_MODULE_ALPHABET[(acc << (6 - nbits)) & 63];
+  return out;
+}
+const isCssModule = (p) => p.slice(p.lastIndexOf("/") + 1).includes(".module.");
+function cssModuleExports(path, source) {
+  // The hash input must be the same URL the client compiled under: url_of on
+  // the Rust side gives "/{rel}" inside the root and "/@fs{abs}" outside it.
+  const rel = path.startsWith(APP + "/") ? path.slice(APP.length) : "/@fs" + path;
+  const hash = cssModuleHash(rel);
+  const base = path.slice(path.lastIndexOf("/") + 1);
+  const stem = base.slice(0, base.lastIndexOf(".")).replace(/\./g, "-");
+  // Keep only selector-position tokens: strip strings, comments, url() and
+  // :global(...) scopes, then collect class/id selectors and @keyframes
+  // names, which is what components read from the map. Extra keys from
+  // letter-leading hex colors are harmless (same formula, never read).
+  // Known approximations, all unread in practice: container-name,
+  // @counter-style and bare animation-name references are also scoped by
+  // lightningcss but not collected here; a sass &-suffix class is invisible
+  // in the source; composes maps to its own single name, matching what the
+  // client serves (css_exports drops composed chains too).
+  const body = source
+    .replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/url\([^)]*\)/g, "")
+    .replace(/\/\/[^\n]*/g, "")
+    .replace(/:global\s*\([^)]*\)/g, "");
+  const out = {};
+  for (const m of body.matchAll(/(?:[.#]|@keyframes\s+)(-?[A-Za-z_][A-Za-z0-9_-]*)/g)) {
+    out[m[1]] ??= `${stem}_${m[1]}_${hash}`;
+  }
+  return out;
+}
 
 const ALIASES = {
   "#tanstack-router-entry": pathResolve(APP, "src/router"),
@@ -652,7 +731,7 @@ function resolveUncached(spec, context, next) {
     // with a leftover query is either already-tagged (a runner re-importing a
     // ?ojasset/?ojv URL, which must pass through with its query intact) or
     // asks for something we don't handle.
-    const kind = intent ?? (clean.includes("?") ? null : /\.css$/.test(abs) ? "css" : ASSET_EXT.test(abs) ? "url" : null);
+    const kind = intent ?? (clean.includes("?") ? null : STYLE_EXT.test(abs) ? "css" : ASSET_EXT.test(abs) ? "url" : null);
     if (kind) return { url: pathToFileURL(abs).href + `?ojasset=${kind}`, shortCircuit: true };
   }
   if (res.via === "local") return { url: withV(pathToFileURL(res.abs).href), shortCircuit: true, _ojv: true };
@@ -682,7 +761,14 @@ export function load(url, context, next) {
     if (kind === "raw") src = `export default ${JSON.stringify(readFileSync(path, "utf8"))};`;
     else if (kind === "url") src = `export default ${JSON.stringify("/@oj-start/fs" + path)};`;
     else if (kind === "inline")
-      src = `export default ${JSON.stringify(`data:${mimeOf(path)};base64,` + readFileSync(path).toString("base64"))};`;
+      // Stylesheets inline as css text (the client and Vite serve the
+      // compiled css string; here it is the on-disk source, uncompiled),
+      // everything else as a data URL with the file's content type.
+      src = `export default ${JSON.stringify(STYLE_EXT.test(path)
+        ? readFileSync(path, "utf8")
+        : `data:${mimeOf(path)};base64,` + readFileSync(path).toString("base64"))};`;
+    else if (kind === "css" && isCssModule(path))
+      src = `export default ${JSON.stringify(cssModuleExports(path, readFileSync(path, "utf8")))};`;
     return { format: "module", source: src, shortCircuit: true };
   }
   if (clean.endsWith(".json")) {
