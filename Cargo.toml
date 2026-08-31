@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/oj_compiler",
+    "crates/stylex",
     "crates/oj_css",
     "crates/oj_env",
     "crates/oj_config",
@@ -26,6 +27,7 @@ oj_css = { version = "0.1.16", path = "crates/oj_css" }
 oj_env = { version = "0.1.16", path = "crates/oj_env" }
 oj_config = { version = "0.1.16", path = "crates/oj_config" }
 oj_server = { version = "0.1.16", path = "crates/oj_server" }
+fru = { version = "0.1.16", path = "crates/stylex" }
 
 oxc_allocator = "0.146.0"
 oxc_parser = "0.146.0"
