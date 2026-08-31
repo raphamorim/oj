@@ -88,33 +88,78 @@ fn json_scalar(v: &serde_json::Value) -> String {
     }
 }
 
+fn parse_flag_array(s: &str) -> Vec<String> {
+    s.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .map(|x| x.trim().trim_matches('"').to_string())
+        .filter(|x| !x.is_empty())
+        .collect()
+}
+
 fn parse_toml(text: &str) -> WranglerConfig {
     let mut cfg = WranglerConfig::default();
-    let mut in_vars = false;
+    let mut section = "top";
+    let mut binding: Option<String> = None;
+    let mut service: Option<String> = None;
+    let mut flag_buf: Option<String> = None;
     for line in text.lines() {
         let t = line.trim();
+        if let Some(buf) = flag_buf.as_mut() {
+            buf.push(' ');
+            buf.push_str(t);
+            if t.contains(']') {
+                cfg.compat_flags = parse_flag_array(&flag_buf.take().unwrap());
+            }
+            continue;
+        }
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
         if t.starts_with('[') {
-            in_vars = t == "[vars]";
+            if let (Some(b), Some(s)) = (binding.take(), service.take()) {
+                cfg.service_bindings.push((b, s));
+            }
+            section = if t == "[vars]" {
+                "vars"
+            } else if t == "[[services]]" {
+                "services"
+            } else {
+                "other"
+            };
             continue;
         }
         if let Some((key, rest)) = t.split_once('=') {
             let key = key.trim();
             let val = rest.trim().trim_matches('"').to_string();
-            if in_vars {
-                cfg.vars.push((key.to_string(), val));
-            } else if key == "compatibility_date" {
-                cfg.compat_date = Some(val);
-            } else if key == "compatibility_flags" {
-                cfg.compat_flags = rest
-                    .trim()
-                    .trim_start_matches('[')
-                    .trim_end_matches(']')
-                    .split(',')
-                    .map(|s| s.trim().trim_matches('"').to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+            match section {
+                "vars" => cfg.vars.push((key.to_string(), val)),
+                "services" => {
+                    if key == "binding" || key == "name" {
+                        binding = Some(val);
+                    } else if key == "service" {
+                        service = Some(val);
+                    }
+                }
+                "top" => {
+                    if key == "compatibility_date" {
+                        cfg.compat_date = Some(val);
+                    } else if key == "compatibility_flags" {
+                        let r = rest.trim();
+                        if r.contains(']') {
+                            cfg.compat_flags = parse_flag_array(r);
+                        } else {
+                            flag_buf = Some(r.to_string());
+                        }
+                    }
+                }
+                _ => {}
             }
         }
+    }
+    if let (Some(b), Some(s)) = (binding.take(), service.take()) {
+        cfg.service_bindings.push((b, s));
     }
     cfg
 }
@@ -187,17 +232,22 @@ mod tests {
     }
 
     #[test]
-    fn parses_toml_vars_and_compat() {
+    fn parses_toml_vars_compat_services_and_multiline_flags() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("wrangler.toml"),
-            "compatibility_date = \"2026-08-01\"\ncompatibility_flags = [\"nodejs_compat\"]\n[vars]\nA = \"b\"\n",
+            "compatibility_date = \"2026-08-01\"\n\
+             compatibility_flags = [\n  \"nodejs_compat\",\n  \"nodejs_als\",\n]\n\
+             [vars]\nA = \"b\"\n\
+             [[services]]\nbinding = \"RESOLVER\"\nservice = \"resolver-svc\"\n\
+             [env.production]\ncompatibility_date = \"2099-01-01\"\n",
         )
         .unwrap();
         let cfg = load(dir.path());
-        assert_eq!(cfg.compat_date.as_deref(), Some("2026-08-01"));
-        assert_eq!(cfg.compat_flags, vec!["nodejs_compat".to_string()]);
+        assert_eq!(cfg.compat_date.as_deref(), Some("2026-08-01"), "env.production must not override top-level");
+        assert_eq!(cfg.compat_flags, vec!["nodejs_compat".to_string(), "nodejs_als".to_string()]);
         assert!(cfg.vars.contains(&("A".into(), "b".into())));
+        assert_eq!(cfg.service_bindings, vec![("RESOLVER".to_string(), "resolver-svc".to_string())]);
     }
 
     #[test]

@@ -183,6 +183,20 @@ fn resolve_file(base: &Path) -> Option<PathBuf> {
     None
 }
 
+fn is_denied(file: &Path) -> bool {
+    if file.components().any(|c| c.as_os_str() == ".git") {
+        return true;
+    }
+    let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name == ".env" || name.starts_with(".env.") {
+        return true;
+    }
+    matches!(
+        file.extension().and_then(|e| e.to_str()),
+        Some("pem" | "crt" | "key")
+    )
+}
+
 fn spec_to_existing(root: &Path, specifier: &str) -> Option<PathBuf> {
     let abs = PathBuf::from(specifier);
     if abs.is_absolute() && abs.exists() {
@@ -274,6 +288,9 @@ fn serve_resolved(
     resolver: &OjResolver,
     aliases: &[(String, PathBuf)],
 ) -> Option<(String, String)> {
+    if is_denied(file) {
+        return None;
+    }
     let name = specifier.trim_start_matches('/').to_string();
     let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
     if is_asset_ext(ext) {
@@ -333,6 +350,9 @@ fn serve_file(
     resolver: &OjResolver,
     aliases: &[(String, PathBuf)],
 ) -> Fallback {
+    if is_denied(file) {
+        return Fallback::NotFound;
+    }
     if needs_plugin_transform(file) {
         return Fallback::TransformFile {
             file: file.to_path_buf(),
@@ -404,8 +424,10 @@ pub fn resolve_fallback(
         let name = specifier.trim_start_matches('/').to_string();
         if query.split('&').any(|q| q == "raw") {
             if let Some(file) = spec_to_file(root, path_part) {
-                if let Ok(s) = std::fs::read_to_string(&file) {
-                    return Fallback::Module { name, code: format!("export default {};\n", js_str(&s)) };
+                if !is_denied(&file) {
+                    if let Ok(s) = std::fs::read_to_string(&file) {
+                        return Fallback::Module { name, code: format!("export default {};\n", js_str(&s)) };
+                    }
                 }
             }
             return Fallback::NotFound;
@@ -670,6 +692,25 @@ mod tests {
         assert!(code.contains("module.exports"), "cjs body not wrapped: {code}");
         // a node builtin require() is mapped to a node: import for nodejs_compat
         assert!(code.contains("\"node:os\""), "node builtin not mapped: {code}");
+    }
+
+    #[test]
+    fn denied_paths_are_never_served() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=1\n").unwrap();
+        std::fs::write(dir.path().join("key.pem"), "-----BEGIN-----\n").unwrap();
+        let r = resolver(dir.path());
+        let env = format!("/{}", dir.path().join(".env").display());
+        assert!(matches!(
+            resolve_fallback(dir.path(), &r, &[], &env, &env, "/e"),
+            Fallback::NotFound
+        ));
+        // even via ?raw (which returns file contents)
+        let pem_raw = format!("/{}?raw", dir.path().join("key.pem").display());
+        assert!(matches!(
+            resolve_fallback(dir.path(), &r, &[], &pem_raw, "./key.pem?raw", "/e"),
+            Fallback::NotFound
+        ));
     }
 
     #[test]

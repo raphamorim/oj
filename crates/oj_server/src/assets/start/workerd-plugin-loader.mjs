@@ -11,6 +11,17 @@ import { rewriteServerFns } from "./loader-util.mjs";
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
 const PORT = Number(process.argv[2] || process.env.OJ_LOADER_PORT || 0);
 
+function isDenied(file) {
+  const f = file.replaceAll("\\", "/");
+  const base = f.split("/").pop() ?? "";
+  return (
+    f.includes("/.git/") ||
+    base === ".env" ||
+    base.startsWith(".env.") ||
+    /\.(pem|crt|key)$/.test(base)
+  );
+}
+
 function importerFor(referrer) {
   if (!referrer) return undefined;
   const rel = referrer.replace(/^\//, "");
@@ -40,6 +51,11 @@ const server = http.createServer(async (req, res) => {
     const u = new URL(req.url, "http://loader");
     if (u.pathname === "/transform") {
       const file = u.searchParams.get("file") ?? "";
+      if (!file || isDenied(file)) {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
       let raw;
       const loaded = await container.load(file);
       if (loaded != null) {

@@ -303,18 +303,29 @@ async fn native_workerd_proxies_a_virtual_module_to_the_plugin_loader() {
     let loader = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let loader_port = loader.local_addr().unwrap().port();
     tokio::spawn(async move {
-        let svc = axum::Router::new().route(
-            "/load",
-            axum::routing::get(|q: axum::extract::Query<std::collections::HashMap<String, String>>| async move {
-                let spec = q.get("specifier").cloned().unwrap_or_default();
-                if spec.contains("virtual:greeting") {
-                    axum::Json(serde_json::json!({ "code": "export default \" +from-plugin\";\n" }))
-                        .into_response()
-                } else {
-                    axum::http::StatusCode::NOT_FOUND.into_response()
-                }
-            }),
-        );
+        let svc = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::get(|q: axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                    let spec = q.get("rawSpecifier").or_else(|| q.get("specifier")).cloned().unwrap_or_default();
+                    if spec.contains("virtual:greeting") {
+                        axum::Json(serde_json::json!({ "code": "export default \" +from-plugin\";\n" }))
+                            .into_response()
+                    } else {
+                        axum::http::StatusCode::NOT_FOUND.into_response()
+                    }
+                }),
+            )
+            .route(
+                "/transform",
+                axum::routing::get(|q: axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                    let file = q.get("file").cloned().unwrap_or_default();
+                    match std::fs::read_to_string(&file) {
+                        Ok(s) => axum::Json(serde_json::json!({ "code": s })).into_response(),
+                        Err(_) => axum::http::StatusCode::NOT_FOUND.into_response(),
+                    }
+                }),
+            );
         let _ = axum::serve(loader, svc).await;
     });
 
@@ -335,7 +346,7 @@ async fn native_workerd_proxies_a_virtual_module_to_the_plugin_loader() {
         &workerd,
         &root.join(".oj-cache"),
         vec![],
-        Some(format!("http://127.0.0.1:{loader_port}/load")),
+        Some(format!("http://127.0.0.1:{loader_port}/")),
         WorkerdSpawn {
             compat_date: "2024-11-01".into(),
             compat_flags: vec![],

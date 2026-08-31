@@ -68,6 +68,7 @@ impl WorkerdSpawn {
 
 pub struct WorkerdSession {
     child: Child,
+    fallback: tokio::task::JoinHandle<()>,
     pub worker_addr: String,
 }
 
@@ -79,6 +80,7 @@ impl WorkerdSession {
 
 impl Drop for WorkerdSession {
     fn drop(&mut self) {
+        self.fallback.abort();
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -105,7 +107,7 @@ pub async fn spawn(
         plugin_loader,
         http: reqwest::Client::new(),
     });
-    tokio::spawn(async move {
+    let fallback = tokio::spawn(async move {
         let app = Router::new().route("/", get(fallback_handler)).with_state(state);
         let _ = axum::serve(fb, app).await;
     });
@@ -127,7 +129,7 @@ pub async fn spawn(
 
     let log = std::fs::File::create(config_dir.join("workerd.log"))?;
     let log_err = log.try_clone()?;
-    let child = Command::new(workerd_bin)
+    let mut child = Command::new(workerd_bin)
         .arg("serve")
         .arg(&config_path)
         .arg("--experimental")
@@ -135,7 +137,25 @@ pub async fn spawn(
         .stderr(Stdio::from(log_err))
         .spawn()?;
 
-    Ok(WorkerdSession { child, worker_addr: format!("127.0.0.1:{wd_port}") })
+    let mut ready = false;
+    for _ in 0..150 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", wd_port)).await.is_ok() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if !ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        fallback.abort();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "workerd did not start listening",
+        ));
+    }
+
+    Ok(WorkerdSession { child, fallback, worker_addr: format!("127.0.0.1:{wd_port}") })
 }
 
 async fn fallback_handler(
@@ -146,12 +166,22 @@ async fn fallback_handler(
     let Some(specifier) = get("specifier") else {
         return (axum::http::StatusCode::BAD_REQUEST, "no specifier").into_response();
     };
-    let raw = get("rawSpecifier").unwrap_or("");
-    let referrer = get("referrer").unwrap_or("");
-    let debug = std::env::var_os("OJ_WORKERD_DEBUG").is_some();
-    let outcome =
-        resolve_fallback(&state.root, &state.resolver, &state.aliases, specifier, raw, referrer);
-    if debug {
+    let specifier = specifier.to_string();
+    let raw = get("rawSpecifier").unwrap_or("").to_string();
+    let referrer = get("referrer").unwrap_or("").to_string();
+
+    let st = state.clone();
+    let (spec, rawc, refc) = (specifier.clone(), raw.clone(), referrer.clone());
+    let outcome = match tokio::task::spawn_blocking(move || {
+        resolve_fallback(&st.root, &st.resolver, &st.aliases, &spec, &rawc, &refc)
+    })
+    .await
+    {
+        Ok(o) => o,
+        Err(_) => return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    if std::env::var_os("OJ_WORKERD_DEBUG").is_some() {
         let kind = match &outcome {
             Fallback::Module { .. } => "module".to_string(),
             Fallback::Redirect { location } => format!("redirect->{location}"),
@@ -168,30 +198,36 @@ async fn fallback_handler(
         )
             .into_response(),
         Fallback::TransformFile { file, name } => {
-            let transformed = match &state.plugin_loader {
-                Some(loader) => proxy_transform(&state.http, loader, &file).await,
-                None => None,
+            let source = match &state.plugin_loader {
+                Some(loader) => match proxy_transform(&state.http, loader, &file).await {
+                    Some(s) => s,
+                    None => return axum::http::StatusCode::NOT_FOUND.into_response(),
+                },
+                None => match std::fs::read_to_string(&file) {
+                    Ok(s) => s,
+                    Err(_) => return axum::http::StatusCode::NOT_FOUND.into_response(),
+                },
             };
-            let source = match transformed {
-                Some(s) => s,
-                None => std::fs::read_to_string(&file).unwrap_or_default(),
-            };
-            match crate::workerd::compile_transformed(
-                &file,
-                &name,
-                &source,
-                &state.resolver,
-                &state.aliases,
-            ) {
-                Some((n, code)) => module_response(&n, &code),
-                None => axum::http::StatusCode::NOT_FOUND.into_response(),
+            let st = state.clone();
+            let compiled = tokio::task::spawn_blocking(move || {
+                crate::workerd::compile_transformed(&file, &name, &source, &st.resolver, &st.aliases)
+            })
+            .await;
+            match compiled {
+                Ok(Some((n, code))) => module_response(&n, &code),
+                _ => axum::http::StatusCode::NOT_FOUND.into_response(),
             }
         }
         Fallback::NotFound => {
             if let Some(loader) = &state.plugin_loader {
-                if let Some(code) = proxy_plugin_loader(&state.http, loader, specifier, raw, referrer).await {
-                    let code = compile_proxied(&state.root, &code);
-                    return module_response(specifier.trim_start_matches('/'), &code);
+                if let Some(code) =
+                    proxy_plugin_loader(&state.http, loader, &specifier, &raw, &referrer).await
+                {
+                    let root = state.root.clone();
+                    let compiled = tokio::task::spawn_blocking(move || compile_proxied(&root, &code))
+                        .await
+                        .unwrap_or_default();
+                    return module_response(specifier.trim_start_matches('/'), &compiled);
                 }
             }
             axum::http::StatusCode::NOT_FOUND.into_response()
