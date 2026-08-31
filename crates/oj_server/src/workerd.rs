@@ -3,6 +3,12 @@
 
 use std::path::{Path, PathBuf};
 
+pub fn is_cloudflare_app(root: &Path) -> bool {
+    ["wrangler.jsonc", "wrangler.json", "wrangler.toml"]
+        .iter()
+        .any(|f| root.join(f).is_file())
+}
+
 pub fn platform_tag() -> &'static str {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => "darwin-arm64",
@@ -196,6 +202,14 @@ mod tests {
         assert_eq!(name, "src/dep.ts", "name must drop the leading slash");
         assert!(code.contains("export const hi"), "{code}");
         assert!(!code.contains(": string"), "TS type survived: {code}");
+    }
+
+    #[test]
+    fn detects_cloudflare_app_by_wrangler_config() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_cloudflare_app(dir.path()));
+        std::fs::write(dir.path().join("wrangler.jsonc"), "{}").unwrap();
+        assert!(is_cloudflare_app(dir.path()));
     }
 
     #[test]
