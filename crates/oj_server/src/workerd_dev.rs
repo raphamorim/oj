@@ -67,10 +67,28 @@ impl WorkerdSpawn {
     }
 }
 
+pub struct WorkerReload {
+    config_path: PathBuf,
+    config: String,
+    seq: std::sync::atomic::AtomicU64,
+}
+
+impl WorkerReload {
+    fn write(&self) -> std::io::Result<()> {
+        let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(&self.config_path, format!("{}\n# oj-reload {n}\n", self.config))
+    }
+
+    pub fn bump(&self) {
+        let _ = self.write();
+    }
+}
+
 pub struct WorkerdSession {
     child: Child,
     fallback: tokio::task::JoinHandle<()>,
     pub worker_addr: String,
+    pub reload: Arc<WorkerReload>,
 }
 
 impl WorkerdSession {
@@ -128,7 +146,12 @@ pub async fn spawn(
             vars: opts.vars.clone(),
             service_bindings: opts.service_bindings.clone(),
         });
-        std::fs::write(&config_path, config)?;
+        let reload = Arc::new(WorkerReload {
+            config_path: config_path.clone(),
+            config,
+            seq: std::sync::atomic::AtomicU64::new(0),
+        });
+        reload.write()?;
 
         let log = std::fs::File::create(config_dir.join("workerd.log"))?;
         let log_err = log.try_clone()?;
@@ -136,6 +159,7 @@ pub async fn spawn(
             .arg("serve")
             .arg(&config_path)
             .arg("--experimental")
+            .arg("--watch")
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err))
             .spawn()?;
@@ -157,6 +181,7 @@ pub async fn spawn(
             return Ok(WorkerdSession {
                 child,
                 fallback,
+                reload,
                 worker_addr: format!("127.0.0.1:{wd_port}"),
             });
         }

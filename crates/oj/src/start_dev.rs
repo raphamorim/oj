@@ -36,6 +36,7 @@ struct StartState {
     ws_tx: broadcast::Sender<String>,
     css_host: Option<Arc<tokio::sync::Mutex<Runner>>>,
     worker_url: Option<String>,
+    worker_reload: Option<Arc<oj_server::workerd_dev::WorkerReload>>,
 }
 
 pub async fn start_dev(
@@ -113,6 +114,7 @@ pub async fn start_dev(
     };
     let workerd = spawn_workerd_if_cloudflare(&root, &cache).await;
     let worker_url = workerd.as_ref().map(|w| w.session.worker_url());
+    let worker_reload = workerd.as_ref().map(|w| w.session.reload.clone());
     let state = Arc::new(StartState {
         proxy_prefixes: built.proxy_prefixes.clone(),
         plugin_mw_port: built.plugin_mw_port,
@@ -125,6 +127,7 @@ pub async fn start_dev(
         ws_tx: built.reload_tx.clone(),
         css_host,
         worker_url,
+        worker_reload,
     });
 
     spawn_start_watcher(root.clone(), cache.clone(), Arc::clone(&state));
@@ -350,6 +353,9 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
                     *state.bundle.write().unwrap() = Arc::new(pinned);
                 }
             });
+            if let Some(reload) = &state.worker_reload {
+                reload.bump();
+            }
             let _ = state.reload_tx.send(());
             let modules = client_module_count(&cache);
             let _ = state.ws_tx.send(oj_server::update_progress_frame(
