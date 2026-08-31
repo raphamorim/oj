@@ -640,7 +640,9 @@ async fn spawn_plugin_loader(
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
     let mut child = cmd.spawn()?;
-    let stdout = child.stdout.take().expect("piped stdout");
+    let Some(stdout) = child.stdout.take() else {
+        anyhow::bail!("plugin loader stdout was not piped");
+    };
     let mut lines = BufReader::new(stdout).lines();
     let port = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         while let Ok(Some(line)) = lines.next_line().await {

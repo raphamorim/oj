@@ -48,8 +48,12 @@ fn upsert(vars: &mut Vec<(String, String)>, key: String, value: String) {
 fn parse_json(text: &str) -> WranglerConfig {
     let mut cleaned = text.to_string();
     let _ = json_strip_comments::strip(&mut cleaned);
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&cleaned) else {
-        return WranglerConfig::default();
+    let v = match serde_json::from_str::<serde_json::Value>(&cleaned) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("oj: could not parse wrangler config ({e}); using defaults (compat date, vars, and bindings will be missing)");
+            return WranglerConfig::default();
+        }
     };
     let mut cfg = WranglerConfig {
         compat_date: v

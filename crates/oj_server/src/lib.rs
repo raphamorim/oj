@@ -1455,7 +1455,10 @@ pub async fn forward_to_worker(
     let m = reqwest::Method::from_bytes(method.as_bytes()).ok()?;
     let mut out = client.request(m, &target);
     for (name, value) in headers.iter() {
-        if name == header::HOST {
+        if name == header::HOST
+            || name == header::CONTENT_LENGTH
+            || name == header::TRANSFER_ENCODING
+        {
             continue;
         }
         out = out.header(name, value);

@@ -112,50 +112,68 @@ pub async fn spawn(
         let _ = axum::serve(fb, app).await;
     });
 
-    let wd_port = free_port()?;
-
-    let config = render_config(&WorkerdOptions {
-        compat_date: opts.compat_date,
-        compat_flags: opts.compat_flags,
-        entry_specifier: opts.entry_specifier,
-        fallback_addr: format!("127.0.0.1:{fb_port}"),
-        socket_addr: format!("127.0.0.1:{wd_port}"),
-        vars: opts.vars,
-        service_bindings: opts.service_bindings,
-    });
     std::fs::create_dir_all(config_dir)?;
     let config_path = config_dir.join("oj.workerd.capnp");
-    std::fs::write(&config_path, config)?;
 
-    let log = std::fs::File::create(config_dir.join("workerd.log"))?;
-    let log_err = log.try_clone()?;
-    let mut child = Command::new(workerd_bin)
-        .arg("serve")
-        .arg(&config_path)
-        .arg("--experimental")
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err))
-        .spawn()?;
+    for _ in 0..3 {
+        let wd_port = free_port()?;
+        let config = render_config(&WorkerdOptions {
+            compat_date: opts.compat_date.clone(),
+            compat_flags: opts.compat_flags.clone(),
+            entry_specifier: opts.entry_specifier.clone(),
+            fallback_addr: format!("127.0.0.1:{fb_port}"),
+            socket_addr: format!("127.0.0.1:{wd_port}"),
+            vars: opts.vars.clone(),
+            service_bindings: opts.service_bindings.clone(),
+        });
+        std::fs::write(&config_path, config)?;
 
-    let mut ready = false;
-    for _ in 0..150 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", wd_port)).await.is_ok() {
-            ready = true;
-            break;
+        let log = std::fs::File::create(config_dir.join("workerd.log"))?;
+        let log_err = log.try_clone()?;
+        let mut child = Command::new(workerd_bin)
+            .arg("serve")
+            .arg(&config_path)
+            .arg("--experimental")
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log_err))
+            .spawn()?;
+
+        let mut ready = false;
+        let mut died = false;
+        for _ in 0..150 {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                died = true;
+                break;
+            }
+            if tokio::net::TcpStream::connect(("127.0.0.1", wd_port)).await.is_ok() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    if !ready {
+        if ready {
+            return Ok(WorkerdSession {
+                child,
+                fallback,
+                worker_addr: format!("127.0.0.1:{wd_port}"),
+            });
+        }
         let _ = child.kill();
         let _ = child.wait();
-        fallback.abort();
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "workerd did not start listening",
-        ));
+        if !died {
+            fallback.abort();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "workerd did not start listening",
+            ));
+        }
     }
 
-    Ok(WorkerdSession { child, fallback, worker_addr: format!("127.0.0.1:{wd_port}") })
+    fallback.abort();
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        "workerd could not bind a free port",
+    ))
 }
 
 async fn fallback_handler(
