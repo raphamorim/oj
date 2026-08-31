@@ -163,6 +163,10 @@ const START_ASSETS: &[(&str, &str)] = &[
     ),
     ("manifest.ts", include_str!("assets/start/manifest.ts")),
     ("manifest-dev.ts", include_str!("assets/start/manifest-dev.ts")),
+    (
+        "workerd-plugin-loader.mjs",
+        include_str!("assets/start/workerd-plugin-loader.mjs"),
+    ),
 ];
 
 pub fn boot_phase(label: &str) {
@@ -1438,6 +1442,36 @@ async fn forward_to_plugin_middleware(
 // middleware falls through (x-oj-fallthrough), so the caller can fall back to
 // SSR. Used by the TanStack start path, where GET requests are otherwise
 // SSR'd and would never reach editor endpoints (the dev-server bridge).
+pub async fn forward_get_to_worker(
+    worker_url: &str,
+    path_and_query: &str,
+    headers: &HeaderMap,
+) -> Option<Response> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = CLIENT.get_or_init(reqwest::Client::new);
+    let target = format!("{}{}", worker_url.trim_end_matches('/'), path_and_query);
+    let mut out = client.get(&target);
+    for (name, value) in headers.iter() {
+        if name == header::HOST {
+            continue;
+        }
+        out = out.header(name, value);
+    }
+    let resp = out.send().await.ok()?;
+    let status = resp.status();
+    let resp_headers = resp.headers().clone();
+    let bytes = resp.bytes().await.ok()?;
+    let mut response = Response::new(Body::from(bytes));
+    *response.status_mut() = status;
+    for (name, value) in resp_headers.iter() {
+        if name == header::TRANSFER_ENCODING || name == header::CONTENT_LENGTH {
+            continue;
+        }
+        response.headers_mut().insert(name, value.clone());
+    }
+    Some(response)
+}
+
 pub async fn forward_get_to_plugin_mw(
     port: u16,
     path_and_query: &str,

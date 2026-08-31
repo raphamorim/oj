@@ -121,12 +121,14 @@ pub async fn spawn(
     let config_path = config_dir.join("oj.workerd.capnp");
     std::fs::write(&config_path, config)?;
 
+    let log = std::fs::File::create(config_dir.join("workerd.log"))?;
+    let log_err = log.try_clone()?;
     let child = Command::new(workerd_bin)
         .arg("serve")
         .arg(&config_path)
         .arg("--experimental")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
         .spawn()?;
 
     Ok(WorkerdSession { child, worker_addr: format!("127.0.0.1:{wd_port}") })
@@ -152,11 +154,20 @@ async fn fallback_handler(
         Fallback::NotFound => {
             if let Some(loader) = &state.plugin_loader {
                 if let Some(code) = proxy_plugin_loader(&state.http, loader, specifier, raw, referrer).await {
+                    let code = compile_proxied(&state.root, &code);
                     return module_response(specifier.trim_start_matches('/'), &code);
                 }
             }
             axum::http::StatusCode::NOT_FOUND.into_response()
         }
+    }
+}
+
+fn compile_proxied(root: &Path, code: &str) -> String {
+    let path = root.join("__oj_virtual__.tsx");
+    match oj_compiler::compile(&path, code, &oj_compiler::CompileOptions::prod()) {
+        Ok(out) => out.code,
+        Err(_) => code.to_string(),
     }
 }
 
