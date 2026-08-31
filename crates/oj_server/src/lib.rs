@@ -22,6 +22,7 @@ pub mod optimize;
 pub mod pkg_bundle;
 pub mod workerd;
 pub mod workerd_dev;
+pub mod wrangler;
 pub mod pkg_rolldown;
 pub mod plugins;
 pub mod sidecar;

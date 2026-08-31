@@ -162,10 +162,6 @@ fn spec_to_file(root: &Path, specifier: &str) -> Option<PathBuf> {
     resolve_file(&root.join(specifier.trim_start_matches('/')))
 }
 
-/// Answers a workerd module-fallback request for a specifier that maps to a file
-/// (an absolute path handed back from a redirect, or a root-relative app path).
-/// Returns the module `name` (specifier without a leading slash) and its ESM
-/// source, transpiled from TS/JSX. `None` means the specifier is not a file.
 pub fn fallback_module(root: &Path, specifier: &str) -> Option<(String, String)> {
     let file = spec_to_file(root, specifier)?;
     let source = std::fs::read_to_string(&file).ok()?;
@@ -179,10 +175,6 @@ pub enum Fallback {
     NotFound,
 }
 
-/// The full module-fallback decision. A specifier that maps to a file is served
-/// as a module; a bare `rawSpecifier` (a node_modules import) is resolved through
-/// `resolver` and answered with a 301 redirect to its absolute path (workerd then
-/// re-requests that path, which maps to a file). Everything else is a 404.
 pub fn resolve_fallback(
     root: &Path,
     resolver: &OjResolver,

@@ -34,6 +34,20 @@ pub struct WorkerdSpawn {
     pub service_bindings: Vec<(String, String)>,
 }
 
+const DEFAULT_COMPAT_DATE: &str = "2024-11-01";
+
+impl WorkerdSpawn {
+    pub fn from_wrangler(cfg: crate::wrangler::WranglerConfig, entry_specifier: String) -> Self {
+        WorkerdSpawn {
+            compat_date: cfg.compat_date.unwrap_or_else(|| DEFAULT_COMPAT_DATE.to_string()),
+            compat_flags: cfg.compat_flags,
+            entry_specifier,
+            vars: cfg.vars,
+            service_bindings: cfg.service_bindings,
+        }
+    }
+}
+
 pub struct WorkerdSession {
     child: Child,
     pub worker_addr: String,
@@ -56,9 +70,6 @@ fn free_port() -> std::io::Result<u16> {
     Ok(StdTcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
 }
 
-/// Boots a workerd process for `root`: starts oj's module-fallback service, picks
-/// a port for the worker's HTTP socket, writes the config into `config_dir`, and
-/// spawns `workerd serve`. The returned session kills workerd on drop.
 pub async fn spawn(
     root: &Path,
     workerd_bin: &Path,
@@ -123,5 +134,36 @@ async fn fallback_handler(
         )
             .into_response(),
         Fallback::NotFound => axum::http::StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wrangler::WranglerConfig;
+
+    #[test]
+    fn from_wrangler_carries_bindings_and_defaults_compat_date() {
+        let cfg = WranglerConfig {
+            compat_date: None,
+            compat_flags: vec!["nodejs_compat".into()],
+            vars: vec![("EVENTS_API_URL".into(), "https://x".into())],
+            service_bindings: vec![("CONFIDENCE_RESOLVER".into(), "resolver".into())],
+        };
+        let spawn = WorkerdSpawn::from_wrangler(cfg, "/src/entry.tsx".into());
+        assert_eq!(spawn.compat_date, DEFAULT_COMPAT_DATE);
+        assert_eq!(spawn.compat_flags, vec!["nodejs_compat".to_string()]);
+        assert_eq!(spawn.vars, vec![("EVENTS_API_URL".to_string(), "https://x".to_string())]);
+        assert_eq!(
+            spawn.service_bindings,
+            vec![("CONFIDENCE_RESOLVER".to_string(), "resolver".to_string())]
+        );
+    }
+
+    #[test]
+    fn from_wrangler_keeps_an_explicit_compat_date() {
+        let cfg = WranglerConfig { compat_date: Some("2026-08-01".into()), ..Default::default() };
+        let spawn = WorkerdSpawn::from_wrangler(cfg, "/e".into());
+        assert_eq!(spawn.compat_date, "2026-08-01");
     }
 }
