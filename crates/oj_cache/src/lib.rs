@@ -102,6 +102,15 @@ impl PersistentCache {
         }
     }
 
+    /// Compiled modules embed inlined `import.meta.env` values, so anything
+    /// that changes the defines (dotenv edits, process env, plugin config()
+    /// mutations) must land in the salt or warm restarts serve stale env.
+    pub fn with_salt_extra(mut self, extra: &str) -> Self {
+        self.salt.push(':');
+        self.salt.push_str(extra);
+        self
+    }
+
     pub fn key(&self, source: &[u8], url: &str, mode: &str) -> String {
         let mut hasher = blake3::Hasher::new();
         hasher.update(self.salt.as_bytes());
@@ -207,6 +216,13 @@ mod tests {
             base,
             other_version.key(b"source", "/src/App.tsx", "dev"),
             "version"
+        );
+        let salted = PersistentCache::new(std::env::temp_dir(), "9.9.9").with_salt_extra("env-a");
+        let resalted = PersistentCache::new(std::env::temp_dir(), "9.9.9").with_salt_extra("env-b");
+        assert_ne!(
+            salted.key(b"source", "/src/App.tsx", "dev"),
+            resalted.key(b"source", "/src/App.tsx", "dev"),
+            "env defines salt"
         );
     }
 

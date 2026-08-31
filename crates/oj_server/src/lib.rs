@@ -411,8 +411,19 @@ impl DevServer {
             }
             defines
         };
+        let digest_defines = |defines: &[(String, String)]| {
+            let mut hasher = blake3::Hasher::new();
+            for (k, v) in defines {
+                hasher.update(k.as_bytes());
+                hasher.update(&[0]);
+                hasher.update(v.as_bytes());
+                hasher.update(&[0]);
+            }
+            hasher.finalize().to_hex().to_string()
+        };
         let defines = build_env_defines(&std::collections::BTreeMap::new());
         let mut html_env = oj_env::html_env_map(&defines);
+        let mut env_defines_digest = digest_defines(&defines);
         oj_compiler::set_import_meta_env(defines);
 
         let server_cfg = config.server.clone().unwrap_or_default();
@@ -536,6 +547,7 @@ impl DevServer {
             if !prefixed.is_empty() {
                 let defines = build_env_defines(&prefixed);
                 html_env = oj_env::html_env_map(&defines);
+                env_defines_digest = digest_defines(&defines);
                 oj_compiler::set_import_meta_env(defines);
             }
         }
@@ -634,7 +646,8 @@ impl DevServer {
                     preserve_symlinks: oj_config::resolve_preserve_symlinks(&config),
                 },
             )),
-            cache: PersistentCache::new(oj_cache::cache_root(&root), env!("CARGO_PKG_VERSION")),
+            cache: PersistentCache::new(oj_cache::cache_root(&root), env!("CARGO_PKG_VERSION"))
+                .with_salt_extra(&env_defines_digest),
             memory: Mutex::new(MemoryCache::new(memory_cache_budget())),
             mtime_keys: Mutex::new(HashMap::new()),
             compile_locks: Mutex::new(HashMap::new()),
