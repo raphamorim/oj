@@ -13,9 +13,10 @@ import { AsyncLocalStorage } from "node:async_hooks";
 const pluginsPath = process.argv[2];
 const initial = JSON.parse(process.argv[3] ?? "{}");
 
-const ssrEnvBase = { ...process.env };
-
 process.env.VITE_CONFIG_NATIVE_IGNORE_WARNING ??= "true";
+// Snapshot after the host's own env tweaks so the config()-hook delta reports
+// only plugin mutations, not host bootstrap noise.
+const ssrEnvBase = { ...process.env };
 const env = initial.env ?? { command: "serve", mode: "development" };
 
 // resolve.alias from the app's own vite config (loaded below for its plugins).
@@ -951,6 +952,15 @@ async function run(hook, args) {
   }
   if (hook === "writeBundle") return writeBundle(args[0], args[1] === "true");
   if (hook === "getPluginCount") return String(plugins.length);
+  if (hook === "getEnvDelta") {
+    // config() hooks ran at module init (top-level await), so the diff vs the
+    // process-start snapshot is final by the time any stdio hook is answered.
+    const delta = {};
+    for (const [k, v] of Object.entries(process.env)) {
+      if (ssrEnvBase[k] !== v) delta[k] = v;
+    }
+    return JSON.stringify(delta);
+  }
   if (hook === "getHasTransform") {
     const has = plugins.some((p) => {
       const t = p && p.transform;
