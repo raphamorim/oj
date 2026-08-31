@@ -5,6 +5,11 @@ All notable changes to oj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.10] - 2026-09-01
+
+### Fixed
+- CSS modules now resolve to the same scoped class names during SSR as on the client. The SSR loader (`loader.mjs`) reproduces oj's client class map in JavaScript (lightningcss's `[name]_[local]_[hash]` naming, including the SipHash-1-3 hash over the root-relative URL), so a `.module.css` import yields identical names on the server and the client and server-rendered markup matches the hydrated DOM. Both sides are pinned to the same literals by tests (`oj_css` and `e2e/unit/ssr-loader-css-modules.test.mjs`), so a future lightningcss naming change fails loudly rather than drifting.
+
 ## [0.1.9] - 2026-08-31
 
 ### Added
