@@ -213,6 +213,18 @@ fn js_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| format!("{s:?}"))
 }
 
+fn manifest_module(dir: &Path) -> String {
+    let css = std::fs::read_to_string(dir.join("css-urls.json"))
+        .ok()
+        .filter(|s| serde_json::from_str::<serde_json::Value>(s).is_ok())
+        .unwrap_or_else(|| "[]".to_string());
+    format!(
+        "export const tsrStartManifest = () => ({{ routes: {{ __root__: {{ \
+preloads: [\"/@oj-start/client-entry.js\"], css: {css}, \
+scripts: [{{ attrs: {{ type: \"module\", async: true, src: \"/@oj-start/client-entry.js\" }} }}] }} }} }});\n"
+    )
+}
+
 fn resolve_import(
     dir: &Path,
     spec: &str,
@@ -249,11 +261,14 @@ fn serve_resolved(
     if is_asset_ext(ext) {
         return Some((name, format!("export default {};\n", js_str(&asset_url(file)))));
     }
+    let dir = file.parent()?.to_path_buf();
+    if file.file_name().and_then(|n| n.to_str()) == Some("manifest-dev.ts") {
+        return Some((name, manifest_module(&dir)));
+    }
     let source = std::fs::read_to_string(file).ok()?;
     if ext == "json" {
         return Some((name, format!("export default {source};\n")));
     }
-    let dir = file.parent()?.to_path_buf();
     let is_cjs = match ext {
         "cjs" => true,
         "js" => !oj_compiler::cjs::has_module_syntax_pub(file, &source),
@@ -606,6 +621,24 @@ mod tests {
             resolve_fallback(dir.path(), &r, &[], "/ghost", "ghost", "/src/entry.tsx"),
             Fallback::NotFound
         ));
+    }
+
+    #[test]
+    fn manifest_dev_is_served_with_css_inlined_and_no_node_apis() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("manifest-dev.ts"), "import { readFileSync } from \"node:fs\";\n").unwrap();
+        std::fs::write(dir.path().join("css-urls.json"), "[\"/a.css\",\"/b.css\"]").unwrap();
+        let r = resolver(dir.path());
+        let spec = format!("/{}", dir.path().join("manifest-dev.ts").display());
+        match resolve_fallback(dir.path(), &r, &[], &spec, &spec, "/e") {
+            Fallback::Module { code, .. } => {
+                assert!(code.contains("tsrStartManifest"), "{code}");
+                assert!(code.contains("[\"/a.css\",\"/b.css\"]"), "css not inlined: {code}");
+                assert!(!code.contains("node:fs"), "node api leaked: {code}");
+                assert!(!code.contains("import.meta.url"), "import.meta.url leaked: {code}");
+            }
+            _ => panic!("expected the manifest served as a module"),
+        }
     }
 
     #[test]
