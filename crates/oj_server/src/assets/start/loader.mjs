@@ -434,7 +434,23 @@ const stripQ = (u) => u.split("?")[0];
 const withV = (u) => (V ? `${stripQ(u)}?ojv=${V}` : stripQ(u));
 const isTanstack = (u) => /\/@tanstack\//.test(u) && /\.(js|mjs)$/.test(stripQ(u));
 const ASSET_SUFFIX = /\?(raw|url|inline)$/;
-const ASSET_EXT = /\.(png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|eot|mp4|webm|wasm)$/;
+// Kept in sync with is_importable_asset_ext on the Rust side (the client
+// graph's classifier), plus wasm which only the SSR loader URL-exports; svg is
+// excluded here too, it routes through the svgr path.
+const ASSET_EXT = /\.(png|jpe?g|gif|webp|avif|ico|bmp|woff2?|ttf|otf|eot|mp4|webm|ogg|mp3|wav|flac|m4a|aac|mov|pdf|webmanifest|wasm)$/;
+// Vite inlines with the file's real content type (mrmime lookup, falling back
+// to octet-stream); match it for the types oj treats as assets.
+const MIME = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
+  webp: "image/webp", avif: "image/avif", ico: "image/x-icon", svg: "image/svg+xml",
+  woff: "font/woff", woff2: "font/woff2", ttf: "font/ttf", otf: "font/otf",
+  eot: "application/vnd.ms-fontobject", mp4: "video/mp4", webm: "video/webm",
+  ogg: "audio/ogg", mp3: "audio/mpeg", wav: "audio/wav", flac: "audio/flac",
+  m4a: "audio/mp4", aac: "audio/aac", mov: "video/quicktime", bmp: "image/bmp",
+  pdf: "application/pdf", webmanifest: "application/manifest+json",
+  wasm: "application/wasm", css: "text/css", json: "application/json", txt: "text/plain",
+};
+const mimeOf = (p) => MIME[p.slice(p.lastIndexOf(".") + 1).toLowerCase()] ?? "application/octet-stream";
 
 const ALIASES = {
   "#tanstack-router-entry": pathResolve(APP, "src/router"),
@@ -541,6 +557,75 @@ export function resolve(spec, context, next) {
   return r;
 }
 
+// One resolution ladder for every specifier, shared by asset, svg?react, and
+// plain module paths: relative probe, built-in aliases, package.json #imports,
+// tsconfig paths, then Node's resolver with its two error recoveries. `via`
+// records how the hit was found so the caller can keep versioning semantics:
+// "local" hits are user-reachable files that take a ?ojv version, "recovered"
+// hits short-circuit unversioned, "default" passes Node's result through.
+function resolveSpec(clean, context, next) {
+  if (clean.startsWith(".")) {
+    if (context.parentURL && context.parentURL.startsWith("file:")) {
+      const hit = probe(pathResolve(dirname(fileURLToPath(context.parentURL)), clean));
+      if (hit) return { abs: hit, via: "local" };
+    }
+  } else {
+    if (ALIASES[clean]) {
+      const hit = probe(ALIASES[clean]);
+      if (hit) return { abs: hit, via: "local" };
+    }
+    if (clean.startsWith("#")) {
+      const hit = resolveImports(clean);
+      if (hit) return { abs: hit, via: "local" };
+    }
+    if (clean.startsWith("/")) {
+      // A /-prefixed id resolves against the project root (Vite's asSrc
+      // behavior; the client graph already serves these URLs directly).
+      // True absolute fs paths miss this probe and fall through to Node.
+      const hit = probe(pathResolve(APP, clean.slice(1)));
+      if (hit) return { abs: hit, via: "local" };
+    } else {
+      const hit = resolveTsPaths(clean);
+      if (hit) return { abs: hit, via: "local" };
+    }
+  }
+  let r;
+  try {
+    r = next(clean, context);
+  } catch (err) {
+    if (err && err.code === "ERR_MODULE_NOT_FOUND") {
+      const tried = err.url && err.url.startsWith("file:")
+        ? fileURLToPath(err.url)
+        : (err.message.match(/Cannot find module '([^']+)'/) || [])[1];
+      const hit = tried ? probe(tried) : null;
+      if (hit) return { abs: hit, via: "recovered" };
+    }
+    // A dep subpath that is a directory with its own package.json (the legacy
+    // `pkg/query/react/package.json` entry pattern, e.g. @reduxjs/toolkit): Node
+    // ESM refuses the directory import, but CJS resolvers and bundlers read its
+    // module/main. Resolve it to that entry so oj serves the same file Vite does.
+    if (err && err.code === "ERR_UNSUPPORTED_DIR_IMPORT") {
+      const dir = err.url && err.url.startsWith("file:")
+        ? fileURLToPath(err.url)
+        : (err.message.match(/Directory import '([^']+)'/) || [])[1];
+      const hit = dir ? resolveDirEntry(dir) : null;
+      if (hit) return { abs: hit, via: "recovered" };
+    }
+    throw err;
+  }
+  return { result: r, via: "default" };
+}
+
+const toPath = (u) => {
+  try { return fileURLToPath(u); } catch { return null; }
+};
+
+// Resolve first, classify second (Vite's ordering: its alias plugin rewrites
+// the specifier before the asset plugin ever sees it). Strip the intent query,
+// resolve the cleaned specifier through the shared ladder, then decide asset /
+// svg-react / plain-module treatment from the *resolved* path, so every
+// resolution route (aliases, exports maps, error recoveries) gets the same
+// asset tagging.
 function resolveUncached(spec, context, next) {
   if (container && (spec.startsWith("virtual:") || spec.startsWith("\0"))) {
     const importer = context.parentURL && context.parentURL.startsWith("file:")
@@ -552,81 +637,27 @@ function resolveUncached(spec, context, next) {
       return { url: V ? `${u}?ojv=${V}` : u, shortCircuit: true };
     }
   }
-  const suffix = spec.match(ASSET_SUFFIX);
-  const isCss = !spec.includes("?") && /\.css$/.test(spec);
-  const isAsset = !spec.includes("?") && ASSET_EXT.test(spec);
-  if (suffix || isCss || isAsset) {
-    const kind = suffix ? suffix[1] : isCss ? "css" : "url";
-    const clean = spec.replace(ASSET_SUFFIX, "");
-    let abs = null;
-    if (clean.startsWith(".") && context.parentURL) {
-      abs = probe(pathResolve(dirname(fileURLToPath(context.parentURL)), clean));
-    } else if (ALIASES[clean]) {
-      abs = probe(ALIASES[clean]);
-    }
-    if (!abs && clean.startsWith("#")) abs = resolveImports(clean);
-    if (!abs && !clean.startsWith("/") && !clean.startsWith(".")) abs = resolveTsPaths(clean);
-    if (!abs) {
-      try { abs = fileURLToPath(stripQ(next(clean, context).url)); } catch {}
-    }
-    if (abs) return { url: pathToFileURL(abs).href + `?ojasset=${kind}`, shortCircuit: true };
+  const svgReact = /\.svg\?react$/.test(spec);
+  const intent = svgReact ? null : (spec.match(ASSET_SUFFIX)?.[1] ?? null);
+  const clean = svgReact || intent ? spec.replace(/\?(raw|url|inline|react)$/, "") : spec;
+
+  const res = resolveSpec(clean, context, next);
+  const abs = res.abs ?? (res.result && res.result.url && res.result.url.startsWith("file:")
+    ? toPath(stripQ(res.result.url))
+    : null);
+
+  if (abs) {
+    if (svgReact) return { url: pathToFileURL(abs).href + "?ojsvg=react", shortCircuit: true };
+    // Only classify by extension when the specifier carried no query: a spec
+    // with a leftover query is either already-tagged (a runner re-importing a
+    // ?ojasset/?ojv URL, which must pass through with its query intact) or
+    // asks for something we don't handle.
+    const kind = intent ?? (clean.includes("?") ? null : /\.css$/.test(abs) ? "css" : ASSET_EXT.test(abs) ? "url" : null);
+    if (kind) return { url: pathToFileURL(abs).href + `?ojasset=${kind}`, shortCircuit: true };
   }
-  if (/\.svg\?react$/.test(spec)) {
-    const clean = spec.replace(/\?react$/, "");
-    let abs = null;
-    if (clean.startsWith(".") && context.parentURL) {
-      abs = probe(pathResolve(dirname(fileURLToPath(context.parentURL)), clean));
-    } else if (clean.startsWith("#")) {
-      abs = resolveImports(clean);
-    } else if (!clean.startsWith("/")) {
-      abs = resolveTsPaths(clean);
-    }
-    if (!abs) {
-      try { abs = fileURLToPath(stripQ(next(clean, context).url)); } catch {}
-    }
-    if (abs) return { url: pathToFileURL(abs).href + "?ojsvg=react", shortCircuit: true };
-  }
-  if (ALIASES[spec]) {
-    const hit = probe(ALIASES[spec]);
-    if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true, _ojv: true };
-  }
-  if (spec.startsWith("#")) {
-    const hit = resolveImports(spec);
-    if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true, _ojv: true };
-  }
-  if (!spec.startsWith(".") && !spec.startsWith("/")) {
-    const hit = resolveTsPaths(spec);
-    if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true, _ojv: true };
-  }
-  if (spec.startsWith(".") && context.parentURL) {
-    const base = pathResolve(dirname(fileURLToPath(context.parentURL)), spec);
-    const hit = probe(base);
-    if (hit) return { url: withV(pathToFileURL(hit).href), shortCircuit: true, _ojv: true };
-  }
-  let r;
-  try {
-    r = next(spec, context);
-  } catch (err) {
-    if (err && err.code === "ERR_MODULE_NOT_FOUND") {
-      const tried = err.url && err.url.startsWith("file:")
-        ? fileURLToPath(err.url)
-        : (err.message.match(/Cannot find module '([^']+)'/) || [])[1];
-      const hit = tried ? probe(tried) : null;
-      if (hit) return { url: pathToFileURL(hit).href, shortCircuit: true };
-    }
-    // A dep subpath that is a directory with its own package.json (the legacy
-    // `pkg/query/react/package.json` entry pattern, e.g. @reduxjs/toolkit): Node
-    // ESM refuses the directory import, but CJS resolvers and bundlers read its
-    // module/main. Resolve it to that entry so oj serves the same file Vite does.
-    if (err && err.code === "ERR_UNSUPPORTED_DIR_IMPORT") {
-      const dir = err.url && err.url.startsWith("file:")
-        ? fileURLToPath(err.url)
-        : (err.message.match(/Directory import '([^']+)'/) || [])[1];
-      const hit = dir ? resolveDirEntry(dir) : null;
-      if (hit) return { url: pathToFileURL(hit).href, shortCircuit: true };
-    }
-    throw err;
-  }
+  if (res.via === "local") return { url: withV(pathToFileURL(res.abs).href), shortCircuit: true, _ojv: true };
+  if (res.via === "recovered") return { url: pathToFileURL(res.abs).href, shortCircuit: true };
+  const r = res.result;
   if (r && r.url && isTanstack(r.url)) return { ...r, url: withV(r.url), shortCircuit: true, _ojv: true };
   return r;
 }
@@ -651,7 +682,7 @@ export function load(url, context, next) {
     if (kind === "raw") src = `export default ${JSON.stringify(readFileSync(path, "utf8"))};`;
     else if (kind === "url") src = `export default ${JSON.stringify("/@oj-start/fs" + path)};`;
     else if (kind === "inline")
-      src = `export default ${JSON.stringify("data:application/octet-stream;base64," + readFileSync(path).toString("base64"))};`;
+      src = `export default ${JSON.stringify(`data:${mimeOf(path)};base64,` + readFileSync(path).toString("base64"))};`;
     return { format: "module", source: src, shortCircuit: true };
   }
   if (clean.endsWith(".json")) {
