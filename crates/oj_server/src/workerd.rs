@@ -419,9 +419,6 @@ pub fn resolve_fallback(
         return Fallback::NotFound;
     }
 
-    // A bare / `#` / alias import must resolve by its original specifier (its
-    // package intent), not workerd's dir-joined `specifier` (which collides with
-    // a same-named local file, e.g. `import "sonner"` from a `sonner/` folder).
     let alias_key = if raw_specifier.is_empty() {
         specifier.trim_start_matches('/')
     } else {
