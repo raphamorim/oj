@@ -743,13 +743,13 @@ mod tests {
         let r = resolver(dir.path());
         let cache = ModuleCache::default();
         let spec = format!("/{}", pkg.join("index.mjs").display());
-        let first = match resolve_fallback(dir.path(), &r, &[], Some(&cache), &spec, "dep", "/e") {
+        let first = match resolve_fallback(dir.path(), &r, &[], Some(&cache), &spec, "", "/e") {
             Fallback::Module { code, .. } => code,
             _ => panic!("expected module"),
         };
         assert_eq!(cache.lock().unwrap().len(), 1, "compile result should be cached");
         // a second resolve returns the identical cached code
-        let second = match resolve_fallback(dir.path(), &r, &[], Some(&cache), &spec, "dep", "/e") {
+        let second = match resolve_fallback(dir.path(), &r, &[], Some(&cache), &spec, "", "/e") {
             Fallback::Module { code, .. } => code,
             _ => panic!("expected module"),
         };
