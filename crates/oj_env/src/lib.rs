@@ -113,6 +113,22 @@ pub fn load(dir: &Path, mode: &str) -> Vec<(String, String)> {
     merged.into_iter().collect()
 }
 
+/// Vite parity: the actual process environment (and any plugin `config()` env
+/// mutations layered on top of it) wins over `.env` files for prefixed vars.
+pub fn with_process_env(
+    loaded: Vec<(String, String)>,
+    process_env: impl IntoIterator<Item = (String, String)>,
+    prefixes: &[&str],
+) -> Vec<(String, String)> {
+    let mut map: BTreeMap<String, String> = loaded.into_iter().collect();
+    for (k, v) in process_env {
+        if prefixes.iter().any(|p| k.starts_with(p)) {
+            map.insert(k, v);
+        }
+    }
+    map.into_iter().collect()
+}
+
 pub fn import_meta_env_defines(
     loaded: &[(String, String)],
     mode: &str,
@@ -291,6 +307,45 @@ mod tests {
         assert_eq!(map["MISSING"], "[]");
         assert_eq!(map["FROMBASE"], "envval");
         assert_eq!(map["UNCLOSED"], "${OOPS");
+    }
+
+    #[test]
+    fn process_env_wins_over_files_for_prefixed_vars() {
+        let loaded = vec![
+            ("VITE_A".into(), "file-a".into()),
+            ("VITE_B".into(), "file-b".into()),
+        ];
+        let process_env = vec![
+            ("VITE_A".into(), "proc-a".into()),
+            ("VITE_C".into(), "proc-c".into()),
+            ("SECRET".into(), "nope".into()),
+        ];
+        let merged = with_process_env(loaded, process_env, &["VITE_"]);
+        let map: std::collections::HashMap<_, _> = merged.into_iter().collect();
+        assert_eq!(map["VITE_A"], "proc-a", "process env wins over file value");
+        assert_eq!(map["VITE_B"], "file-b", "file-only var survives");
+        assert_eq!(map["VITE_C"], "proc-c", "process-only prefixed var is added");
+        assert!(!map.contains_key("SECRET"), "unprefixed process var excluded");
+    }
+
+    #[test]
+    fn process_env_overlay_flows_into_defines() {
+        let merged = with_process_env(
+            vec![("VITE_FLAG".into(), "off".into())],
+            vec![("VITE_FLAG".into(), "true".into())],
+            &["VITE_"],
+        );
+        let d = import_meta_env_defines(&merged, "development", true, "/", &["VITE_"]);
+        let map: std::collections::HashMap<_, _> = d.iter().cloned().collect();
+        assert_eq!(map["import.meta.env.VITE_FLAG"], "\"true\"");
+        assert!(map["import.meta.env"].contains("\"VITE_FLAG\":\"true\""));
+    }
+
+    #[test]
+    fn empty_process_env_is_a_no_op() {
+        let loaded = vec![("VITE_A".into(), "file-a".into())];
+        let merged = with_process_env(loaded.clone(), Vec::new(), &["VITE_"]);
+        assert_eq!(merged, loaded);
     }
 
     #[test]

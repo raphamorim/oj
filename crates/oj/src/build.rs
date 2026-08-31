@@ -1550,7 +1550,7 @@ pub async fn build(
                 .unwrap_or(sourcemap)
                 .then_some(SourceMapType::File),
             define: Some({
-                let env = oj_env::load(&root, mode);
+                let env = oj_env::with_process_env(oj_env::load(&root, mode), std::env::vars(), &["VITE_"]);
                 let mut pairs: Vec<(String, String)> =
                     vec![("process.env.NODE_ENV".into(), "'production'".into())];
                 pairs.extend(oj_env::import_meta_env_defines(
@@ -1617,7 +1617,7 @@ pub async fn build(
     // %VITE_*% / import.meta.env substitution (Vite's htmlEnvHook), applied to
     // each page before the plugin transformIndexHtml below.
     let html_env = {
-        let env = oj_env::load(&root, mode);
+        let env = oj_env::with_process_env(oj_env::load(&root, mode), std::env::vars(), &["VITE_"]);
         let mut defines = oj_env::import_meta_env_defines(&env, mode, false, &base, &["VITE_"]);
         defines.extend(oj_config::config_defines(&config));
         oj_env::html_env_map(&defines)
@@ -2524,7 +2524,7 @@ async fn build_client_entry(
                 .unwrap_or(sourcemap)
                 .then_some(SourceMapType::File),
             define: Some({
-                let env = oj_env::load(root, "production");
+                let env = oj_env::with_process_env(oj_env::load(root, "production"), std::env::vars(), &["VITE_"]);
                 let mut pairs = vec![(
                     "process.env.NODE_ENV".to_string(),
                     "'production'".to_string(),

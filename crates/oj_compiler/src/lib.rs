@@ -67,14 +67,16 @@ pub(crate) fn detect_refresh_registrations(program: &Program) -> bool {
     detector.found
 }
 
-static ENV_DEFINES: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+// RwLock, not OnceLock: the server re-sets these once the plugin host reports
+// config()-hook env mutations, which land after the initial dotenv-based set.
+static ENV_DEFINES: std::sync::RwLock<Option<Vec<(String, String)>>> = std::sync::RwLock::new(None);
 
 pub fn set_import_meta_env(defines: Vec<(String, String)>) {
-    let _ = ENV_DEFINES.set(defines);
+    *ENV_DEFINES.write().expect("ENV_DEFINES poisoned") = Some(defines);
 }
 
 pub(crate) fn import_meta_env_defines(dev: bool, ssr: bool) -> Vec<(String, String)> {
-    if let Some(defines) = ENV_DEFINES.get() {
+    if let Some(defines) = ENV_DEFINES.read().expect("ENV_DEFINES poisoned").as_ref() {
         if !ssr {
             return defines.clone();
         }

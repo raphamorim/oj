@@ -71,6 +71,9 @@ jobs:
       - name: plugin resolveId without a load hook serves from disk
         if: matrix.mode == 'unbundled'
         run: node e2e/plugin-resolve-no-load.mjs
+      - name: client env define (dotenv + process env + plugin config mutations)
+        if: matrix.mode == 'unbundled'
+        run: node e2e/env-define.mjs
 
   # i need to fix this or automate
   build:
