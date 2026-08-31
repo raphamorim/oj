@@ -75,7 +75,18 @@ pub fn set_import_meta_env(defines: Vec<(String, String)>) {
 
 pub(crate) fn import_meta_env_defines(dev: bool, ssr: bool) -> Vec<(String, String)> {
     if let Some(defines) = ENV_DEFINES.get() {
-        return defines.clone();
+        if !ssr {
+            return defines.clone();
+        }
+        let mut out = defines.clone();
+        for (k, v) in out.iter_mut() {
+            if k == "import.meta.env.SSR" {
+                *v = "true".into();
+            } else if k == "import.meta.env" {
+                *v = v.replace("\"SSR\":false", "\"SSR\":true");
+            }
+        }
+        return out;
     }
     let mode = if dev { "development" } else { "production" };
     vec![
