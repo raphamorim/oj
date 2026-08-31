@@ -176,7 +176,9 @@ async fn fallback_handler(
 
 fn compile_proxied(root: &Path, code: &str) -> String {
     let path = root.join("__oj_virtual__.tsx");
-    match oj_compiler::compile(&path, code, &oj_compiler::CompileOptions::prod()) {
+    let mut opts = oj_compiler::CompileOptions::prod();
+    opts.ssr = true;
+    match oj_compiler::compile(&path, code, &opts) {
         Ok(out) => out.code,
         Err(_) => code.to_string(),
     }

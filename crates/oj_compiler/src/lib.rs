@@ -73,7 +73,7 @@ pub fn set_import_meta_env(defines: Vec<(String, String)>) {
     let _ = ENV_DEFINES.set(defines);
 }
 
-pub(crate) fn import_meta_env_defines(dev: bool) -> Vec<(String, String)> {
+pub(crate) fn import_meta_env_defines(dev: bool, ssr: bool) -> Vec<(String, String)> {
     if let Some(defines) = ENV_DEFINES.get() {
         return defines.clone();
     }
@@ -83,11 +83,11 @@ pub(crate) fn import_meta_env_defines(dev: bool) -> Vec<(String, String)> {
         ("import.meta.env.MODE".into(), format!("\"{mode}\"")),
         ("import.meta.env.DEV".into(), dev.to_string()),
         ("import.meta.env.PROD".into(), (!dev).to_string()),
-        ("import.meta.env.SSR".into(), "false".into()),
+        ("import.meta.env.SSR".into(), ssr.to_string()),
         (
             "import.meta.env".into(),
             format!(
-                "({{\"BASE_URL\":\"/\",\"MODE\":\"{mode}\",\"DEV\":{dev},\"PROD\":{prod},\"SSR\":false}})",
+                "({{\"BASE_URL\":\"/\",\"MODE\":\"{mode}\",\"DEV\":{dev},\"PROD\":{prod},\"SSR\":{ssr}}})",
                 prod = !dev
             ),
         ),
@@ -99,6 +99,7 @@ pub struct CompileOptions {
     pub dev: bool,
     pub refresh: bool,
     pub sourcemap: bool,
+    pub ssr: bool,
 }
 
 impl CompileOptions {
@@ -107,6 +108,7 @@ impl CompileOptions {
             dev: true,
             refresh: true,
             sourcemap: true,
+            ssr: false,
         }
     }
 
@@ -115,6 +117,7 @@ impl CompileOptions {
             dev: false,
             refresh: false,
             sourcemap: true,
+            ssr: false,
         }
     }
 }
@@ -263,7 +266,7 @@ pub fn compile_module_with_maps(
         });
     }
 
-    let defines = import_meta_env_defines(opts.dev);
+    let defines = import_meta_env_defines(opts.dev, opts.ssr);
     let needs_defines = F_IMPORT_META_ENV.find(source_text.as_bytes()).is_some()
         || defines
             .iter()
@@ -808,6 +811,7 @@ export const used: A extends B ? number : number = c + d;
                 dev: true,
                 refresh: false,
                 sourcemap: false,
+                ssr: false,
             },
             None,
         )
@@ -837,6 +841,7 @@ export const used: A extends B ? number : number = c + d;
                 dev: false,
                 refresh: false,
                 sourcemap: false,
+                ssr: false,
             },
             None,
         )

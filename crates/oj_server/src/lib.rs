@@ -2241,6 +2241,7 @@ async fn ensure_module(
                         dev: true,
                         refresh: false,
                         sourcemap: true,
+                        ssr: false,
                     }
                 } else {
                     oj_compiler::CompileOptions::dev()

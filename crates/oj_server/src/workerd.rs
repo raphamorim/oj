@@ -270,13 +270,9 @@ fn serve_resolved(
         let out = oj_compiler::cjs::wrap_cjs(file, &url, &source, &mut rewrite).ok()?;
         return Some((name, out.code));
     }
-    let out = oj_compiler::compile_module(
-        file,
-        &source,
-        &oj_compiler::CompileOptions::prod(),
-        Some(&mut rewrite),
-    )
-    .ok()?;
+    let mut opts = oj_compiler::CompileOptions::prod();
+    opts.ssr = true;
+    let out = oj_compiler::compile_module(file, &source, &opts, Some(&mut rewrite)).ok()?;
     Some((name, out.code))
 }
 
