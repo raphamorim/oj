@@ -95,18 +95,30 @@ pub fn render_config(o: &WorkerdOptions) -> String {
     for (k, v) in &o.vars {
         bindings.push(format!("    (name = {}, text = {}),", capnp_str(k), capnp_str(v)));
     }
-    for (k, service) in &o.service_bindings {
+    for (k, _service) in &o.service_bindings {
         bindings.push(format!(
-            "    (name = {}, service = (name = {})),",
-            capnp_str(k),
-            capnp_str(service)
+            "    (name = {}, service = (name = \"oj_stub_service\")),",
+            capnp_str(k)
         ));
     }
     let bindings = bindings.join("\n");
+    let (stub_service, stub_worker) = if o.service_bindings.is_empty() {
+        (String::new(), String::new())
+    } else {
+        let body = "export default { fetch() { return new Response(\"oj: service binding unavailable in local dev\", { status: 501 }); } };";
+        (
+            ",\n    (name = \"oj_stub_service\", worker = .stubWorker)".to_string(),
+            format!(
+                "const stubWorker :Workerd.Worker = (\n  compatibilityDate = {date},\n  modules = [ (name = \"stub.js\", esModule = {body}) ],\n);\n",
+                date = capnp_str(&o.compat_date),
+                body = capnp_str(body),
+            ),
+        )
+    };
     format!(
         "using Workerd = import \"/workerd/workerd.capnp\";\n\
 const config :Workerd.Config = (\n  \
-  services = [ (name = \"main\", worker = .mainWorker) ],\n  \
+  services = [ (name = \"main\", worker = .mainWorker){stub_service} ],\n  \
   sockets = [ (name = \"http\", address = {socket}, http = (), service = \"main\") ],\n\
 );\n\
 const mainWorker :Workerd.Worker = (\n  \
@@ -115,13 +127,15 @@ const mainWorker :Workerd.Worker = (\n  \
   modules = [ (name = \"entry.js\", esModule = {stub}) ],\n  \
   moduleFallback = {fallback},\n  \
   bindings = [\n{bindings}\n  ],\n\
-);\n",
+);\n{stub_worker}",
         socket = capnp_str(&o.socket_addr),
         date = capnp_str(&o.compat_date),
         flags = flags,
         stub = capnp_str(&stub),
         fallback = capnp_str(&o.fallback_addr),
         bindings = bindings,
+        stub_service = stub_service,
+        stub_worker = stub_worker,
     )
 }
 
@@ -134,6 +148,17 @@ const RESOLVE_EXTS: &[&str] = &[".ts", ".tsx", ".js", ".jsx", ".mjs"];
 fn resolve_file(base: &Path) -> Option<PathBuf> {
     if base.is_file() {
         return Some(base.to_path_buf());
+    }
+    if matches!(
+        base.extension().and_then(|e| e.to_str()),
+        Some("js" | "jsx" | "mjs" | "cjs")
+    ) {
+        for ts in ["ts", "tsx"] {
+            let cand = base.with_extension(ts);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
     }
     for ext in RESOLVE_EXTS {
         let p = PathBuf::from(format!("{}{ext}", base.display()));
@@ -168,38 +193,90 @@ pub fn fallback_module(
     specifier: &str,
 ) -> Option<(String, String)> {
     let file = spec_to_file(root, specifier)?;
-    serve_resolved(&file, specifier, resolver)
+    serve_resolved(&file, specifier, resolver, &[])
+}
+
+const ASSET_EXTS: &[&str] = &[
+    "css", "svg", "png", "jpg", "jpeg", "gif", "webp", "avif", "ico", "bmp", "woff", "woff2",
+    "ttf", "otf", "eot", "mp4", "webm", "ogg", "wav", "mp3", "flac", "pdf", "txt", "md",
+];
+
+fn is_asset_ext(ext: &str) -> bool {
+    ASSET_EXTS.contains(&ext)
+}
+
+fn asset_url(file: &Path) -> String {
+    format!("/@oj-start/fs{}", file.to_string_lossy())
+}
+
+fn js_str(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| format!("{s:?}"))
+}
+
+fn resolve_import(
+    dir: &Path,
+    spec: &str,
+    resolver: &OjResolver,
+    aliases: &[(String, PathBuf)],
+) -> Option<PathBuf> {
+    if let Some((path, query)) = spec.split_once('?') {
+        let base = resolve_import(dir, path, resolver, aliases)?;
+        return Some(PathBuf::from(format!("{}?{query}", base.display())));
+    }
+    if spec.starts_with('#') {
+        return resolve_hash_import(dir, spec);
+    }
+    if let Some((_, target)) = aliases.iter().find(|(k, _)| k == spec) {
+        return resolve_file(target);
+    }
+    if spec.starts_with('.') {
+        return resolve_file(&dir.join(spec));
+    }
+    if spec.starts_with('/') {
+        return resolve_file(Path::new(spec));
+    }
+    resolver.resolve(dir, spec).ok()
 }
 
 fn serve_resolved(
     file: &Path,
     specifier: &str,
     resolver: &OjResolver,
+    aliases: &[(String, PathBuf)],
 ) -> Option<(String, String)> {
-    let source = std::fs::read_to_string(file).ok()?;
     let name = specifier.trim_start_matches('/').to_string();
     let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if is_asset_ext(ext) {
+        return Some((name, format!("export default {};\n", js_str(&asset_url(file)))));
+    }
+    let source = std::fs::read_to_string(file).ok()?;
     if ext == "json" {
         return Some((name, format!("export default {source};\n")));
     }
+    let dir = file.parent()?.to_path_buf();
     let is_cjs = match ext {
         "cjs" => true,
         "js" => !oj_compiler::cjs::has_module_syntax_pub(file, &source),
         _ => false,
     };
+    let mut rewrite = |spec: &str| -> Option<String> {
+        if crate::is_node_builtin(spec) {
+            return Some(format!("node:{}", spec.strip_prefix("node:").unwrap_or(spec)));
+        }
+        resolve_import(&dir, spec, resolver, aliases).map(|p| p.to_string_lossy().into_owned())
+    };
     if is_cjs {
-        let dir = file.parent()?.to_path_buf();
         let url = file.to_string_lossy().into_owned();
-        let mut resolve = |spec: &str| -> Option<String> {
-            if crate::is_node_builtin(spec) {
-                return Some(format!("node:{}", spec.strip_prefix("node:").unwrap_or(spec)));
-            }
-            resolver.resolve(&dir, spec).ok().map(|p| p.to_string_lossy().into_owned())
-        };
-        let out = oj_compiler::cjs::wrap_cjs(file, &url, &source, &mut resolve).ok()?;
+        let out = oj_compiler::cjs::wrap_cjs(file, &url, &source, &mut rewrite).ok()?;
         return Some((name, out.code));
     }
-    let out = oj_compiler::compile(file, &source, &oj_compiler::CompileOptions::prod()).ok()?;
+    let out = oj_compiler::compile_module(
+        file,
+        &source,
+        &oj_compiler::CompileOptions::prod(),
+        Some(&mut rewrite),
+    )
+    .ok()?;
     Some((name, out.code))
 }
 
@@ -235,34 +312,44 @@ pub fn resolve_fallback(
     raw_specifier: &str,
     referrer: &str,
 ) -> Fallback {
-    if let Some(file) = spec_to_file(root, specifier) {
-        let resolved_index = file.file_stem().and_then(|s| s.to_str()) == Some("index");
-        let spec_index = Path::new(specifier).file_stem().and_then(|s| s.to_str()) == Some("index");
-        if resolved_index && !spec_index {
-            return Fallback::Redirect { location: file.to_string_lossy().into_owned() };
-        }
-        if let Some((name, mut code)) = serve_resolved(&file, specifier, resolver) {
-            rewrite_hash_aliases(&mut code, aliases);
-            return Fallback::Module { name, code };
+    let importer_dir = spec_to_file(root, referrer)
+        .and_then(|f| f.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| root.to_path_buf());
+
+    if let Some((path_part, query)) = specifier.split_once('?') {
+        if let Some(file) = spec_to_file(root, path_part) {
+            let code = if query.split('&').any(|q| q == "raw") {
+                match std::fs::read_to_string(&file) {
+                    Ok(s) => format!("export default {};\n", js_str(&s)),
+                    Err(_) => return Fallback::NotFound,
+                }
+            } else {
+                format!("export default {};\n", js_str(&asset_url(&file)))
+            };
+            return Fallback::Module {
+                name: specifier.trim_start_matches('/').to_string(),
+                code,
+            };
         }
         return Fallback::NotFound;
     }
-    let key = if raw_specifier.is_empty() {
+
+    // A bare / `#` / alias import must resolve by its original specifier (its
+    // package intent), not workerd's dir-joined `specifier` (which collides with
+    // a same-named local file, e.g. `import "sonner"` from a `sonner/` folder).
+    let alias_key = if raw_specifier.is_empty() {
         specifier.trim_start_matches('/')
     } else {
         raw_specifier
     };
-    if let Some((_, target)) = aliases.iter().find(|(k, _)| k == key) {
+    if let Some((_, target)) = aliases.iter().find(|(k, _)| k == alias_key) {
         if let Some(file) = resolve_file(target) {
-            return Fallback::Redirect { location: file.to_string_lossy().into_owned() };
+            return serve_or_redirect(&file, specifier, resolver, aliases);
         }
     }
-    let importer_dir = spec_to_file(root, referrer)
-        .and_then(|f| f.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| root.to_path_buf());
     if raw_specifier.starts_with('#') {
         if let Some(file) = resolve_hash_import(&importer_dir, raw_specifier) {
-            return Fallback::Redirect { location: file.to_string_lossy().into_owned() };
+            return serve_or_redirect(&file, specifier, resolver, aliases);
         }
     }
     if !raw_specifier.is_empty()
@@ -270,10 +357,43 @@ pub fn resolve_fallback(
         && !raw_specifier.starts_with('/')
     {
         if let Ok(abs) = resolver.resolve(&importer_dir, raw_specifier) {
-            return Fallback::Redirect { location: abs.to_string_lossy().into_owned() };
+            return serve_or_redirect(&abs, specifier, resolver, aliases);
+        }
+        if crate::is_node_builtin(raw_specifier) {
+            let name = raw_specifier.strip_prefix("node:").unwrap_or(raw_specifier);
+            return Fallback::Redirect { location: format!("node:{name}") };
+        }
+    }
+
+    if let Some(file) = spec_to_file(root, specifier) {
+        let resolved_index = file.file_stem().and_then(|s| s.to_str()) == Some("index");
+        let spec_index = Path::new(specifier).file_stem().and_then(|s| s.to_str()) == Some("index");
+        if resolved_index && !spec_index {
+            return Fallback::Redirect { location: file.to_string_lossy().into_owned() };
+        }
+        if let Some((name, mut code)) = serve_resolved(&file, specifier, resolver, aliases) {
+            rewrite_hash_aliases(&mut code, aliases);
+            return Fallback::Module { name, code };
         }
     }
     Fallback::NotFound
+}
+
+fn serve_or_redirect(
+    file: &Path,
+    specifier: &str,
+    resolver: &OjResolver,
+    aliases: &[(String, PathBuf)],
+) -> Fallback {
+    let canonical = file.to_string_lossy();
+    if specifier.trim_start_matches('/') == canonical.trim_start_matches('/') {
+        if let Some((name, mut code)) = serve_resolved(file, specifier, resolver, aliases) {
+            rewrite_hash_aliases(&mut code, aliases);
+            return Fallback::Module { name, code };
+        }
+        return Fallback::NotFound;
+    }
+    Fallback::Redirect { location: canonical.into_owned() }
 }
 
 fn resolve_hash_import(importer_dir: &Path, raw: &str) -> Option<PathBuf> {
@@ -335,9 +455,11 @@ mod tests {
         assert!(cfg.contains(r#"compatibilityFlags = ["nodejs_compat"]"#), "{cfg}");
         assert!(cfg.contains(r#"(name = "EVENTS_API_URL", text = "https://x")"#), "{cfg}");
         assert!(
-            cfg.contains(r#"(name = "CONFIDENCE_RESOLVER", service = (name = "resolver"))"#),
+            cfg.contains(r#"(name = "CONFIDENCE_RESOLVER", service = (name = "oj_stub_service"))"#),
             "{cfg}"
         );
+        assert!(cfg.contains(r#"(name = "oj_stub_service", worker = .stubWorker)"#), "{cfg}");
+        assert!(cfg.contains("const stubWorker :Workerd.Worker"), "{cfg}");
         // the embedded entry stub imports the real entry via fallback
         assert!(cfg.contains(r#"import handler from \"/src/entry.tsx\""#), "{cfg}");
     }
@@ -488,6 +610,29 @@ mod tests {
             resolve_fallback(dir.path(), &r, &[], "/ghost", "ghost", "/src/entry.tsx"),
             Fallback::NotFound
         ));
+    }
+
+    #[test]
+    fn bare_import_wins_over_a_same_named_local_file() {
+        // workerd joins a bare import to the importer dir, so `import "sonner"` from
+        // .../sonner/sonner arrives as specifier .../sonner/sonner (the importer
+        // itself). The package must still win over that local collision.
+        let dir = tempfile::tempdir().unwrap();
+        let comp = dir.path().join("ui/sonner");
+        std::fs::create_dir_all(&comp).unwrap();
+        std::fs::write(comp.join("sonner.tsx"), "export const Local = 1;\n").unwrap();
+        let pkg = dir.path().join("node_modules/sonner");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("package.json"), r#"{"name":"sonner","module":"index.mjs"}"#).unwrap();
+        std::fs::write(pkg.join("index.mjs"), "export const useSonner = 1;\n").unwrap();
+        let r = resolver(dir.path());
+        let spec = format!("/{}", comp.join("sonner").display());
+        match resolve_fallback(dir.path(), &r, &[], &spec, "sonner", &format!("/{}", comp.join("sonner").display())) {
+            Fallback::Redirect { location } => {
+                assert!(location.ends_with("node_modules/sonner/index.mjs"), "{location}");
+            }
+            other => panic!("bare import must redirect to the package, not the local file: {:?}", matches!(other, Fallback::Module{..})),
+        }
     }
 
     #[test]

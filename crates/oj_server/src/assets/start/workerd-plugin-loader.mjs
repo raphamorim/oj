@@ -37,7 +37,8 @@ try {
 const server = http.createServer(async (req, res) => {
   try {
     const u = new URL(req.url, "http://loader");
-    const specifier = u.searchParams.get("specifier") ?? "";
+    const specifier =
+      u.searchParams.get("rawSpecifier") || u.searchParams.get("specifier") || "";
     const referrer = u.searchParams.get("referrer") ?? "";
     const rid = await container.resolveId(specifier, importerFor(referrer));
     if (rid == null) {

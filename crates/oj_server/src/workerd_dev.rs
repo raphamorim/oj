@@ -144,7 +144,18 @@ async fn fallback_handler(
     };
     let raw = get("rawSpecifier").unwrap_or("");
     let referrer = get("referrer").unwrap_or("");
-    match resolve_fallback(&state.root, &state.resolver, &state.aliases, specifier, raw, referrer) {
+    let debug = std::env::var_os("OJ_WORKERD_DEBUG").is_some();
+    let outcome =
+        resolve_fallback(&state.root, &state.resolver, &state.aliases, specifier, raw, referrer);
+    if debug {
+        let kind = match &outcome {
+            Fallback::Module { .. } => "module".to_string(),
+            Fallback::Redirect { location } => format!("redirect->{location}"),
+            Fallback::NotFound => "404".to_string(),
+        };
+        eprintln!("wd-fb spec={specifier} raw={raw} ref={referrer} => {kind}");
+    }
+    match outcome {
         Fallback::Module { name, code } => module_response(&name, &code),
         Fallback::Redirect { location } => (
             axum::http::StatusCode::MOVED_PERMANENTLY,
