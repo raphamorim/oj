@@ -82,7 +82,13 @@ fn capnp_str(s: &str) -> String {
 
 pub fn render_config(o: &WorkerdOptions) -> String {
     let stub = format!(
-        "import handler from {};\nexport default handler;",
+        "globalThis.process ??= {{}};\n\
+globalThis.process.env ??= {{}};\n\
+globalThis.process.env.TSS_SERVER_FN_BASE ??= \"/_serverFn/\";\n\
+globalThis.process.env.TSS_DEV_SERVER ??= \"true\";\n\
+globalThis.process.env.TSS_DEV_SSR_STYLES_ENABLED ??= \"false\";\n\
+const __oj_mod = await import({});\n\
+export default __oj_mod.default;",
         json_ident(&o.entry_specifier)
     );
     let flags = o
@@ -173,6 +179,18 @@ fn resolve_file(base: &Path) -> Option<PathBuf> {
                 return Some(p);
             }
         }
+    }
+    None
+}
+
+fn spec_to_existing(root: &Path, specifier: &str) -> Option<PathBuf> {
+    let abs = PathBuf::from(specifier);
+    if abs.is_absolute() && abs.exists() {
+        return Some(abs);
+    }
+    let p = root.join(specifier.trim_start_matches('/'));
+    if p.exists() {
+        return Some(p);
     }
     None
 }
@@ -383,18 +401,19 @@ pub fn resolve_fallback(
         .unwrap_or_else(|| root.to_path_buf());
 
     if let Some((path_part, query)) = specifier.split_once('?') {
-        if let Some(file) = spec_to_file(root, path_part) {
-            let code = if query.split('&').any(|q| q == "raw") {
-                match std::fs::read_to_string(&file) {
-                    Ok(s) => format!("export default {};\n", js_str(&s)),
-                    Err(_) => return Fallback::NotFound,
+        let name = specifier.trim_start_matches('/').to_string();
+        if query.split('&').any(|q| q == "raw") {
+            if let Some(file) = spec_to_file(root, path_part) {
+                if let Ok(s) = std::fs::read_to_string(&file) {
+                    return Fallback::Module { name, code: format!("export default {};\n", js_str(&s)) };
                 }
-            } else {
-                format!("export default {};\n", js_str(&asset_url(&file)))
-            };
+            }
+            return Fallback::NotFound;
+        }
+        if let Some(p) = spec_to_file(root, path_part).or_else(|| spec_to_existing(root, path_part)) {
             return Fallback::Module {
-                name: specifier.trim_start_matches('/').to_string(),
-                code,
+                name,
+                code: format!("export default {};\n", js_str(&asset_url(&p))),
             };
         }
         return Fallback::NotFound;
@@ -519,8 +538,9 @@ mod tests {
         );
         assert!(cfg.contains(r#"(name = "oj_stub_service", worker = .stubWorker)"#), "{cfg}");
         assert!(cfg.contains("const stubWorker :Workerd.Worker"), "{cfg}");
-        // the embedded entry stub imports the real entry via fallback
-        assert!(cfg.contains(r#"import handler from \"/src/entry.tsx\""#), "{cfg}");
+        // the embedded entry stub sets TSS env then dynamic-imports the real entry
+        assert!(cfg.contains(r#"TSS_SERVER_FN_BASE"#), "{cfg}");
+        assert!(cfg.contains(r#"await import(\"/src/entry.tsx\")"#), "{cfg}");
     }
 
     #[test]
@@ -653,6 +673,21 @@ mod tests {
         assert!(code.contains("module.exports"), "cjs body not wrapped: {code}");
         // a node builtin require() is mapped to a node: import for nodejs_compat
         assert!(code.contains("\"node:os\""), "node builtin not mapped: {code}");
+    }
+
+    #[test]
+    fn url_query_serves_a_directory_asset_url() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("client")).unwrap();
+        let r = resolver(dir.path());
+        let spec = format!("/{}?url", dir.path().join("client").display());
+        match resolve_fallback(dir.path(), &r, &[], &spec, "./client?url", "/e") {
+            Fallback::Module { code, .. } => {
+                assert!(code.contains("/@oj-start/fs"), "{code}");
+                assert!(code.ends_with("client\";\n") || code.contains("/client\""), "{code}");
+            }
+            _ => panic!("expected a directory asset url module"),
+        }
     }
 
     #[test]

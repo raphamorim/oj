@@ -793,11 +793,25 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
             .map(|p| p.as_str())
             .unwrap_or("/")
             .to_string();
-        let headers = collect_headers(req.headers());
-        let body = axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024)
+        let header_map = req.headers().clone();
+        let body_bytes = axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024)
             .await
-            .ok()
-            .map(|b| String::from_utf8_lossy(&b).into_owned());
+            .ok();
+        if let Some(worker_url) = &state.worker_url {
+            if let Some(resp) = oj_server::forward_to_worker(
+                worker_url,
+                &method,
+                &url,
+                &header_map,
+                body_bytes.as_ref().map(|b| b.to_vec()),
+            )
+            .await
+            {
+                return resp;
+            }
+        }
+        let headers = collect_headers(&header_map);
+        let body = body_bytes.map(|b| String::from_utf8_lossy(&b).into_owned());
         return forward(&state.runner, method, url, headers, body).await;
     }
     match classify(&req, &state.proxy_prefixes) {
