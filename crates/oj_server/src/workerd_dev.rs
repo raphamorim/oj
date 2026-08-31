@@ -25,6 +25,8 @@ struct FallbackState {
     root: PathBuf,
     resolver: OjResolver,
     aliases: Vec<(String, PathBuf)>,
+    plugin_loader: Option<String>,
+    http: reqwest::Client,
 }
 
 pub fn start_aliases(app_root: &Path, assets_dir: &Path) -> Vec<(String, PathBuf)> {
@@ -87,6 +89,7 @@ pub async fn spawn(
     workerd_bin: &Path,
     config_dir: &Path,
     aliases: Vec<(String, PathBuf)>,
+    plugin_loader: Option<String>,
     opts: WorkerdSpawn,
 ) -> std::io::Result<WorkerdSession> {
     let fb = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -95,6 +98,8 @@ pub async fn spawn(
         root: root.to_path_buf(),
         resolver: OjResolver::with_conditions(root, &worker_conditions()),
         aliases,
+        plugin_loader,
+        http: reqwest::Client::new(),
     });
     tokio::spawn(async move {
         let app = Router::new().route("/", get(fallback_handler)).with_state(state);
@@ -138,17 +143,47 @@ async fn fallback_handler(
     let raw = get("rawSpecifier").unwrap_or("");
     let referrer = get("referrer").unwrap_or("");
     match resolve_fallback(&state.root, &state.resolver, &state.aliases, specifier, raw, referrer) {
-        Fallback::Module { name, code } => {
-            let body = serde_json::json!({ "name": name, "esModule": code }).to_string();
-            ([(axum::http::header::CONTENT_TYPE, "application/json")], body).into_response()
-        }
+        Fallback::Module { name, code } => module_response(&name, &code),
         Fallback::Redirect { location } => (
             axum::http::StatusCode::MOVED_PERMANENTLY,
             [(axum::http::header::LOCATION, location)],
         )
             .into_response(),
-        Fallback::NotFound => axum::http::StatusCode::NOT_FOUND.into_response(),
+        Fallback::NotFound => {
+            if let Some(loader) = &state.plugin_loader {
+                if let Some(code) = proxy_plugin_loader(&state.http, loader, specifier, raw, referrer).await {
+                    return module_response(specifier.trim_start_matches('/'), &code);
+                }
+            }
+            axum::http::StatusCode::NOT_FOUND.into_response()
+        }
     }
+}
+
+fn module_response(name: &str, code: &str) -> Response {
+    let body = serde_json::json!({ "name": name, "esModule": code }).to_string();
+    ([(axum::http::header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+async fn proxy_plugin_loader(
+    http: &reqwest::Client,
+    loader: &str,
+    specifier: &str,
+    raw: &str,
+    referrer: &str,
+) -> Option<String> {
+    let url = reqwest::Url::parse_with_params(
+        loader,
+        &[("specifier", specifier), ("rawSpecifier", raw), ("referrer", referrer)],
+    )
+    .ok()?;
+    let resp = http.get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let text = resp.text().await.ok()?;
+    let body: serde_json::Value = serde_json::from_str(&text).ok()?;
+    body.get("code").and_then(|c| c.as_str()).map(str::to_string)
 }
 
 #[cfg(test)]

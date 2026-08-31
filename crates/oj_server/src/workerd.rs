@@ -426,4 +426,16 @@ mod tests {
             Fallback::NotFound
         ));
     }
+
+    #[test]
+    fn resolve_fallback_leaves_a_plugin_virtual_for_the_loader() {
+        // a `virtual:` module is synthesized by a JS plugin, so the Rust tiers
+        // must not claim it: it falls through to NotFound (then the async proxy).
+        let dir = tempfile::tempdir().unwrap();
+        let r = resolver(dir.path());
+        assert!(matches!(
+            resolve_fallback(dir.path(), &r, &[], "/virtual:greeting", "virtual:greeting", "/src/entry.tsx"),
+            Fallback::NotFound
+        ));
+    }
 }

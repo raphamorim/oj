@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+use axum::response::IntoResponse;
 use oj_server::workerd::find_workerd;
 use oj_server::workerd_dev::{spawn, WorkerdSpawn};
 
@@ -49,6 +50,7 @@ async fn native_workerd_renders_a_typescript_route() {
         &workerd,
         &root.join(".oj-cache"),
         vec![],
+        None,
         WorkerdSpawn {
             compat_date: "2024-11-01".into(),
             compat_flags: vec![],
@@ -115,6 +117,7 @@ async fn native_workerd_resolves_a_colon_scheme_alias() {
         &workerd,
         &root.join(".oj-cache"),
         aliases,
+        None,
         WorkerdSpawn {
             compat_date: "2024-11-01".into(),
             compat_flags: vec![],
@@ -181,6 +184,7 @@ async fn native_workerd_rewrites_a_hash_alias_import() {
         &workerd,
         &root.join(".oj-cache"),
         aliases,
+        None,
         WorkerdSpawn {
             compat_date: "2024-11-01".into(),
             compat_flags: vec![],
@@ -254,6 +258,7 @@ async fn native_workerd_imports_a_cjs_node_modules_package() {
         &workerd,
         &root.join(".oj-cache"),
         vec![],
+        None,
         WorkerdSpawn {
             compat_date: "2024-11-01".into(),
             compat_flags: vec![],
@@ -280,5 +285,82 @@ async fn native_workerd_imports_a_cjs_node_modules_package() {
     assert!(
         body.contains("cjs-rendered +leaf"),
         "workerd did not render a CJS node_modules package (transitive require) through the fallback.\n--- body ---\n{body}",
+    );
+}
+
+#[tokio::test]
+async fn native_workerd_proxies_a_virtual_module_to_the_plugin_loader() {
+    let app = tempfile::tempdir().unwrap();
+    let root = app.path().to_path_buf();
+
+    let Some(workerd) = find_workerd(&root) else {
+        eprintln!("SKIP workerd_native virtual: workerd binary not found (set OJ_WORKERD_BIN)");
+        return;
+    };
+
+    // Stand-in for oj's JS plugin container: returns native ESM for a plugin
+    // virtual module (what the real TanStack router plugin would synthesize).
+    let loader = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let loader_port = loader.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let svc = axum::Router::new().route(
+            "/load",
+            axum::routing::get(|q: axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                let spec = q.get("specifier").cloned().unwrap_or_default();
+                if spec.contains("virtual:greeting") {
+                    axum::Json(serde_json::json!({ "code": "export default \" +from-plugin\";\n" }))
+                        .into_response()
+                } else {
+                    axum::http::StatusCode::NOT_FOUND.into_response()
+                }
+            }),
+        );
+        let _ = axum::serve(loader, svc).await;
+    });
+
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/entry.tsx"),
+        "import v from \"virtual:greeting\";\n\
+         export default {\n\
+           fetch(): Response {\n\
+             return new Response(\"plugin\" + v);\n\
+           },\n\
+         };\n",
+    )
+    .unwrap();
+
+    let session = spawn(
+        &root,
+        &workerd,
+        &root.join(".oj-cache"),
+        vec![],
+        Some(format!("http://127.0.0.1:{loader_port}/load")),
+        WorkerdSpawn {
+            compat_date: "2024-11-01".into(),
+            compat_flags: vec![],
+            entry_specifier: "/src/entry.tsx".into(),
+            vars: vec![],
+            service_bindings: vec![],
+        },
+    )
+    .await
+    .expect("spawn workerd session");
+
+    let mut body = String::new();
+    let client = reqwest::Client::new();
+    for _ in 0..60 {
+        if let Ok(resp) = client.get(session.worker_url()).send().await {
+            if resp.status().is_success() {
+                body = resp.text().await.unwrap_or_default();
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    assert!(
+        body.contains("plugin +from-plugin"),
+        "workerd did not render a route importing a plugin virtual module via the loader proxy.\n--- body ---\n{body}",
     );
 }
