@@ -27,13 +27,18 @@ async fn native_workerd_renders_a_typescript_route() {
         "export const greeting: string = \"rendered by real workerd\";\n",
     )
     .unwrap();
+    let pkg = root.join("node_modules/banner");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(pkg.join("package.json"), "{\"name\":\"banner\",\"main\":\"index.js\"}").unwrap();
+    std::fs::write(pkg.join("index.js"), "export const suffix = \" +node_modules\";\n").unwrap();
     std::fs::write(
         root.join("src/entry.tsx"),
         "import { greeting } from \"./dep.ts\";\n\
+         import { suffix } from \"banner\";\n\
          interface Env {}\n\
          export default {\n\
            fetch(_req: Request, _env: Env): Response {\n\
-             return new Response(greeting + \" [ts-stripped]\");\n\
+             return new Response(greeting + \" [ts-stripped]\" + suffix);\n\
            },\n\
          };\n",
     )
@@ -67,7 +72,7 @@ async fn native_workerd_renders_a_typescript_route() {
     }
 
     assert!(
-        body.contains("rendered by real workerd [ts-stripped]"),
-        "workerd did not render the TS route through the orchestration.\n--- body ---\n{body}",
+        body.contains("rendered by real workerd [ts-stripped] +node_modules"),
+        "workerd did not render the TS route (with its node_modules import) through the orchestration.\n--- body ---\n{body}",
     );
 }

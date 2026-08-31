@@ -3,6 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
+use oj_resolver::OjResolver;
+
 pub fn is_cloudflare_app(root: &Path) -> bool {
     ["wrangler.jsonc", "wrangler.json", "wrangler.toml"]
         .iter()
@@ -150,16 +152,59 @@ fn resolve_file(base: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Answers a workerd module-fallback request: given the resolved (root-relative)
-/// specifier, returns the module `name` (specifier without a leading slash) and
-/// its ESM source, transpiled from TS/JSX. `None` means 404.
+fn spec_to_file(root: &Path, specifier: &str) -> Option<PathBuf> {
+    let as_abs = PathBuf::from(specifier);
+    if as_abs.is_absolute() {
+        if let Some(f) = resolve_file(&as_abs) {
+            return Some(f);
+        }
+    }
+    resolve_file(&root.join(specifier.trim_start_matches('/')))
+}
+
+/// Answers a workerd module-fallback request for a specifier that maps to a file
+/// (an absolute path handed back from a redirect, or a root-relative app path).
+/// Returns the module `name` (specifier without a leading slash) and its ESM
+/// source, transpiled from TS/JSX. `None` means the specifier is not a file.
 pub fn fallback_module(root: &Path, specifier: &str) -> Option<(String, String)> {
-    let name = specifier.trim_start_matches('/').to_string();
-    let file = resolve_file(&root.join(&name))?;
+    let file = spec_to_file(root, specifier)?;
     let source = std::fs::read_to_string(&file).ok()?;
-    let out =
-        oj_compiler::compile(&file, &source, &oj_compiler::CompileOptions::prod()).ok()?;
-    Some((name, out.code))
+    let out = oj_compiler::compile(&file, &source, &oj_compiler::CompileOptions::prod()).ok()?;
+    Some((specifier.trim_start_matches('/').to_string(), out.code))
+}
+
+pub enum Fallback {
+    Module { name: String, code: String },
+    Redirect { location: String },
+    NotFound,
+}
+
+/// The full module-fallback decision. A specifier that maps to a file is served
+/// as a module; a bare `rawSpecifier` (a node_modules import) is resolved through
+/// `resolver` and answered with a 301 redirect to its absolute path (workerd then
+/// re-requests that path, which maps to a file). Everything else is a 404.
+pub fn resolve_fallback(
+    root: &Path,
+    resolver: &OjResolver,
+    specifier: &str,
+    raw_specifier: &str,
+    referrer: &str,
+) -> Fallback {
+    if let Some((name, code)) = fallback_module(root, specifier) {
+        return Fallback::Module { name, code };
+    }
+    if !raw_specifier.is_empty()
+        && !raw_specifier.starts_with('.')
+        && !raw_specifier.starts_with('/')
+    {
+        let importer_dir = spec_to_file(root, referrer)
+            .and_then(|f| f.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| root.to_path_buf());
+        if let Ok(abs) = resolver.resolve(&importer_dir, raw_specifier) {
+            return Fallback::Redirect { location: abs.to_string_lossy().into_owned() };
+        }
+    }
+    Fallback::NotFound
 }
 
 #[cfg(test)]
@@ -216,5 +261,57 @@ mod tests {
     fn fallback_module_404s_missing() {
         let dir = tempfile::tempdir().unwrap();
         assert!(fallback_module(dir.path(), "/nope.ts").is_none());
+    }
+
+    fn resolver(root: &Path) -> OjResolver {
+        OjResolver::with_conditions(root, &["import".to_string(), "default".to_string()])
+    }
+
+    #[test]
+    fn resolve_fallback_serves_an_app_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/dep.ts"), "export const x = 1;\n").unwrap();
+        let r = resolver(dir.path());
+        match resolve_fallback(dir.path(), &r, "/src/dep.ts", "./dep.ts", "/src/entry.tsx") {
+            Fallback::Module { name, code } => {
+                assert_eq!(name, "src/dep.ts");
+                assert!(code.contains("export const x"), "{code}");
+            }
+            _ => panic!("expected a served module"),
+        }
+    }
+
+    #[test]
+    fn resolve_fallback_redirects_a_bare_import_to_its_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("node_modules/foo");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("package.json"), r#"{"name":"foo","main":"index.js"}"#).unwrap();
+        std::fs::write(pkg.join("index.js"), "export const foo = 1;\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let r = resolver(dir.path());
+        match resolve_fallback(dir.path(), &r, "/foo", "foo", "/src/entry.tsx") {
+            Fallback::Redirect { location } => {
+                assert!(location.ends_with("node_modules/foo/index.js"), "{location}");
+                assert!(PathBuf::from(&location).is_absolute(), "{location}");
+                // the redirect target then maps to a real file
+                assert!(matches!(
+                    resolve_fallback(dir.path(), &r, &location, "foo", "/src/entry.tsx"),
+                    Fallback::Module { .. }
+                ));
+            }
+            _ => panic!("expected a redirect for the bare import"),
+        }
+    }
+
+    #[test]
+    fn resolve_fallback_404s_an_unresolvable_bare_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = resolver(dir.path());
+        assert!(matches!(
+            resolve_fallback(dir.path(), &r, "/ghost", "ghost", "/src/entry.tsx"),
+            Fallback::NotFound
+        ));
     }
 }

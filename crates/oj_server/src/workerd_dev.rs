@@ -4,13 +4,27 @@
 use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use oj_resolver::OjResolver;
 
-use crate::workerd::{fallback_module, render_config, WorkerdOptions};
+use crate::workerd::{render_config, resolve_fallback, Fallback, WorkerdOptions};
+
+fn worker_conditions() -> Vec<String> {
+    ["workerd", "worker", "browser", "module", "import", "default"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+struct FallbackState {
+    root: PathBuf,
+    resolver: OjResolver,
+}
 
 pub struct WorkerdSpawn {
     pub compat_date: String,
@@ -53,9 +67,12 @@ pub async fn spawn(
 ) -> std::io::Result<WorkerdSession> {
     let fb = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let fb_port = fb.local_addr()?.port();
-    let fb_root = root.to_path_buf();
+    let state = Arc::new(FallbackState {
+        root: root.to_path_buf(),
+        resolver: OjResolver::with_conditions(root, &worker_conditions()),
+    });
     tokio::spawn(async move {
-        let app = Router::new().route("/", get(fallback_handler)).with_state(fb_root);
+        let app = Router::new().route("/", get(fallback_handler)).with_state(state);
         let _ = axum::serve(fb, app).await;
     });
 
@@ -86,17 +103,25 @@ pub async fn spawn(
 }
 
 async fn fallback_handler(
-    State(root): State<PathBuf>,
+    State(state): State<Arc<FallbackState>>,
     Query(q): Query<Vec<(String, String)>>,
 ) -> Response {
-    let Some((_, specifier)) = q.iter().find(|(k, _)| k == "specifier") else {
+    let get = |key: &str| q.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+    let Some(specifier) = get("specifier") else {
         return (axum::http::StatusCode::BAD_REQUEST, "no specifier").into_response();
     };
-    match fallback_module(&root, specifier) {
-        Some((name, code)) => {
+    let raw = get("rawSpecifier").unwrap_or("");
+    let referrer = get("referrer").unwrap_or("");
+    match resolve_fallback(&state.root, &state.resolver, specifier, raw, referrer) {
+        Fallback::Module { name, code } => {
             let body = serde_json::json!({ "name": name, "esModule": code }).to_string();
             ([(axum::http::header::CONTENT_TYPE, "application/json")], body).into_response()
         }
-        None => axum::http::StatusCode::NOT_FOUND.into_response(),
+        Fallback::Redirect { location } => (
+            axum::http::StatusCode::MOVED_PERMANENTLY,
+            [(axum::http::header::LOCATION, location)],
+        )
+            .into_response(),
+        Fallback::NotFound => axum::http::StatusCode::NOT_FOUND.into_response(),
     }
 }
