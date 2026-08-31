@@ -225,7 +225,7 @@ pub fn fallback_module(
     specifier: &str,
 ) -> Option<(String, String)> {
     let file = spec_to_file(root, specifier)?;
-    serve_resolved(&file, specifier, resolver, &[])
+    serve_resolved(&file, specifier, resolver, &[], None)
 }
 
 const ASSET_EXTS: &[&str] = &[
@@ -282,11 +282,35 @@ fn resolve_import(
     resolver.resolve(dir, spec).ok()
 }
 
+pub type ModuleCache =
+    std::sync::Mutex<std::collections::HashMap<PathBuf, (std::time::SystemTime, String)>>;
+
+fn cache_get(cache: Option<&ModuleCache>, file: &Path, mtime: Option<std::time::SystemTime>) -> Option<String> {
+    let (cache, mtime) = (cache?, mtime?);
+    let guard = cache.lock().ok()?;
+    let (cached_mtime, code) = guard.get(file)?;
+    (*cached_mtime == mtime).then(|| code.clone())
+}
+
+pub fn cached_module(cache: &ModuleCache, file: &Path) -> Option<String> {
+    let mtime = std::fs::metadata(file).and_then(|m| m.modified()).ok();
+    cache_get(Some(cache), file, mtime)
+}
+
+fn cache_put(cache: Option<&ModuleCache>, file: &Path, mtime: Option<std::time::SystemTime>, code: &str) {
+    if let (Some(cache), Some(mtime)) = (cache, mtime) {
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(file.to_path_buf(), (mtime, code.to_string()));
+        }
+    }
+}
+
 fn serve_resolved(
     file: &Path,
     specifier: &str,
     resolver: &OjResolver,
     aliases: &[(String, PathBuf)],
+    cache: Option<&ModuleCache>,
 ) -> Option<(String, String)> {
     if is_denied(file) {
         return None;
@@ -300,30 +324,36 @@ fn serve_resolved(
     if file.file_name().and_then(|n| n.to_str()) == Some("manifest-dev.ts") {
         return Some((name, manifest_module(&dir)));
     }
+    let mtime = std::fs::metadata(file).and_then(|m| m.modified()).ok();
+    if let Some(code) = cache_get(cache, file, mtime) {
+        return Some((name, code));
+    }
     let source = std::fs::read_to_string(file).ok()?;
-    if ext == "json" {
-        return Some((name, format!("export default {source};\n")));
-    }
-    let is_cjs = match ext {
-        "cjs" => true,
-        "js" => !oj_compiler::cjs::has_module_syntax_pub(file, &source),
-        _ => false,
-    };
-    let mut rewrite = |spec: &str| -> Option<String> {
-        if crate::is_node_builtin(spec) {
-            return Some(format!("node:{}", spec.strip_prefix("node:").unwrap_or(spec)));
+    let code = if ext == "json" {
+        format!("export default {source};\n")
+    } else {
+        let is_cjs = match ext {
+            "cjs" => true,
+            "js" => !oj_compiler::cjs::has_module_syntax_pub(file, &source),
+            _ => false,
+        };
+        let mut rewrite = |spec: &str| -> Option<String> {
+            if crate::is_node_builtin(spec) {
+                return Some(format!("node:{}", spec.strip_prefix("node:").unwrap_or(spec)));
+            }
+            resolve_import(&dir, spec, resolver, aliases).map(|p| p.to_string_lossy().into_owned())
+        };
+        if is_cjs {
+            let url = file.to_string_lossy().into_owned();
+            oj_compiler::cjs::wrap_cjs(file, &url, &source, &mut rewrite).ok()?.code
+        } else {
+            let mut opts = oj_compiler::CompileOptions::prod();
+            opts.ssr = true;
+            oj_compiler::compile_module(file, &source, &opts, Some(&mut rewrite)).ok()?.code
         }
-        resolve_import(&dir, spec, resolver, aliases).map(|p| p.to_string_lossy().into_owned())
     };
-    if is_cjs {
-        let url = file.to_string_lossy().into_owned();
-        let out = oj_compiler::cjs::wrap_cjs(file, &url, &source, &mut rewrite).ok()?;
-        return Some((name, out.code));
-    }
-    let mut opts = oj_compiler::CompileOptions::prod();
-    opts.ssr = true;
-    let out = oj_compiler::compile_module(file, &source, &opts, Some(&mut rewrite)).ok()?;
-    Some((name, out.code))
+    cache_put(cache, file, mtime, &code);
+    Some((name, code))
 }
 
 pub enum Fallback {
@@ -349,6 +379,7 @@ fn serve_file(
     specifier: &str,
     resolver: &OjResolver,
     aliases: &[(String, PathBuf)],
+    cache: Option<&ModuleCache>,
 ) -> Fallback {
     if is_denied(file) {
         return Fallback::NotFound;
@@ -359,7 +390,7 @@ fn serve_file(
             name: specifier.trim_start_matches('/').to_string(),
         };
     }
-    match serve_resolved(file, specifier, resolver, aliases) {
+    match serve_resolved(file, specifier, resolver, aliases, cache) {
         Some((name, mut code)) => {
             rewrite_hash_aliases(&mut code, aliases);
             Fallback::Module { name, code }
@@ -374,7 +405,12 @@ pub fn compile_transformed(
     source: &str,
     resolver: &OjResolver,
     aliases: &[(String, PathBuf)],
+    cache: Option<&ModuleCache>,
 ) -> Option<(String, String)> {
+    let mtime = std::fs::metadata(file).and_then(|m| m.modified()).ok();
+    if let Some(code) = cache_get(cache, file, mtime) {
+        return Some((name.to_string(), code));
+    }
     let dir = file.parent()?.to_path_buf();
     let mut rewrite = |spec: &str| -> Option<String> {
         if crate::is_node_builtin(spec) {
@@ -387,6 +423,7 @@ pub fn compile_transformed(
     let out = oj_compiler::compile_module(file, source, &opts, Some(&mut rewrite)).ok()?;
     let mut code = out.code;
     rewrite_hash_aliases(&mut code, aliases);
+    cache_put(cache, file, mtime, &code);
     Some((name.to_string(), code))
 }
 
@@ -412,6 +449,7 @@ pub fn resolve_fallback(
     root: &Path,
     resolver: &OjResolver,
     aliases: &[(String, PathBuf)],
+    cache: Option<&ModuleCache>,
     specifier: &str,
     raw_specifier: &str,
     referrer: &str,
@@ -448,12 +486,12 @@ pub fn resolve_fallback(
     };
     if let Some((_, target)) = aliases.iter().find(|(k, _)| k == alias_key) {
         if let Some(file) = resolve_file(target) {
-            return serve_or_redirect(&file, specifier, resolver, aliases);
+            return serve_or_redirect(&file, specifier, resolver, aliases, cache);
         }
     }
     if raw_specifier.starts_with('#') {
         if let Some(file) = resolve_hash_import(&importer_dir, raw_specifier) {
-            return serve_or_redirect(&file, specifier, resolver, aliases);
+            return serve_or_redirect(&file, specifier, resolver, aliases, cache);
         }
     }
     if !raw_specifier.is_empty()
@@ -461,7 +499,7 @@ pub fn resolve_fallback(
         && !raw_specifier.starts_with('/')
     {
         if let Ok(abs) = resolver.resolve(&importer_dir, raw_specifier) {
-            return serve_or_redirect(&abs, specifier, resolver, aliases);
+            return serve_or_redirect(&abs, specifier, resolver, aliases, cache);
         }
         if crate::is_node_builtin(raw_specifier) {
             let name = raw_specifier.strip_prefix("node:").unwrap_or(raw_specifier);
@@ -475,7 +513,7 @@ pub fn resolve_fallback(
         if resolved_index && !spec_index {
             return Fallback::Redirect { location: file.to_string_lossy().into_owned() };
         }
-        return serve_file(&file, specifier, resolver, aliases);
+        return serve_file(&file, specifier, resolver, aliases, cache);
     }
     Fallback::NotFound
 }
@@ -485,10 +523,11 @@ fn serve_or_redirect(
     specifier: &str,
     resolver: &OjResolver,
     aliases: &[(String, PathBuf)],
+    cache: Option<&ModuleCache>,
 ) -> Fallback {
     let canonical = file.to_string_lossy();
     if specifier.trim_start_matches('/') == canonical.trim_start_matches('/') {
-        return serve_file(file, specifier, resolver, aliases);
+        return serve_file(file, specifier, resolver, aliases, cache);
     }
     Fallback::Redirect { location: canonical.into_owned() }
 }
@@ -604,7 +643,7 @@ mod tests {
         // user source files go through the plugin transform pipeline (container
         // load-override + transformUserCode + rewriteServerFns), like loader.mjs
         assert!(matches!(
-            resolve_fallback(dir.path(), &r, &[], "/src/dep.ts", "./dep.ts", "/src/entry.tsx"),
+            resolve_fallback(dir.path(), &r, &[], None, "/src/dep.ts", "./dep.ts", "/src/entry.tsx"),
             Fallback::TransformFile { .. }
         ));
     }
@@ -619,7 +658,7 @@ mod tests {
         let r = resolver(dir.path());
         let file = dir.path().join("src/entry.tsx");
         let src = "import { router } from \"#tanstack-router-entry\";\nexport const hi: string = \"x\";\nexport default router;\n";
-        let (name, code) = compile_transformed(&file, "src/entry.tsx", src, &r, &aliases).unwrap();
+        let (name, code) = compile_transformed(&file, "src/entry.tsx", src, &r, &aliases, None).unwrap();
         assert_eq!(name, "src/entry.tsx");
         assert!(!code.contains("#tanstack-router-entry"), "hash alias survived: {code}");
         assert!(code.contains("src/router.tsx"), "not rewritten: {code}");
@@ -639,12 +678,12 @@ mod tests {
             ("#tanstack-router-entry".to_string(), dir.path().join("src/router")),
         ];
         let r = resolver(dir.path());
-        match resolve_fallback(dir.path(), &r, &aliases, "/tanstack-start-manifest:v", "tanstack-start-manifest:v", "/e") {
+        match resolve_fallback(dir.path(), &r, &aliases, None, "/tanstack-start-manifest:v", "tanstack-start-manifest:v", "/e") {
             Fallback::Redirect { location } => assert!(location.ends_with("manifest-dev.ts"), "{location}"),
             _ => panic!("expected an alias redirect"),
         }
         // an extensionless alias target resolves through the extension probe
-        match resolve_fallback(dir.path(), &r, &aliases, "/#tanstack-router-entry", "#tanstack-router-entry", "/e") {
+        match resolve_fallback(dir.path(), &r, &aliases, None, "/#tanstack-router-entry", "#tanstack-router-entry", "/e") {
             Fallback::Redirect { location } => assert!(location.ends_with("src/router.tsx"), "{location}"),
             _ => panic!("expected the router alias to resolve to router.tsx"),
         }
@@ -659,13 +698,13 @@ mod tests {
         std::fs::write(pkg.join("index.js"), "export const foo = 1;\n").unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         let r = resolver(dir.path());
-        match resolve_fallback(dir.path(), &r, &[], "/foo", "foo", "/src/entry.tsx") {
+        match resolve_fallback(dir.path(), &r, &[], None, "/foo", "foo", "/src/entry.tsx") {
             Fallback::Redirect { location } => {
                 assert!(location.ends_with("node_modules/foo/index.js"), "{location}");
                 assert!(PathBuf::from(&location).is_absolute(), "{location}");
                 // the redirect target then maps to a real file
                 assert!(matches!(
-                    resolve_fallback(dir.path(), &r, &[], &location, "foo", "/src/entry.tsx"),
+                    resolve_fallback(dir.path(), &r, &[], None, &location, "foo", "/src/entry.tsx"),
                     Fallback::Module { .. }
                 ));
             }
@@ -695,6 +734,33 @@ mod tests {
     }
 
     #[test]
+    fn module_cache_populates_and_survives_reserve() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("node_modules/dep");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("package.json"), r#"{"name":"dep","module":"index.mjs"}"#).unwrap();
+        std::fs::write(pkg.join("index.mjs"), "export const x = 1;\n").unwrap();
+        let r = resolver(dir.path());
+        let cache = ModuleCache::default();
+        let spec = format!("/{}", pkg.join("index.mjs").display());
+        let first = match resolve_fallback(dir.path(), &r, &[], Some(&cache), &spec, "dep", "/e") {
+            Fallback::Module { code, .. } => code,
+            _ => panic!("expected module"),
+        };
+        assert_eq!(cache.lock().unwrap().len(), 1, "compile result should be cached");
+        // a second resolve returns the identical cached code
+        let second = match resolve_fallback(dir.path(), &r, &[], Some(&cache), &spec, "dep", "/e") {
+            Fallback::Module { code, .. } => code,
+            _ => panic!("expected module"),
+        };
+        assert_eq!(first, second);
+        // touching the file (new mtime) invalidates the cache entry
+        std::fs::write(pkg.join("index.mjs"), "export const x = 2;\n").unwrap();
+        let third = cached_module(&cache, &pkg.join("index.mjs"));
+        assert!(third.is_none() || third == Some(second), "stale entry must not be served");
+    }
+
+    #[test]
     fn denied_paths_are_never_served() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".env"), "SECRET=1\n").unwrap();
@@ -702,13 +768,13 @@ mod tests {
         let r = resolver(dir.path());
         let env = format!("/{}", dir.path().join(".env").display());
         assert!(matches!(
-            resolve_fallback(dir.path(), &r, &[], &env, &env, "/e"),
+            resolve_fallback(dir.path(), &r, &[], None, &env, &env, "/e"),
             Fallback::NotFound
         ));
         // even via ?raw (which returns file contents)
         let pem_raw = format!("/{}?raw", dir.path().join("key.pem").display());
         assert!(matches!(
-            resolve_fallback(dir.path(), &r, &[], &pem_raw, "./key.pem?raw", "/e"),
+            resolve_fallback(dir.path(), &r, &[], None, &pem_raw, "./key.pem?raw", "/e"),
             Fallback::NotFound
         ));
     }
@@ -719,7 +785,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("client")).unwrap();
         let r = resolver(dir.path());
         let spec = format!("/{}?url", dir.path().join("client").display());
-        match resolve_fallback(dir.path(), &r, &[], &spec, "./client?url", "/e") {
+        match resolve_fallback(dir.path(), &r, &[], None, &spec, "./client?url", "/e") {
             Fallback::Module { code, .. } => {
                 assert!(code.contains("/@oj-start/fs"), "{code}");
                 assert!(code.ends_with("client\";\n") || code.contains("/client\""), "{code}");
@@ -733,7 +799,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let r = resolver(dir.path());
         assert!(matches!(
-            resolve_fallback(dir.path(), &r, &[], "/ghost", "ghost", "/src/entry.tsx"),
+            resolve_fallback(dir.path(), &r, &[], None, "/ghost", "ghost", "/src/entry.tsx"),
             Fallback::NotFound
         ));
     }
@@ -750,13 +816,13 @@ mod tests {
         // any user source file goes through the plugin transform pipeline
         let plain = format!("/{}", dir.path().join("src/lib/plain.ts").display());
         assert!(matches!(
-            resolve_fallback(dir.path(), &r, &[], &plain, &plain, "/e"),
+            resolve_fallback(dir.path(), &r, &[], None, &plain, &plain, "/e"),
             Fallback::TransformFile { .. }
         ));
         // a node_modules file is served directly by Rust (no plugin transform)
         let np = format!("/{}", pkg.join("index.js").display());
         assert!(matches!(
-            resolve_fallback(dir.path(), &r, &[], &np, &np, "/e"),
+            resolve_fallback(dir.path(), &r, &[], None, &np, &np, "/e"),
             Fallback::Module { .. }
         ));
     }
@@ -770,7 +836,7 @@ mod tests {
         std::fs::write(cache.join("css-urls.json"), "[\"/a.css\",\"/b.css\"]").unwrap();
         let r = resolver(dir.path());
         let spec = format!("/{}", cache.join("manifest-dev.ts").display());
-        match resolve_fallback(dir.path(), &r, &[], &spec, &spec, "/e") {
+        match resolve_fallback(dir.path(), &r, &[], None, &spec, &spec, "/e") {
             Fallback::Module { code, .. } => {
                 assert!(code.contains("tsrStartManifest"), "{code}");
                 assert!(code.contains("[\"/a.css\",\"/b.css\"]"), "css not inlined: {code}");
@@ -796,7 +862,7 @@ mod tests {
         std::fs::write(pkg.join("index.mjs"), "export const useSonner = 1;\n").unwrap();
         let r = resolver(dir.path());
         let spec = format!("/{}", comp.join("sonner").display());
-        match resolve_fallback(dir.path(), &r, &[], &spec, "sonner", &format!("/{}", comp.join("sonner").display())) {
+        match resolve_fallback(dir.path(), &r, &[], None, &spec, "sonner", &format!("/{}", comp.join("sonner").display())) {
             Fallback::Redirect { location } => {
                 assert!(location.ends_with("node_modules/sonner/index.mjs"), "{location}");
             }
@@ -814,7 +880,7 @@ mod tests {
         // a bare directory specifier must redirect to <dir>/index.tsx, not serve
         // inline under the extensionless name (which breaks relative children)
         let spec = format!("/{}", comp.display());
-        match resolve_fallback(dir.path(), &r, &[], &spec, "./tooltip", "/src/entry.tsx") {
+        match resolve_fallback(dir.path(), &r, &[], None, &spec, "./tooltip", "/src/entry.tsx") {
             Fallback::Redirect { location } => assert!(location.ends_with("tooltip/index.tsx"), "{location}"),
             _ => panic!("expected a directory-index redirect"),
         }
@@ -822,7 +888,7 @@ mod tests {
         // file it goes through the transform pipeline
         let idx = format!("/{}", comp.join("index.tsx").display());
         assert!(matches!(
-            resolve_fallback(dir.path(), &r, &[], &idx, "./tooltip", "/src/entry.tsx"),
+            resolve_fallback(dir.path(), &r, &[], None, &idx, "./tooltip", "/src/entry.tsx"),
             Fallback::TransformFile { .. }
         ));
     }
@@ -834,7 +900,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let r = resolver(dir.path());
         assert!(matches!(
-            resolve_fallback(dir.path(), &r, &[], "/virtual:greeting", "virtual:greeting", "/src/entry.tsx"),
+            resolve_fallback(dir.path(), &r, &[], None, "/virtual:greeting", "virtual:greeting", "/src/entry.tsx"),
             Fallback::NotFound
         ));
     }

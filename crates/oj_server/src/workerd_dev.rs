@@ -27,6 +27,7 @@ struct FallbackState {
     aliases: Vec<(String, PathBuf)>,
     plugin_loader: Option<String>,
     http: reqwest::Client,
+    cache: crate::workerd::ModuleCache,
 }
 
 pub fn start_aliases(app_root: &Path, assets_dir: &Path) -> Vec<(String, PathBuf)> {
@@ -106,6 +107,7 @@ pub async fn spawn(
         aliases,
         plugin_loader,
         http: reqwest::Client::new(),
+        cache: Default::default(),
     });
     let fallback = tokio::spawn(async move {
         let app = Router::new().route("/", get(fallback_handler)).with_state(state);
@@ -191,7 +193,7 @@ async fn fallback_handler(
     let st = state.clone();
     let (spec, rawc, refc) = (specifier.clone(), raw.clone(), referrer.clone());
     let outcome = match tokio::task::spawn_blocking(move || {
-        resolve_fallback(&st.root, &st.resolver, &st.aliases, &spec, &rawc, &refc)
+        resolve_fallback(&st.root, &st.resolver, &st.aliases, Some(&st.cache), &spec, &rawc, &refc)
     })
     .await
     {
@@ -216,6 +218,9 @@ async fn fallback_handler(
         )
             .into_response(),
         Fallback::TransformFile { file, name } => {
+            if let Some(code) = crate::workerd::cached_module(&state.cache, &file) {
+                return module_response(&name, &code);
+            }
             let source = match &state.plugin_loader {
                 Some(loader) => match proxy_transform(&state.http, loader, &file).await {
                     Some(s) => s,
@@ -228,7 +233,14 @@ async fn fallback_handler(
             };
             let st = state.clone();
             let compiled = tokio::task::spawn_blocking(move || {
-                crate::workerd::compile_transformed(&file, &name, &source, &st.resolver, &st.aliases)
+                crate::workerd::compile_transformed(
+                    &file,
+                    &name,
+                    &source,
+                    &st.resolver,
+                    &st.aliases,
+                    Some(&st.cache),
+                )
             })
             .await;
             match compiled {
