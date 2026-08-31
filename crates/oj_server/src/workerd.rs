@@ -168,12 +168,23 @@ pub fn fallback_module(
     specifier: &str,
 ) -> Option<(String, String)> {
     let file = spec_to_file(root, specifier)?;
-    let source = std::fs::read_to_string(&file).ok()?;
+    serve_resolved(&file, specifier, resolver)
+}
+
+fn serve_resolved(
+    file: &Path,
+    specifier: &str,
+    resolver: &OjResolver,
+) -> Option<(String, String)> {
+    let source = std::fs::read_to_string(file).ok()?;
     let name = specifier.trim_start_matches('/').to_string();
     let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if ext == "json" {
+        return Some((name, format!("export default {source};\n")));
+    }
     let is_cjs = match ext {
         "cjs" => true,
-        "js" => !oj_compiler::cjs::has_module_syntax_pub(&file, &source),
+        "js" => !oj_compiler::cjs::has_module_syntax_pub(file, &source),
         _ => false,
     };
     if is_cjs {
@@ -185,10 +196,10 @@ pub fn fallback_module(
             }
             resolver.resolve(&dir, spec).ok().map(|p| p.to_string_lossy().into_owned())
         };
-        let out = oj_compiler::cjs::wrap_cjs(&file, &url, &source, &mut resolve).ok()?;
+        let out = oj_compiler::cjs::wrap_cjs(file, &url, &source, &mut resolve).ok()?;
         return Some((name, out.code));
     }
-    let out = oj_compiler::compile(&file, &source, &oj_compiler::CompileOptions::prod()).ok()?;
+    let out = oj_compiler::compile(file, &source, &oj_compiler::CompileOptions::prod()).ok()?;
     Some((name, out.code))
 }
 
@@ -224,9 +235,17 @@ pub fn resolve_fallback(
     raw_specifier: &str,
     referrer: &str,
 ) -> Fallback {
-    if let Some((name, mut code)) = fallback_module(root, resolver, specifier) {
-        rewrite_hash_aliases(&mut code, aliases);
-        return Fallback::Module { name, code };
+    if let Some(file) = spec_to_file(root, specifier) {
+        let resolved_index = file.file_stem().and_then(|s| s.to_str()) == Some("index");
+        let spec_index = Path::new(specifier).file_stem().and_then(|s| s.to_str()) == Some("index");
+        if resolved_index && !spec_index {
+            return Fallback::Redirect { location: file.to_string_lossy().into_owned() };
+        }
+        if let Some((name, mut code)) = serve_resolved(&file, specifier, resolver) {
+            rewrite_hash_aliases(&mut code, aliases);
+            return Fallback::Module { name, code };
+        }
+        return Fallback::NotFound;
     }
     let key = if raw_specifier.is_empty() {
         specifier.trim_start_matches('/')
@@ -238,18 +257,62 @@ pub fn resolve_fallback(
             return Fallback::Redirect { location: file.to_string_lossy().into_owned() };
         }
     }
+    let importer_dir = spec_to_file(root, referrer)
+        .and_then(|f| f.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| root.to_path_buf());
+    if raw_specifier.starts_with('#') {
+        if let Some(file) = resolve_hash_import(&importer_dir, raw_specifier) {
+            return Fallback::Redirect { location: file.to_string_lossy().into_owned() };
+        }
+    }
     if !raw_specifier.is_empty()
         && !raw_specifier.starts_with('.')
         && !raw_specifier.starts_with('/')
     {
-        let importer_dir = spec_to_file(root, referrer)
-            .and_then(|f| f.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| root.to_path_buf());
         if let Ok(abs) = resolver.resolve(&importer_dir, raw_specifier) {
             return Fallback::Redirect { location: abs.to_string_lossy().into_owned() };
         }
     }
     Fallback::NotFound
+}
+
+fn resolve_hash_import(importer_dir: &Path, raw: &str) -> Option<PathBuf> {
+    let mut dir = Some(importer_dir);
+    while let Some(d) = dir {
+        let pkg = d.join("package.json");
+        if pkg.is_file() {
+            let text = std::fs::read_to_string(&pkg).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+            let imports = v.get("imports").and_then(|i| i.as_object());
+            if let Some(imports) = imports {
+                if let Some(target) = match_imports(imports, raw) {
+                    let joined = d.join(target.trim_start_matches("./"));
+                    if let Some(f) = resolve_file(&joined) {
+                        return Some(f);
+                    }
+                }
+                return None;
+            }
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+fn match_imports(imports: &serde_json::Map<String, serde_json::Value>, raw: &str) -> Option<String> {
+    if let Some(v) = imports.get(raw).and_then(|x| x.as_str()) {
+        return Some(v.to_string());
+    }
+    for (k, v) in imports {
+        if let Some(prefix) = k.strip_suffix('*') {
+            if let Some(rest) = raw.strip_prefix(prefix) {
+                if let Some(tmpl) = v.as_str() {
+                    return Some(tmpl.replace('*', rest));
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -424,6 +487,28 @@ mod tests {
         assert!(matches!(
             resolve_fallback(dir.path(), &r, &[], "/ghost", "ghost", "/src/entry.tsx"),
             Fallback::NotFound
+        ));
+    }
+
+    #[test]
+    fn resolve_fallback_redirects_a_directory_index_to_its_real_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let comp = dir.path().join("src/tooltip");
+        std::fs::create_dir_all(comp.join("patterns")).unwrap();
+        std::fs::write(comp.join("index.tsx"), "export * from \"./patterns/x\";\n").unwrap();
+        let r = resolver(dir.path());
+        // a bare directory specifier must redirect to <dir>/index.tsx, not serve
+        // inline under the extensionless name (which breaks relative children)
+        let spec = format!("/{}", comp.display());
+        match resolve_fallback(dir.path(), &r, &[], &spec, "./tooltip", "/src/entry.tsx") {
+            Fallback::Redirect { location } => assert!(location.ends_with("tooltip/index.tsx"), "{location}"),
+            _ => panic!("expected a directory-index redirect"),
+        }
+        // the redirected index path itself serves inline (no loop)
+        let idx = format!("/{}", comp.join("index.tsx").display());
+        assert!(matches!(
+            resolve_fallback(dir.path(), &r, &[], &idx, "./tooltip", "/src/entry.tsx"),
+            Fallback::Module { .. }
         ));
     }
 
