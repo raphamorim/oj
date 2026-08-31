@@ -52,9 +52,13 @@ const DEFAULT_COMPAT_DATE: &str = "2024-11-01";
 
 impl WorkerdSpawn {
     pub fn from_wrangler(cfg: crate::wrangler::WranglerConfig, entry_specifier: String) -> Self {
+        let mut compat_flags = cfg.compat_flags;
+        if !compat_flags.iter().any(|f| f == "nodejs_als") {
+            compat_flags.push("nodejs_als".to_string());
+        }
         WorkerdSpawn {
             compat_date: cfg.compat_date.unwrap_or_else(|| DEFAULT_COMPAT_DATE.to_string()),
-            compat_flags: cfg.compat_flags,
+            compat_flags,
             entry_specifier,
             vars: cfg.vars,
             service_bindings: cfg.service_bindings,
@@ -261,7 +265,7 @@ mod tests {
         };
         let spawn = WorkerdSpawn::from_wrangler(cfg, "/src/entry.tsx".into());
         assert_eq!(spawn.compat_date, DEFAULT_COMPAT_DATE);
-        assert_eq!(spawn.compat_flags, vec!["nodejs_compat".to_string()]);
+        assert_eq!(spawn.compat_flags, vec!["nodejs_compat".to_string(), "nodejs_als".to_string()]);
         assert_eq!(spawn.vars, vec![("EVENTS_API_URL".to_string(), "https://x".to_string())]);
         assert_eq!(
             spawn.service_bindings,
