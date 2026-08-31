@@ -75,7 +75,7 @@ test("SSR loader resolves tsconfig-aliased static assets as URL modules", () => 
     assert.equal(assets.font, "/@oj-start/fs" + join(fonts, "ui.woff2"));
     assert.equal(assets.notes, "synthetic notes");
     assert.equal(assets.explicitUrl, assets.icon);
-    assert.match(assets.inline, /^data:application\/octet-stream;base64,/);
+    assert.match(assets.inline, /^data:image\/png;base64,/);
     assert.deepEqual(assets.styles, {});
   } finally {
     rmSync(app, { recursive: true, force: true });
