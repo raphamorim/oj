@@ -23,6 +23,7 @@ pub mod pkg_bundle;
 pub mod pkg_rolldown;
 pub mod plugins;
 pub mod sidecar;
+pub mod stylex;
 pub mod svgr;
 use oj_graph::{HmrDecision, ModuleGraph};
 use oj_resolver::OjResolver;
@@ -228,6 +229,9 @@ pub struct DevServer {
     pub bundle: bool,
     pub host: Option<String>,
     pub config: Option<PathBuf>,
+    /// StylexConfig-as-JSON override (--stylex-config / OJ_STYLEX_CONFIG);
+    /// takes precedence over the config file's `stylex` section.
+    pub stylex_config: Option<PathBuf>,
     /// Enable the experimental on-disk module cache (off by default).
     pub enable_cache: bool,
     /// Force the on-disk module cache off even if enabled.
@@ -271,6 +275,7 @@ struct ServerState {
     preprocess: tokio::sync::OnceCell<std::sync::Arc<Sidecar>>,
     svelte: tokio::sync::OnceCell<std::sync::Arc<Sidecar>>,
     tailwind_urls: Mutex<std::collections::HashSet<String>>,
+    stylex: Option<Arc<stylex::StylexState>>,
     has_postcss: bool,
     scss_additional_data: Option<String>,
     sass_additional_data: Option<String>,
@@ -527,6 +532,16 @@ impl DevServer {
         let mut env_defines_digest = digest_defines(&defines);
         oj_compiler::set_import_meta_env(defines);
 
+        let stylex_state = resolve_stylex_state(self.stylex_config.as_deref(), &config, &root)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if let Some(sx) = &stylex_state {
+            println!(
+                "  stylex: native pass enabled ({} include glob(s))",
+                sx.pass.include.len()
+            );
+            sx.seed_fake_rules_from_env(&root);
+        }
+
         let server_cfg = config.server.clone().unwrap_or_default();
         let port = self.port.or(server_cfg.port).unwrap_or(5199);
         let strict_port = oj_config::server_strict_port(&config);
@@ -590,6 +605,11 @@ impl DevServer {
             "pluginsFormat": plugins_format,
             "ojStartMode": is_start,
         });
+        if stylex_state.is_some() {
+            // The native pass replaces the pilot's Babel Vite plugin; hosting
+            // both would transform stylex modules twice.
+            plugin_cfg["nativePluginNames"] = serde_json::json!(["lovable:stylex-transform"]);
+        }
         if let Some(dir) = &ssr_bridge_dir {
             plugin_cfg["ssrBridge"] = serde_json::json!({ "dir": dir.display().to_string() });
         }
@@ -864,6 +884,7 @@ impl DevServer {
             preprocess: tokio::sync::OnceCell::new(),
             svelte: tokio::sync::OnceCell::new(),
             tailwind_urls: Mutex::new(std::collections::HashSet::new()),
+            stylex: stylex_state,
             has_postcss: has_postcss_config(&root),
             scss_additional_data: oj_config::css_additional_data(&config, "scss"),
             sass_additional_data: oj_config::css_additional_data(&config, "sass"),
@@ -1020,6 +1041,7 @@ impl DevServer {
             .route("/@oj/worker.js", get(serve_worker_chunk))
             .route("/@oj/routes.js", get(serve_oj_routes))
             .route("/@oj/server-fn.js", get(|| async { js(SERVER_FN_JS) }))
+            .route("/@oj/stylex.css", get(serve_stylex_css))
             .route(
                 "/@oj/lingui-macro-shim.js",
                 get(|| async { js(LINGUI_MACRO_SHIM_JS) }),
@@ -3218,7 +3240,14 @@ async fn serve_path(
     match tokio::fs::read(&file).await {
         Ok(bytes) if ext == "html" => serve_html(&state, bytes, &url_of(&state.root, &file), &file).await,
         Ok(bytes) if ext == "css" => {
-            let source = String::from_utf8_lossy(&bytes).into_owned();
+            let mut source = String::from_utf8_lossy(&bytes).into_owned();
+            if let Some(sx) = &state.stylex {
+                if stylex::has_directive(&source) {
+                    stylex_flush_dirty(&state).await;
+                    sx.record_css_url(&url_of(&state.root, &file));
+                    source = stylex::substitute_directive(&source, &sx.assembled());
+                }
+            }
             if is_tailwind_css(&source) {
                 let url = url_of(&state.root, &file);
                 return match compile_tailwind(&state, &url, &source).await {
@@ -3408,6 +3437,7 @@ async fn ensure_module(
                     css_exports: Vec::new(),
                     fs_allow: Vec::new(),
                     watch_files: Vec::new(),
+                    stylex_rules: Vec::new(),
                 });
                 register_in_graph(state, url, &module);
                 return Ok((String::new(), module));
@@ -3442,6 +3472,7 @@ async fn ensure_module(
                     css_exports: Vec::new(),
                     fs_allow: Vec::new(),
                     watch_files: Vec::new(),
+                    stylex_rules: Vec::new(),
                 });
                 register_in_graph(state, url, &module);
                 return Ok((String::new(), module));
@@ -3473,6 +3504,7 @@ async fn ensure_module(
                 css_exports: Vec::new(),
                 fs_allow: Vec::new(),
                 watch_files: Vec::new(),
+                stylex_rules: Vec::new(),
             })
         } else {
             Arc::new(CachedModule {
@@ -3486,6 +3518,7 @@ async fn ensure_module(
                 css_exports: Vec::new(),
                 fs_allow: Vec::new(),
                 watch_files: Vec::new(),
+                stylex_rules: Vec::new(),
             })
         };
         register_in_graph(state, url, &module);
@@ -3506,6 +3539,7 @@ async fn ensure_module(
             .map(|(_, _, k)| k.clone());
         if let Some(key) = cached_key {
             if let Some(module) = memory_get(state, url, &key) {
+                stylex_register(state, file, &module);
                 register_in_graph(state, url, &module);
                 return Ok((key, module));
             }
@@ -3550,7 +3584,7 @@ async fn ensure_module(
     } else {
         None
     };
-    let source = match plugin_loaded {
+    let mut source = match plugin_loaded {
         Some(code) => code,
         None => bytes_to_string(
             tokio::fs::read(file)
@@ -3559,6 +3593,21 @@ async fn ensure_module(
         )
         .map_err(|err| format!("read error for {url}: {err}"))?,
     };
+    // `@stylex;` substitution runs before the tailwind/postcss handling so the
+    // sidecars see plain CSS. Such css is generation-dependent: it must never
+    // enter the mtime fast path (the file is unchanged when the sheet changes);
+    // content-keyed caching below stays sound because the sheet is inlined.
+    let mut stylex_css = false;
+    if file.extension().and_then(|e| e.to_str()) == Some("css") {
+        if let Some(sx) = &state.stylex {
+            if stylex::has_directive(&source) {
+                stylex_flush_dirty(state).await;
+                sx.record_css_url(url);
+                source = stylex::substitute_directive(&source, &sx.assembled());
+                stylex_css = true;
+            }
+        }
+    }
     if !state.bundle && source.contains("import.meta.glob") {
         let patterns: Vec<glob::Pattern> = oj_compiler::glob::glob_patterns(&source, file)
             .iter()
@@ -3585,6 +3634,7 @@ async fn ensure_module(
             css_exports: Vec::new(),
             fs_allow: Vec::new(),
             watch_files: Vec::new(),
+            stylex_rules: Vec::new(),
         });
         register_in_graph(state, url, &module);
         return Ok((String::new(), module));
@@ -3612,16 +3662,25 @@ async fn ensure_module(
     } else {
         mode.to_string()
     };
+    // Fold the stylex config + pass identity into the key: rules ride the
+    // cached module, so a config change or pass bump must invalidate.
+    let mode_key = match &state.stylex {
+        Some(sx) => format!("{mode_key}:sx{}", sx.cache_salt),
+        None => mode_key,
+    };
     let key = state.cache.key(source.as_bytes(), url, &mode_key);
     if let Some((mtime, size)) = stamp {
-        state
-            .mtime_keys
-            .lock()
-            .unwrap()
-            .insert(url.to_string(), (mtime, size, key.clone()));
+        if !stylex_css {
+            state
+                .mtime_keys
+                .lock()
+                .unwrap()
+                .insert(url.to_string(), (mtime, size, key.clone()));
+        }
     }
 
     if let Some(module) = memory_get(state, url, &key) {
+        stylex_register(state, file, &module);
         register_in_graph(state, url, &module);
         return Ok((key, module));
     }
@@ -3633,6 +3692,7 @@ async fn ensure_module(
     let _guard = lock.lock().await;
 
     if let Some(module) = memory_get(state, url, &key) {
+        stylex_register(state, file, &module);
         register_in_graph(state, url, &module);
         return Ok((key, module));
     }
@@ -3647,12 +3707,17 @@ async fn ensure_module(
     // those. Modules whose imports are all real files (svgr on disk, plain
     // source, deps) keep the fast persistent cache (Vite has no cross-restart
     // transform cache at all; this preserves oj's where it is sound).
-    if let Some(module) = state.persistent_cache.then(|| state.cache.get(&key)).flatten() {
+    if let Some(module) = state
+        .persistent_cache
+        .then(|| state.cache.get(&key))
+        .flatten()
+    {
         let module = Arc::new(module);
         let needs_retransform = state.plugins_have_transform
             && !is_dep_early
             && imports_a_plugin_virtual(&module.imports, &state.root, &state.dir_cache);
         if !needs_retransform {
+            stylex_register(state, file, &module);
             memory_put(state, url, &key, &module);
             register_in_graph(state, url, &module);
             replay_module_parsed(state, file, &key, is_dep_early, is_server).await;
@@ -3673,6 +3738,7 @@ async fn ensure_module(
             css_exports: Vec::new(),
             fs_allow: Vec::new(),
             watch_files: Vec::new(),
+            stylex_rules: Vec::new(),
         });
         if state.persistent_cache {
             let _ = state
@@ -3817,6 +3883,7 @@ async fn ensure_module(
             css_exports: Vec::new(),
             fs_allow: Vec::new(),
             watch_files: Vec::new(),
+            stylex_rules: Vec::new(),
         });
         register_in_graph(state, url, &module);
         return Ok((String::new(), module));
@@ -3847,6 +3914,7 @@ async fn ensure_module(
         file.to_path_buf()
     };
     let url_owned = url.to_string();
+    let stylex_pass = state.stylex.as_ref().map(|sx| sx.pass.clone());
     let sass_data = sass_additional_data_for(state, &url_owned);
     let sass_load_paths = sass_load_paths_for(state, &url_owned);
     let css_resolve = state.css_resolve.clone();
@@ -3888,6 +3956,7 @@ async fn ensure_module(
                 css_exports: Vec::new(),
                 fs_allow: Vec::new(),
                 watch_files: Vec::new(),
+                stylex_rules: Vec::new(),
             });
         }
         if is_css {
@@ -3928,6 +3997,7 @@ async fn ensure_module(
                 css_exports: output.exports.unwrap_or_default(),
                 fs_allow: Vec::new(),
                 watch_files: Vec::new(),
+                stylex_rules: Vec::new(),
             });
         }
         // The first relative import nothing on disk satisfies. Vite's import
@@ -4032,6 +4102,7 @@ async fn ensure_module(
                 map_data_url: None,
                 fs_allow: fs_allow_from(&factory.imports),
                 watch_files: Vec::new(),
+                stylex_rules: Vec::new(),
                 imports: factory.imports,
                 require_map: factory.require_map,
                 css_exports: Vec::new(),
@@ -4106,11 +4177,13 @@ async fn ensure_module(
                         sourcemap: true,
                         ssr: false,
                         jsx: oj_compiler::JsxConfig::default(),
+                        stylex: None,
                     }
                 } else {
                     oj_compiler::CompileOptions::dev()
                 };
                 opts.jsx = jsx_config;
+                opts.stylex = stylex_pass.as_ref();
                 oj_compiler::compile_module_with_maps(
                     &file_owned,
                     interopped.as_deref().unwrap_or(&source),
@@ -4133,6 +4206,7 @@ async fn ensure_module(
                 map_data_url: output.map_data_url,
                 fs_allow: fs_allow_from(&output.imports),
                 watch_files: Vec::new(),
+                stylex_rules: output.stylex_rules,
                 imports: output.imports,
                 kind: if is_svelte {
                     "svelte".into()
@@ -4173,6 +4247,7 @@ async fn ensure_module(
             .cache_writes
             .try_send((key.clone(), Arc::clone(&module)));
     }
+    stylex_register(state, file, &module);
     memory_put(state, url, &key, &module);
     register_in_graph(state, url, &module);
     state
@@ -4314,6 +4389,11 @@ fn module_weight(module: &CachedModule) -> usize {
         + strs(&module.watch_files)
         + pairs(&module.require_map)
         + pairs(&module.css_exports)
+        + module
+            .stylex_rules
+            .iter()
+            .map(|r| r.class_name.len() + r.ltr.len() + r.rtl.as_ref().map_or(0, |s| s.len()) + 64)
+            .sum::<usize>()
 }
 
 fn memory_cache_budget() -> usize {
@@ -4491,6 +4571,55 @@ async fn serve_css_wrapper(state: &Arc<ServerState>, file: &Path, url: &str) -> 
             (header::CACHE_CONTROL, "no-cache"),
         ],
         body,
+    )
+        .into_response()
+}
+
+fn resolve_stylex_state(
+    override_path: Option<&Path>,
+    config: &oj_config::OjConfig,
+    root: &Path,
+) -> Result<Option<Arc<stylex::StylexState>>, String> {
+    let default_dev = std::env::var("NODE_ENV").as_deref() != Ok("production");
+    Ok(
+        stylex::resolve_pass_config(override_path, config, root, default_dev)?
+            .map(|pass| Arc::new(stylex::StylexState::new(pass))),
+    )
+}
+
+/// Feed a compile-pipeline module's rules into the registry; runs on fresh
+/// compiles and on every cache-hit path, so warm starts rebuild the registry.
+fn stylex_register(state: &ServerState, file: &Path, module: &CachedModule) {
+    if let Some(sx) = &state.stylex {
+        sx.register(file, &module.stylex_rules);
+    }
+}
+
+/// Re-ensure watcher-dirtied stylex modules so the registry is current before
+/// a sheet is assembled, regardless of which client fetch lands first.
+async fn stylex_flush_dirty(state: &Arc<ServerState>) {
+    let Some(sx) = &state.stylex else { return };
+    for path in sx.take_dirty() {
+        if path.exists() {
+            let url = url_of(&state.root, &path);
+            let _ = Box::pin(ensure_module(state, &path, &url)).await;
+        } else {
+            sx.remove(&path);
+        }
+    }
+}
+
+async fn serve_stylex_css(State(state): State<Arc<ServerState>>) -> Response {
+    let Some(sx) = &state.stylex else {
+        return (StatusCode::NOT_FOUND, "oj: stylex is not enabled").into_response();
+    };
+    stylex_flush_dirty(&state).await;
+    (
+        [
+            (header::CONTENT_TYPE, "text/css"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        sx.assembled(),
     )
         .into_response()
 }
@@ -5815,7 +5944,7 @@ async fn serve_oj_routes(State(state): State<Arc<ServerState>>) -> Response {
     }
 }
 
-fn dev_compile_opts(state: &ServerState) -> oj_compiler::CompileOptions {
+fn dev_compile_opts(state: &ServerState) -> oj_compiler::CompileOptions<'static> {
     let mut opts = oj_compiler::CompileOptions::dev();
     opts.jsx = state.jsx.clone();
     opts
@@ -7599,6 +7728,40 @@ async fn decide(
         let file = state.root.join(importer.trim_start_matches('/'));
         if !paths.contains(&file) {
             paths.push(file);
+        }
+    }
+
+    if let Some(sx) = &state.stylex {
+        let mut gated = false;
+        for path in &paths {
+            if path.components().any(|c| {
+                let c = c.as_os_str();
+                c == "node_modules" || c == ".oj-cache" || c == "dist"
+            }) {
+                continue;
+            }
+            let compilable = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| COMPILABLE.contains(&e));
+            if !compilable || !sx.pass.matches_path(path) {
+                continue;
+            }
+            if path.exists() {
+                sx.mark_dirty(path);
+            } else {
+                sx.remove(path);
+            }
+            gated = true;
+        }
+        if gated {
+            // Mirror the tailwind repush: the client refetches each sheet, and
+            // the serving paths flush dirty modules before assembling.
+            let timestamp = now_millis() as u64;
+            for url in sx.css_urls() {
+                updates.push(update_entry("css-update", &url, timestamp));
+            }
+            updates.push(update_entry("css-update", "/@oj/stylex.css", timestamp));
         }
     }
 

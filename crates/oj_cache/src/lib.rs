@@ -111,6 +111,10 @@ pub struct CachedModule {
     /// context, and these are the `accept` declarations for the module graph.
     #[serde(default)]
     pub hot: Option<HotMeta>,
+    /// StyleX rules extracted from this module, persisted so warm starts can
+    /// rebuild the server-side registry without retransforming.
+    #[serde(default)]
+    pub stylex_rules: Vec<fru::rules::StylexRule>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -220,6 +224,14 @@ mod tests {
             fs_allow: Vec::new(),
             watch_files: Vec::new(),
             hot: None,
+            stylex_rules: vec![fru::rules::StylexRule {
+                class_name: "xtest".into(),
+                ltr: ".xtest{color:red}".into(),
+                rtl: None,
+                const_key: None,
+                const_val: None,
+                priority: 3000.0,
+            }],
         }
     }
 
@@ -256,6 +268,14 @@ mod tests {
             resalted.key(b"source", "/src/App.tsx", "dev"),
             "env defines salt"
         );
+    }
+
+    #[test]
+    fn entries_without_stylex_rules_still_deserialize() {
+        // Pre-stylex cache entries lack the field; serde(default) keeps them valid.
+        let legacy = r#"{"code":"x","map_data_url":null,"imports":[],"is_boundary":false}"#;
+        let module: CachedModule = serde_json::from_str(legacy).unwrap();
+        assert!(module.stylex_rules.is_empty());
     }
 
     #[test]

@@ -45,6 +45,7 @@ pub async fn ssr_dev(
         bundle: false,
         host,
         config: None,
+        stylex_config: None,
         enable_cache: false,
         no_cache: false,
         lazy: false,

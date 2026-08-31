@@ -2193,4 +2193,5 @@ mod tests {
         // The rebased (dev) path parses the same way.
         assert!(compile_css_rebased("/src/vendor.css", src, false).is_ok());
     }
+
 }

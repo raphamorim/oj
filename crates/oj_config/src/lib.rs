@@ -820,6 +820,15 @@ pub fn load(root: &Path) -> Result<OjConfig, ConfigError> {
     load_with(root, "serve", "development")
 }
 
+/// Standalone `StylexConfig` as JSON, for `--stylex-config` / OJ_STYLEX_CONFIG
+/// (projects whose oj/vite config cannot carry the section).
+pub fn load_stylex_json(path: &Path) -> Result<StylexConfig, ConfigError> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|e| ConfigError::Parse(path.to_path_buf(), e.to_string()))?;
+    serde_json::from_str(&source)
+        .map_err(|e| ConfigError::Schema(path.to_path_buf(), e.to_string()))
+}
+
 pub fn load_with(root: &Path, command: &str, mode: &str) -> Result<OjConfig, ConfigError> {
     let Some(path) = CANDIDATES
         .iter()
@@ -1374,6 +1383,49 @@ mod tests {
             environment_defines(&cfg, "ssr").into_iter().collect();
         assert_eq!(ssr_defines.get("__SSR__").unwrap(), "true");
         assert!(environment_defines(&cfg, "client").is_empty());
+    }
+
+    #[test]
+    fn stylex_section_parses_camel_case_and_defaults() {
+        let json = r#"{"stylex":{
+            "include":["src/**"],
+            "exclude":["src/vendor/**"],
+            "rootDir":"..",
+            "dev":true,
+            "useCssLayers":true,
+            "classNamePrefix":"oj"}}"#;
+        let cfg: OjConfig = serde_json::from_str(json).unwrap();
+        let sx = cfg.stylex.unwrap();
+        assert_eq!(sx.include, vec!["src/**".to_string()]);
+        assert_eq!(sx.exclude, vec!["src/vendor/**".to_string()]);
+        assert_eq!(sx.root_dir.as_deref(), Some(".."));
+        assert_eq!(sx.dev, Some(true));
+        assert_eq!(sx.use_css_layers, Some(true));
+        assert_eq!(sx.class_name_prefix.as_deref(), Some("oj"));
+
+        // Every field is optional: an empty section still enables the pass.
+        let minimal: OjConfig = serde_json::from_str(r#"{"stylex":{}}"#).unwrap();
+        let sx = minimal.stylex.unwrap();
+        assert!(sx.include.is_empty() && sx.exclude.is_empty());
+        assert!(sx.root_dir.is_none() && sx.dev.is_none() && sx.use_css_layers.is_none());
+        assert!(sx.class_name_prefix.is_none());
+        let absent: OjConfig = serde_json::from_str("{}").unwrap();
+        assert!(absent.stylex.is_none());
+    }
+
+    #[test]
+    fn stylex_json_override_reads_the_same_schema() {
+        let dir = std::env::temp_dir().join(format!("oj-stylex-json-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stylex.json");
+        std::fs::write(&path, r#"{"include":["src/**"],"useCssLayers":true}"#).unwrap();
+        let sx = load_stylex_json(&path).unwrap();
+        assert_eq!(sx.include, vec!["src/**".to_string()]);
+        assert_eq!(sx.use_css_layers, Some(true));
+        assert!(load_stylex_json(&dir.join("missing.json")).is_err());
+        std::fs::write(&path, "not json").unwrap();
+        assert!(load_stylex_json(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

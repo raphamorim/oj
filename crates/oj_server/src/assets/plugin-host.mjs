@@ -365,6 +365,9 @@ const OJ_NATIVE_PLUGIN_NAMES = new Set([
   "vite:react-swc",
   "vite:react-swc:resolve-runtime",
 ]);
+// Extra names the server reimplements natively for this app (e.g. a JS
+// StyleX plugin when the native stylex pass is enabled).
+for (const name of initial.nativePluginNames ?? []) OJ_NATIVE_PLUGIN_NAMES.add(name);
 
 // Dev-tooling plugins oj cannot host: they drive a full Vite dev server (ws
 // error overlay, file watcher, a worker running tsc/eslint) that oj does not

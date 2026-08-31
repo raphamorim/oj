@@ -7,6 +7,7 @@ description = "Content-addressed persistent cache for compiled module outputs"
 
 [dependencies]
 blake3.workspace = true
+fru.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 
