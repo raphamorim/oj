@@ -27,7 +27,7 @@ struct FallbackState {
     aliases: Vec<(String, PathBuf)>,
     plugin_loader: Option<String>,
     http: reqwest::Client,
-    cache: crate::workerd::ModuleCache,
+    cache: Arc<crate::workerd::ModuleCache>,
 }
 
 pub fn start_aliases(app_root: &Path, assets_dir: &Path) -> Vec<(String, PathBuf)> {
@@ -89,6 +89,7 @@ pub struct WorkerdSession {
     fallback: tokio::task::JoinHandle<()>,
     pub worker_addr: String,
     pub reload: Arc<WorkerReload>,
+    pub cache: Arc<crate::workerd::ModuleCache>,
 }
 
 impl WorkerdSession {
@@ -119,13 +120,14 @@ pub async fn spawn(
 ) -> std::io::Result<WorkerdSession> {
     let fb = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let fb_port = fb.local_addr()?.port();
+    let cache: Arc<crate::workerd::ModuleCache> = Default::default();
     let state = Arc::new(FallbackState {
         root: root.to_path_buf(),
         resolver: OjResolver::with_conditions(root, &worker_conditions()),
         aliases,
         plugin_loader,
         http: reqwest::Client::new(),
-        cache: Default::default(),
+        cache: cache.clone(),
     });
     let fallback = tokio::spawn(async move {
         let app = Router::new().route("/", get(fallback_handler)).with_state(state);
@@ -182,6 +184,7 @@ pub async fn spawn(
                 child,
                 fallback,
                 reload,
+                cache: cache.clone(),
                 worker_addr: format!("127.0.0.1:{wd_port}"),
             });
         }
@@ -218,7 +221,7 @@ async fn fallback_handler(
     let st = state.clone();
     let (spec, rawc, refc) = (specifier.clone(), raw.clone(), referrer.clone());
     let outcome = match tokio::task::spawn_blocking(move || {
-        resolve_fallback(&st.root, &st.resolver, &st.aliases, Some(&st.cache), &spec, &rawc, &refc)
+        resolve_fallback(&st.root, &st.resolver, &st.aliases, Some(st.cache.as_ref()), &spec, &rawc, &refc)
     })
     .await
     {
@@ -264,7 +267,7 @@ async fn fallback_handler(
                     &source,
                     &st.resolver,
                     &st.aliases,
-                    Some(&st.cache),
+                    Some(st.cache.as_ref()),
                 )
             })
             .await;

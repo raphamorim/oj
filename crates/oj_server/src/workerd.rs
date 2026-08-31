@@ -297,6 +297,17 @@ pub fn cached_module(cache: &ModuleCache, file: &Path) -> Option<String> {
     cache_get(Some(cache), file, mtime)
 }
 
+pub fn invalidate<I: IntoIterator<Item = PathBuf>>(cache: &ModuleCache, paths: I) {
+    if let Ok(mut guard) = cache.lock() {
+        for p in paths {
+            guard.remove(&p);
+            if let Ok(canon) = std::fs::canonicalize(&p) {
+                guard.remove(&canon);
+            }
+        }
+    }
+}
+
 fn cache_put(cache: Option<&ModuleCache>, file: &Path, mtime: Option<std::time::SystemTime>, code: &str) {
     if let (Some(cache), Some(mtime)) = (cache, mtime) {
         if let Ok(mut guard) = cache.lock() {

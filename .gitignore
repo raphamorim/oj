@@ -13,3 +13,6 @@ e2e/.ssr-stderr.log
 # cargo-mutants scratch output
 mutants.out/
 mutants.out.old/
+
+# TanStack Start dev-time scratch
+.tanstack/

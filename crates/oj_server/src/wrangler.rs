@@ -92,80 +92,49 @@ fn json_scalar(v: &serde_json::Value) -> String {
     }
 }
 
-fn parse_flag_array(s: &str) -> Vec<String> {
-    s.trim()
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .split(',')
-        .map(|x| x.trim().trim_matches('"').to_string())
-        .filter(|x| !x.is_empty())
-        .collect()
-}
-
 fn parse_toml(text: &str) -> WranglerConfig {
-    let mut cfg = WranglerConfig::default();
-    let mut section = "top";
-    let mut binding: Option<String> = None;
-    let mut service: Option<String> = None;
-    let mut flag_buf: Option<String> = None;
-    for line in text.lines() {
-        let t = line.trim();
-        if let Some(buf) = flag_buf.as_mut() {
-            buf.push(' ');
-            buf.push_str(t);
-            if t.contains(']') {
-                cfg.compat_flags = parse_flag_array(&flag_buf.take().unwrap());
-            }
-            continue;
+    let v: toml::Value = match text.parse() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("oj: could not parse wrangler.toml ({e}); using defaults (compat date, vars, and bindings will be missing)");
+            return WranglerConfig::default();
         }
-        if t.is_empty() || t.starts_with('#') {
-            continue;
-        }
-        if t.starts_with('[') {
-            if let (Some(b), Some(s)) = (binding.take(), service.take()) {
-                cfg.service_bindings.push((b, s));
-            }
-            section = if t == "[vars]" {
-                "vars"
-            } else if t == "[[services]]" {
-                "services"
-            } else {
-                "other"
-            };
-            continue;
-        }
-        if let Some((key, rest)) = t.split_once('=') {
-            let key = key.trim();
-            let val = rest.trim().trim_matches('"').to_string();
-            match section {
-                "vars" => cfg.vars.push((key.to_string(), val)),
-                "services" => {
-                    if key == "binding" || key == "name" {
-                        binding = Some(val);
-                    } else if key == "service" {
-                        service = Some(val);
-                    }
-                }
-                "top" => {
-                    if key == "compatibility_date" {
-                        cfg.compat_date = Some(val);
-                    } else if key == "compatibility_flags" {
-                        let r = rest.trim();
-                        if r.contains(']') {
-                            cfg.compat_flags = parse_flag_array(r);
-                        } else {
-                            flag_buf = Some(r.to_string());
-                        }
-                    }
-                }
-                _ => {}
-            }
+    };
+    let mut cfg = WranglerConfig {
+        compat_date: v
+            .get("compatibility_date")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        ..Default::default()
+    };
+    if let Some(flags) = v.get("compatibility_flags").and_then(|x| x.as_array()) {
+        cfg.compat_flags = flags
+            .iter()
+            .filter_map(|f| f.as_str().map(str::to_string))
+            .collect();
+    }
+    if let Some(vars) = v.get("vars").and_then(|x| x.as_table()) {
+        for (k, val) in vars {
+            cfg.vars.push((k.clone(), toml_scalar(val)));
         }
     }
-    if let (Some(b), Some(s)) = (binding.take(), service.take()) {
-        cfg.service_bindings.push((b, s));
+    if let Some(services) = v.get("services").and_then(|x| x.as_array()) {
+        for s in services {
+            let binding = s.get("binding").and_then(|x| x.as_str());
+            let service = s.get("service").and_then(|x| x.as_str());
+            if let (Some(b), Some(svc)) = (binding, service) {
+                cfg.service_bindings.push((b.to_string(), svc.to_string()));
+            }
+        }
     }
     cfg
+}
+
+fn toml_scalar(v: &toml::Value) -> String {
+    match v {
+        toml::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
 }
 
 fn load_dev_vars(root: &Path) -> Vec<(String, String)> {
@@ -240,9 +209,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("wrangler.toml"),
-            "compatibility_date = \"2026-08-01\"\n\
-             compatibility_flags = [\n  \"nodejs_compat\",\n  \"nodejs_als\",\n]\n\
-             [vars]\nA = \"b\"\n\
+            "compatibility_date = \"2026-08-01\" # prod date\n\
+             compatibility_flags = [\n  \"nodejs_compat\", # node\n  \"nodejs_als\",\n]\n\
+             [vars]\nA = \"b\" # a var\n\
              [[services]]\nbinding = \"RESOLVER\"\nservice = \"resolver-svc\"\n\
              [env.production]\ncompatibility_date = \"2099-01-01\"\n",
         )
