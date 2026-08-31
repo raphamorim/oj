@@ -37,7 +37,7 @@ pub fn start_aliases(app_root: &Path, assets_dir: &Path) -> Vec<(String, PathBuf
         ("#tanstack-start-plugin-adapters".into(), assets_dir.join("plugin-adapters.ts")),
         ("#tanstack-start-server-fn-resolver".into(), assets_dir.join("server-fn-resolver.mjs")),
         ("tanstack-start-manifest:v".into(), assets_dir.join("manifest-dev.ts")),
-        ("@cloudflare/vite-plugin/server".into(), assets_dir.join("cf-server.mjs")),
+        ("@cloudflare/vite-plugin/server".into(), assets_dir.join("cf-server-workerd.mjs")),
     ]
 }
 

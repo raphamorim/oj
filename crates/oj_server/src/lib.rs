@@ -123,6 +123,10 @@ const START_ASSETS: &[(&str, &str)] = &[
         include_str!("assets/start/ssr-fetch-module.mjs"),
     ),
     ("cf-server.mjs", include_str!("assets/start/cf-server.mjs")),
+    (
+        "cf-server-workerd.mjs",
+        include_str!("assets/start/cf-server-workerd.mjs"),
+    ),
     ("css-host.mjs", include_str!("assets/start/css-host.mjs")),
     ("loader.mjs", include_str!("assets/start/loader.mjs")),
     (
