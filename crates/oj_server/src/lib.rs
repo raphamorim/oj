@@ -374,34 +374,45 @@ impl DevServer {
             .map(|d| root.join(d))
             .unwrap_or_else(|| root.clone());
         let env = oj_env::load(&env_dir, "development");
-        let mut defines = oj_env::import_meta_env_defines(
-            &env,
-            "development",
-            true,
-            config.base.as_deref().unwrap_or("/"),
-            &env_prefix_refs,
-        );
-        defines.extend(oj_config::config_defines(&config));
-        defines.extend(oj_config::environment_defines(&config, "client"));
-        defines.extend(oj_config::environment_defines(&config, "ssr"));
-        // Vite defines process.env.NODE_ENV in dev too (nodeEnv = NODE_ENV || mode);
-        // without it, library code that reads it throws a ReferenceError in dev.
-        let node_env = std::env::var("NODE_ENV")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "development".into());
-        let node_env_json =
-            serde_json::to_string(&node_env).unwrap_or_else(|_| "\"development\"".into());
-        for key in [
-            "process.env.NODE_ENV",
-            "global.process.env.NODE_ENV",
-            "globalThis.process.env.NODE_ENV",
-        ] {
-            if !defines.iter().any(|(k, _)| k == key) {
-                defines.push((key.to_string(), node_env_json.clone()));
+        // Rebuilt after plugin-host boot with the config()-hook env delta, so
+        // it stays a closure over the same inputs rather than a one-shot block.
+        let build_env_defines = |extra: &std::collections::BTreeMap<String, String>| {
+            let merged = oj_env::with_process_env(
+                env.clone(),
+                std::env::vars().chain(extra.iter().map(|(k, v)| (k.clone(), v.clone()))),
+                &env_prefix_refs,
+            );
+            let mut defines = oj_env::import_meta_env_defines(
+                &merged,
+                "development",
+                true,
+                config.base.as_deref().unwrap_or("/"),
+                &env_prefix_refs,
+            );
+            defines.extend(oj_config::config_defines(&config));
+            defines.extend(oj_config::environment_defines(&config, "client"));
+            defines.extend(oj_config::environment_defines(&config, "ssr"));
+            // Vite defines process.env.NODE_ENV in dev too (nodeEnv = NODE_ENV || mode);
+            // without it, library code that reads it throws a ReferenceError in dev.
+            let node_env = std::env::var("NODE_ENV")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "development".into());
+            let node_env_json =
+                serde_json::to_string(&node_env).unwrap_or_else(|_| "\"development\"".into());
+            for key in [
+                "process.env.NODE_ENV",
+                "global.process.env.NODE_ENV",
+                "globalThis.process.env.NODE_ENV",
+            ] {
+                if !defines.iter().any(|(k, _)| k == key) {
+                    defines.push((key.to_string(), node_env_json.clone()));
+                }
             }
-        }
-        let html_env = oj_env::html_env_map(&defines);
+            defines
+        };
+        let defines = build_env_defines(&std::collections::BTreeMap::new());
+        let mut html_env = oj_env::html_env_map(&defines);
         oj_compiler::set_import_meta_env(defines);
 
         let server_cfg = config.server.clone().unwrap_or_default();
@@ -512,6 +523,21 @@ impl DevServer {
         };
         if let Some(p) = plugin_mw_port {
             println!("  plugin middleware: forwarding unmatched requests to :{p}");
+        }
+        if let Some(host) = &plugin_host {
+            // Fold config()-hook env mutations (e.g. a plugin flipping a VITE_*
+            // flag) into the client defines before any module compiles.
+            let prefixed: std::collections::BTreeMap<String, String> = host
+                .env_delta()
+                .await
+                .into_iter()
+                .filter(|(k, _)| env_prefix_refs.iter().any(|p| k.starts_with(p)))
+                .collect();
+            if !prefixed.is_empty() {
+                let defines = build_env_defines(&prefixed);
+                html_env = oj_env::html_env_map(&defines);
+                oj_compiler::set_import_meta_env(defines);
+            }
         }
         let plugins_use_module_parsed = match &plugin_host {
             Some(host) => host.has_module_parsed().await,

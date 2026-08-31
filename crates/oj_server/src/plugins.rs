@@ -791,6 +791,17 @@ impl PluginHost {
             .unwrap_or(1)
     }
 
+    /// Env mutations made by plugin `config()` hooks in the host process (e.g.
+    /// a plugin flipping a VITE_* flag). Empty on RPC failure.
+    pub async fn env_delta(&self) -> std::collections::BTreeMap<String, String> {
+        self.call("getEnvDelta", &[])
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
     /// Whether any active plugin has a `transform` hook. Defaults to true on RPC
     /// failure so the per-module transform pass is never skipped by mistake.
     pub async fn has_transform(&self) -> bool {

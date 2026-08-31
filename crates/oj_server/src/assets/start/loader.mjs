@@ -80,12 +80,20 @@ const envDelta = (() => {
   if (process.env.OJ_SSR_LOADER_CACHE !== "off") {
     try {
       const h = createHash("sha256");
-      hashAdd(h, "v", "oj-ssr-env-delta-v1");
+      hashAdd(h, "v", "oj-ssr-env-delta-v2");
       hashBaseInputs(h);
       for (const name of [".env", ".env.local", ".env.development", ".env.development.local"]) {
         try { hashAdd(h, name, readFileSync(pathResolve(APP, name))); } catch {}
       }
       hashAdd(h, "git", gitStateBytes());
+      // config() hooks read arbitrary env (a sidecar URL, a profile toggle), so
+      // the cached delta must not outlive an env change; skip shell-session noise.
+      const ENV_HASH_SKIP = new Set(["_", "PWD", "OLDPWD", "SHLVL", "TERM", "TERM_PROGRAM", "TERM_SESSION_ID", "SSH_AUTH_SOCK", "XPC_SERVICE_NAME", "XPC_FLAGS"]);
+      hashAdd(h, "penv", Object.entries(process.env)
+        .filter(([k]) => !ENV_HASH_SKIP.has(k))
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([k, v]) => `${k}=${v}`)
+        .join("\n"));
       deltaKey = h.digest("hex");
     } catch {}
   }
