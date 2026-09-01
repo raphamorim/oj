@@ -2117,7 +2117,13 @@ async fn ensure_module(
         Some(host) if state.plugins_have_transform && (!is_dep || dep_wants_transform) => {
             let resolved =
                 resolved_imports_json(&state.resolver, &state.fs_allow, &source, file);
-            match host.transform(&source, &file.to_string_lossy(), &resolved).await {
+            // Pass the id WITH its query (e.g. `?tsr-shared=1`), like Vite: the router
+            // code-splitter emits a different variant per query, keyed off the id.
+            let transform_id = match url.split_once('?') {
+                Some((_, q)) => format!("{}?{}", file.display(), q),
+                None => file.to_string_lossy().into_owned(),
+            };
+            match host.transform(&source, &transform_id, &resolved).await {
                 Ok((code, watches, maps, _)) => {
                     plugin_watch_files = watches;
                     plugin_maps = maps;
