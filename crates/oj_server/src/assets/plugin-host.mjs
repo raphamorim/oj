@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, isAbsolute, join, resolve as pathResolve } from "node:path";
 import readline from "node:readline";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { EventEmitter } from "node:events";
 
 const pluginsPath = process.argv[2];
 const initial = JSON.parse(process.argv[3] ?? "{}");
@@ -217,7 +218,7 @@ function withResolvedDefaults(config) {
         reportCompressedSize: true,
         chunkSizeWarningLimit: 500,
       },
-      server: {},
+      server: { headers: {} },
       define: {},
       resolve: {},
       optimizeDeps: {},
@@ -239,6 +240,15 @@ function withResolvedDefaults(config) {
   if (merged.publicDir !== false) {
     const pd = typeof merged.publicDir === "string" && merged.publicDir.length > 0 ? merged.publicDir : "public";
     merged.publicDir = isAbsolute(pd) ? pd : pathResolve(merged.root, pd);
+  }
+  // Vite's resolved config carries a `logger`; plugins (e.g. the cloudflare
+  // plugin's ViteMiniflareLogger) call `config.logger.info/warn/error`.
+  if (!merged.logger || typeof merged.logger.info !== "function") {
+    const w = (...a) => process.stderr.write(a.map(String).join(" ") + "\n");
+    merged.logger = {
+      info: () => {}, warn: w, warnOnce: w, error: w,
+      clearScreen: () => {}, hasErrorLogged: () => false, hasWarned: false,
+    };
   }
   return merged;
 }
@@ -567,29 +577,153 @@ const wsApi = {
 };
 
 let middlewarePort = null;
+let appVite = null;
+async function loadAppVite() {
+  if (appVite) return appVite;
+  try {
+    const root = (resolvedConfig && resolvedConfig.root) || (initial.config && initial.config.root) || process.cwd();
+    appVite = await import(createRequire(root + "/package.json").resolve("vite"));
+  } catch (e) {
+    process.stderr.write(`${OJ} plugin host: could not load app vite: ${(e && e.message) || e}\n`);
+  }
+  return appVite;
+}
+
+// Build real Vite DevEnvironments from the app's installed Vite so plugins that
+// use the Environment API (e.g. @cloudflare/vite-plugin, which subclasses
+// vite.DevEnvironment) run. oj does not depend on Vite; it loads the app's copy.
+async function buildEnvironments(server) {
+  const vite = await loadAppVite();
+  if (!vite || typeof vite.resolveConfig !== "function") return undefined;
+  const root = (resolvedConfig && resolvedConfig.root) || (initial.config && initial.config.root) || process.cwd();
+  // Real DevEnvironments need a real resolved Vite config (root, cacheDir,
+  // resolve.builtins, per-env dev.createEnvironment factories). Hand-faking it
+  // is endless whack-a-mole, so ask the app's Vite to resolve it once.
+  let rc;
+  try {
+    // configFile:undefined lets Vite resolve fresh plugin instances. Reusing
+    // oj's instances (configFile:false + plugins) corrupts stateful plugins
+    // (e.g. @cloudflare/vite-plugin's virtual:cloudflare/export-types) when
+    // their config hooks run a second time, so we accept a second resolve. The
+    // environments bind to these fresh instances; oj drives its own instances
+    // in configureServer, and the two agree because both resolve from `root`.
+    rc = await vite.resolveConfig({ root, configFile: undefined, mode: environment.mode }, "serve", "development", "development");
+  } catch (e) {
+    process.stderr.write(`${OJ} plugin host: vite.resolveConfig failed: ${(e && e.message) || e}\n`);
+    return undefined;
+  }
+  server.config = rc;
+  const environments = {};
+  for (const [name, envOpts] of Object.entries(rc.environments || {})) {
+    try {
+      const factory = envOpts && envOpts.dev && envOpts.dev.createEnvironment;
+      environments[name] = factory
+        ? await factory(name, rc, { ws: server.ws })
+        : new vite.DevEnvironment(name, rc, { hot: true, transport: server.ws });
+    } catch (e) {
+      process.stderr.write(`${OJ} plugin host: createEnvironment(${name}) failed: ${(e && e.message) || e}\n`);
+    }
+  }
+  for (const [name, ei] of Object.entries(environments)) {
+    try { if (ei && typeof ei.init === "function") await ei.init({ watcher: server.watcher }); }
+    catch (e) { process.stderr.write(`${OJ} plugin host: env.init(${name}) failed: ${(e && e.message) || e}\n`); }
+  }
+  return environments;
+}
+
+// On a source edit oj POSTs the changed paths to /__oj_invalidate; invalidate the
+// affected modules in each DevEnvironment's graph and tell its runner to reload,
+// so the plugin's Miniflare/workerd re-fetches changed modules (Vite's watcher
+// does this itself; oj drives it since it owns the file watcher).
+function invalidateEnvironments(environments, watcher, paths) {
+  for (const file of paths) {
+    try { watcher.emit("change", file); } catch {}
+  }
+  if (!environments) return;
+  for (const env of Object.values(environments)) {
+    if (!env) continue;
+    try {
+      const mg = env.moduleGraph;
+      for (const file of paths) {
+        if (mg && typeof mg.getModulesByFile === "function") {
+          const mods = mg.getModulesByFile(file);
+          if (mods) for (const m of mods) mg.invalidateModule && mg.invalidateModule(m);
+        }
+        if (mg && typeof mg.onFileChange === "function") mg.onFileChange(file);
+      }
+      if (env.hot && typeof env.hot.send === "function") env.hot.send({ type: "full-reload" });
+    } catch (e) {
+      process.stderr.write(`${OJ} plugin host: invalidate failed: ${(e && e.message) || e}\n`);
+    }
+  }
+}
+
 async function setupConfigureServer() {
   const stack = [];
-  const middlewares = {
-    use(a, b) {
-      if (typeof a === "function") stack.push({ path: null, fn: a });
-      else stack.push({ path: a, fn: b });
-    },
+  function runStack(req, res, done) {
+    let i = 0;
+    const next = (err) => {
+      while (i < stack.length) {
+        const entry = stack[i++];
+        const path = entry.route === "/" ? null : entry.route;
+        const fn = entry.handle;
+        if (path && !req.url.startsWith(path)) continue;
+        if ((fn.length >= 4) !== (err != null)) continue;
+        try {
+          return err != null ? fn(err, req, res, next) : fn(req, res, next);
+        } catch (e) {
+          return next(e);
+        }
+      }
+      if (typeof done === "function") return done(err);
+      if (err != null) {
+        res.statusCode = 500;
+        res.end(String((err && err.stack) || err));
+        return;
+      }
+      res.setHeader("x-oj-fallthrough", "1");
+      res.statusCode = 404;
+      res.end();
+    };
+    next();
+  }
+  // @cloudflare/vite-plugin uses `server.middlewares` both as a callable
+  // connect app (its workerd->node bridge) and via `.use()`, so provide both.
+  function middlewares(req, res, done) {
+    return runStack(req, res, done);
+  }
+  // connect stack entries are { route, handle } (plugins walk .stack reading
+  // handle.name); mirror that shape.
+  middlewares.use = (a, b) => {
+    if (typeof a === "function") stack.push({ route: "/", handle: a });
+    else stack.push({ route: a, handle: b });
   };
+  middlewares.stack = stack;
   const noop = () => {};
+  const fileWatcher = Object.assign(new EventEmitter(), { add: noop, unwatch: noop, close: noop });
   const server = {
     config: resolvedConfig,
     middlewares,
     httpServer: null,
     ws: wsApi,
     hot: wsApi,
-    watcher: { on: noop, off: noop, add: noop, unwatch: noop, close: noop, emit: () => true, removeAllListeners: noop },
+    watcher: fileWatcher,
     moduleGraph: { getModuleById: () => null, getModulesByFile: () => null, invalidateModule: noop, onFileChange: noop },
     restart: async () => {},
+    close: async () => {},
+    transformIndexHtml: async (_url, html) => transformIndexHtml(html),
     transformRequest: async () => null,
     ssrLoadModule: async () => {
       throw new Error("oj: server.ssrLoadModule is not available in configureServer");
     },
   };
+  if (plugins.some((p) => p && p.name === "vite-plugin-cloudflare:dev")) {
+    try {
+      server.environments = await buildEnvironments(server);
+    } catch (e) {
+      process.stderr.write(`${OJ} plugin host: buildEnvironments failed: ${(e && e.message) || e}\n`);
+    }
+  }
   const post = [];
   for (const p of plugins) {
     if (typeof p.configureServer !== "function") continue;
@@ -614,28 +748,19 @@ async function setupConfigureServer() {
   if (stack.length === 0) return;
 
   const srv = http.createServer((req, res) => {
-    let i = 0;
-    const next = (err) => {
-      while (i < stack.length) {
-        const { path, fn } = stack[i++];
-        if (path && !req.url.startsWith(path)) continue;
-        if ((fn.length >= 4) !== (err != null)) continue;
-        try {
-          return err != null ? fn(err, req, res, next) : fn(req, res, next);
-        } catch (e) {
-          return next(e);
-        }
-      }
-      if (err != null) {
-        res.statusCode = 500;
-        res.end(String((err && err.stack) || err));
-        return;
-      }
-      res.setHeader("x-oj-fallthrough", "1");
-      res.statusCode = 404;
-      res.end();
-    };
-    next();
+    if (req.method === "POST" && req.url === "/__oj_invalidate") {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        let paths = [];
+        try { paths = JSON.parse(body || "{}").paths || []; } catch {}
+        invalidateEnvironments(server.environments, fileWatcher, paths);
+        res.statusCode = 204;
+        res.end();
+      });
+      return;
+    }
+    middlewares(req, res);
   });
   await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
   middlewarePort = srv.address().port;

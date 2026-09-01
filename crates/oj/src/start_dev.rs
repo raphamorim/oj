@@ -35,9 +35,6 @@ struct StartState {
     // only drives the app iframe's live reload).
     ws_tx: broadcast::Sender<String>,
     css_host: Option<Arc<tokio::sync::Mutex<Runner>>>,
-    worker_url: Option<String>,
-    worker_reload: Option<Arc<oj_server::workerd_dev::WorkerReload>>,
-    worker_cache: Option<Arc<oj_server::workerd::ModuleCache>>,
 }
 
 pub async fn start_dev(
@@ -113,10 +110,6 @@ pub async fn start_dev(
     } else {
         None
     };
-    let workerd = spawn_workerd_if_cloudflare(&root, &cache).await;
-    let worker_url = workerd.as_ref().map(|w| w.session.worker_url());
-    let worker_reload = workerd.as_ref().map(|w| w.session.reload.clone());
-    let worker_cache = workerd.as_ref().map(|w| w.session.cache.clone());
     let state = Arc::new(StartState {
         proxy_prefixes: built.proxy_prefixes.clone(),
         plugin_mw_port: built.plugin_mw_port,
@@ -128,9 +121,6 @@ pub async fn start_dev(
         reload_tx: reload_tx.clone(),
         ws_tx: built.reload_tx.clone(),
         css_host,
-        worker_url,
-        worker_reload,
-        worker_cache,
     });
 
     spawn_start_watcher(root.clone(), cache.clone(), Arc::clone(&state));
@@ -340,6 +330,10 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             let _ = state.ws_tx.send(oj_server::update_progress_frame(
                 batch, "watch", 0, 0, None, false,
             ));
+            let changed_paths: Vec<String> = paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
             rt.block_on(async {
                 let (r, c) = (root.clone(), cache.clone());
                 let client = tokio::task::spawn_blocking(move || {
@@ -351,17 +345,16 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
                         None => oj_cache::start_bundle::PinnedBundle::from_build_dir(&c),
                     }
                 });
+                // Invalidate the plugin's worker DevEnvironments so a Cloudflare
+                // app re-renders with the changed modules (not stale SSR).
+                if let Some(port) = state.plugin_mw_port {
+                    oj_server::notify_plugin_mw_invalidate(port, &changed_paths).await;
+                }
                 let (pinned, _) = tokio::join!(client, reload_runner(&state));
                 if let Ok(Some(pinned)) = pinned {
                     *state.bundle.write().unwrap() = Arc::new(pinned);
                 }
             });
-            if let Some(cache) = &state.worker_cache {
-                oj_server::workerd::invalidate(cache, paths.iter().cloned());
-            }
-            if let Some(reload) = &state.worker_reload {
-                reload.bump();
-            }
             let _ = state.reload_tx.send(());
             let modules = client_module_count(&cache);
             let _ = state.ws_tx.send(oj_server::update_progress_frame(
@@ -597,83 +590,6 @@ async fn spawn_start_runner(root: &Path, cache: &Path) -> anyhow::Result<Runner>
     spawn_node_service(root, &cache.join("runner.mjs")).await
 }
 
-struct WorkerdGuard {
-    session: oj_server::workerd_dev::WorkerdSession,
-    _loader: tokio::process::Child,
-}
-
-async fn spawn_workerd_if_cloudflare(root: &Path, cache: &Path) -> Option<WorkerdGuard> {
-    if !oj_server::workerd::is_cloudflare_app(root) {
-        return None;
-    }
-    let Some(bin) = oj_server::workerd::find_workerd(root) else {
-        eprintln!("oj: cloudflare app detected but no workerd binary found; using node ssr");
-        return None;
-    };
-    let (loader_child, loader_url) = match spawn_plugin_loader(root, cache).await {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("oj: workerd plugin-loader failed to start ({e}); using node ssr");
-            return None;
-        }
-    };
-    let aliases = oj_server::workerd_dev::start_aliases(root, cache);
-    let cfg = oj_server::wrangler::load(root);
-    let entry = cache.join("server-entry.tsx");
-    let opts = oj_server::workerd_dev::WorkerdSpawn::from_wrangler(
-        cfg,
-        entry.to_string_lossy().into_owned(),
-    );
-    match oj_server::workerd_dev::spawn(root, &bin, cache, aliases, Some(loader_url), opts).await {
-        Ok(session) => {
-            eprintln!("oj: cloudflare dev via native workerd at {}", session.worker_url());
-            Some(WorkerdGuard { session, _loader: loader_child })
-        }
-        Err(e) => {
-            eprintln!("oj: workerd failed to start ({e}); using node ssr");
-            None
-        }
-    }
-}
-
-async fn spawn_plugin_loader(
-    root: &Path,
-    cache: &Path,
-) -> anyhow::Result<(tokio::process::Child, String)> {
-    let mut cmd = tokio::process::Command::new("node");
-    cmd.arg(cache.join("workerd-plugin-loader.mjs"))
-        .arg("0")
-        .env("OJ_APP_ROOT", root)
-        .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
-        .env("NODE_ENV", "development")
-        .env("OJ_SSR_BRIDGE_DIR", oj_server::plugins::ssr_bridge_dir(root))
-        .current_dir(root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true);
-    let mut child = cmd.spawn()?;
-    let Some(stdout) = child.stdout.take() else {
-        anyhow::bail!("plugin loader stdout was not piped");
-    };
-    let mut lines = BufReader::new(stdout).lines();
-    let port = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        while let Ok(Some(line)) = lines.next_line().await {
-            if let Some(p) = line.strip_prefix("OJ_LOADER_PORT=") {
-                return p.trim().parse::<u16>().ok();
-            }
-        }
-        None
-    })
-    .await
-    .ok()
-    .flatten();
-    tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
-    match port {
-        Some(p) => Ok((child, format!("http://127.0.0.1:{p}/"))),
-        None => anyhow::bail!("plugin loader did not report a port"),
-    }
-}
-
 async fn spawn_node_service(root: &Path, script: &Path) -> anyhow::Result<Runner> {
     let mut cmd = tokio::process::Command::new("node");
     cmd.arg(script)
@@ -811,9 +727,12 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
         let body_bytes = axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024)
             .await
             .ok();
-        if let Some(worker_url) = &state.worker_url {
-            if let Some(resp) = oj_server::forward_to_worker(
-                worker_url,
+        // A Cloudflare-plugin app's Miniflare handles every request; route server
+        // functions through it so they run in the worker (real runtime/bindings),
+        // like documents do. Falls back to the Node runner otherwise.
+        if let Some(port) = state.plugin_mw_port {
+            if let Some(resp) = oj_server::forward_to_plugin_mw(
+                port,
                 &method,
                 &url,
                 &header_map,
@@ -843,13 +762,6 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
             if let Some(port) = state.plugin_mw_port {
                 if let Some(resp) =
                     oj_server::forward_get_to_plugin_mw(port, &raw, req.headers()).await
-                {
-                    return resp;
-                }
-            }
-            if let Some(worker_url) = &state.worker_url {
-                if let Some(resp) =
-                    oj_server::forward_get_to_worker(worker_url, &raw, req.headers()).await
                 {
                     return resp;
                 }

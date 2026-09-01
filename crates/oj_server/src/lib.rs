@@ -20,9 +20,6 @@ use oj_cache::{CachedModule, PersistentCache};
 
 pub mod optimize;
 pub mod pkg_bundle;
-pub mod workerd;
-pub mod workerd_dev;
-pub mod wrangler;
 pub mod pkg_rolldown;
 pub mod plugins;
 pub mod sidecar;
@@ -123,10 +120,6 @@ const START_ASSETS: &[(&str, &str)] = &[
         include_str!("assets/start/ssr-fetch-module.mjs"),
     ),
     ("cf-server.mjs", include_str!("assets/start/cf-server.mjs")),
-    (
-        "cf-server-workerd.mjs",
-        include_str!("assets/start/cf-server-workerd.mjs"),
-    ),
     ("css-host.mjs", include_str!("assets/start/css-host.mjs")),
     ("loader.mjs", include_str!("assets/start/loader.mjs")),
     (
@@ -167,10 +160,6 @@ const START_ASSETS: &[(&str, &str)] = &[
     ),
     ("manifest.ts", include_str!("assets/start/manifest.ts")),
     ("manifest-dev.ts", include_str!("assets/start/manifest-dev.ts")),
-    (
-        "workerd-plugin-loader.mjs",
-        include_str!("assets/start/workerd-plugin-loader.mjs"),
-    ),
 ];
 
 pub fn boot_phase(label: &str) {
@@ -1485,8 +1474,26 @@ async fn forward_to_plugin_middleware(
 // middleware falls through (x-oj-fallthrough), so the caller can fall back to
 // SSR. Used by the TanStack start path, where GET requests are otherwise
 // SSR'd and would never reach editor endpoints (the dev-server bridge).
-pub async fn forward_to_worker(
-    worker_url: &str,
+// Tell a plugin's configureServer middleware server that source files changed,
+// so it can invalidate the DevEnvironments' module graphs and reload the worker
+// runner (the Cloudflare-plugin HMR path). Fire-and-forget.
+pub async fn notify_plugin_mw_invalidate(port: u16, paths: &[String]) {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = CLIENT.get_or_init(reqwest::Client::new);
+    let body = serde_json::json!({ "paths": paths }).to_string();
+    let _ = client
+        .post(format!("http://127.0.0.1:{port}/__oj_invalidate"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await;
+}
+
+// Method+body version of forward_get_to_plugin_mw, for the /_serverFn/ path so
+// server functions reach a Cloudflare plugin's worker (Miniflare) like documents
+// do, instead of running in the Node runner without the real runtime/bindings.
+pub async fn forward_to_plugin_mw(
+    port: u16,
     method: &str,
     path_and_query: &str,
     headers: &HeaderMap,
@@ -1494,14 +1501,11 @@ pub async fn forward_to_worker(
 ) -> Option<Response> {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     let client = CLIENT.get_or_init(reqwest::Client::new);
-    let target = format!("{}{}", worker_url.trim_end_matches('/'), path_and_query);
+    let target = format!("http://127.0.0.1:{port}{path_and_query}");
     let m = reqwest::Method::from_bytes(method.as_bytes()).ok()?;
     let mut out = client.request(m, &target);
     for (name, value) in headers.iter() {
-        if name == header::HOST
-            || name == header::CONTENT_LENGTH
-            || name == header::TRANSFER_ENCODING
-        {
+        if name == header::HOST {
             continue;
         }
         out = out.header(name, value);
@@ -1510,39 +1514,12 @@ pub async fn forward_to_worker(
         out = out.body(b);
     }
     let resp = out.send().await.ok()?;
+    if resp.headers().contains_key("x-oj-fallthrough") {
+        return None;
+    }
     let status = resp.status();
     let resp_headers = resp.headers().clone();
-    let bytes = resp.bytes().await.ok()?;
-    let mut response = Response::new(Body::from(bytes));
-    *response.status_mut() = status;
-    for (name, value) in resp_headers.iter() {
-        if name == header::TRANSFER_ENCODING || name == header::CONTENT_LENGTH {
-            continue;
-        }
-        response.headers_mut().insert(name, value.clone());
-    }
-    Some(response)
-}
-
-pub async fn forward_get_to_worker(
-    worker_url: &str,
-    path_and_query: &str,
-    headers: &HeaderMap,
-) -> Option<Response> {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    let client = CLIENT.get_or_init(reqwest::Client::new);
-    let target = format!("{}{}", worker_url.trim_end_matches('/'), path_and_query);
-    let mut out = client.get(&target);
-    for (name, value) in headers.iter() {
-        if name == header::HOST {
-            continue;
-        }
-        out = out.header(name, value);
-    }
-    let resp = out.send().await.ok()?;
-    let status = resp.status();
-    let resp_headers = resp.headers().clone();
-    let bytes = resp.bytes().await.ok()?;
+    let bytes = resp.bytes().await.unwrap_or_default();
     let mut response = Response::new(Body::from(bytes));
     *response.status_mut() = status;
     for (name, value) in resp_headers.iter() {
