@@ -600,6 +600,12 @@ async function buildEnvironments(server) {
   // is endless whack-a-mole, so ask the app's Vite to resolve it once.
   let rc;
   try {
+    // configFile:undefined lets Vite resolve fresh plugin instances. Reusing
+    // oj's instances (configFile:false + plugins) corrupts stateful plugins
+    // (e.g. @cloudflare/vite-plugin's virtual:cloudflare/export-types) when
+    // their config hooks run a second time, so we accept a second resolve. The
+    // environments bind to these fresh instances; oj drives its own instances
+    // in configureServer, and the two agree because both resolve from `root`.
     rc = await vite.resolveConfig({ root, configFile: undefined, mode: environment.mode }, "serve", "development", "development");
   } catch (e) {
     process.stderr.write(`${OJ} plugin host: vite.resolveConfig failed: ${(e && e.message) || e}\n`);
@@ -630,7 +636,9 @@ async function setupConfigureServer() {
     let i = 0;
     const next = (err) => {
       while (i < stack.length) {
-        const { path, fn } = stack[i++];
+        const entry = stack[i++];
+        const path = entry.route === "/" ? null : entry.route;
+        const fn = entry.handle;
         if (path && !req.url.startsWith(path)) continue;
         if ((fn.length >= 4) !== (err != null)) continue;
         try {
@@ -656,9 +664,11 @@ async function setupConfigureServer() {
   function middlewares(req, res, done) {
     return runStack(req, res, done);
   }
+  // connect stack entries are { route, handle } (plugins walk .stack reading
+  // handle.name); mirror that shape.
   middlewares.use = (a, b) => {
-    if (typeof a === "function") stack.push({ path: null, fn: a });
-    else stack.push({ path: a, fn: b });
+    if (typeof a === "function") stack.push({ route: "/", handle: a });
+    else stack.push({ route: a, handle: b });
   };
   middlewares.stack = stack;
   const noop = () => {};
