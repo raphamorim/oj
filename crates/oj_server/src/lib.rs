@@ -671,8 +671,8 @@ impl DevServer {
             has_postcss: has_postcss_config(&root),
             scss_additional_data: oj_config::css_additional_data(&config, "scss"),
             sass_additional_data: oj_config::css_additional_data(&config, "sass"),
-            fs_allow: Arc::new(Mutex::new(
-                server_cfg
+            fs_allow: Arc::new(Mutex::new({
+                let mut set: std::collections::HashSet<PathBuf> = server_cfg
                     .fs
                     .as_ref()
                     .and_then(|f| f.allow.as_ref())
@@ -689,8 +689,13 @@ impl DevServer {
                             })
                             .collect()
                     })
-                    .unwrap_or_default(),
-            )),
+                    .unwrap_or_default();
+                // Vite defaults server.fs.allow to [searchForWorkspaceRoot(root)], so
+                // workspace packages (shared UI, fonts) are served without an explicit
+                // allow entry. Match that instead of allow-listing package-by-package.
+                set.insert(workspace_root(&root));
+                set
+            })),
             fs_deny: compile_fs_deny(&oj_config::server_fs_deny(&config)),
             dir_cache: Arc::new(Mutex::new(DirCache::new())),
             patch_seq: std::sync::atomic::AtomicU64::new(0),
@@ -2758,6 +2763,35 @@ pub(crate) fn is_node_builtin(spec: &str) -> bool {
     )
 }
 
+// Vite's searchForWorkspaceRoot: walk up from the app root and stop at the first
+// workspace marker (pnpm-workspace.yaml / lerna.json / .git, or a package.json with
+// a `workspaces` field); otherwise the farthest ancestor that still has a
+// package.json. oj seeds server.fs.allow with this, matching Vite's default.
+fn workspace_root(root: &Path) -> PathBuf {
+    let mut pkg_root = root.to_path_buf();
+    let mut dir = root;
+    loop {
+        if dir.join("pnpm-workspace.yaml").exists()
+            || dir.join("lerna.json").exists()
+            || dir.join(".git").exists()
+        {
+            return dir.to_path_buf();
+        }
+        if dir.join("package.json").exists() {
+            if let Ok(txt) = std::fs::read_to_string(dir.join("package.json")) {
+                if txt.contains("\"workspaces\"") {
+                    return dir.to_path_buf();
+                }
+            }
+            pkg_root = dir.to_path_buf();
+        }
+        match dir.parent() {
+            Some(p) => dir = p,
+            None => return pkg_root,
+        }
+    }
+}
+
 // Rewrite `import { X } from "node:builtin"` to read X off the browser-externalized
 // stub (undefined) instead of a native named import that fails to link, matching
 // Vite's importAnalysis interop for browser-external modules. Returns None when the
@@ -3061,14 +3095,21 @@ fn rewrite_specifier(
     css_import_marker: bool,
 ) -> Option<String> {
     if spec.starts_with('/') {
-        // A root-relative URL (/src/x) is already servable. But a plugin can emit
-        // an absolute filesystem path under root (TanStack's dev client entry does)
-        // -- rewrite that to its root-relative URL, as Vite's import analysis does.
-        if !spec.contains('?') {
-            let p = Path::new(spec);
-            if p.starts_with(root) && is_file_cached(dir_cache, p) {
-                return Some(url_of(root, p));
-            }
+        // A root-relative URL (/src/x) is already servable. But a plugin can emit an
+        // absolute filesystem path under root -- TanStack's dev client entry, and the
+        // router code-splitter's `?tsr-shared=1` imports -- so rewrite that to its
+        // root-relative URL (preserving any query), as Vite's import analysis does.
+        let (base, query) = match spec.split_once('?') {
+            Some((b, q)) => (b, Some(q)),
+            None => (spec, None),
+        };
+        let p = Path::new(base);
+        if p.starts_with(root) && is_file_cached(dir_cache, p) {
+            let url = url_of(root, p);
+            return Some(match query {
+                Some(q) => format!("{url}?{q}"),
+                None => url,
+            });
         }
         return None;
     }
