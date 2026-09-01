@@ -2,7 +2,9 @@
 // toString) and media-query-transform.js (last-media-query-wins), both at 0.19.0.
 
 use crate::errors::StylexError;
+use crate::fxhash::FxHashMap;
 use crate::jsrt::js_number_to_string;
+use std::cell::RefCell;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -85,11 +87,35 @@ impl fmt::Display for MediaQuery {
     }
 }
 
+thread_local! {
+    // The rewrite is a pure function of the sibling list, and a design-system
+    // corpus repeats the same few breakpoint sets in every file.
+    static TRANSFORM_MEMO: RefCell<FxHashMap<Vec<String>, Vec<String>>> =
+        RefCell::new(FxHashMap::default());
+}
+
+const TRANSFORM_MEMO_CAP: usize = 1 << 16;
+
 /// Depth>=1 sibling `@media` rewrite: earlier keys gain ANDed not-clauses of
 /// later siblings; every key (last included) re-serializes via normalize.
 pub fn last_media_query_wins_transform(
     sibling_keys: &[String],
 ) -> Result<Vec<String>, MediaQueryError> {
+    if let Some(hit) = TRANSFORM_MEMO.with(|memo| memo.borrow().get(sibling_keys).cloned()) {
+        return Ok(hit);
+    }
+    let out = transform_uncached(sibling_keys)?;
+    TRANSFORM_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.len() >= TRANSFORM_MEMO_CAP {
+            memo.clear();
+        }
+        memo.insert(sibling_keys.to_vec(), out.clone());
+    });
+    Ok(out)
+}
+
+fn transform_uncached(sibling_keys: &[String]) -> Result<Vec<String>, MediaQueryError> {
     let queries = sibling_keys
         .iter()
         .map(|key| MediaQuery::parse(key))

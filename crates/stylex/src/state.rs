@@ -1,19 +1,23 @@
 //! Per-file compile state: semantic model, import tables, collected rules.
 // parity: babel-plugin src/utils/state-manager.js (traversal-state subset)
 
-use crate::fxhash::{FxHashMap, FxHashSet};
+use std::cell::RefCell;
+
+use crate::fxhash::FxHashMap;
 
 use oxc_ast::AstKind;
 use oxc_ast::ast::{
     BindingPattern, Expression, ForStatementLeft, IdentifierReference, Program,
     VariableDeclarationKind, VariableDeclarator,
 };
-use oxc_semantic::{AstNodes, Semantic, SemanticBuilder};
+use oxc_semantic::{AstNodes, Semantic, SemanticBuilder, Stats};
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::node::NodeId;
+use oxc_syntax::reference::ReferenceId;
 use oxc_syntax::symbol::SymbolId;
 
 use crate::errors::StylexError;
+use crate::eval::cross_file::VarGroupProxy;
 use crate::eval::value::EvalValue;
 use crate::imports::{ImportTable, scan_imports};
 use crate::options::ResolvedOptions;
@@ -71,10 +75,9 @@ pub struct CompileState<'a> {
     pub cwd: String,
     pub imports: ImportTable,
     pub semantic: Semantic<'a>,
-    /// babel constantViolations: write references, redeclarations, var for-heads.
-    violation_symbols: FxHashSet<SymbolId>,
-    /// evaluate-path.js isMutated: member-level mutations of the binding.
-    mutated_symbols: FxHashSet<SymbolId>,
+    /// (babel constantViolations non-empty, evaluate-path.js isMutated) per
+    /// symbol, computed on first query: eval touches a handful of symbols.
+    constness: RefCell<FxHashMap<SymbolId, (bool, bool)>>,
     pub style_vars_to_keep: Vec<StyleVarToKeep>,
     /// metadata.stylex accumulator in traversal order (integrator appends).
     pub rules: Vec<StylexRule>,
@@ -90,6 +93,9 @@ pub struct CompileState<'a> {
     /// `import_path_resolver` memo, keyed by specifier (filename + options are
     /// fixed per compile): otherwise every evaluated reference re-walks the fs.
     import_resolutions: FxHashMap<String, Option<String>>,
+    /// Theme-file proxies by import symbol: the `seen` cache is per entry, so
+    /// every evaluated reference would otherwise re-hash the var group.
+    theme_proxies: Vec<(SymbolId, VarGroupProxy)>,
 }
 
 impl<'a> CompileState<'a> {
@@ -103,28 +109,52 @@ impl<'a> CompileState<'a> {
             let _t = crate::timings::start(crate::timings::Stage::ImportScan);
             scan_imports(program, options)?
         };
+        Ok(Self::build_with_imports(
+            program, options, filename, cwd, imports,
+        ))
+    }
+
+    /// [`Self::build`] over an import table the caller already scanned.
+    pub fn build_with_imports(
+        program: &'a Program<'a>,
+        options: &'a ResolvedOptions,
+        filename: Option<String>,
+        cwd: String,
+        imports: ImportTable,
+    ) -> Self {
         let _t = crate::timings::start(crate::timings::Stage::Semantic);
         let semantic = SemanticBuilder::new()
+            .with_stats(estimated_stats(program.source_text.len()))
             .with_build_nodes(true)
             .build(program)
             .semantic;
-        let (violation_symbols, mutated_symbols) = scan_non_constant_symbols(&semantic);
         drop(_t);
-        Ok(CompileState {
+        CompileState {
             options,
             filename,
             cwd,
             imports,
             semantic,
-            violation_symbols,
-            mutated_symbols,
+            constness: RefCell::new(FxHashMap::default()),
             style_vars_to_keep: Vec::new(),
             rules: Vec::new(),
             other_injected_rules: Vec::new(),
             treeshake_imports: Vec::new(),
             binding_overrides: FxHashMap::default(),
             import_resolutions: FxHashMap::default(),
-        })
+            theme_proxies: Vec::new(),
+        }
+    }
+
+    pub fn theme_proxy(&self, symbol: SymbolId) -> Option<&VarGroupProxy> {
+        self.theme_proxies
+            .iter()
+            .find(|(s, _)| *s == symbol)
+            .map(|(_, proxy)| proxy)
+    }
+
+    pub fn record_theme_proxy(&mut self, symbol: SymbolId, proxy: VarGroupProxy) {
+        self.theme_proxies.push((symbol, proxy));
     }
 
     /// Memoized [`crate::module_resolution::import_path_resolver`]: the dep
@@ -159,12 +189,21 @@ impl<'a> CompileState<'a> {
 
     /// babel `binding.constantViolations.length > 0` (= `!binding.constant`).
     pub fn is_non_constant(&self, symbol: SymbolId) -> bool {
-        self.violation_symbols.contains(&symbol)
+        self.constness(symbol).0
     }
 
     /// evaluate-path.js `isMutated(binding)` — resolve() chains bypass this.
     pub fn is_mutated(&self, symbol: SymbolId) -> bool {
-        self.mutated_symbols.contains(&symbol)
+        self.constness(symbol).1
+    }
+
+    fn constness(&self, symbol: SymbolId) -> (bool, bool) {
+        if let Some(&flags) = self.constness.borrow().get(&symbol) {
+            return flags;
+        }
+        let flags = non_constant_flags(&self.semantic, symbol);
+        self.constness.borrow_mut().insert(symbol, flags);
+        flags
     }
 
     pub fn binding_info(&self, symbol: SymbolId) -> BindingInfo<'a> {
@@ -260,6 +299,48 @@ impl<'a> CompileState<'a> {
         scoping
             .symbol_ids()
             .any(|symbol| scoping.symbol_name(symbol) == name)
+    }
+
+    /// Sorted start offsets of every identifier reference named in `names`,
+    /// whichever binding it resolves to (the visitors match by name, as upstream).
+    pub fn reference_starts(&self, names: &[&str]) -> Vec<u32> {
+        self.reference_starts_where(names, |_, _, _| true)
+    }
+
+    /// [`Self::reference_starts`] keeping only the references `keep` accepts,
+    /// given the reference's name and node.
+    pub fn reference_starts_where(
+        &self,
+        names: &[&str],
+        keep: impl Fn(&str, &AstNodes<'a>, NodeId) -> bool,
+    ) -> Vec<u32> {
+        let mut starts = Vec::new();
+        if names.is_empty() {
+            return starts;
+        }
+        let scoping = self.semantic.scoping();
+        let nodes = self.semantic.nodes();
+        let mut push_all = |name: &str, ids: &[ReferenceId]| {
+            for &id in ids {
+                let node_id = scoping.get_reference(id).node_id();
+                if keep(name, nodes, node_id) {
+                    starts.push(nodes.kind(node_id).span().start);
+                }
+            }
+        };
+        for symbol in scoping.symbol_ids() {
+            let name = scoping.symbol_name(symbol);
+            if names.contains(&name) {
+                push_all(name, scoping.get_resolved_reference_ids(symbol));
+            }
+        }
+        for (name, ids) in scoping.root_unresolved_references() {
+            if names.contains(&name.as_str()) {
+                push_all(name.as_str(), ids);
+            }
+        }
+        starts.sort_unstable();
+        starts
     }
 
     /// Whether `name` at the scope holding `node` resolves to the given
@@ -387,46 +468,55 @@ fn binding_pattern_type_name(pattern: &BindingPattern<'_>) -> &'static str {
     }
 }
 
+// Capacity hints only (release builds never check them), so oxc skips its
+// counting walk; web-corpus p90 ratios, so a rare larger file regrows once.
+fn estimated_stats(source_len: usize) -> Stats {
+    let per_kb = |n: u64| {
+        u32::try_from((source_len as u64 * n) / 1024)
+            .unwrap_or(u32::MAX / 2)
+            .max(64)
+    };
+    Stats::new(per_kb(150), per_kb(4), per_kb(10), per_kb(20))
+}
+
 // parity: babel constantViolations (write references, redeclarations, var
-// for-in/of heads) + evaluate-path.js isMutated, keyed by symbol.
-fn scan_non_constant_symbols(
-    semantic: &Semantic<'_>,
-) -> (FxHashSet<SymbolId>, FxHashSet<SymbolId>) {
+// for-in/of heads) + evaluate-path.js isMutated, for one symbol.
+fn non_constant_flags(semantic: &Semantic<'_>, symbol: SymbolId) -> (bool, bool) {
     let scoping = semantic.scoping();
     let nodes = semantic.nodes();
-    let mut violations = FxHashSet::default();
-    let mut mutations = FxHashSet::default();
-    for symbol in scoping.symbol_ids() {
-        if !scoping.symbol_redeclarations(symbol).is_empty() {
-            violations.insert(symbol);
+    let mut violated = !scoping.symbol_redeclarations(symbol).is_empty()
+        || is_var_for_head(nodes, scoping.symbol_declaration(symbol));
+    let mut mutated = false;
+    for reference in scoping.get_resolved_references(symbol) {
+        if reference.is_write() {
+            violated = true;
+        } else if !mutated && reference_is_mutation(nodes, reference.node_id()) {
+            mutated = true;
         }
-        for reference in scoping.get_resolved_references(symbol) {
-            if reference.is_write() {
-                violations.insert(symbol);
-            } else if reference_is_mutation(nodes, reference.node_id()) {
-                mutations.insert(symbol);
-            }
-        }
-    }
-    for node in nodes.iter() {
-        let left = match node.kind() {
-            AstKind::ForInStatement(stmt) => &stmt.left,
-            AstKind::ForOfStatement(stmt) => &stmt.left,
-            _ => continue,
-        };
-        if let ForStatementLeft::VariableDeclaration(decl) = left
-            && decl.kind == VariableDeclarationKind::Var
-        {
-            for declarator in &decl.declarations {
-                for id in declarator.id.get_binding_identifiers() {
-                    if let Some(symbol) = id.symbol_id.get() {
-                        violations.insert(symbol);
-                    }
-                }
-            }
+        if violated && mutated {
+            break;
         }
     }
-    (violations, mutations)
+    (violated, mutated)
+}
+
+fn is_var_for_head(nodes: &AstNodes<'_>, declaration: NodeId) -> bool {
+    if !matches!(nodes.kind(declaration), AstKind::VariableDeclarator(_)) {
+        return false;
+    }
+    let decl_id = nodes.parent_id(declaration);
+    let AstKind::VariableDeclaration(decl) = nodes.kind(decl_id) else {
+        return false;
+    };
+    if decl.kind != VariableDeclarationKind::Var {
+        return false;
+    }
+    let left = match nodes.kind(nodes.parent_id(decl_id)) {
+        AstKind::ForInStatement(stmt) => &stmt.left,
+        AstKind::ForOfStatement(stmt) => &stmt.left,
+        _ => return false,
+    };
+    matches!(left, ForStatementLeft::VariableDeclaration(head) if std::ptr::eq(&**head, decl))
 }
 
 const MUTATING_ARRAY_METHODS: [&str; 9] = [
@@ -450,7 +540,7 @@ const MUTATING_OBJECT_STATICS: [&str; 4] = [
 
 /// Climbs from `node` through ParenthesizedExpression parents (babel has no
 /// paren nodes, so they are transparent to its parent checks).
-fn climb_parens(nodes: &AstNodes<'_>, node: NodeId) -> (NodeId, NodeId) {
+pub(crate) fn climb_parens(nodes: &AstNodes<'_>, node: NodeId) -> (NodeId, NodeId) {
     let mut child = node;
     let mut parent = nodes.parent_id(child);
     while child != parent && matches!(nodes.kind(parent), AstKind::ParenthesizedExpression(_)) {
@@ -460,7 +550,7 @@ fn climb_parens(nodes: &AstNodes<'_>, node: NodeId) -> (NodeId, NodeId) {
     (child, parent)
 }
 
-fn member_object_span(kind: AstKind<'_>) -> Option<(Span, Option<&str>)> {
+pub(crate) fn member_object_span(kind: AstKind<'_>) -> Option<(Span, Option<&str>)> {
     match kind {
         AstKind::StaticMemberExpression(member) => {
             Some((member.object.span(), Some(member.property.name.as_str())))
@@ -705,6 +795,27 @@ mod tests {
                 assert!(state.is_non_constant(root_symbol(state, "k")));
                 assert!(!state.is_non_constant(c));
                 assert!(state.is_non_constant(root_symbol(state, "d")));
+            },
+        );
+    }
+
+    #[test]
+    fn for_head_rule_is_the_loop_left_only() {
+        with_state(
+            "for (var k in {}) var body = 1;\nfor (var [a, { b }] of []) {}\n\
+             var early; for (var early in {}) {}\nfor (let l of []) {}\n",
+            |state| {
+                assert!(state.is_non_constant(root_symbol(state, "k")));
+                assert!(!state.is_non_constant(root_symbol(state, "body")));
+                assert!(state.is_non_constant(root_symbol(state, "a")));
+                assert!(state.is_non_constant(root_symbol(state, "b")));
+                assert!(state.is_non_constant(root_symbol(state, "early")));
+                let scoping = state.semantic.scoping();
+                let l = scoping
+                    .symbol_ids()
+                    .find(|s| scoping.symbol_name(*s) == "l")
+                    .expect("for-of let binding");
+                assert!(!state.is_non_constant(l));
             },
         );
     }

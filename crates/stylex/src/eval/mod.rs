@@ -6,6 +6,8 @@ pub mod functions;
 pub mod methods;
 pub mod value;
 
+use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::collections::BTreeMap;
 
 use crate::fxhash::FxHashMap;
@@ -74,70 +76,237 @@ pub enum Callable {
 
 /// Insertion-ordered object; ES OwnPropertyKeys ordering is restored when the
 /// value converts to `JsObjectMap`, which every observable path goes through.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct JsObj {
-    entries: Vec<(String, JsValue)>,
-    /// Lazy key→position table so wide objects avoid quadratic scans.
-    // Boxed to keep the usually-None field one word in every JsObj.
-    #[allow(clippy::box_collection)]
-    index: Option<Box<FxHashMap<String, usize>>>,
-    /// CSSType `instanceof` brand (the syntax): out-of-band like a prototype —
-    /// spreads copy entries only, aliases share the allocation.
-    css_type: Option<String>,
+    repr: ObjRepr,
+}
+
+#[derive(Debug, Clone)]
+enum ObjRepr {
+    Built {
+        entries: Vec<(String, JsValue)>,
+        /// Lazy key→position table so wide objects avoid quadratic scans.
+        // Boxed to keep the usually-None field one word in every JsObj.
+        #[allow(clippy::box_collection)]
+        index: Option<Box<FxHashMap<String, usize>>>,
+        /// CSSType `instanceof` brand (the syntax): out-of-band like a prototype —
+        /// spreads copy entries only, aliases share the allocation.
+        css_type: Option<String>,
+    },
+    /// A compiled map read in place; a slot converts once so repeat reads of
+    /// one entry keep one identity (`===`), like a real property.
+    Frozen {
+        map: Arc<JsObjectMap>,
+        slots: OnceCell<Box<[OnceCell<JsValue>]>>,
+    },
+}
+
+type FrozenSlots = OnceCell<Box<[OnceCell<JsValue>]>>;
+
+fn frozen_slot<'o>(map: &'o JsObjectMap, slots: &'o FrozenSlots, i: usize) -> &'o JsValue {
+    let slots = slots.get_or_init(|| {
+        std::iter::repeat_with(OnceCell::new)
+            .take(map.len())
+            .collect()
+    });
+    slots[i].get_or_init(|| from_eval_value(map.entry_at(i).1))
+}
+
+enum Entries<'o> {
+    Built(std::slice::Iter<'o, (String, JsValue)>),
+    Frozen {
+        map: &'o JsObjectMap,
+        slots: &'o FrozenSlots,
+        next: usize,
+    },
+}
+
+impl<'o> Iterator for Entries<'o> {
+    type Item = (&'o str, &'o JsValue);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Entries::Built(iter) => iter.next().map(|(k, v)| (k.as_str(), v)),
+            Entries::Frozen { map, slots, next } => {
+                let i = *next;
+                if i >= map.len() {
+                    return None;
+                }
+                *next += 1;
+                Some((map.entry_at(i).0, frozen_slot(map, slots, i)))
+            }
+        }
+    }
+}
+
+impl Default for JsObj {
+    fn default() -> Self {
+        Self::built(Vec::new())
+    }
 }
 
 impl JsObj {
+    fn built(entries: Vec<(String, JsValue)>) -> Self {
+        Self {
+            repr: ObjRepr::Built {
+                entries,
+                index: None,
+                css_type: None,
+            },
+        }
+    }
+
+    pub fn with_capacity(n: usize) -> Self {
+        Self::built(Vec::with_capacity(n))
+    }
+
+    /// The object sequential `insert` would build from `entries`, which must
+    /// not repeat a key (callers hand over a map's entries).
+    pub fn from_unique_entries(entries: Vec<(String, JsValue)>) -> Self {
+        debug_assert!(
+            entries
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .collect::<crate::fxhash::FxHashSet<_>>()
+                .len()
+                == entries.len()
+        );
+        Self::built(entries)
+    }
+
+    pub fn frozen(map: Arc<JsObjectMap>) -> Self {
+        Self {
+            repr: ObjRepr::Frozen {
+                map,
+                slots: OnceCell::new(),
+            },
+        }
+    }
+
+    fn frozen_map(&self) -> Option<&Arc<JsObjectMap>> {
+        match &self.repr {
+            ObjRepr::Frozen { map, .. } => Some(map),
+            ObjRepr::Built { .. } => None,
+        }
+    }
+
     pub fn get(&self, key: &str) -> Option<&JsValue> {
-        if let Some(index) = &self.index {
-            index.get(key).map(|&i| &self.entries[i].1)
-        } else {
-            self.entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+        match &self.repr {
+            ObjRepr::Built { entries, index, .. } => match index {
+                Some(index) => index.get(key).map(|&i| &entries[i].1),
+                None => entries.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            },
+            ObjRepr::Frozen { map, slots } => {
+                let i = map.position(key)?;
+                Some(frozen_slot(map, slots, i))
+            }
         }
     }
 
     pub fn insert(&mut self, key: String, value: JsValue) {
-        if self.index.is_none() && self.entries.len() >= value::NAMED_INDEX_THRESHOLD {
-            self.index = Some(Box::new(
-                self.entries
+        self.materialize();
+        let ObjRepr::Built { entries, index, .. } = &mut self.repr else {
+            unreachable!("materialize leaves a built object");
+        };
+        if index.is_none() && entries.len() >= value::NAMED_INDEX_THRESHOLD {
+            *index = Some(Box::new(
+                entries
                     .iter()
                     .enumerate()
                     .map(|(i, (k, _))| (k.clone(), i))
                     .collect(),
             ));
         }
-        if let Some(index) = &mut self.index {
+        if let Some(index) = index {
             match index.entry(key) {
                 std::collections::hash_map::Entry::Occupied(e) => {
-                    self.entries[*e.get()].1 = value;
+                    entries[*e.get()].1 = value;
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    self.entries.push((e.key().clone(), value));
-                    e.insert(self.entries.len() - 1);
+                    entries.push((e.key().clone(), value));
+                    e.insert(entries.len() - 1);
                 }
             }
-        } else if let Some(entry) = self.entries.iter_mut().find(|(k, _)| *k == key) {
+        } else if let Some(entry) = entries.iter_mut().find(|(k, _)| *k == key) {
             entry.1 = value;
         } else {
-            self.entries.push((key, value));
+            entries.push((key, value));
         }
     }
 
     pub fn entries(&self) -> impl Iterator<Item = (&str, &JsValue)> {
-        self.entries.iter().map(|(k, v)| (k.as_str(), v))
+        match &self.repr {
+            ObjRepr::Built { entries, .. } => Entries::Built(entries.iter()),
+            ObjRepr::Frozen { map, slots } => Entries::Frozen {
+                map,
+                slots,
+                next: 0,
+            },
+        }
     }
 
     pub fn css_type(&self) -> Option<&str> {
-        self.css_type.as_deref()
+        match &self.repr {
+            ObjRepr::Built { css_type, .. } => css_type.as_deref(),
+            ObjRepr::Frozen { map, .. } => map.css_type(),
+        }
     }
 
     pub fn set_css_type(&mut self, syntax: String) {
-        self.css_type = Some(syntax);
+        self.materialize();
+        if let ObjRepr::Built { css_type, .. } = &mut self.repr {
+            *css_type = Some(syntax);
+        }
+    }
+
+    /// Frozen → Built; slots already handed out keep their identity.
+    fn materialize(&mut self) {
+        let ObjRepr::Frozen { map, slots } = &mut self.repr else {
+            return;
+        };
+        let mut slots = slots.take();
+        let entries = map
+            .entries()
+            .enumerate()
+            .map(|(i, (k, v))| {
+                let value = slots
+                    .as_mut()
+                    .and_then(|s| s[i].take())
+                    .unwrap_or_else(|| from_eval_value(v));
+                (k.to_string(), value)
+            })
+            .collect();
+        let css_type = map.css_type().map(str::to_string);
+        self.repr = ObjRepr::Built {
+            entries,
+            index: None,
+            css_type,
+        };
+    }
+
+    fn into_map(self) -> Arc<JsObjectMap> {
+        match self.repr {
+            ObjRepr::Built {
+                entries, css_type, ..
+            } => {
+                let entries = entries
+                    .into_iter()
+                    .map(|(k, v)| (k, into_eval_value(v)))
+                    .collect();
+                let mut map = JsObjectMap::from_unique_entries(entries);
+                if let Some(syntax) = css_type {
+                    map.set_css_type(syntax);
+                }
+                Arc::new(map)
+            }
+            ObjRepr::Frozen { map, .. } => map,
+        }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Deopt {
-    pub reason: String,
+    pub reason: Cow<'static, str>,
     pub span: Span,
 }
 
@@ -161,16 +330,43 @@ pub fn to_eval_value(value: &JsValue) -> EvalValue {
         JsValue::Num(n) => EvalValue::Num(*n),
         JsValue::Str(s) => EvalValue::Str(s.clone()),
         JsValue::Arr(items) => EvalValue::Arr(items.iter().map(to_eval_value).collect()),
-        JsValue::Obj(obj) => {
-            let mut map = JsObjectMap::new();
-            for (k, v) in obj.entries() {
-                map.insert(k.to_string(), to_eval_value(v));
-            }
-            if let Some(syntax) = obj.css_type() {
-                map.set_css_type(syntax.to_string());
-            }
-            EvalValue::Obj(Arc::new(map))
-        }
+        JsValue::Obj(obj) => EvalValue::Obj(obj_to_map(obj)),
+        JsValue::Proxy(_) => EvalValue::Obj(JsObjectMap::new().into()),
+    }
+}
+
+fn obj_to_map(obj: &JsObj) -> Arc<JsObjectMap> {
+    if let Some(map) = obj.frozen_map() {
+        return Arc::clone(map);
+    }
+    let entries = obj
+        .entries()
+        .map(|(k, v)| (k.to_string(), to_eval_value(v)))
+        .collect();
+    let mut map = JsObjectMap::from_unique_entries(entries);
+    if let Some(syntax) = obj.css_type() {
+        map.set_css_type(syntax.to_string());
+    }
+    Arc::new(map)
+}
+
+/// `to_eval_value` for a value the caller is finished with: strings and
+/// uniquely owned containers move; aliased containers fall back to copying.
+pub fn into_eval_value(value: JsValue) -> EvalValue {
+    match value {
+        JsValue::Null => EvalValue::Null,
+        JsValue::Undefined | JsValue::Callable(_) => EvalValue::Undefined,
+        JsValue::Bool(b) => EvalValue::Bool(b),
+        JsValue::Num(n) => EvalValue::Num(n),
+        JsValue::Str(s) => EvalValue::Str(s),
+        JsValue::Arr(items) => match Rc::try_unwrap(items) {
+            Ok(items) => EvalValue::Arr(items.into_iter().map(into_eval_value).collect()),
+            Err(shared) => EvalValue::Arr(shared.iter().map(to_eval_value).collect()),
+        },
+        JsValue::Obj(obj) => EvalValue::Obj(match Rc::try_unwrap(obj) {
+            Ok(obj) => obj.into_map(),
+            Err(shared) => obj_to_map(&shared),
+        }),
         JsValue::Proxy(_) => EvalValue::Obj(JsObjectMap::new().into()),
     }
 }
@@ -183,16 +379,20 @@ pub fn from_eval_value(value: &EvalValue) -> JsValue {
         EvalValue::Num(n) => JsValue::Num(*n),
         EvalValue::Str(s) => JsValue::Str(s.clone()),
         EvalValue::Arr(items) => JsValue::array(items.iter().map(from_eval_value).collect()),
-        EvalValue::Obj(map) => {
-            let mut obj = JsObj::default();
-            for (k, v) in map.entries() {
-                obj.insert(k.to_string(), from_eval_value(v));
-            }
-            if let Some(syntax) = map.css_type() {
-                obj.set_css_type(syntax.to_string());
-            }
-            JsValue::object(obj)
-        }
+        EvalValue::Obj(map) => JsValue::object(JsObj::frozen(Arc::clone(map))),
+    }
+}
+
+/// `from_eval_value` for a value the caller is finished with.
+pub fn into_js_value(value: EvalValue) -> JsValue {
+    match value {
+        EvalValue::Null => JsValue::Null,
+        EvalValue::Undefined => JsValue::Undefined,
+        EvalValue::Bool(b) => JsValue::Bool(b),
+        EvalValue::Num(n) => JsValue::Num(n),
+        EvalValue::Str(s) => JsValue::Str(s),
+        EvalValue::Arr(items) => JsValue::array(items.into_iter().map(into_js_value).collect()),
+        EvalValue::Obj(map) => JsValue::object(JsObj::frozen(map)),
     }
 }
 
@@ -229,7 +429,7 @@ impl Resolved<'_> {
 #[derive(Debug, Clone, Default)]
 pub struct FunctionRegistry {
     identifiers: BTreeMap<String, RegistryEntry>,
-    member_callables: BTreeMap<(String, String), StylexCallable>,
+    member_callables: Vec<(String, &'static str, StylexCallable)>,
 }
 
 fn when_object() -> JsValue {
@@ -256,8 +456,9 @@ impl FunctionRegistry {
             }
         }
         for namespace in &imports.stylex_namespaces {
-            registry.member_callables.insert(
-                (namespace.clone(), "firstThatWorks".to_string()),
+            registry.add_member_callable(
+                namespace,
+                "firstThatWorks",
                 StylexCallable::FirstThatWorks,
             );
         }
@@ -276,10 +477,7 @@ impl FunctionRegistry {
             }
         }
         for namespace in &imports.stylex_namespaces {
-            registry.member_callables.insert(
-                (namespace.clone(), "defaultMarker".to_string()),
-                StylexCallable::DefaultMarker,
-            );
+            registry.add_member_callable(namespace, "defaultMarker", StylexCallable::DefaultMarker);
         }
         registry
     }
@@ -302,12 +500,34 @@ impl FunctionRegistry {
             }
         }
         for namespace in &imports.stylex_namespaces {
-            registry.member_callables.insert(
-                (namespace.clone(), "keyframes".to_string()),
-                StylexCallable::Keyframes,
-            );
+            registry.add_member_callable(namespace, "keyframes", StylexCallable::Keyframes);
         }
         registry
+    }
+
+    pub(crate) fn add_member_callable(
+        &mut self,
+        object: &str,
+        prop: &'static str,
+        callable: StylexCallable,
+    ) {
+        match self
+            .member_callables
+            .iter_mut()
+            .find(|(o, p, _)| o == object && *p == prop)
+        {
+            Some(slot) => slot.2 = callable,
+            None => self
+                .member_callables
+                .push((object.to_string(), prop, callable)),
+        }
+    }
+
+    pub(crate) fn member_callable(&self, object: &str, prop: &str) -> Option<&StylexCallable> {
+        self.member_callables
+            .iter()
+            .find(|(o, p, _)| o == object && *p == prop)
+            .map(|(_, _, callable)| callable)
     }
 
     fn restricted_base(imports: &ImportTable, env: &EvalValue) -> Self {
@@ -364,9 +584,7 @@ impl FunctionRegistry {
                 ("positionTry", StylexCallable::PositionTry),
                 ("defaultMarker", StylexCallable::DefaultMarker),
             ] {
-                registry
-                    .member_callables
-                    .insert((namespace.clone(), name.to_string()), callable);
+                registry.add_member_callable(namespace, name, callable);
             }
         }
         registry
@@ -377,7 +595,9 @@ pub struct Evaluator<'a, 'env> {
     pub state: &'env mut CompileState<'a>,
     pub fs: &'env dyn FsProvider,
     pub callables: &'env dyn EvalCallables,
-    registry: FunctionRegistry,
+    /// Arrow parameter binding writes through `to_mut`, so a borrowed registry
+    /// is copied only by evaluations that call arrows.
+    registry: Cow<'env, FunctionRegistry>,
     /// parity: FunctionConfig.disableImports — named-import resolution off.
     disable_imports: bool,
     arrow_bodies: BTreeMap<u32, (&'a Expression<'a>, Vec<String>)>,
@@ -397,7 +617,7 @@ enum SeenEntry {
 
 macro_rules! value_or_return {
     ($self:expr, $expr:expr) => {
-        match $self.eval($expr)? {
+        match $self.eval_node($expr)? {
             EvalOutcome::Value(v) => v,
             deopt => return Ok(deopt),
         }
@@ -415,7 +635,7 @@ impl<'a, 'env> Evaluator<'a, 'env> {
             state,
             fs,
             callables,
-            registry,
+            registry: Cow::Owned(registry),
             disable_imports: false,
             arrow_bodies: BTreeMap::new(),
             dynamic_namespaces: false,
@@ -436,6 +656,32 @@ impl<'a, 'env> Evaluator<'a, 'env> {
         registry: FunctionRegistry,
         disable_imports: bool,
     ) -> Self {
+        Self::with_registry_cow(state, fs, callables, Cow::Owned(registry), disable_imports)
+    }
+
+    pub fn with_registry_ref(
+        state: &'env mut CompileState<'a>,
+        fs: &'env dyn FsProvider,
+        callables: &'env dyn EvalCallables,
+        registry: &'env FunctionRegistry,
+        disable_imports: bool,
+    ) -> Self {
+        Self::with_registry_cow(
+            state,
+            fs,
+            callables,
+            Cow::Borrowed(registry),
+            disable_imports,
+        )
+    }
+
+    fn with_registry_cow(
+        state: &'env mut CompileState<'a>,
+        fs: &'env dyn FsProvider,
+        callables: &'env dyn EvalCallables,
+        registry: Cow<'env, FunctionRegistry>,
+        disable_imports: bool,
+    ) -> Self {
         Evaluator {
             state,
             fs,
@@ -449,7 +695,7 @@ impl<'a, 'env> Evaluator<'a, 'env> {
         }
     }
 
-    fn deopt(&self, span: Span, reason: impl Into<String>) -> EvalResult {
+    fn deopt(&self, span: Span, reason: impl Into<Cow<'static, str>>) -> EvalResult {
         Ok(EvalOutcome::NonStatic(Deopt {
             reason: reason.into(),
             span,
@@ -465,6 +711,13 @@ impl<'a, 'env> Evaluator<'a, 'env> {
         let _t = crate::timings::start(crate::timings::Stage::Eval);
         self.seen.clear();
         self.eval(expr)
+    }
+
+    /// Converts a finished `eval_entry` result; the node cache still holds Rc
+    /// clones of its tree and would otherwise force `into_eval_value` to copy.
+    fn consume(&mut self, value: JsValue) -> EvalValue {
+        self.seen.clear();
+        into_eval_value(value)
     }
 
     /// parity: nested `evaluate(...)` without the shared seen map (array
@@ -483,11 +736,16 @@ impl<'a, 'env> Evaluator<'a, 'env> {
         self.eval_cached(span, |ev| ev.eval_inner(expr))
     }
 
-    fn eval_cached(
-        &mut self,
-        span: Span,
-        eval_fn: impl FnOnce(&mut Self) -> EvalResult,
-    ) -> EvalResult {
+    // Only binding resolution (`eval`/`eval_cached`) can revisit a node within
+    // one `seen` lifetime; structural children skip the cache.
+    fn eval_node(&mut self, expr: &'a Expression<'a>) -> EvalResult {
+        self.enter()?;
+        let result = self.eval_inner(expr);
+        self.depth -= 1;
+        result
+    }
+
+    fn enter(&mut self) -> Result<(), StylexError> {
         self.depth += 1;
         if self.depth > 128 {
             self.depth -= 1;
@@ -496,6 +754,15 @@ impl<'a, 'env> Evaluator<'a, 'env> {
                 "StyleX evaluation exceeded the recursion limit.",
             ));
         }
+        Ok(())
+    }
+
+    fn eval_cached(
+        &mut self,
+        span: Span,
+        eval_fn: impl FnOnce(&mut Self) -> EvalResult,
+    ) -> EvalResult {
+        self.enter()?;
         let key = (span.start, span.end);
         match self.seen.get(&key) {
             Some(SeenEntry::InFlight) => {
@@ -520,9 +787,9 @@ impl<'a, 'env> Evaluator<'a, 'env> {
 
     fn eval_inner(&mut self, expr: &'a Expression<'a>) -> EvalResult {
         match expr {
-            Expression::ParenthesizedExpression(e) => self.eval(&e.expression),
-            Expression::TSAsExpression(e) => self.eval(&e.expression),
-            Expression::TSSatisfiesExpression(e) => self.eval(&e.expression),
+            Expression::ParenthesizedExpression(e) => self.eval_node(&e.expression),
+            Expression::TSAsExpression(e) => self.eval_node(&e.expression),
+            Expression::TSSatisfiesExpression(e) => self.eval_node(&e.expression),
             Expression::ArrowFunctionExpression(arrow) => {
                 let simple_params = arrow.params.rest.is_none();
                 let expression_body =
@@ -558,7 +825,7 @@ impl<'a, 'env> Evaluator<'a, 'env> {
                 }
             }
             Expression::SequenceExpression(seq) => match seq.expressions.last() {
-                Some(last) => self.eval(last),
+                Some(last) => self.eval_node(last),
                 None => self.deopt(seq.span, errs::PATH_WITHOUT_NODE),
             },
             Expression::StringLiteral(lit) => {
@@ -574,9 +841,9 @@ impl<'a, 'env> Evaluator<'a, 'env> {
             Expression::ConditionalExpression(cond) => {
                 let test = value_or_return!(self, &cond.test);
                 if truthy(&test) {
-                    self.eval(&cond.consequent)
+                    self.eval_node(&cond.consequent)
                 } else {
-                    self.eval(&cond.alternate)
+                    self.eval_node(&cond.alternate)
                 }
             }
             Expression::StaticMemberExpression(_) | Expression::ComputedMemberExpression(_) => {
@@ -626,7 +893,7 @@ impl<'a, 'env> Evaluator<'a, 'env> {
     }
 
     fn eval_template(&mut self, tpl: &'a TemplateLiteral<'a>) -> EvalResult {
-        let mut out = String::new();
+        let mut out = String::with_capacity(tpl.quasis.iter().map(|q| q.value.raw.len()).sum());
         for (i, quasi) in tpl.quasis.iter().enumerate() {
             if quasi.lone_surrogates {
                 return Err(StylexError::lone_surrogate("a template literal"));
@@ -672,7 +939,7 @@ impl<'a, 'env> Evaluator<'a, 'env> {
         };
         let info = self.state.binding_info(symbol);
         if matches!(info.decl, BindingDecl::NamedImport) && !self.disable_imports {
-            return self.eval_named_import(name, span);
+            return self.eval_named_import(symbol, name, span);
         }
         if matches!(info.decl, BindingDecl::DefaultImport) {
             return self.deopt(span, errs::IMPORT_FILE_EVAL_ERROR);
@@ -702,7 +969,7 @@ impl<'a, 'env> Evaluator<'a, 'env> {
             return self.deopt(span, errs::UNDEFINED_CONST);
         }
         match resolved {
-            Resolved::Override(value) => self.value(from_eval_value(&value)),
+            Resolved::Override(value) => self.value(into_js_value(value)),
             Resolved::Expr(expr) => self.eval(expr),
             Resolved::Identifier(other) => {
                 self.eval_cached(other.span, |ev| ev.eval_identifier(other))
@@ -714,7 +981,10 @@ impl<'a, 'env> Evaluator<'a, 'env> {
         }
     }
 
-    fn eval_named_import(&mut self, name: &str, span: Span) -> EvalResult {
+    fn eval_named_import(&mut self, symbol: SymbolId, name: &str, span: Span) -> EvalResult {
+        if let Some(proxy) = self.state.theme_proxy(symbol) {
+            return self.value(JsValue::proxy(proxy.clone()));
+        }
         let Some(record) = self.state.imports.import_record(name).cloned() else {
             return self.deopt(span, errs::UNDEFINED_CONST);
         };
@@ -729,6 +999,7 @@ impl<'a, 'env> Evaluator<'a, 'env> {
                     record.source_span,
                 );
                 let proxy = VarGroupProxy::new(canonical, imported, self.state.options);
+                self.state.record_theme_proxy(symbol, proxy.clone());
                 self.value(JsValue::proxy(proxy))
             }
             None => self.deopt(span, errs::IMPORT_PATH_RESOLUTION_ERROR),
@@ -838,14 +1109,14 @@ impl<'a, 'env> Evaluator<'a, 'env> {
             }
             return self.value(current);
         }
-        let (object_expr, key) = match expr {
+        let (object_expr, key): (_, Cow<str>) = match expr {
             Expression::StaticMemberExpression(member) => {
-                (&member.object, member.property.name.to_string())
+                (&member.object, Cow::Borrowed(member.property.name.as_str()))
             }
             Expression::ComputedMemberExpression(member) => {
                 let key_value = value_or_return!(self, &member.expression);
                 match js_to_string(&key_value) {
-                    Some(key) => (&member.object, key),
+                    Some(key) => (&member.object, Cow::Owned(key)),
                     None => {
                         return self
                             .deopt(member.expression.span(), errs::UNEXPECTED_MEMBER_LOOKUP);
@@ -862,7 +1133,7 @@ impl<'a, 'env> Evaluator<'a, 'env> {
         match object {
             JsValue::Proxy(proxy) => self.value(match key {
                 "__IS_PROXY" => JsValue::Bool(true),
-                "__varGroupHash__" => JsValue::Str(proxy.var_group_hash.clone()),
+                "__varGroupHash__" => JsValue::Str(proxy.var_group_hash().to_string()),
                 "toString" => JsValue::Callable(Callable::Opaque),
                 _ => JsValue::Str(proxy.resolve_key(key)),
             }),
@@ -950,7 +1221,7 @@ impl<'a, 'env> Evaluator<'a, 'env> {
     }
 
     fn eval_object(&mut self, object: &'a ObjectExpression<'a>) -> EvalResult {
-        let mut obj = JsObj::default();
+        let mut obj = JsObj::with_capacity(object.properties.len());
         for property in &object.properties {
             match property {
                 ObjectPropertyKind::SpreadProperty(spread) => {
@@ -993,8 +1264,8 @@ impl<'a, 'env> Evaluator<'a, 'env> {
     // parity: evaluate-path.js isLogicalExpression — both sides evaluate with
     // fresh confidence; `0 ?? x` deopts with literally "unknown error".
     fn eval_logical(&mut self, logical: &'a LogicalExpression<'a>) -> EvalResult {
-        let left = self.eval(&logical.left)?;
-        let right = self.eval(&logical.right)?;
+        let left = self.eval_node(&logical.left)?;
+        let right = self.eval_node(&logical.right)?;
         if let EvalOutcome::Value(l) = &left {
             match logical.operator {
                 LogicalOperator::Or => {
@@ -1206,11 +1477,8 @@ impl<'a, 'env> Evaluator<'a, 'env> {
                     }
                 }
                 if let Some(prop) = prop_static.or(prop_string)
-                    && let Some(callable) = self
-                        .registry
-                        .member_callables
-                        .get(&(object_name.to_string(), prop.to_string()))
-                        .cloned()
+                    && let Some(callable) =
+                        self.registry.member_callable(object_name, prop).cloned()
                 {
                     return self.dispatch(callable, call);
                 }
@@ -1246,7 +1514,7 @@ impl<'a, 'env> Evaluator<'a, 'env> {
             if let JsValue::Proxy(proxy) = &object_value
                 && property == "toString"
             {
-                let hash = proxy.var_group_hash.clone();
+                let hash = proxy.var_group_hash().to_string();
                 return match self.eval_arguments(call)? {
                     Ok(_) => self.value(JsValue::Str(hash)),
                     Err(deopt) => Ok(EvalOutcome::NonStatic(deopt)),
@@ -1343,18 +1611,20 @@ impl<'a, 'env> Evaluator<'a, 'env> {
             let value = args.get(i).cloned().unwrap_or(JsValue::Undefined);
             let previous = self
                 .registry
+                .to_mut()
                 .identifiers
                 .insert(name.clone(), RegistryEntry::Value(value));
             saved.push((name.clone(), previous));
         }
         let result = self.eval_fresh(body);
+        let identifiers = &mut self.registry.to_mut().identifiers;
         for (name, previous) in saved.into_iter().rev() {
             match previous {
                 Some(entry) => {
-                    self.registry.identifiers.insert(name, entry);
+                    identifiers.insert(name, entry);
                 }
                 None => {
-                    self.registry.identifiers.remove(&name);
+                    identifiers.remove(&name);
                 }
             }
         }
@@ -1382,12 +1652,14 @@ impl<'a, 'env> Evaluator<'a, 'env> {
         let args: Vec<EvalValue> = raw
             .iter()
             .map(|value| match value {
-                JsValue::Proxy(proxy) if is_when => EvalValue::Str(proxy.var_group_hash.clone()),
+                JsValue::Proxy(proxy) if is_when => {
+                    EvalValue::Str(proxy.var_group_hash().to_string())
+                }
                 other => to_eval_value(other),
             })
             .collect();
         let result = self.callables.call(&callable, &args, self.state)?;
-        self.value(from_eval_value(&result))
+        self.value(into_js_value(result))
     }
 
     fn eval_arguments(
@@ -1408,11 +1680,11 @@ impl<'a, 'env> Evaluator<'a, 'env> {
             match argument {
                 Argument::SpreadElement(spread) => {
                     return Ok(Err(Deopt {
-                        reason: errs::unsupported_expression("SpreadElement"),
+                        reason: errs::unsupported_expression("SpreadElement").into(),
                         span: spread.span,
                     }));
                 }
-                _ => match self.eval(argument.to_expression())? {
+                _ => match self.eval_node(argument.to_expression())? {
                     EvalOutcome::Value(v) => out.push(v),
                     EvalOutcome::NonStatic(deopt) => return Ok(Err(deopt)),
                 },
@@ -1445,7 +1717,7 @@ pub fn evaluate_stylex_create_arg<'a>(
     object: &'a ObjectExpression<'a>,
 ) -> Result<EvaluatedCreateArg, StylexError> {
     let _t = crate::timings::start(crate::timings::Stage::Eval);
-    let mut namespaces = JsObjectMap::new();
+    let mut namespaces = JsObjectMap::with_capacity(object.properties.len());
     let mut key_spans: Vec<(String, u32)> = Vec::new();
     let mut fns: Vec<(String, DynamicFn)> = Vec::new();
     for property in &object.properties {
@@ -1521,7 +1793,7 @@ pub fn evaluate_stylex_create_arg<'a>(
             if !key_spans.iter().any(|(k, _)| *k == key) {
                 key_spans.push((key.clone(), prop.span.start));
             }
-            namespaces.insert(key.clone(), to_eval_value(&JsValue::object(value)));
+            namespaces.insert(key.clone(), evaluator.consume(JsValue::object(value)));
             // parity: `fns[key] =` is a [[Set]]; "__proto__" never lands.
             if key != "__proto__" {
                 match fns.iter_mut().find(|(k, _)| *k == key) {
@@ -1536,7 +1808,7 @@ pub fn evaluate_stylex_create_arg<'a>(
                 if !key_spans.iter().any(|(k, _)| *k == key) {
                     key_spans.push((key.clone(), prop.span.start));
                 }
-                namespaces.insert(key, to_eval_value(&v));
+                namespaces.insert(key, evaluator.consume(v));
             }
             EvalOutcome::NonStatic(deopt) => {
                 return Err(StylexError::new(ErrorCode::NonStaticValue, deopt.reason));
@@ -1558,7 +1830,7 @@ fn reevaluate_create_object<'a>(
     evaluator.seen.clear();
     match evaluator.eval_object(object)? {
         EvalOutcome::Value(v) => Ok(EvaluatedCreateArg {
-            namespaces: match to_eval_value(&v) {
+            namespaces: match evaluator.consume(v) {
                 EvalValue::Obj(map) => Arc::unwrap_or_clone(map),
                 _ => JsObjectMap::new(),
             },
@@ -1579,7 +1851,7 @@ fn evaluate_partial_object<'a>(
     key_path: &[String],
     fn_def: &mut DynamicFn,
 ) -> Result<Option<JsObj>, StylexError> {
-    let mut obj = JsObj::default();
+    let mut obj = JsObj::with_capacity(object.properties.len());
     for property in &object.properties {
         match property {
             ObjectPropertyKind::SpreadProperty(spread) => {
@@ -1671,30 +1943,47 @@ pub fn unwrap_parens<'a, 'b>(expr: &'b Expression<'a>) -> &'b Expression<'a> {
 
 fn collect_member_chain<'a, 'b>(
     expr: &'b Expression<'a>,
-) -> Option<(&'b Expression<'a>, Vec<String>)> {
-    let mut parts: Vec<String> = Vec::new();
+) -> Option<(&'b Expression<'a>, Vec<Cow<'b, str>>)> {
+    let mut depth = 0;
+    let mut current = expr;
+    loop {
+        match current {
+            Expression::StaticMemberExpression(member) => current = &member.object,
+            Expression::ComputedMemberExpression(member) => match &member.expression {
+                Expression::StringLiteral(_) | Expression::NumericLiteral(_) => {
+                    current = &member.object;
+                }
+                _ => return None,
+            },
+            _ => break,
+        }
+        depth += 1;
+    }
+    if depth < 2 {
+        return None;
+    }
+    let mut parts: Vec<Cow<'b, str>> = Vec::with_capacity(depth);
     let mut current = expr;
     loop {
         match current {
             Expression::StaticMemberExpression(member) => {
-                parts.push(member.property.name.to_string());
+                parts.push(Cow::Borrowed(member.property.name.as_str()));
                 current = &member.object;
             }
             Expression::ComputedMemberExpression(member) => {
                 match &member.expression {
-                    Expression::StringLiteral(lit) => parts.push(lit.value.to_string()),
-                    Expression::NumericLiteral(lit) => {
-                        parts.push(js_number_to_string(lit.value));
+                    Expression::StringLiteral(lit) => {
+                        parts.push(Cow::Borrowed(lit.value.as_str()));
                     }
-                    _ => return None,
+                    Expression::NumericLiteral(lit) => {
+                        parts.push(Cow::Owned(js_number_to_string(lit.value)));
+                    }
+                    _ => unreachable!("checked by the depth pass"),
                 }
                 current = &member.object;
             }
             _ => break,
         }
-    }
-    if parts.len() < 2 {
-        return None;
     }
     parts.reverse();
     Some((current, parts))
@@ -1819,7 +2108,7 @@ pub fn js_to_string(value: &JsValue) -> Option<String> {
             parts.join(",")
         }
         JsValue::Obj(_) => "[object Object]".to_string(),
-        JsValue::Proxy(proxy) => proxy.var_group_hash.clone(),
+        JsValue::Proxy(proxy) => proxy.var_group_hash().to_string(),
         JsValue::Callable(_) => return None,
     })
 }

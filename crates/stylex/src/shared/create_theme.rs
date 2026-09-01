@@ -40,7 +40,7 @@ pub fn create_theme(
         _ => return Err(StylexError::non_style_object("createTheme")),
     };
     let var_group_hash = match theme_vars {
-        JsValue::Proxy(proxy) => proxy.var_group_hash.clone(),
+        JsValue::Proxy(proxy) => proxy.var_group_hash().to_string(),
         JsValue::Obj(obj) => match obj.get("__varGroupHash__") {
             Some(JsValue::Str(s)) if !s.is_empty() => s.clone(),
             _ => return Err(StylexError::theme_without_var_group()),
@@ -145,7 +145,7 @@ fn theme_var_name_hash(theme_vars: &JsValue, key: &str) -> Result<String, Stylex
         JsValue::Proxy(proxy) => {
             // Mirror the proxy traps: __varGroupHash__ answers the hash string.
             let resolved = match key {
-                "__varGroupHash__" => proxy.var_group_hash.clone(),
+                "__varGroupHash__" => proxy.var_group_hash().to_string(),
                 "__IS_PROXY" | "toString" => {
                     return Err(StylexError::upstream_type_crash(
                         "a proxy trap value without .slice in createTheme",

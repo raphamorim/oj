@@ -56,7 +56,7 @@ pub fn define_consts(
             ltr: "".into(),
             rtl: None,
             const_key: Some(const_key.into()),
-            const_val: Some(value.to_json()),
+            const_val: Some(Box::new(value.to_json())),
             priority: 0.0,
         });
     }
@@ -129,12 +129,18 @@ mod tests {
         assert_eq!(out.rules.len(), 2);
         assert_eq!(&*out.rules[0].class_name, "xjvywqn");
         assert_eq!(out.rules[0].const_key.as_deref(), Some("xjvywqn"));
-        assert_eq!(out.rules[0].const_val, Some(serde_json::json!("red")));
+        assert_eq!(
+            out.rules[0].const_val.as_deref(),
+            Some(&serde_json::json!("red"))
+        );
         assert_eq!(&*out.rules[0].ltr, "");
         assert_eq!(out.rules[0].rtl, None);
         assert!(out.rules[0].priority == 0.0);
         assert_eq!(&*out.rules[1].class_name, "xont6ws");
-        assert_eq!(out.rules[1].const_val, Some(serde_json::json!(12)));
+        assert_eq!(
+            out.rules[1].const_val.as_deref(),
+            Some(&serde_json::json!(12))
+        );
     }
 
     #[test]

@@ -36,23 +36,24 @@ pub enum PreRule<'a> {
     Set(Vec<PreRule<'a>>),
 }
 
-/// One compiled slot: `None` mirrors upstream's `null` ComputedStyle; the
-/// second element is the classesToOriginalPath keyPath for that class.
-pub type ComputedStyle<'a, 'b> = Option<(CompiledDecl, &'b [Cow<'a, str>])>;
-
 /// The property-value branch's per-property (condition, rule) groupings.
 type ConditionGroups<'a> = Vec<(Cow<'a, str>, Vec<(&'a str, PreRule<'a>)>)>;
 
 impl<'a> PreRule<'a> {
     // parity: PreRule.js PreRuleSet.create
     fn create_set(rules: Vec<PreRule<'a>>) -> PreRule<'a> {
-        let mut flat: Vec<PreRule> = Vec::with_capacity(rules.len());
-        for rule in rules {
-            match rule {
-                PreRule::Set(inner) => flat.extend(inner),
-                other => flat.push(other),
+        let flat = if rules.iter().any(|rule| matches!(rule, PreRule::Set(_))) {
+            let mut flat: Vec<PreRule> = Vec::with_capacity(rules.len());
+            for rule in rules {
+                match rule {
+                    PreRule::Set(inner) => flat.extend(inner),
+                    other => flat.push(other),
+                }
             }
-        }
+            flat
+        } else {
+            rules
+        };
         match flat.len() {
             0 => PreRule::Null,
             1 => flat.into_iter().next().expect("len checked"),
@@ -60,54 +61,29 @@ impl<'a> PreRule<'a> {
         }
     }
 
-    pub fn compiled(
+    /// Visits the compiled declarations in upstream's ComputedStyle order with
+    /// each one's classesToOriginalPath keyPath; `null` slots are skipped.
+    pub fn for_each_compiled(
         &self,
         options: &ResolvedOptions,
-    ) -> Result<Vec<ComputedStyle<'a, '_>>, StylexError> {
+        f: &mut dyn FnMut(CompiledDecl, &[Cow<'a, str>]),
+    ) -> Result<(), StylexError> {
         match self {
-            PreRule::Null => Ok(vec![None]),
+            PreRule::Null => Ok(()),
             PreRule::Rule {
                 property,
                 value,
                 key_path,
             } => {
-                // Condition lists stay in keyPath order; the sorted orders are
-                // derived inside the conversion, on its memo-miss path only.
-                let pseudos: Vec<&str> = key_path
-                    .iter()
-                    .filter(|k| k.starts_with(':') || k.starts_with('['))
-                    .map(Cow::as_ref)
-                    .collect();
-                let at_rules: Vec<&str> = key_path
-                    .iter()
-                    .filter(|k| k.starts_with('@'))
-                    .map(Cow::as_ref)
-                    .collect();
-                let const_rules: Vec<&str> = key_path
-                    .iter()
-                    .filter(|k| k.starts_with("var(--"))
-                    .map(Cow::as_ref)
-                    .collect();
-                let decl = convert_style_to_class_name(
-                    property,
-                    value,
-                    &pseudos,
-                    &at_rules,
-                    &const_rules,
-                    options,
-                )?;
-                Ok(vec![Some((decl, key_path.as_slice()))])
+                let decl = convert_style_to_class_name(property, value, key_path, options)?;
+                f(decl, key_path);
+                Ok(())
             }
             PreRule::Set(rules) => {
-                let mut tuples: Vec<ComputedStyle<'a, '_>> = Vec::new();
                 for rule in rules {
-                    tuples.extend(rule.compiled(options)?.into_iter().flatten().map(Some));
+                    rule.for_each_compiled(options, f)?;
                 }
-                if tuples.is_empty() {
-                    Ok(vec![None])
-                } else {
-                    Ok(tuples)
-                }
+                Ok(())
             }
         }
     }
@@ -115,60 +91,85 @@ impl<'a> PreRule<'a> {
 
 // Upstream copies via `obj[key]=value`, so "__proto__" is a [[Set]]: primitives
 // vanish, objects become the prototype, array/null protos break isPlainObject.
-struct ProtoSplit<'a> {
-    own: Vec<(&'a str, &'a EvalValue)>,
-    proto: Option<&'a JsObjectMap>,
-    non_plain: bool,
+fn is_plain(obj: &JsObjectMap) -> bool {
+    match obj.get("__proto__") {
+        None => true,
+        Some(EvalValue::Obj(proto)) => is_plain(proto),
+        Some(EvalValue::Null | EvalValue::Arr(_)) => false,
+        Some(_) => true,
+    }
 }
 
-fn proto_split(obj: &JsObjectMap) -> ProtoSplit<'_> {
-    let mut split = ProtoSplit {
-        own: Vec::with_capacity(obj.len()),
-        proto: None,
-        non_plain: false,
-    };
-    for (key, val) in obj.entries() {
-        if key == "__proto__" {
-            match val {
-                EvalValue::Obj(p) => split.proto = Some(p),
-                EvalValue::Null | EvalValue::Arr(_) => split.non_plain = true,
-                _ => {}
-            }
-        } else {
-            split.own.push((key, val));
+enum ForIn<'a, I> {
+    Own(I),
+    Chain(std::vec::IntoIter<(&'a str, &'a EvalValue)>),
+}
+
+impl<'a, I: Iterator<Item = (&'a str, &'a EvalValue)>> Iterator for ForIn<'a, I> {
+    type Item = (&'a str, &'a EvalValue);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            ForIn::Own(own) => own.next(),
+            ForIn::Chain(chain) => chain.next(),
         }
     }
-    // a non-plain link anywhere up the chain breaks the constructor lookup
-    if let Some(p) = split.proto
-        && proto_split(p).non_plain
-    {
-        split.non_plain = true;
-    }
-    split
 }
 
-// for..in order: own keys, then unshadowed prototype-chain keys.
-fn for_in_entries(obj: &JsObjectMap) -> Vec<(&str, &EvalValue)> {
+// for..in order: own keys, then unshadowed prototype-chain keys — which is the
+// map's own order, iterated in place, unless a "__proto__" key is present.
+fn for_in_entries(obj: &JsObjectMap) -> impl Iterator<Item = (&str, &EvalValue)> {
+    if obj.get("__proto__").is_none() {
+        ForIn::Own(obj.entries())
+    } else {
+        ForIn::Chain(for_in_chain(obj).into_iter())
+    }
+}
+
+fn for_in_chain(obj: &JsObjectMap) -> Vec<(&str, &EvalValue)> {
     let mut entries = Vec::new();
     let mut cursor = Some(obj);
     while let Some(map) = cursor {
-        let split = proto_split(map);
-        for (key, val) in split.own {
-            if !entries.iter().any(|(k, _)| *k == key) {
+        cursor = None;
+        for (key, val) in map.entries() {
+            if key == "__proto__" {
+                if let EvalValue::Obj(proto) = val {
+                    cursor = Some(proto);
+                }
+            } else if !entries.iter().any(|(k, _)| *k == key) {
                 entries.push((key, val));
             }
         }
-        cursor = split.proto;
     }
     entries
 }
 
-fn is_plain(obj: &JsObjectMap) -> bool {
-    !proto_split(obj).non_plain
+/// Enclosing condition keys, innermost first, linked through the call stack.
+struct Conditions<'p> {
+    key: &'p str,
+    outer: Option<&'p Conditions<'p>>,
+}
+
+fn is_enclosing_condition(conditions: Option<&Conditions<'_>>, key: &str) -> bool {
+    let mut cursor = conditions;
+    while let Some(condition) = cursor {
+        if condition.key == key {
+            return true;
+        }
+        cursor = condition.outer;
+    }
+    false
 }
 
 // parity: basic-validation.js validateNamespace
-pub fn validate_namespace(namespace: &EvalValue, conditions: &[String]) -> Result<(), StylexError> {
+pub fn validate_namespace(namespace: &EvalValue) -> Result<(), StylexError> {
+    validate_namespace_in(namespace, None)
+}
+
+fn validate_namespace_in(
+    namespace: &EvalValue,
+    conditions: Option<&Conditions<'_>>,
+) -> Result<(), StylexError> {
     let EvalValue::Obj(ns) = namespace else {
         return Err(StylexError::illegal_namespace_value());
     };
@@ -190,14 +191,16 @@ pub fn validate_namespace(namespace: &EvalValue, conditions: &[String]) -> Resul
             // through to ILLEGAL_PROP_VALUE exactly as upstream's last throw.
             EvalValue::Obj(inner) if is_plain(inner) => {
                 if key.starts_with('@') || key.starts_with(':') || key.starts_with('[') {
-                    if conditions.iter().any(|c| c == key) {
+                    if is_enclosing_condition(conditions, key) {
                         return Err(StylexError::duplicate_conditional());
                     }
-                    let mut nested = conditions.to_vec();
-                    nested.push(key.to_string());
-                    validate_namespace(val, &nested)?;
+                    let nested = Conditions {
+                        key,
+                        outer: conditions,
+                    };
+                    validate_namespace_in(val, Some(&nested))?;
                 } else {
-                    validate_conditional_styles(val, &[])?;
+                    validate_conditional_styles(val, None)?;
                 }
             }
             EvalValue::Obj(_) | EvalValue::Undefined | EvalValue::Bool(_) => {
@@ -209,7 +212,10 @@ pub fn validate_namespace(namespace: &EvalValue, conditions: &[String]) -> Resul
 }
 
 // parity: basic-validation.js validateConditionalStyles
-fn validate_conditional_styles(val: &EvalValue, conditions: &[String]) -> Result<(), StylexError> {
+fn validate_conditional_styles(
+    val: &EvalValue,
+    conditions: Option<&Conditions<'_>>,
+) -> Result<(), StylexError> {
     let EvalValue::Obj(obj) = val else {
         unreachable!("callers only pass objects");
     };
@@ -222,7 +228,7 @@ fn validate_conditional_styles(val: &EvalValue, conditions: &[String]) -> Result
         {
             return Err(StylexError::invalid_pseudo_or_at_rule());
         }
-        if conditions.iter().any(|c| c == key) {
+        if is_enclosing_condition(conditions, key) {
             return Err(StylexError::duplicate_conditional());
         }
         match v {
@@ -238,9 +244,11 @@ fn validate_conditional_styles(val: &EvalValue, conditions: &[String]) -> Result
                 }
             }
             EvalValue::Obj(inner) if is_plain(inner) => {
-                let mut nested = conditions.to_vec();
-                nested.push(key.to_string());
-                validate_conditional_styles(v, &nested)?;
+                let nested = Conditions {
+                    key,
+                    outer: conditions,
+                };
+                validate_conditional_styles(v, Some(&nested))?;
             }
             EvalValue::Obj(_) | EvalValue::Undefined | EvalValue::Bool(_) => {
                 return Err(StylexError::illegal_prop_value());
@@ -285,12 +293,14 @@ fn dfs_can_change(obj: &JsObjectMap, depth: usize) -> bool {
 // delete+reinsert moves every rewritten @media key to the end of its siblings.
 // Map-in skips a redundant top-level deep clone the EvalValue wrapper needed.
 fn dfs_process_map(obj: &JsObjectMap, depth: usize) -> Result<JsObjectMap, StylexError> {
-    let mut result = JsObjectMap::new();
+    let mut result = JsObjectMap::with_capacity(obj.len());
     // Object.entries-style clone: own keys only — a "__proto__"-carried
     // prototype (and its inherited entries) is stripped here, before flatten.
-    for (key, val) in proto_split(obj).own {
+    for (key, val) in obj.entries().filter(|(key, _)| *key != "__proto__") {
         let processed = match val {
-            EvalValue::Obj(inner) => EvalValue::Obj(Arc::new(dfs_process_map(inner, depth + 1)?)),
+            EvalValue::Obj(inner) if dfs_can_change(inner, depth + 1) => {
+                EvalValue::Obj(Arc::new(dfs_process_map(inner, depth + 1)?))
+            }
             other => other.clone(),
         };
         result.insert(key, processed);
@@ -382,7 +392,8 @@ fn rule_key_path<'a>(
             })
             .collect()
     } else {
-        let mut path = key_path.to_vec();
+        let mut path = Vec::with_capacity(key_path.len() + 1);
+        path.extend_from_slice(key_path);
         path.push(property);
         path
     }
@@ -393,7 +404,7 @@ fn flatten_inner<'a>(
     key_path: &[Cow<'a, str>],
     options: &ResolvedOptions,
 ) -> Result<Vec<(Cow<'a, str>, PreRule<'a>)>, StylexError> {
-    let mut flattened: Vec<(Cow<'a, str>, PreRule<'a>)> = Vec::new();
+    let mut flattened: Vec<(Cow<'a, str>, PreRule<'a>)> = Vec::with_capacity(style.len());
     // for..in reach: prototype entries planted by "__proto__" keys stay
     // visible here unless the media-query clone above already stripped them.
     for (raw_key, value) in for_in_entries(style) {
@@ -471,17 +482,25 @@ fn flatten_inner<'a>(
             {
                 // Property-value objects, e.g. color: { default, ':hover' }.
                 let mut equivalent: ConditionGroups<'a> = Vec::new();
+                let mut leaf = Vec::new();
                 for (condition, inner_value) in for_in_entries(obj) {
                     let nested_path: Vec<Cow<'a, str>> = if key_path.is_empty() {
                         vec![key.clone(), Cow::Borrowed(condition)]
                     } else {
-                        let mut p = key_path.to_vec();
+                        let mut p = Vec::with_capacity(key_path.len() + 1);
+                        p.extend_from_slice(key_path);
                         p.push(Cow::Borrowed(condition));
                         p
                     };
-                    for (property, pre_rule) in
-                        flatten_value_as_property(&key, inner_value, &nested_path, options)?
-                    {
+                    leaf.clear();
+                    flatten_value_as_property(
+                        key.clone(),
+                        inner_value,
+                        &nested_path,
+                        options,
+                        &mut leaf,
+                    )?;
+                    for (property, pre_rule) in leaf.drain(..) {
                         match equivalent.iter_mut().find(|(p, _)| *p == property) {
                             Some((_, conds)) => {
                                 match conds.iter_mut().find(|(c, _)| *c == condition) {
@@ -500,10 +519,15 @@ fn flatten_inner<'a>(
             }
             EvalValue::Obj(obj) => {
                 // Pseudo / at-rule / attribute objects, e.g. ':hover': { … }.
-                let mut nested_path = key_path.to_vec();
+                let mut nested_path = Vec::with_capacity(key_path.len() + 1);
+                nested_path.extend_from_slice(key_path);
                 nested_path.push(Cow::Borrowed(raw_key));
                 for (property, pre_rule) in flatten_inner(obj, &nested_path, options)? {
-                    flattened.push((Cow::Owned(format!("{key}_{property}")), pre_rule));
+                    let mut joined = String::with_capacity(key.len() + 1 + property.len());
+                    joined.push_str(&key);
+                    joined.push('_');
+                    joined.push_str(&property);
+                    flattened.push((Cow::Owned(joined), pre_rule));
                 }
             }
             // Upstream's flatten silently skips other types (validation ran first).
@@ -516,22 +540,22 @@ fn flatten_inner<'a>(
 /// The property-value-object recursion, without upstream's intermediate
 /// `{key: value}` object: identical to flatten_inner on that single-key map.
 fn flatten_value_as_property<'a>(
-    key: &Cow<'a, str>,
+    key: Cow<'a, str>,
     value: &'a EvalValue,
     nested_path: &[Cow<'a, str>],
     options: &ResolvedOptions,
-) -> Result<Vec<(Cow<'a, str>, PreRule<'a>)>, StylexError> {
+    out: &mut Vec<(Cow<'a, str>, PreRule<'a>)>,
+) -> Result<(), StylexError> {
     match value {
         EvalValue::Null | EvalValue::Str(_) | EvalValue::Num(_) => {
             let scalar = scalar_of(value);
-            let mut out = Vec::new();
             for (property, expanded) in
                 flat_map_expanded_shorthands(key.clone(), scalar, false, options)?
             {
                 match expanded {
                     None => out.push((property, PreRule::Null)),
                     Some(expanded) => {
-                        let path = rule_key_path(nested_path, key, property.clone());
+                        let path = rule_key_path(nested_path, &key, property.clone());
                         out.push((
                             property.clone(),
                             PreRule::Rule {
@@ -543,7 +567,7 @@ fn flatten_value_as_property<'a>(
                     }
                 }
             }
-            Ok(out)
+            Ok(())
         }
         EvalValue::Arr(items) => {
             let mut equivalent: Vec<(Cow<'a, str>, Vec<StyleScalar<'a>>)> = Vec::new();
@@ -564,7 +588,6 @@ fn flatten_value_as_property<'a>(
                     }
                 }
             }
-            let mut out = Vec::new();
             for (property, values) in equivalent {
                 let mut deduped: Vec<StyleScalar> = Vec::new();
                 for value in values {
@@ -577,28 +600,31 @@ fn flatten_value_as_property<'a>(
                     1 => PreRule::Rule {
                         property: property.clone(),
                         value: PreRuleValue::Single(deduped.into_iter().next().expect("len 1")),
-                        key_path: rule_key_path(nested_path, key, property.clone()),
+                        key_path: rule_key_path(nested_path, &key, property.clone()),
                     },
                     _ => PreRule::Rule {
                         property: property.clone(),
                         value: PreRuleValue::Multi(deduped),
-                        key_path: rule_key_path(nested_path, key, property.clone()),
+                        key_path: rule_key_path(nested_path, &key, property.clone()),
                     },
                 };
                 out.push((property, pre_rule));
             }
-            Ok(out)
+            Ok(())
         }
         // Deeper nesting (condition inside a property-value object): group by
         // property and condition into per-property sets, exactly the
         // property-value branch's shape one level down.
         EvalValue::Obj(obj) => {
-            let mut out = Vec::new();
             let mut equivalent: ConditionGroups<'a> = Vec::new();
+            let mut leaf = Vec::new();
             for (condition, inner) in for_in_entries(obj) {
-                let mut p = nested_path.to_vec();
+                let mut p = Vec::with_capacity(nested_path.len() + 1);
+                p.extend_from_slice(nested_path);
                 p.push(Cow::Borrowed(condition));
-                for (property, pre_rule) in flatten_value_as_property(key, inner, &p, options)? {
+                leaf.clear();
+                flatten_value_as_property(key.clone(), inner, &p, options, &mut leaf)?;
+                for (property, pre_rule) in leaf.drain(..) {
                     match equivalent.iter_mut().find(|(pr, _)| *pr == property) {
                         Some((_, conds)) => match conds.iter_mut().find(|(c, _)| *c == condition) {
                             Some((_, slot)) => *slot = pre_rule,
@@ -612,15 +638,109 @@ fn flatten_value_as_property<'a>(
                 let rules: Vec<PreRule> = conds.into_iter().map(|(_, r)| r).collect();
                 out.push((property, PreRule::create_set(rules)));
             }
-            Ok(out)
+            Ok(())
         }
-        EvalValue::Undefined | EvalValue::Bool(_) => Ok(Vec::new()),
+        EvalValue::Undefined | EvalValue::Bool(_) => Ok(()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn s(v: &str) -> EvalValue {
+        EvalValue::Str(v.to_string())
+    }
+
+    fn obj(entries: Vec<(&str, EvalValue)>) -> Arc<JsObjectMap> {
+        let mut map = JsObjectMap::new();
+        for (key, val) in entries {
+            map.insert(key, val);
+        }
+        Arc::new(map)
+    }
+
+    // the pre-sharing rebuild: every level copied, every scalar cloned
+    fn deep_rebuild(map: &JsObjectMap, depth: usize) -> JsObjectMap {
+        let mut result = JsObjectMap::new();
+        for (key, val) in map.entries().filter(|(key, _)| *key != "__proto__") {
+            let processed = match val {
+                EvalValue::Obj(inner) => EvalValue::Obj(Arc::new(deep_rebuild(inner, depth + 1))),
+                other => other.clone(),
+            };
+            result.insert(key, processed);
+        }
+        if depth >= 1 {
+            let media_keys: Vec<String> = result
+                .keys()
+                .filter(|k| is_media_key(k))
+                .map(str::to_string)
+                .collect();
+            if !media_keys.is_empty() {
+                let rewritten =
+                    last_media_query_wins_transform(&media_keys).expect("valid fixture");
+                for (old_key, new_key) in media_keys.iter().zip(rewritten) {
+                    let value = result.remove(old_key).expect("collected from map");
+                    result.insert(new_key, value);
+                }
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn dfs_process_map_shares_unchangeable_subtrees() {
+        let hover = obj(vec![
+            ("color", s("blue")),
+            (":focus", EvalValue::Obj(obj(vec![("color", s("green"))]))),
+        ]);
+        let media = obj(vec![
+            ("color", s("a")),
+            (
+                "@media (min-width: 900px)",
+                EvalValue::Obj(obj(vec![("color", s("b"))])),
+            ),
+            (
+                "@media (min-width: 700px)",
+                EvalValue::Obj(obj(vec![("color", s("c"))])),
+            ),
+            (
+                "__proto__",
+                EvalValue::Obj(obj(vec![("inherited", s("x"))])),
+            ),
+        ]);
+        let root = obj(vec![
+            ("color", s("red")),
+            (":hover", EvalValue::Obj(Arc::clone(&hover))),
+            (
+                "@media (min-width: 600px)",
+                EvalValue::Obj(Arc::clone(&media)),
+            ),
+            (
+                "__proto__",
+                EvalValue::Obj(obj(vec![("inherited", s("y"))])),
+            ),
+        ]);
+        assert!(dfs_can_change(&root, 0));
+        let processed = dfs_process_map(&root, 0).expect("fixture transforms");
+        assert_eq!(processed, deep_rebuild(&root, 0));
+        assert!(!processed.contains_key("__proto__"));
+
+        let Some(EvalValue::Obj(shared)) = processed.get(":hover") else {
+            panic!(":hover survives");
+        };
+        assert!(Arc::ptr_eq(shared, &hover));
+
+        let Some(EvalValue::Obj(rebuilt)) = processed.get("@media (min-width: 600px)") else {
+            panic!("depth-0 media key stays verbatim");
+        };
+        assert!(!Arc::ptr_eq(rebuilt, &media));
+        assert!(!rebuilt.contains_key("__proto__"));
+        assert_eq!(
+            rebuilt.keys().collect::<Vec<_>>(),
+            vec!["color", "@media not all", "@media (min-width: 700px)"]
+        );
+    }
 
     #[test]
     fn unwrap_var_key_matches_upstream_regex() {

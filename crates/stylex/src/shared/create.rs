@@ -8,12 +8,14 @@ use crate::fxhash::FxHashSet;
 use crate::hash::create_short_hash;
 use crate::options::{ModuleResolutionType, ResolvedOptions};
 use crate::rules::StylexRule;
+use crate::shared::dashify::sanitize_dev_class_name;
 use crate::shared::dev_naming::{
-    DebugPathInfo, add_source_map_data, convert_to_test_styles, inject_dev_class_names,
+    DebugPathInfo, convert_to_test_styles, create_short_filename, dev_class_prefix,
 };
 use crate::shared::flatten::{
     PreRule, flatten_raw_style_object, media_order_transform, validate_namespace,
 };
+use crate::shared::generate_rule::CompiledDecl;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -80,11 +82,11 @@ pub fn compile_atom(
     raw.insert(property, EvalValue::Str(value.to_string()));
     let mut namespaces = JsObjectMap::new();
     namespaces.insert(INLINE_NAMESPACE, EvalValue::Obj(raw.into()));
-    let mut out = compile_namespaces_core(&namespaces, ctx, false)?;
-    if ctx.options.dev && ctx.options.enable_dev_class_names {
-        out.compiled = inject_dev_class_names(out.compiled, None, ctx.filename.as_deref());
-    }
-    Ok(out)
+    let mut shape = DevShape {
+        dev_prefix: dev_prefix_for(ctx, None),
+        debug: None,
+    };
+    compile_namespaces_core(&namespaces, ctx, false, &mut shape)
 }
 
 /// Dynamic-fn namespaces are wave 3: callers reject them with `unsupported_api`
@@ -94,36 +96,37 @@ pub fn compile_namespaces(
     ctx: &CreateContext<'_>,
     need_class_paths: bool,
 ) -> Result<CreateOutput, StylexError> {
-    let mut out = compile_namespaces_core(namespaces, ctx, need_class_paths)?;
     let options = ctx.options;
-    if options.debug && options.enable_debug_data_prop {
-        let debug_paths = DebugPathInfo {
-            file_package: ctx.file_package.clone(),
-            cwd_package_name: ctx.cwd_package_name.clone(),
-            root_dir: options
-                .unstable_module_resolution
-                .as_ref()
-                .and_then(|m| m.root_dir.as_ref())
-                .map(|r| r.to_string_lossy().into_owned()),
-            is_haste: options
-                .unstable_module_resolution
-                .as_ref()
-                .is_some_and(|m| m.kind == ModuleResolutionType::Haste),
-        };
-        out.compiled = add_source_map_data(
-            out.compiled,
-            ctx.namespace_lines.as_ref(),
-            ctx.filename.as_deref(),
-            &debug_paths,
-        );
-    }
-    if options.dev && options.enable_dev_class_names {
-        out.compiled = inject_dev_class_names(
-            out.compiled,
-            ctx.var_name.as_deref(),
-            ctx.filename.as_deref(),
-        );
-    }
+    let debug = if options.debug && options.enable_debug_data_prop {
+        ctx.namespace_lines
+            .as_ref()
+            .zip(ctx.filename.as_deref())
+            .map(|(lines, filename)| DebugSource {
+                lines,
+                filename,
+                info: DebugPathInfo {
+                    file_package: ctx.file_package.clone(),
+                    cwd_package_name: ctx.cwd_package_name.clone(),
+                    root_dir: options
+                        .unstable_module_resolution
+                        .as_ref()
+                        .and_then(|m| m.root_dir.as_ref())
+                        .map(|r| r.to_string_lossy().into_owned()),
+                    is_haste: options
+                        .unstable_module_resolution
+                        .as_ref()
+                        .is_some_and(|m| m.kind == ModuleResolutionType::Haste),
+                },
+                short: None,
+            })
+    } else {
+        None
+    };
+    let mut shape = DevShape {
+        dev_prefix: dev_prefix_for(ctx, ctx.var_name.as_deref()),
+        debug,
+    };
+    let mut out = compile_namespaces_core(namespaces, ctx, need_class_paths, &mut shape)?;
     if options.test {
         out.compiled = convert_to_test_styles(
             &out.compiled,
@@ -134,17 +137,65 @@ pub fn compile_namespaces(
     Ok(out)
 }
 
+struct DevShape<'a> {
+    dev_prefix: Option<String>,
+    debug: Option<DebugSource<'a>>,
+}
+
+struct DebugSource<'a> {
+    lines: &'a BTreeMap<String, u32>,
+    filename: &'a str,
+    info: DebugPathInfo,
+    short: Option<String>,
+}
+
+impl DevShape<'_> {
+    // parity: dev-classname.js — `{[devClass]: devClass, ...namespace}`
+    fn dev_class(&self, namespace: &str) -> Option<String> {
+        let prefix = self.dev_prefix.as_ref()?;
+        Some(sanitize_dev_class_name(&format!("{prefix}{namespace}")))
+    }
+
+    // parity: add-sourcemap-data.js — namespaces without a known source line
+    // (upstream cannot find them in the AST) keep `$$css: true`.
+    fn css_marker(&mut self, namespace: &str) -> EvalValue {
+        let Some(debug) = &mut self.debug else {
+            return EvalValue::Bool(true);
+        };
+        match debug.lines.get(namespace) {
+            Some(&line) if line > 0 => {
+                let short = debug
+                    .short
+                    .get_or_insert_with(|| create_short_filename(debug.filename, &debug.info));
+                if short.is_empty() {
+                    EvalValue::Bool(true)
+                } else {
+                    EvalValue::Str(format!("{short}:{line}"))
+                }
+            }
+            _ => EvalValue::Bool(true),
+        }
+    }
+}
+
+fn dev_prefix_for(ctx: &CreateContext<'_>, var_name: Option<&str>) -> Option<String> {
+    (ctx.options.dev && ctx.options.enable_dev_class_names)
+        .then(|| dev_class_prefix(var_name, ctx.filename.as_deref().unwrap_or("UnknownFile")))
+}
+
 fn compile_namespaces_core(
     namespaces: &JsObjectMap,
     ctx: &CreateContext<'_>,
     need_class_paths: bool,
+    shape: &mut DevShape<'_>,
 ) -> Result<CreateOutput, StylexError> {
     let _t = crate::timings::start(crate::timings::Stage::Create);
     let options = ctx.options;
-    let mut resolved_namespaces = JsObjectMap::new();
+    let mut resolved_namespaces = JsObjectMap::with_capacity(namespaces.len());
     let mut rules: Vec<StylexRule> = Vec::new();
     let mut class_paths: Vec<(String, ClassPathsInNamespace)> = Vec::new();
     let mut seen_class_names: FxHashSet<Arc<str>> = FxHashSet::default();
+    let mut decls: Vec<CompiledDecl> = Vec::new();
 
     for (namespace_name, namespace_value) in namespaces.entries() {
         // The evaluator's `value[key] =` [[Set]] never creates a "__proto__"
@@ -152,7 +203,7 @@ fn compile_namespaces_core(
         if namespace_name == "__proto__" {
             continue;
         }
-        validate_namespace(namespace_value, &[])?;
+        validate_namespace(namespace_value)?;
         let EvalValue::Obj(namespace) = namespace_value else {
             unreachable!("validate_namespace only accepts objects");
         };
@@ -168,40 +219,21 @@ fn compile_namespaces_core(
         let flattened = flatten_raw_style_object(namespace_ref, options)?;
         let deduped = dedupe_last_wins(flattened);
 
-        let mut namespace_obj = JsObjectMap::new();
+        let mut namespace_obj = JsObjectMap::with_capacity(deduped.len() + 2);
+        if let Some(dev_class) = shape.dev_class(namespace_name) {
+            namespace_obj.insert(dev_class.clone(), EvalValue::Str(dev_class));
+        }
         let mut paths_in_namespace: Vec<(String, Vec<String>)> = Vec::new();
-        let mut namespace_rules: Vec<StylexRule> = Vec::new();
         for (key, pre_rule) in &deduped {
             // Variables-as-keys skip minification to avoid dynamic-style regressions.
             let display_key = if options.enable_minified_keys && !key.starts_with("--") {
-                let hashed = minified_key_hash(key.as_ref());
-                if options.debug {
-                    format!("{key}-k{hashed}")
-                } else {
-                    format!("k{hashed}")
-                }
+                minified_display_key(key, options.debug)
             } else {
                 key.to_string()
             };
 
-            let computed = pre_rule.compiled(options)?;
-            let mut class_names: Vec<&str> = Vec::new();
-            for entry in computed.iter().flatten() {
-                let name: &str = &entry.0.class_name;
-                if !class_names.contains(&name) {
-                    class_names.push(name);
-                }
-            }
-            let joined = class_names.join(" ");
-            namespace_obj.insert(
-                display_key,
-                if joined.is_empty() {
-                    EvalValue::Null
-                } else {
-                    EvalValue::Str(joined)
-                },
-            );
-            for (decl, key_path) in computed.into_iter().flatten() {
+            decls.clear();
+            pre_rule.for_each_compiled(options, &mut |decl, key_path| {
                 if need_class_paths {
                     match paths_in_namespace
                         .iter_mut()
@@ -216,19 +248,44 @@ fn compile_namespaces_core(
                         )),
                     }
                 }
-                namespace_rules.push((*decl).clone());
+                decls.push(decl);
+            })?;
+
+            let mut joined =
+                String::with_capacity(decls.iter().map(|d| d.class_name.len() + 1).sum());
+            let mut first = true;
+            for (i, decl) in decls.iter().enumerate() {
+                if decls[..i]
+                    .iter()
+                    .any(|seen| seen.class_name == decl.class_name)
+                {
+                    continue;
+                }
+                if !first {
+                    joined.push(' ');
+                }
+                first = false;
+                joined.push_str(&decl.class_name);
+            }
+            namespace_obj.insert(
+                display_key,
+                if joined.is_empty() {
+                    EvalValue::Null
+                } else {
+                    EvalValue::Str(joined)
+                },
+            );
+            for decl in &decls {
+                if seen_class_names.insert(decl.class_name.clone()) {
+                    rules.push((**decl).clone());
+                }
             }
         }
-        namespace_obj.insert("$$css", EvalValue::Bool(true));
+        namespace_obj.insert("$$css", shape.css_marker(namespace_name));
         resolved_namespaces.insert(
             namespace_name.to_string(),
             EvalValue::Obj(Arc::new(namespace_obj)),
         );
-        for rule in namespace_rules {
-            if seen_class_names.insert(rule.class_name.clone()) {
-                rules.push(rule);
-            }
-        }
         if need_class_paths {
             class_paths.push((namespace_name.to_string(), paths_in_namespace));
         }
@@ -246,7 +303,12 @@ fn compile_namespaces_core(
 fn dedupe_last_wins<'a>(
     flattened: Vec<(Cow<'a, str>, PreRule<'a>)>,
 ) -> Vec<(Cow<'a, str>, PreRule<'a>)> {
-    let mut seen: FxHashSet<&str> = FxHashSet::default();
+    let mut seen: FxHashSet<&str> =
+        FxHashSet::with_capacity_and_hasher(flattened.len(), Default::default());
+    if flattened.iter().all(|(key, _)| seen.insert(key)) {
+        return flattened;
+    }
+    seen.clear();
     let mut keep = vec![false; flattened.len()];
     for (i, (key, _)) in flattened.iter().enumerate().rev() {
         if seen.insert(key) {
@@ -262,20 +324,35 @@ fn dedupe_last_wins<'a>(
 
 thread_local! {
     // createShortHash('<'+'>'+key) is pure; flattened keys repeat across every
-    // file in a design-system corpus, so the hash is computed once per process.
+    // file in a design-system corpus, so `k{hash}` is computed once per process.
     static MINIFIED_KEYS: std::cell::RefCell<FxHashMap<String, String>> =
         std::cell::RefCell::new(FxHashMap::default());
 }
 
-fn minified_key_hash(key: &str) -> String {
+fn minified_display_key(key: &str, debug: bool) -> String {
+    let display = |k_hash: &str| {
+        if debug {
+            let mut out = String::with_capacity(key.len() + 1 + k_hash.len());
+            out.push_str(key);
+            out.push('-');
+            out.push_str(k_hash);
+            out
+        } else {
+            k_hash.to_string()
+        }
+    };
     MINIFIED_KEYS.with(|memo| {
         let mut memo = memo.borrow_mut();
         match memo.get(key) {
-            Some(hashed) => hashed.clone(),
+            Some(k_hash) => display(k_hash),
             None => {
                 let hashed = create_short_hash(&format!("<>{key}"));
-                memo.insert(key.to_string(), hashed.clone());
-                hashed
+                let mut k_hash = String::with_capacity(hashed.len() + 1);
+                k_hash.push('k');
+                k_hash.push_str(&hashed);
+                let out = display(&k_hash);
+                memo.insert(key.to_string(), k_hash);
+                out
             }
         }
     })

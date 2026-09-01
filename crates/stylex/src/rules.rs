@@ -21,9 +21,8 @@ pub fn non_finite_from_tag(v: &serde_json::Value) -> Option<f64> {
     }
 }
 
-// Wire mirror of babel metadata.stylex tuples [className, {ltr, rtl?, constKey?,
-// constVal?}, priority]; shared with the oj fork — change only with both sides.
-// Arc'd text: clones are refcount bumps; the convert memo shares strings.
+// Wire mirror of babel metadata.stylex tuples; shared with the oj fork by type, change both sides.
+// Arc'd text so clones are refcount bumps; const_val boxed because almost every rule is None.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StylexRule {
     pub class_name: Arc<str>,
@@ -33,7 +32,7 @@ pub struct StylexRule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub const_key: Option<Arc<str>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub const_val: Option<serde_json::Value>,
+    pub const_val: Option<Box<serde_json::Value>>,
     pub priority: f64,
 }
 
@@ -60,7 +59,7 @@ impl StylexRule {
             Some(serde_json::Value::String(s)) => Some(s.as_str().into()),
             Some(_) => return Err("constKey must be a string or null".to_string()),
         };
-        let const_val = obj.get("constVal").cloned();
+        let const_val = obj.get("constVal").cloned().map(Box::new);
         let priority = tuple[2].as_f64().ok_or("priority must be a number")?;
         Ok(StylexRule {
             class_name: class_name.into(),
@@ -91,9 +90,17 @@ impl StylexRule {
             );
         }
         if let Some(const_val) = &self.const_val {
-            body.insert("constVal".to_string(), const_val.clone());
+            body.insert("constVal".to_string(), (**const_val).clone());
         }
         serde_json::json!([self.class_name, body, self.priority])
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    #[test]
+    fn rule_struct_stays_compact() {
+        assert!(std::mem::size_of::<super::StylexRule>() <= 80);
     }
 }
 
@@ -115,11 +122,11 @@ mod non_finite_tag_tests {
                 ltr: "".into(),
                 rtl: None,
                 const_key: Some("xc".into()),
-                const_val: Some(tagged.clone()),
+                const_val: Some(Box::new(tagged.clone())),
                 priority: 0.0,
             };
             let round = StylexRule::from_metadata_tuple(&rule.to_metadata_tuple()).unwrap();
-            assert_eq!(round.const_val, Some(tagged.clone()));
+            assert_eq!(round.const_val.as_deref(), Some(&tagged));
             let decoded = non_finite_from_tag(&tagged).unwrap();
             assert!(decoded.is_nan() == x.is_nan() && (x.is_nan() || decoded == x));
         }

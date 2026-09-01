@@ -1,11 +1,15 @@
 // parity: stylex-0.19.0 packages/@stylexjs/babel-plugin/src/index.js processStylexRules
 
 use std::cmp::Ordering;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::BuildHasherDefault;
+use std::sync::Arc;
 
-use crate::jsrt::{locale_key, utf16_cmp};
+use crate::fxhash::{FxHashMap, FxHashSet};
+use crate::jsrt::{ASCII_LOCALE_KEYS, locale_key, utf16_cmp};
 use crate::rules::StylexRule;
+use crate::timings::{self, Stage};
 
 const LOGICAL_FLOAT_START_VAR: &str = "--stylex-logical-start";
 const LOGICAL_FLOAT_END_VAR: &str = "--stylex-logical-end";
@@ -246,11 +250,11 @@ fn collect_resolved_consts(
 }
 
 fn rule_has_logical_float(r: &StylexRule) -> bool {
-    r.ltr.contains(LOGICAL_FLOAT_START_VAR)
-        || r.ltr.contains(LOGICAL_FLOAT_END_VAR)
-        || r.rtl.as_deref().is_some_and(|t| {
-            t.contains(LOGICAL_FLOAT_START_VAR) || t.contains(LOGICAL_FLOAT_END_VAR)
-        })
+    fn has(text: &str) -> bool {
+        text.contains("--stylex-logical-")
+            && (text.contains(LOGICAL_FLOAT_START_VAR) || text.contains(LOGICAL_FLOAT_END_VAR))
+    }
+    has(&r.ltr) || r.rtl.as_deref().is_some_and(has)
 }
 
 fn logical_float_block(has_logical_float: bool) -> String {
@@ -320,6 +324,21 @@ fn rule_chunk(ltr: &str, rtl: Option<&str>, index: usize, cfg: &AssembleConfig) 
     }
 }
 
+// The common shape (no rtl, no theme pair) is pushed as slices; the rest takes
+// rule_chunk. `", ."` is a literal every theme-pair match contains.
+fn push_chunk(out: &mut String, ltr: &str, rtl: Option<&str>, index: usize, cfg: &AssembleConfig) {
+    if rtl.is_some() || ltr.contains(", .") {
+        out.push_str(&rule_chunk(ltr, rtl, index, cfg));
+        return;
+    }
+    let use_layers_on = matches!(cfg.use_layers, LayersConfig::On { .. });
+    if use_layers_on || cfg.legacy_disable_layers || index == 0 {
+        out.push_str(ltr);
+    } else {
+        push_specificity_level(out, ltr, index);
+    }
+}
+
 fn compare_rules(
     a: &StylexRule,
     b: &StylexRule,
@@ -353,211 +372,311 @@ fn assemble_impl(
         return Ok(String::new());
     }
 
-    let non_const: Vec<&StylexRule> = rules.iter().filter(|r| !is_const_rule(r)).collect();
+    let consts_timer = timings::start(Stage::AssembleConsts);
     let consts =
         collect_resolved_consts(rules.iter().filter(|r| is_const_rule(r)).map(const_decl))?;
     let prepared_consts = prepare_consts(&consts);
+    let non_const: Vec<&StylexRule> = rules.iter().filter(|r| !is_const_rule(r)).collect();
+    drop(consts_timer);
 
-    let mut sorted: Vec<StylexRule> = match custom_cmp {
+    let sorted: Vec<&StylexRule> = match custom_cmp {
         Some(cmp) => {
-            let mut cloned: Vec<StylexRule> = non_const.iter().map(|r| (*r).clone()).collect();
-            cloned.sort_by(|a, b| compare_rules(a, b, cfg, cmp));
-            cloned
+            let _t = timings::start(Stage::AssembleSort);
+            let mut refs = non_const;
+            refs.sort_by(|a, b| compare_rules(a, b, cfg, cmp));
+            refs
         }
-        None => keyed_sorted_clone(&non_const, cfg.use_legacy_classnames_sort),
+        None => keyed_order(non_const, cfg.use_legacy_classnames_sort),
     };
 
     // Logical-float detection reads the pre-substitution rule text.
-    let has_logical_float = non_const.iter().any(|r| rule_has_logical_float(r));
-    let logical_float_vars = logical_float_block(has_logical_float);
+    let logical_float_vars = logical_float_block(sorted.iter().any(|r| rule_has_logical_float(r)));
 
-    for rule in &mut sorted {
-        if let Some(ltr) = substitute_consts(&rule.ltr, &prepared_consts) {
-            rule.ltr = ltr.into();
-        }
-        if let Some(rtl) = &rule.rtl
-            && let Some(rtl_text) = substitute_consts(rtl, &prepared_consts)
-        {
-            rule.rtl = Some(rtl_text.into());
-        }
-    }
+    let subst_timer = timings::start(Stage::AssembleSubst);
+    let substituted: Vec<(Option<String>, Option<String>)> = if prepared_consts.is_empty() {
+        Vec::new()
+    } else {
+        sorted
+            .iter()
+            .map(|r| {
+                (
+                    substitute_consts(&r.ltr, &prepared_consts),
+                    r.rtl
+                        .as_deref()
+                        .and_then(|t| substitute_consts(t, &prepared_consts)),
+                )
+            })
+            .collect()
+    };
+    drop(subst_timer);
+    let text_of = |i: usize| -> (&str, Option<&str>) {
+        let rule = sorted[i];
+        let (ltr, rtl) = match substituted.get(i) {
+            Some((ltr, rtl)) => (ltr.as_deref(), rtl.as_deref()),
+            None => (None, None),
+        };
+        (ltr.unwrap_or(&rule.ltr), rtl.or(rule.rtl.as_deref()))
+    };
 
+    let _render_timer = timings::start(Stage::AssembleRender);
     // Consecutive runs of floor(priority/1000); input is priority-sorted so runs
     // are the priority bands.
-    let mut groups: Vec<Vec<StylexRule>> = Vec::new();
+    let mut bands: Vec<(usize, usize)> = Vec::new();
     let mut last_level = -1.0f64;
-    for rule in sorted {
+    for (i, rule) in sorted.iter().enumerate() {
         let level = (rule.priority / 1000.0).floor();
-        match groups.last_mut() {
-            Some(last) if level == last_level => last.push(rule),
+        match bands.last_mut() {
+            Some(band) if level == last_level => band.1 = i + 1,
             _ => {
                 last_level = level;
-                groups.push(vec![rule]);
+                bands.push((i, i + 1));
             }
         }
     }
 
     let (use_layers_on, _, _, layer_prefix) = layer_parts(cfg);
     let header = if use_layers_on {
-        layers_header(cfg, groups.len())
+        layers_header(cfg, bands.len())
     } else {
         String::new()
     };
 
-    let mut group_blocks: Vec<String> = Vec::with_capacity(groups.len());
-    for (index, group) in groups.iter().enumerate() {
-        let pri = group[0].priority;
+    let text_bytes: usize = sorted
+        .iter()
+        .map(|r| r.ltr.len() + r.rtl.as_ref().map_or(0, |t| t.len() + 40) + 1)
+        .sum();
+    let mut out = String::with_capacity(
+        logical_float_vars.len() + header.len() + text_bytes + 32 * bands.len(),
+    );
+    out.push_str(&logical_float_vars);
+    out.push_str(&header);
 
+    let mut slots: Vec<usize> = Vec::new();
+    let mut slot_of: FxHashMap<&str, usize> = FxHashMap::default();
+    for (index, &(start, end)) in bands.iter().enumerate() {
         // Last-wins dedupe by className, first-occurrence order (JS Map semantics).
-        let mut order: Vec<&str> = Vec::with_capacity(group.len());
-        let mut latest: HashMap<&str, &StylexRule> = HashMap::with_capacity(group.len());
-        for rule in group {
-            if latest.insert(&rule.class_name, rule).is_none() {
-                order.push(&rule.class_name);
+        slots.clear();
+        slot_of.clear();
+        for (offset, rule) in sorted[start..end].iter().enumerate() {
+            let i = start + offset;
+            match slot_of.entry(&rule.class_name) {
+                Entry::Vacant(vacant) => {
+                    vacant.insert(slots.len());
+                    slots.push(i);
+                }
+                Entry::Occupied(occupied) => slots[*occupied.get()] = i,
             }
         }
 
-        let mut chunks: Vec<String> = Vec::with_capacity(order.len());
-        for class_name in order {
-            let rule = latest[class_name];
-            // Empty rtl is falsy upstream and behaves exactly like absent.
-            let rtl = rule.rtl.as_deref().filter(|s| !s.is_empty());
-            chunks.push(rule_chunk(&rule.ltr, rtl, index, cfg));
+        if index > 0 {
+            out.push('\n');
         }
-        let collected = chunks.join("\n");
-        group_blocks.push(if use_layers_on && pri > 0.0 {
-            format!(
-                "@layer {}{{\n{}\n}}",
-                layer_name(layer_prefix, index),
-                collected
-            )
-        } else {
-            collected
-        });
+        let wrap = use_layers_on && sorted[start].priority > 0.0;
+        if wrap {
+            out.push_str("@layer ");
+            out.push_str(&layer_name(layer_prefix, index));
+            out.push_str("{\n");
+        }
+        for (j, &i) in slots.iter().enumerate() {
+            if j > 0 {
+                out.push('\n');
+            }
+            let (ltr, rtl) = text_of(i);
+            // Empty rtl is falsy upstream and behaves exactly like absent.
+            push_chunk(&mut out, ltr, rtl.filter(|s| !s.is_empty()), index, cfg);
+        }
+        if wrap {
+            out.push_str("\n}");
+        }
     }
-
-    Ok(format!(
-        "{logical_float_vars}{header}{}",
-        group_blocks.join("\n")
-    ))
+    Ok(out)
 }
 
-// localeCompare levels of one string, laid out [primary n][secondary n]
-// [tertiary n]; Fallback marks a char outside the pinned collation alphabet.
-enum CollKey {
-    Verified { n: usize, buf: Vec<u8> },
+// localeCompare levels of one string laid out [primary n][secondary n][tertiary n];
+// the declaration slice is its last `decl` chars, so that key is each level's suffix.
+enum RuleKey {
+    Verified { n: usize, decl: usize, buf: Vec<u8> },
+    DeclOnly { decl: usize, buf: Vec<u8> },
     Fallback,
 }
 
-impl CollKey {
-    fn derive(s: &str) -> CollKey {
+type Segments<'a> = [&'a [u8]; 3];
+
+fn cmp_segments(a: Segments<'_>, b: Segments<'_>) -> Ordering {
+    a[0].cmp(b[0])
+        .then_with(|| a[1].cmp(b[1]))
+        .then_with(|| a[2].cmp(b[2]))
+}
+
+impl RuleKey {
+    fn for_rule(r: &StylexRule, legacy: bool) -> RuleKey {
+        if legacy {
+            RuleKey::derive(&r.class_name, 0)
+        } else {
+            RuleKey::derive(&r.ltr, decl_slice(&r.ltr).len())
+        }
+    }
+
+    fn derive(s: &str, decl_bytes: usize) -> RuleKey {
+        let decl_start = s.len() - decl_bytes;
+        if s.is_ascii() {
+            let n = s.len();
+            let mut buf = vec![0u8; 3 * n];
+            for (i, &b) in s.as_bytes().iter().enumerate() {
+                match ASCII_LOCALE_KEYS[usize::from(b)] {
+                    Some((p, sec, ter)) => {
+                        buf[i] = p;
+                        buf[n + i] = sec;
+                        buf[2 * n + i] = ter;
+                    }
+                    None => return RuleKey::decl_only(s, decl_start, i),
+                }
+            }
+            return RuleKey::Verified {
+                n,
+                decl: decl_bytes,
+                buf,
+            };
+        }
         let n = s.chars().count();
         let mut buf = vec![0u8; 3 * n];
-        for (i, c) in s.chars().enumerate() {
+        for (i, (at, c)) in s.char_indices().enumerate() {
             match locale_key(c) {
                 Ok((p, sec, ter)) => {
                     buf[i] = p;
                     buf[n + i] = sec;
                     buf[2 * n + i] = ter;
                 }
-                Err(_) => return CollKey::Fallback,
+                Err(_) => return RuleKey::decl_only(s, decl_start, at),
             }
         }
-        CollKey::Verified { n, buf }
+        RuleKey::Verified {
+            n,
+            decl: s[decl_start..].chars().count(),
+            buf,
+        }
+    }
+
+    // An unverified char at byte `at`; only a fully verified declaration suffix
+    // after it keeps a key.
+    fn decl_only(s: &str, decl_start: usize, at: usize) -> RuleKey {
+        if at >= decl_start || decl_start == s.len() {
+            return RuleKey::Fallback;
+        }
+        match RuleKey::derive(&s[decl_start..], s.len() - decl_start) {
+            RuleKey::Verified { n, buf, .. } => RuleKey::DeclOnly { decl: n, buf },
+            _ => RuleKey::Fallback,
+        }
     }
 
     fn verified(&self) -> bool {
-        matches!(self, CollKey::Verified { .. })
+        matches!(self, RuleKey::Verified { .. })
+    }
+
+    fn decl_segments(&self) -> Option<Segments<'_>> {
+        match self {
+            RuleKey::Verified { n, decl, buf } => Some([
+                &buf[n - decl..*n],
+                &buf[2 * n - decl..2 * n],
+                &buf[3 * n - decl..],
+            ]),
+            RuleKey::DeclOnly { decl, buf } => {
+                Some([&buf[..*decl], &buf[*decl..2 * decl], &buf[2 * decl..]])
+            }
+            RuleKey::Fallback => None,
+        }
+    }
+
+    fn full_segments(&self) -> Option<Segments<'_>> {
+        match self {
+            RuleKey::Verified { n, buf, .. } => Some([&buf[..*n], &buf[*n..2 * n], &buf[2 * n..]]),
+            _ => None,
+        }
     }
 
     // Equal primary sequences imply equal char counts, so the secondary and
     // tertiary segment comparisons are always aligned.
-    fn cmp_verified(&self, other: &CollKey) -> Ordering {
+    fn cmp_verified(&self, other: &RuleKey) -> Ordering {
         match (self, other) {
-            (CollKey::Verified { n: na, buf: ba }, CollKey::Verified { n: nb, buf: bb }) => ba
-                [..*na]
-                .cmp(&bb[..*nb])
+            (
+                RuleKey::Verified {
+                    n: na,
+                    decl: da,
+                    buf: ba,
+                },
+                RuleKey::Verified {
+                    n: nb,
+                    decl: db,
+                    buf: bb,
+                },
+            ) => ba[na - da..*na]
+                .cmp(&bb[nb - db..*nb])
+                .then_with(|| ba[2 * na - da..2 * na].cmp(&bb[2 * nb - db..2 * nb]))
+                .then_with(|| ba[3 * na - da..].cmp(&bb[3 * nb - db..]))
+                .then_with(|| ba[..*na].cmp(&bb[..*nb]))
                 .then_with(|| ba[*na..2 * na].cmp(&bb[*nb..2 * nb]))
                 .then_with(|| ba[2 * na..].cmp(&bb[2 * nb..])),
             _ => unreachable!("cmp_verified on a fallback collation key"),
         }
     }
 
-    // default_locale_cmp semantics: either side unverified → UTF-16 order.
-    fn cmp_or<'x>(
+    // default_locale_cmp semantics per step: either side unverified → UTF-16 order.
+    fn cmp_with_fallback(
         &self,
-        other: &CollKey,
-        fallback: impl FnOnce() -> (&'x str, &'x str),
+        other: &RuleKey,
+        a: &StylexRule,
+        b: &StylexRule,
+        legacy: bool,
     ) -> Ordering {
-        if self.verified() && other.verified() {
-            self.cmp_verified(other)
-        } else {
-            let (a, b) = fallback();
-            utf16_cmp(a, b)
-        }
-    }
-}
-
-enum SortKeys {
-    Legacy(CollKey),
-    Standard { decl: CollKey, ltr: CollKey },
-}
-
-impl SortKeys {
-    fn for_rule(r: &StylexRule, legacy: bool) -> SortKeys {
         if legacy {
-            SortKeys::Legacy(CollKey::derive(&r.class_name))
-        } else {
-            SortKeys::Standard {
-                decl: CollKey::derive(decl_slice(&r.ltr)),
-                ltr: CollKey::derive(&r.ltr),
-            }
+            return match (self.full_segments(), other.full_segments()) {
+                (Some(ka), Some(kb)) => cmp_segments(ka, kb),
+                _ => utf16_cmp(&a.class_name, &b.class_name),
+            };
         }
-    }
-
-    fn verified(&self) -> bool {
-        match self {
-            SortKeys::Legacy(k) => k.verified(),
-            SortKeys::Standard { decl, ltr } => decl.verified() && ltr.verified(),
+        let decl = match (self.decl_segments(), other.decl_segments()) {
+            (Some(ka), Some(kb)) => cmp_segments(ka, kb),
+            _ => utf16_cmp(decl_slice(&a.ltr), decl_slice(&b.ltr)),
+        };
+        if decl != Ordering::Equal {
+            return decl;
         }
-    }
-
-    fn cmp_with_fallback(&self, other: &SortKeys, a: &StylexRule, b: &StylexRule) -> Ordering {
-        match (self, other) {
-            (SortKeys::Legacy(ka), SortKeys::Legacy(kb)) => {
-                ka.cmp_or(kb, || (&a.class_name, &b.class_name))
-            }
-            (
-                SortKeys::Standard { decl: da, ltr: la },
-                SortKeys::Standard { decl: db, ltr: lb },
-            ) => match da.cmp_or(db, || (decl_slice(&a.ltr), decl_slice(&b.ltr))) {
-                Ordering::Equal => la.cmp_or(lb, || (&a.ltr, &b.ltr)),
-                other => other,
-            },
-            _ => unreachable!("mixed sort key kinds"),
-        }
-    }
-
-    fn cmp_verified(&self, other: &SortKeys) -> Ordering {
-        match (self, other) {
-            (SortKeys::Legacy(ka), SortKeys::Legacy(kb)) => ka.cmp_verified(kb),
-            (
-                SortKeys::Standard { decl: da, ltr: la },
-                SortKeys::Standard { decl: db, ltr: lb },
-            ) => da.cmp_verified(db).then_with(|| la.cmp_verified(lb)),
-            _ => unreachable!("mixed sort key kinds"),
+        match (self.full_segments(), other.full_segments()) {
+            (Some(ka), Some(kb)) => cmp_segments(ka, kb),
+            _ => utf16_cmp(&a.ltr, &b.ltr),
         }
     }
 }
 
-// Collation keys derived once per rule instead of once per comparison; the
-// stable sort and the per-pair fallback keep comparator semantics identical.
-fn keyed_sorted_clone(non_const: &[&StylexRule], legacy: bool) -> Vec<StylexRule> {
-    let mut entries: Vec<(SortKeys, &StylexRule)> = non_const
+// Keys derived once per rule; the stable index sort and the per-pair fallback
+// keep comparator semantics identical.
+fn keyed_order(non_const: Vec<&StylexRule>, legacy: bool) -> Vec<&StylexRule> {
+    let dedupe_timer = timings::start(Stage::AssembleDedupe);
+    let mut unique = dedupe_keep_first(&non_const);
+    drop(dedupe_timer);
+    let keys_timer = timings::start(Stage::AssembleKeys);
+    let mut keys: Vec<RuleKey> = unique
         .iter()
-        .map(|r| (SortKeys::for_rule(r, legacy), *r))
+        .map(|r| RuleKey::for_rule(r, legacy))
         .collect();
-    entries.sort_by(|(ka, a), (kb, b)| {
+    // Dropping duplicates is order-neutral only under a consistent total order
+    // (verified keys, finite priorities); otherwise sort the full input as before.
+    if keys
+        .iter()
+        .zip(&unique)
+        .any(|(k, r)| !k.verified() || !r.priority.is_finite())
+    {
+        unique = non_const;
+        keys = unique
+            .iter()
+            .map(|r| RuleKey::for_rule(r, legacy))
+            .collect();
+    }
+    drop(keys_timer);
+    let _sort_timer = timings::start(Stage::AssembleSort);
+    let mut order: Vec<u32> = (0..unique.len() as u32).collect();
+    order.sort_by(|&ia, &ib| {
+        let (a, b) = (unique[ia as usize], unique[ib as usize]);
         let diff = a.priority - b.priority;
         if diff != 0.0 {
             return if diff < 0.0 {
@@ -566,9 +685,40 @@ fn keyed_sorted_clone(non_const: &[&StylexRule], legacy: bool) -> Vec<StylexRule
                 Ordering::Greater
             };
         }
-        ka.cmp_with_fallback(kb, a, b)
+        keys[ia as usize].cmp_with_fallback(&keys[ib as usize], a, b, legacy)
     });
-    entries.into_iter().map(|(_, r)| r.clone()).collect()
+    order.into_iter().map(|i| unique[i as usize]).collect()
+}
+
+// Keep-first is output-neutral (copies sort Equal, adjacent); a class with two
+// distinct texts keeps every copy, since a copy between them decides last-wins.
+fn dedupe_keep_first<'a>(rules: &[&'a StylexRule]) -> Vec<&'a StylexRule> {
+    let mut seen: FxHashSet<(&str, &str, Option<&str>, u64)> = FxHashSet::default();
+    let first: Vec<bool> = rules
+        .iter()
+        .map(|r| {
+            seen.insert((
+                &r.class_name,
+                &r.ltr,
+                r.rtl.as_deref(),
+                r.priority.to_bits(),
+            ))
+        })
+        .collect();
+    if seen.len() == rules.len() {
+        return rules.to_vec();
+    }
+    let mut texts: FxHashMap<&str, u32> = FxHashMap::default();
+    for (r, _) in rules.iter().zip(&first).filter(|(_, fresh)| **fresh) {
+        *texts.entry(&r.class_name).or_default() += 1;
+    }
+    let single_text_classes = texts.len() == seen.len();
+    rules
+        .iter()
+        .zip(first)
+        .filter(|(r, fresh)| *fresh || (!single_text_classes && texts[&*r.class_name] > 1))
+        .map(|(r, _)| *r)
+        .collect()
 }
 
 // rule.slice(rule.lastIndexOf('{')): lastIndexOf misses → -1 → JS slice(-1) is
@@ -676,6 +826,9 @@ fn prepare_consts(consts: &[(String, ConstVal)]) -> Vec<PreparedConst> {
 /// `None` when no const reference matched: callers keep sharing the rule's
 /// Arc'd text instead of materializing an identical String.
 fn substitute_consts(text: &str, consts: &[PreparedConst]) -> Option<String> {
+    if consts.is_empty() {
+        return None;
+    }
     let mut out: Option<String> = None;
     let mut has_ref = text.contains("var(--");
     for c in consts {
@@ -761,11 +914,21 @@ fn js_replace_all(s: &str, needle: &str, replacement: &str) -> String {
 // :not(#\#) polyfill; inserted before the first '::' when present, else before
 // the last '{'; @keyframes exempt (only @keyframes — @property etc. are not).
 fn add_specificity_level(selector: &str, index: usize) -> String {
+    let mut out = String::with_capacity(selector.len() + 9 * index);
+    push_specificity_level(&mut out, selector, index);
+    out
+}
+
+fn push_specificity_level(out: &mut String, selector: &str, index: usize) {
     if selector.starts_with("@keyframes") {
-        return selector.to_string();
+        out.push_str(selector);
+        return;
     }
-    let pseudo = ":not(#\\#)".repeat(index);
-    let split_at = match selector.find("::") {
+    push_split(out, selector, specificity_split(selector), index);
+}
+
+fn specificity_split(selector: &str) -> usize {
+    match selector.find("::") {
         Some(i) => i,
         None => match selector.rfind('{') {
             Some(i) => i,
@@ -773,13 +936,24 @@ fn add_specificity_level(selector: &str, index: usize) -> String {
             // final character.
             None => selector.char_indices().last().map(|(i, _)| i).unwrap_or(0),
         },
-    };
-    format!(
-        "{}{}{}",
-        &selector[..split_at],
-        pseudo,
-        &selector[split_at..]
-    )
+    }
+}
+
+fn push_split(out: &mut String, selector: &str, split_at: usize, index: usize) {
+    out.push_str(&selector[..split_at]);
+    for _ in 0..index {
+        out.push_str(":not(#\\#)");
+    }
+    out.push_str(&selector[split_at..]);
+}
+
+// Split point of a rule that renders as plain slices (no rtl, no theme pair,
+// not @keyframes); None routes the rule through push_chunk.
+fn plain_split(ltr: &str, rtl: Option<&str>) -> Option<usize> {
+    if rtl.is_some_and(|t| !t.is_empty()) || ltr.contains(", .") || ltr.starts_with("@keyframes") {
+        return None;
+    }
+    Some(specificity_split(ltr))
 }
 
 fn add_ancestor_selector(selector: &str, ancestor_selector: &str) -> String {
@@ -881,15 +1055,14 @@ impl std::hash::Hasher for IdentityHasher {
 }
 
 struct PreparedRule {
-    class_name: std::sync::Arc<str>,
+    class_name: Arc<str>,
     class_hash: u64,
     priority: f64,
-    keys: SortKeys,
-    // ltr/rtl carry the const substitutions; chunk memoizes the emitted text
-    // per group index.
-    ltr: String,
-    rtl: Option<String>,
-    chunk: Option<(usize, String)>,
+    key: RuleKey,
+    // ltr/rtl carry the const substitutions; unchanged text shares the rule's Arc.
+    ltr: Arc<str>,
+    rtl: Option<Arc<str>>,
+    plain_split: Option<usize>,
 }
 
 struct FilePrep {
@@ -914,21 +1087,24 @@ fn prepare_file(rules: &[StylexRule], legacy: bool, consts: &[PreparedConst]) ->
             continue;
         }
         prep.logical_float |= rule_has_logical_float(r);
-        let keys = SortKeys::for_rule(r, legacy);
-        prep.safe &= r.priority.is_finite() && keys.verified();
-        let ltr = substitute_consts(&r.ltr, consts).unwrap_or_else(|| r.ltr.to_string());
-        let rtl = r
-            .rtl
-            .as_ref()
-            .map(|t| substitute_consts(t, consts).unwrap_or_else(|| t.to_string()));
+        let key = RuleKey::for_rule(r, legacy);
+        prep.safe &= r.priority.is_finite() && key.verified();
+        let ltr = substitute_consts(&r.ltr, consts)
+            .map(Arc::from)
+            .unwrap_or_else(|| r.ltr.clone());
+        let rtl = r.rtl.as_ref().map(|t| {
+            substitute_consts(t, consts)
+                .map(Arc::from)
+                .unwrap_or_else(|| t.clone())
+        });
         prep.rules.push(PreparedRule {
             class_name: r.class_name.clone(),
             class_hash: class_hash64(&r.class_name),
             priority: r.priority,
-            keys,
+            key,
+            plain_split: plain_split(&ltr, rtl.as_deref()),
             ltr,
             rtl,
-            chunk: None,
         });
     }
     prep
@@ -947,7 +1123,7 @@ fn entry_cmp(files: &[FilePrep], a: (u32, u32), b: (u32, u32)) -> Ordering {
             Ordering::Greater
         };
     }
-    pa.keys.cmp_verified(&pb.keys).then_with(|| a.cmp(&b))
+    pa.key.cmp_verified(&pb.key).then_with(|| a.cmp(&b))
 }
 
 // Per-config incremental state: prepared rules, resolved consts, and the
@@ -1168,7 +1344,7 @@ fn merge_sorted(
 // collision costs a heap allocation.
 type SlotMap = HashMap<u64, (u32, Vec<u32>), BuildHasherDefault<IdentityHasher>>;
 
-fn render(state: &mut IncrState) -> String {
+fn render(state: &IncrState) -> String {
     let IncrState {
         cfg, files, sorted, ..
     } = state;
@@ -1254,13 +1430,17 @@ fn render(state: &mut IncrState) -> String {
             if j > 0 {
                 out.push('\n');
             }
-            let p = &mut files[rank as usize].rules[seq as usize];
-            if !matches!(&p.chunk, Some((i, _)) if *i == index) {
-                let rtl = p.rtl.as_deref().filter(|s| !s.is_empty());
-                let chunk = rule_chunk(&p.ltr, rtl, index, cfg);
-                p.chunk = Some((index, chunk));
+            let p = &files[rank as usize].rules[seq as usize];
+            match p.plain_split {
+                Some(_) if use_layers_on || cfg.legacy_disable_layers || index == 0 => {
+                    out.push_str(&p.ltr);
+                }
+                Some(split) => push_split(&mut out, &p.ltr, split, index),
+                None => {
+                    let rtl = p.rtl.as_deref().filter(|s| !s.is_empty());
+                    push_chunk(&mut out, &p.ltr, rtl, index, cfg);
+                }
             }
-            out.push_str(&p.chunk.as_ref().expect("chunk just memoized").1);
         }
         if wrap {
             out.push_str("\n}");

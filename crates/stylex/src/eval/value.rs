@@ -118,6 +118,46 @@ impl JsObjectMap {
         Self::default()
     }
 
+    pub fn with_capacity(named: usize) -> Self {
+        Self {
+            named_entries: Vec::with_capacity(named),
+            ..Self::default()
+        }
+    }
+
+    /// The map sequential `insert` would build from `entries`, which must not
+    /// repeat a key (callers hand over another map's or object's entries).
+    pub fn from_unique_entries(entries: Vec<(String, EvalValue)>) -> Self {
+        debug_assert!(
+            entries
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .collect::<crate::fxhash::FxHashSet<_>>()
+                .len()
+                == entries.len()
+        );
+        if !entries.iter().any(|(k, _)| array_index(k).is_some()) {
+            return Self {
+                named_entries: entries,
+                ..Self::default()
+            };
+        }
+        let mut index_entries = Vec::new();
+        let mut named_entries = Vec::with_capacity(entries.len() - 1);
+        for (key, value) in entries {
+            match array_index(&key) {
+                Some(n) => index_entries.push((n, key, value)),
+                None => named_entries.push((key, value)),
+            }
+        }
+        index_entries.sort_unstable_by_key(|e| e.0);
+        Self {
+            index_entries,
+            named_entries,
+            ..Self::default()
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.index_entries.len() + self.named_entries.len()
     }
@@ -143,6 +183,30 @@ impl JsObjectMap {
                 .iter()
                 .find(|(k, _)| k == key)
                 .map(|(_, v)| v)
+        }
+    }
+
+    /// Position of `key` in `entries()` order.
+    pub fn position(&self, key: &str) -> Option<usize> {
+        if let Some(n) = array_index(key) {
+            return self.index_entries.binary_search_by_key(&n, |e| e.0).ok();
+        }
+        let named = match &self.named_index {
+            Some(index) => index.get(key).copied(),
+            None => self.named_entries.iter().position(|(k, _)| k == key),
+        };
+        named.map(|i| i + self.index_entries.len())
+    }
+
+    /// The entry at a `position()` / `entries()` index.
+    pub fn entry_at(&self, i: usize) -> (&str, &EvalValue) {
+        let indexed = self.index_entries.len();
+        if i < indexed {
+            let (_, k, v) = &self.index_entries[i];
+            (k, v)
+        } else {
+            let (k, v) = &self.named_entries[i - indexed];
+            (k, v)
         }
     }
 
@@ -377,6 +441,38 @@ mod tests {
         assert_eq!(map.get("missing"), None);
         let narrow: JsObjectMap = scan.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         assert_eq!(map, narrow);
+    }
+
+    #[test]
+    fn from_unique_entries_matches_sequential_insert() {
+        let n = NAMED_INDEX_THRESHOLD * 2;
+        let entries: Vec<(String, EvalValue)> = (0..n)
+            .map(|i| {
+                let key = match i % 5 {
+                    0 => (n - i).to_string(),
+                    1 => format!("0{i}"),
+                    2 => "4294967295".to_string() + &i.to_string(),
+                    _ => format!("key{i}"),
+                };
+                (key, s(&i.to_string()))
+            })
+            .chain([("__proto__".to_string(), s("p")), ("".to_string(), s("e"))])
+            .collect();
+        let sequential: JsObjectMap = entries.iter().cloned().collect();
+        let direct = JsObjectMap::from_unique_entries(entries.clone());
+        assert_eq!(direct, sequential);
+        assert_eq!(
+            direct.entries().collect::<Vec<_>>(),
+            sequential.entries().collect::<Vec<_>>()
+        );
+        for (k, v) in &entries {
+            assert_eq!(direct.get(k), Some(v));
+        }
+        let named_only: Vec<(String, EvalValue)> =
+            (0..3).map(|i| (format!("k{i}"), s("v"))).collect();
+        let direct = JsObjectMap::from_unique_entries(named_only.clone());
+        assert_eq!(direct, named_only.into_iter().collect());
+        assert!(JsObjectMap::from_unique_entries(Vec::new()).is_empty());
     }
 
     #[test]

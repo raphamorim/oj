@@ -11,6 +11,68 @@ use std::borrow::Cow;
 /// is the `null` punch that stops an earlier longhand from leaking through.
 pub type ExpandedPair<'a> = (Cow<'a, str>, Option<StyleScalar<'a>>);
 
+/// The expansion result; the unexpanded (identity) case carries its pair inline.
+#[derive(Debug)]
+pub enum Expanded<'a> {
+    One(ExpandedPair<'a>),
+    Many(Vec<ExpandedPair<'a>>),
+}
+
+impl<'a> Expanded<'a> {
+    pub fn as_slice(&self) -> &[ExpandedPair<'a>] {
+        match self {
+            Expanded::One(pair) => std::slice::from_ref(pair),
+            Expanded::Many(pairs) => pairs,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, ExpandedPair<'a>> {
+        self.as_slice().iter()
+    }
+}
+
+impl PartialEq for Expanded<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+pub enum ExpandedIter<'a> {
+    One(Option<ExpandedPair<'a>>),
+    Many(std::vec::IntoIter<ExpandedPair<'a>>),
+}
+
+impl<'a> Iterator for ExpandedIter<'a> {
+    type Item = ExpandedPair<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            ExpandedIter::One(pair) => pair.take(),
+            ExpandedIter::Many(pairs) => pairs.next(),
+        }
+    }
+}
+
+impl<'a> IntoIterator for Expanded<'a> {
+    type Item = ExpandedPair<'a>;
+    type IntoIter = ExpandedIter<'a>;
+
+    fn into_iter(self) -> ExpandedIter<'a> {
+        match self {
+            Expanded::One(pair) => ExpandedIter::One(Some(pair)),
+            Expanded::Many(pairs) => ExpandedIter::Many(pairs.into_iter()),
+        }
+    }
+}
+
 const LOGICAL_START_VAR: &str = "var(--stylex-logical-start)";
 const LOGICAL_END_VAR: &str = "var(--stylex-logical-end)";
 
@@ -20,7 +82,7 @@ pub fn flat_map_expanded_shorthands<'a>(
     value: Option<StyleScalar<'a>>,
     value_is_array: bool,
     options: &ResolvedOptions,
-) -> Result<Vec<ExpandedPair<'a>>, StylexError> {
+) -> Result<Expanded<'a>, StylexError> {
     let key: Cow<'a, str> = if key.starts_with("var(") && key.ends_with(')') {
         match key {
             Cow::Borrowed(k) => Cow::Borrowed(&k[4..k.len() - 1]),
@@ -29,19 +91,18 @@ pub fn flat_map_expanded_shorthands<'a>(
     } else {
         key
     };
-    let identity = || Ok(vec![(key.clone(), value.clone())]);
     match options.style_resolution {
         StyleResolution::PropertySpecificity => {
             let expansion = property_specificity_expansion(&key);
             if matches!(expansion, Expansion::None) {
-                return identity();
+                return Ok(Expanded::One((key, value)));
             }
             if value_is_array {
                 return Err(StylexError::shorthand_fallback());
             }
             match expansion {
-                Expansion::Banned => banned(&key, options),
-                Expansion::Alias(target) => Ok(vec![(Cow::Borrowed(target), value)]),
+                Expansion::Banned => banned(&key, options).map(Expanded::Many),
+                Expansion::Alias(target) => Ok(Expanded::One((Cow::Borrowed(target), value))),
                 Expansion::None => unreachable!("checked above"),
             }
         }
@@ -50,31 +111,34 @@ pub fn flat_map_expanded_shorthands<'a>(
                 if value_is_array {
                     return Err(StylexError::shorthand_fallback());
                 }
-                return banned(&key, options);
+                return banned(&key, options).map(Expanded::Many);
             }
             let Some(table) = application_order_expansion(&key) else {
-                return identity();
+                return Ok(Expanded::One((key, value)));
             };
             if value_is_array {
                 return Err(StylexError::shorthand_fallback());
             }
-            let mut pairs = vec![(Cow::Borrowed(table[0]), value)];
+            let mut pairs = Vec::with_capacity(table.len());
+            pairs.push((Cow::Borrowed(table[0]), value));
             pairs.extend(table[1..].iter().map(|k| (Cow::Borrowed(*k), None)));
-            Ok(pairs)
+            Ok(Expanded::Many(pairs))
         }
         StyleResolution::LegacyExpandShorthands => {
             if !legacy_has_expansion(&key) {
-                return identity();
+                return Ok(Expanded::One((key, value)));
             }
             if value_is_array {
                 return Err(StylexError::shorthand_fallback());
             }
             match legacy_expansion(&key, value) {
-                Ok(pairs) => Ok(pairs),
+                Ok(pairs) => Ok(Expanded::Many(pairs)),
                 Err(error) => match options.property_validation_mode {
                     PropertyValidationMode::Throw => Err(error),
                     // Warn logs upstream, then drops just like silent.
-                    PropertyValidationMode::Silent | PropertyValidationMode::Warn => Ok(Vec::new()),
+                    PropertyValidationMode::Silent | PropertyValidationMode::Warn => {
+                        Ok(Expanded::Many(Vec::new()))
+                    }
                 },
             }
         }
@@ -1660,7 +1724,7 @@ mod tests {
         assert_eq!(
             flat_map_expanded_shorthands(Cow::Borrowed("color"), Some(s("red")), true, &opts)
                 .unwrap(),
-            vec![(Cow::Borrowed("color"), Some(s("red")))]
+            Expanded::One((Cow::Borrowed("color"), Some(s("red"))))
         );
     }
 

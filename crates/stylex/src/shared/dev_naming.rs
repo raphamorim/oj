@@ -3,7 +3,6 @@
 
 use crate::eval::value::{EvalValue, JsObjectMap};
 use crate::shared::dashify::sanitize_dev_class_name;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Filesystem-derived inputs wave 3 computes; upstream's package.json walk
@@ -20,7 +19,7 @@ pub struct DebugPathInfo {
 }
 
 /// The `{basename}__{varName.}` prefix shared by every namespace of one call.
-fn dev_class_prefix(var_name: Option<&str>, filename: &str) -> String {
+pub(crate) fn dev_class_prefix(var_name: Option<&str>, filename: &str) -> String {
     let basename = path_basename(filename)
         .split('.')
         .next()
@@ -43,28 +42,6 @@ pub fn namespace_to_dev_class_name(
     ))
 }
 
-/// Prepends the self-mapping dev-classname key to every compiled namespace.
-pub fn inject_dev_class_names(
-    compiled: Arc<JsObjectMap>,
-    var_name: Option<&str>,
-    filename: Option<&str>,
-) -> Arc<JsObjectMap> {
-    let prefix = dev_class_prefix(var_name, filename.unwrap_or("UnknownFile"));
-    let mut result = JsObjectMap::new();
-    for (namespace, value) in compiled.entries() {
-        let dev_class = sanitize_dev_class_name(&format!("{prefix}{namespace}"));
-        let mut obj = JsObjectMap::new();
-        obj.insert(dev_class.clone(), EvalValue::Str(dev_class));
-        if let EvalValue::Obj(inner) = value {
-            for (k, v) in inner.entries() {
-                obj.insert(k.to_string(), v.clone());
-            }
-        }
-        result.insert(namespace.to_string(), EvalValue::Obj(Arc::new(obj)));
-    }
-    Arc::new(result)
-}
-
 // parity: dev-classname.js convertToTestStyles
 pub fn convert_to_test_styles(
     compiled: &Arc<JsObjectMap>,
@@ -79,46 +56,6 @@ pub fn convert_to_test_styles(
         obj.insert(dev_class.clone(), EvalValue::Str(dev_class));
         obj.insert("$$css", EvalValue::Bool(true));
         result.insert(namespace.to_string(), EvalValue::Obj(Arc::new(obj)));
-    }
-    Arc::new(result)
-}
-
-/// Replaces `$$css: true` with `"<shortFilename>:<line>"` per namespace whose
-/// source line is known (upstream skips namespaces it cannot find in the AST).
-pub fn add_source_map_data(
-    compiled: Arc<JsObjectMap>,
-    namespace_lines: Option<&BTreeMap<String, u32>>,
-    filename: Option<&str>,
-    info: &DebugPathInfo,
-) -> Arc<JsObjectMap> {
-    let mut short: Option<String> = None;
-    let mut result = JsObjectMap::new();
-    for (namespace, value) in compiled.entries() {
-        let line = namespace_lines
-            .and_then(|lines| lines.get(namespace))
-            .copied();
-        match (line, filename) {
-            (Some(line), Some(filename)) if line > 0 => {
-                let mut obj = match value {
-                    EvalValue::Obj(inner) => (**inner).clone(),
-                    other => {
-                        result.insert(namespace.to_string(), other.clone());
-                        continue;
-                    }
-                };
-                let short = short.get_or_insert_with(|| create_short_filename(filename, info));
-                let css_value = if short.is_empty() {
-                    EvalValue::Bool(true)
-                } else {
-                    EvalValue::Str(format!("{short}:{line}"))
-                };
-                obj.insert("$$css", css_value);
-                result.insert(namespace.to_string(), EvalValue::Obj(Arc::new(obj)));
-            }
-            _ => {
-                result.insert(namespace.to_string(), value.clone());
-            }
-        }
     }
     Arc::new(result)
 }

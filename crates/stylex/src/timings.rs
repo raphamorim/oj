@@ -17,6 +17,7 @@ pub enum Stage {
     Eval,
     Create,
     PrintSplice,
+    ApplyPlan,
     PrintAst,
     NdjsonOut,
     JobTotal,
@@ -24,9 +25,16 @@ pub enum Stage {
     CacheParse,
     CacheReplay,
     CacheDecode,
+    Fs,
+    AssembleConsts,
+    AssembleDedupe,
+    AssembleKeys,
+    AssembleSort,
+    AssembleSubst,
+    AssembleRender,
 }
 
-const STAGE_COUNT: usize = 16;
+const STAGE_COUNT: usize = 24;
 const NAMES: [&str; STAGE_COUNT] = [
     "ndjson_in",
     "options",
@@ -37,6 +45,7 @@ const NAMES: [&str; STAGE_COUNT] = [
     "eval",
     "create",
     "print_splice",
+    "apply_plan",
     "print_ast",
     "ndjson_out",
     "job_total",
@@ -44,6 +53,13 @@ const NAMES: [&str; STAGE_COUNT] = [
     "cache_parse",
     "cache_replay",
     "cache_decode",
+    "fs",
+    "assemble_consts",
+    "assemble_dedupe",
+    "assemble_keys",
+    "assemble_sort",
+    "assemble_subst",
+    "assemble_render",
 ];
 
 static TOTAL_NS: [AtomicU64; STAGE_COUNT] = [const { AtomicU64::new(0) }; STAGE_COUNT];

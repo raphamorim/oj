@@ -14,8 +14,11 @@ use crate::shared::priorities::get_priority;
 use crate::shared::pseudo_sort::{sort_at_rules, sort_pseudos};
 use crate::shared::rtl::{RtlContext, generate_ltr, generate_rtl};
 use crate::shared::transform_value::{transform_value_num, transform_value_str};
+use std::borrow::Cow;
 use std::cell::RefCell;
+use std::hash::{BuildHasher, BuildHasherDefault};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 fn css_value_error(e: CssValueError) -> StylexError {
     match e {
@@ -47,7 +50,7 @@ pub type CompiledDecl = Rc<StylexRule>;
 
 struct ConvertMemo {
     key: String,
-    map: FxHashMap<String, CompiledDecl>,
+    map: FxHashMap<Arc<str>, CompiledDecl>,
 }
 
 thread_local! {
@@ -58,6 +61,35 @@ thread_local! {
 }
 
 const CONVERT_MEMO_CAP: usize = 1 << 16;
+const SHARD_COUNT: usize = 64;
+const SHARD_CAP: usize = CONVERT_MEMO_CAP / SHARD_COUNT;
+
+type SharedMemo = FxHashMap<Arc<str>, StylexRule>;
+
+// Second level behind the thread-local memo: worker pools (batch threads, oj's
+// blocking pool) otherwise recompute every declaration once per thread.
+static SHARED_MEMO: [Mutex<SharedMemo>; SHARD_COUNT] =
+    [const { Mutex::new(FxHashMap::with_hasher(BuildHasherDefault::new())) }; SHARD_COUNT];
+
+// Threads never share a rule's `Arc<str>`s: every registry clone/drop would
+// then bounce the refcount line between cores (+20% create time at 18 threads).
+fn private_copy(rule: &StylexRule) -> StylexRule {
+    StylexRule {
+        class_name: Arc::from(&*rule.class_name),
+        ltr: Arc::from(&*rule.ltr),
+        rtl: rule.rtl.as_deref().map(Arc::from),
+        const_key: rule.const_key.as_deref().map(Arc::from),
+        const_val: rule.const_val.clone(),
+        priority: rule.priority,
+    }
+}
+
+fn shard_for(key: &str) -> MutexGuard<'static, SharedMemo> {
+    let hash = BuildHasherDefault::<crate::fxhash::FxHasher>::new().hash_one(key);
+    SHARED_MEMO[(hash >> (64 - SHARD_COUNT.trailing_zeros())) as usize]
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Length-prefixed segments with fixed `|` section breaks: injective, so equal
 /// keys mean equal inputs.
@@ -98,15 +130,36 @@ fn push_memo_scalar(key: &mut String, scalar: &StyleScalar) {
     }
 }
 
+// The keyPath carries the property too; the three condition classes are
+// disjoint prefix families, so each list is a filter over the same slice.
+fn pseudos_of<'k>(key_path: &'k [Cow<'_, str>]) -> impl Iterator<Item = &'k str> {
+    key_path
+        .iter()
+        .map(Cow::as_ref)
+        .filter(|k| k.starts_with(':') || k.starts_with('['))
+}
+
+fn at_rules_of<'k>(key_path: &'k [Cow<'_, str>]) -> impl Iterator<Item = &'k str> {
+    key_path
+        .iter()
+        .map(Cow::as_ref)
+        .filter(|k| k.starts_with('@'))
+}
+
+fn const_rules_of<'k>(key_path: &'k [Cow<'_, str>]) -> impl Iterator<Item = &'k str> {
+    key_path
+        .iter()
+        .map(Cow::as_ref)
+        .filter(|k| k.starts_with("var(--"))
+}
+
 // The fingerprint covers every option the uncached path reads: px-to-rem,
 // debug class names + prefix, and the three RtlContext fields.
 fn encode_memo_key(
     key: &mut String,
     property: &str,
     value: &PreRuleValue<'_>,
-    pseudos: &[&str],
-    at_rules: &[&str],
-    const_rules: &[&str],
+    key_path: &[Cow<'_, str>],
     options: &ResolvedOptions,
 ) {
     key.push(if options.enable_font_size_px_to_rem {
@@ -150,52 +203,69 @@ fn encode_memo_key(
             }
         }
     }
-    for list in [pseudos, at_rules, const_rules] {
-        key.push('|');
-        for item in list {
-            push_memo_part(key, item);
-        }
+    key.push('|');
+    for item in pseudos_of(key_path) {
+        push_memo_part(key, item);
+    }
+    key.push('|');
+    for item in at_rules_of(key_path) {
+        push_memo_part(key, item);
+    }
+    key.push('|');
+    for item in const_rules_of(key_path) {
+        push_memo_part(key, item);
     }
 }
 
-/// `pseudos`/`at_rules`/`const_rules` arrive in keyPath order; sorting for the
-/// hash input and selector happens here, on the miss path only.
+/// Conditions are read from `key_path` in keyPath order; sorting for the hash
+/// input and selector happens here, on the miss path only.
 pub fn convert_style_to_class_name(
     property: &str,
     value: &PreRuleValue<'_>,
-    pseudos: &[&str],
-    at_rules: &[&str],
-    const_rules: &[&str],
+    key_path: &[Cow<'_, str>],
     options: &ResolvedOptions,
 ) -> Result<CompiledDecl, StylexError> {
     CONVERT_MEMO.with(|memo| {
         let mut memo = memo.borrow_mut();
         let ConvertMemo { key, map } = &mut *memo;
         key.clear();
-        encode_memo_key(
-            key,
-            property,
-            value,
-            pseudos,
-            at_rules,
-            const_rules,
-            options,
-        );
+        encode_memo_key(key, property, value, key_path, options);
         if let Some(hit) = map.get(key.as_str()) {
             return Ok(Rc::clone(hit));
         }
-        let computed = Rc::new(convert_style_to_class_name_uncached(
-            property,
-            value,
-            pseudos,
-            at_rules,
-            const_rules,
-            options,
-        )?);
+        let shared = shard_for(key)
+            .get_key_value(key.as_str())
+            .map(|(k, v)| (Arc::clone(k), private_copy(v)));
+        let (shared_key, rule) = match shared {
+            Some(hit) => hit,
+            None => {
+                let pseudos: Vec<&str> = pseudos_of(key_path).collect();
+                let at_rules: Vec<&str> = at_rules_of(key_path).collect();
+                let const_rules: Vec<&str> = const_rules_of(key_path).collect();
+                let rule = convert_style_to_class_name_uncached(
+                    property,
+                    value,
+                    &pseudos,
+                    &at_rules,
+                    &const_rules,
+                    options,
+                )?;
+                let shared_key: Arc<str> = Arc::from(key.as_str());
+                let mut shard = shard_for(key);
+                if shard.len() >= SHARD_CAP {
+                    shard.clear();
+                }
+                shard
+                    .entry(Arc::clone(&shared_key))
+                    .or_insert_with(|| private_copy(&rule));
+                (shared_key, rule)
+            }
+        };
+        let computed = Rc::new(rule);
         if map.len() >= CONVERT_MEMO_CAP {
             map.clear();
         }
-        map.insert(key.clone(), Rc::clone(&computed));
+        map.insert(shared_key, Rc::clone(&computed));
         Ok(computed)
     })
 }
@@ -430,9 +500,7 @@ mod tests {
     fn known_answer_color_red() {
         let decl = convert_style_to_class_name(
             "color",
-            &PreRuleValue::Single(StyleScalar::Str(std::borrow::Cow::Borrowed("red"))),
-            &[],
-            &[],
+            &PreRuleValue::Single(StyleScalar::Str(Cow::Borrowed("red"))),
             &[],
             &defaults(),
         )
@@ -448,9 +516,7 @@ mod tests {
         let decl = convert_style_to_class_name(
             "width",
             &PreRuleValue::Single(StyleScalar::Num(16.0)),
-            &[":hover", "::thumb"],
-            &[],
-            &[],
+            &[Cow::Borrowed(":hover"), Cow::Borrowed("::thumb")],
             &defaults(),
         )
         .unwrap();
@@ -465,10 +531,8 @@ mod tests {
 
         let decl = convert_style_to_class_name(
             "color",
-            &PreRuleValue::Single(StyleScalar::Str(std::borrow::Cow::Borrowed("blue"))),
-            &[":where(.x-default-marker:hover *)"],
-            &[],
-            &[],
+            &PreRuleValue::Single(StyleScalar::Str(Cow::Borrowed("blue"))),
+            &[Cow::Borrowed(":where(.x-default-marker:hover *)")],
             &defaults(),
         )
         .unwrap();

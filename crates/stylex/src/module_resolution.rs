@@ -2,8 +2,12 @@
 // parity: babel-plugin src/utils/state-manager.js:566-707 + file-based-identifier.js
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::{LazyLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::SystemTime;
 
+use crate::fxhash::FxHashMap;
 use crate::options::{AliasMap, ModuleResolutionType, ResolvedOptions};
+use crate::timings::{self, Stage};
 
 // parity: state-manager.js EXTENSIONS — probe order is observable via hashes.
 pub const EXTENSIONS: [&str; 6] = [".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs"];
@@ -75,6 +79,7 @@ pub struct StdFs;
 
 impl FsProvider for StdFs {
     fn nearest_package(&self, from: &Path) -> Option<(String, PathBuf)> {
+        let _t = timings::start(Stage::Fs);
         nearest_package_walk(from, None)
     }
 
@@ -84,11 +89,279 @@ impl FsProvider for StdFs {
         importer: &Path,
         config: ResolveConfig<'_>,
     ) -> Option<PathBuf> {
+        let _t = timings::start(Stage::Fs);
         resolve_import_with(self, specifier, importer, config)
     }
 
     fn exists(&self, p: &Path) -> bool {
         p.is_file()
+    }
+}
+
+/// Directory-keyed memo over [`StdFs`]: `snapshot()` freezes the fs for the process;
+/// `live()` re-stats package.json per level and re-parses only on an (mtime, size) change.
+pub struct MemoFs {
+    live: bool,
+    nearest: PathMap<Option<(String, PathBuf)>>,
+    manifests: PathMap<Option<Manifest>>,
+    resolve: PathMap<Vec<ResolveMemo>>,
+    exists: PathMap<bool>,
+    exists_any: PathMap<bool>,
+    hashes: PathMap<(Option<Stamp>, Option<String>)>,
+    canon: PathMap<PathBuf>,
+}
+
+// Keyed by the path's raw bytes: `Path` equality folds spellings (`a//b`,
+// `a/b/`) whose walks return differently spelled directories.
+type PathMap<V> = RwLock<FxHashMap<Box<[u8]>, V>>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+impl Stamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        Self {
+            modified: meta.modified().ok(),
+            len: meta.len(),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum PackageProbe {
+    Name(String),
+    Broken,
+}
+
+#[derive(Clone)]
+struct Manifest {
+    stamp: Stamp,
+    probe: PackageProbe,
+}
+
+struct ResolveMemo {
+    aliases: Option<AliasMap>,
+    root_dir: Option<PathBuf>,
+    by_specifier: FxHashMap<String, Option<PathBuf>>,
+}
+
+impl ResolveMemo {
+    fn matches(&self, config: ResolveConfig<'_>) -> bool {
+        self.aliases.as_ref() == config.aliases
+            && self.root_dir.as_deref().map(Path::as_os_str) == config.root_dir.map(Path::as_os_str)
+    }
+}
+
+fn path_key(p: &Path) -> &[u8] {
+    p.as_os_str().as_encoded_bytes()
+}
+
+fn read_lock<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn write_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+static SHARED: LazyLock<MemoFs> = LazyLock::new(MemoFs::live);
+
+impl MemoFs {
+    pub fn snapshot() -> Self {
+        Self::with_mode(false)
+    }
+
+    pub fn live() -> Self {
+        Self::with_mode(true)
+    }
+
+    /// Process-wide live instance: an embedder swaps `&StdFs` for
+    /// `MemoFs::shared()` at its call sites and nothing else changes.
+    pub fn shared() -> &'static MemoFs {
+        &SHARED
+    }
+
+    fn with_mode(live: bool) -> Self {
+        Self {
+            live,
+            nearest: RwLock::default(),
+            manifests: RwLock::default(),
+            resolve: RwLock::default(),
+            exists: RwLock::default(),
+            exists_any: RwLock::default(),
+            hashes: RwLock::default(),
+            canon: RwLock::default(),
+        }
+    }
+
+    pub fn invalidate_all(&self) {
+        write_lock(&self.nearest).clear();
+        write_lock(&self.manifests).clear();
+        write_lock(&self.resolve).clear();
+        write_lock(&self.exists).clear();
+        write_lock(&self.exists_any).clear();
+        write_lock(&self.hashes).clear();
+        write_lock(&self.canon).clear();
+    }
+
+    /// `None` mirrors `!candidate.is_file()`; the walk keeps climbing.
+    fn probe_manifest(&self, candidate: &Path) -> Option<PackageProbe> {
+        let key = path_key(candidate);
+        if !self.live
+            && let Some(hit) = read_lock(&self.manifests).get(key)
+        {
+            return hit.as_ref().map(|m| m.probe.clone());
+        }
+        let stamp = match std::fs::metadata(candidate) {
+            Ok(meta) if meta.is_file() => Stamp::of(&meta),
+            _ => {
+                if !self.live {
+                    write_lock(&self.manifests).insert(key.into(), None);
+                }
+                return None;
+            }
+        };
+        if self.live
+            && let Some(Some(hit)) = read_lock(&self.manifests).get(key)
+            && hit.stamp == stamp
+        {
+            return Some(hit.probe.clone());
+        }
+        let probe = read_manifest(candidate);
+        write_lock(&self.manifests).insert(
+            key.into(),
+            Some(Manifest {
+                stamp,
+                probe: probe.clone(),
+            }),
+        );
+        Some(probe)
+    }
+
+    fn memo_path<T: Clone>(&self, map: &PathMap<T>, p: &Path, compute: impl FnOnce() -> T) -> T {
+        let key = path_key(p);
+        if let Some(hit) = read_lock(map).get(key) {
+            return hit.clone();
+        }
+        let value = compute();
+        write_lock(map).insert(key.into(), value.clone());
+        value
+    }
+}
+
+impl FsProvider for MemoFs {
+    fn nearest_package(&self, from: &Path) -> Option<(String, PathBuf)> {
+        let _t = timings::start(Stage::Fs);
+        let mut folder = from.parent()?;
+        let mut visited: Vec<&Path> = Vec::new();
+        let answer = loop {
+            if !self.live {
+                if let Some(hit) = read_lock(&self.nearest).get(path_key(folder)) {
+                    break hit.clone();
+                }
+                visited.push(folder);
+            }
+            match self.probe_manifest(&folder.join("package.json")) {
+                Some(PackageProbe::Name(name)) => break Some((name, folder.to_path_buf())),
+                Some(PackageProbe::Broken) => break None,
+                None => {}
+            }
+            if folder == Path::new("/") || folder.as_os_str().is_empty() {
+                break None;
+            }
+            match folder.parent() {
+                Some(parent) => folder = parent,
+                None => break None,
+            }
+        };
+        if !visited.is_empty() {
+            let mut nearest = write_lock(&self.nearest);
+            for dir in visited {
+                nearest.insert(path_key(dir).into(), answer.clone());
+            }
+        }
+        answer
+    }
+
+    fn resolve_import(
+        &self,
+        specifier: &str,
+        importer: &Path,
+        config: ResolveConfig<'_>,
+    ) -> Option<PathBuf> {
+        let _t = timings::start(Stage::Fs);
+        let dir = match importer.parent() {
+            Some(dir) if !self.live => dir,
+            _ => return resolve_import_with(self, specifier, importer, config),
+        };
+        let key = path_key(dir);
+        if let Some(memos) = read_lock(&self.resolve).get(key)
+            && let Some(memo) = memos.iter().find(|m| m.matches(config))
+            && let Some(hit) = memo.by_specifier.get(specifier)
+        {
+            return hit.clone();
+        }
+        let resolved = resolve_import_with(self, specifier, importer, config);
+        let mut map = write_lock(&self.resolve);
+        let memos = map.entry(key.into()).or_default();
+        let memo = match memos.iter().position(|m| m.matches(config)) {
+            Some(i) => &mut memos[i],
+            None => {
+                memos.push(ResolveMemo {
+                    aliases: config.aliases.cloned(),
+                    root_dir: config.root_dir.map(Path::to_path_buf),
+                    by_specifier: FxHashMap::default(),
+                });
+                memos.last_mut().expect("just pushed")
+            }
+        };
+        memo.by_specifier
+            .insert(specifier.to_string(), resolved.clone());
+        resolved
+    }
+
+    fn exists(&self, p: &Path) -> bool {
+        if self.live {
+            return p.is_file();
+        }
+        self.memo_path(&self.exists, p, || p.is_file())
+    }
+
+    fn exists_any(&self, p: &Path) -> bool {
+        if self.live {
+            return p.exists();
+        }
+        self.memo_path(&self.exists_any, p, || p.exists())
+    }
+
+    fn hash_file(&self, p: &Path) -> Option<String> {
+        let stamp = if self.live {
+            match std::fs::metadata(p) {
+                Ok(meta) if meta.is_file() => Some(Stamp::of(&meta)),
+                _ => return StdFs.hash_file(p),
+            }
+        } else {
+            None
+        };
+        let key = path_key(p);
+        if let Some((seen, hash)) = read_lock(&self.hashes).get(key)
+            && (stamp.is_none() || *seen == stamp)
+        {
+            return hash.clone();
+        }
+        let hash = StdFs.hash_file(p);
+        write_lock(&self.hashes).insert(key.into(), (stamp, hash.clone()));
+        hash
+    }
+
+    fn canonicalize_root(&self, root: &Path) -> PathBuf {
+        if self.live {
+            return StdFs.canonicalize_root(root);
+        }
+        self.memo_path(&self.canon, root, || StdFs.canonicalize_root(root))
     }
 }
 
@@ -126,14 +399,25 @@ fn nearest_package_walk(from: &Path, stop_at: Option<&Path>) -> Option<(String, 
         }
         let candidate = folder.join("package.json");
         if candidate.is_file() {
-            let raw = std::fs::read_to_string(&candidate).ok()?;
-            let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
-            return Some((js_name_string(json.get("name")), folder.to_path_buf()));
+            return match read_manifest(&candidate) {
+                PackageProbe::Name(name) => Some((name, folder.to_path_buf())),
+                PackageProbe::Broken => None,
+            };
         }
         if folder == Path::new("/") || folder.as_os_str().is_empty() {
             return None;
         }
         folder = folder.parent()?;
+    }
+}
+
+fn read_manifest(candidate: &Path) -> PackageProbe {
+    let Ok(raw) = std::fs::read_to_string(candidate) else {
+        return PackageProbe::Broken;
+    };
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(json) => PackageProbe::Name(js_name_string(json.get("name"))),
+        Err(_) => PackageProbe::Broken,
     }
 }
 
@@ -1729,5 +2013,166 @@ mod tests {
             normalize_path(Path::new("/a/b/../c/./d.ts")),
             PathBuf::from("/a/c/d.ts")
         );
+    }
+
+    /// Fresh per test (tests mutate it): root manifest, a nested `pkg`
+    /// manifest, and files two and three levels below `pkg`.
+    fn memo_fixture(tag: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("stylex-rs-memofs-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |rel: &str, content: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        };
+        write("package.json", r#"{"name":"root-pkg"}"#);
+        write("pkg/package.json", r#"{"name":"nested-pkg"}"#);
+        write("pkg/src/a/one.ts", "");
+        write("pkg/src/b/two.ts", "");
+        write("pkg/src/b/tokens.stylex.ts", "");
+        write("other/deep/three.ts", "");
+        std::fs::canonicalize(&root).unwrap_or(root)
+    }
+
+    fn os_eq(a: Option<(String, PathBuf)>, b: Option<(String, PathBuf)>) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some((n1, d1)), Some((n2, d2))) => n1 == n2 && d1.as_os_str() == d2.as_os_str(),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn memo_snapshot_matches_std_and_fills_every_visited_level() {
+        let root = memo_fixture("snapshot");
+        let memo = MemoFs::snapshot();
+        for rel in [
+            "pkg/src/a/one.ts",
+            "pkg/src/b/two.ts",
+            "other/deep/three.ts",
+            "pkg/src/a/one.ts",
+        ] {
+            let file = root.join(rel);
+            assert!(os_eq(
+                memo.nearest_package(&file),
+                StdFs.nearest_package(&file)
+            ));
+        }
+        let filled = read_lock(&memo.nearest);
+        for dir in ["pkg/src/a", "pkg/src", "pkg", "other/deep", "other"] {
+            assert!(
+                filled.contains_key(path_key(&root.join(dir))),
+                "{dir} not filled"
+            );
+        }
+        // Seven directories were visited (pkg/src/a, pkg/src/b, pkg/src, pkg,
+        // other/deep, other, root), each probed exactly once.
+        let manifests = read_lock(&memo.manifests);
+        assert!(manifests.contains_key(path_key(&root.join("pkg/package.json"))));
+        assert!(manifests.contains_key(path_key(&root.join("package.json"))));
+        assert_eq!(
+            manifests
+                .keys()
+                .filter(|k| k.starts_with(path_key(&root)))
+                .count(),
+            7
+        );
+    }
+
+    #[test]
+    fn memo_snapshot_freezes_while_live_revalidates_edits_and_new_manifests() {
+        let root = memo_fixture("live");
+        let snapshot = MemoFs::snapshot();
+        let live = MemoFs::live();
+        let file = root.join("pkg/src/a/one.ts");
+        let before = Some(("nested-pkg".to_string(), root.join("pkg")));
+        assert!(os_eq(snapshot.nearest_package(&file), before.clone()));
+        assert!(os_eq(live.nearest_package(&file), before.clone()));
+
+        // Edit: a different length guarantees a stamp change even inside one
+        // mtime tick.
+        std::fs::write(
+            root.join("pkg/package.json"),
+            r#"{"name":"nested-pkg-renamed"}"#,
+        )
+        .unwrap();
+        assert!(os_eq(snapshot.nearest_package(&file), before.clone()));
+        assert!(os_eq(
+            live.nearest_package(&file),
+            Some(("nested-pkg-renamed".to_string(), root.join("pkg")))
+        ));
+
+        // A new manifest at an intermediate level is seen live, not by snapshot.
+        std::fs::write(root.join("pkg/src/package.json"), r#"{"name":"src-pkg"}"#).unwrap();
+        assert!(os_eq(snapshot.nearest_package(&file), before));
+        assert!(os_eq(
+            live.nearest_package(&file),
+            Some(("src-pkg".to_string(), root.join("pkg/src")))
+        ));
+        assert!(os_eq(
+            live.nearest_package(&file),
+            StdFs.nearest_package(&file)
+        ));
+
+        // A broken manifest ends the live walk with no answer, like StdFs.
+        std::fs::write(root.join("pkg/src/package.json"), "{").unwrap();
+        assert!(live.nearest_package(&file).is_none());
+        assert!(StdFs.nearest_package(&file).is_none());
+
+        snapshot.invalidate_all();
+        assert!(snapshot.nearest_package(&file).is_none());
+    }
+
+    #[test]
+    fn memo_keys_by_spelling_so_found_dirs_keep_the_callers_spelling() {
+        let root = memo_fixture("spelling");
+        let memo = MemoFs::snapshot();
+        let plain = root.join("pkg/src/a/one.ts");
+        let doubled = PathBuf::from(format!("{}//pkg/src/a/one.ts", root.display()));
+        assert_eq!(Path::new(&plain), Path::new(&doubled));
+        assert!(os_eq(
+            memo.nearest_package(&plain),
+            StdFs.nearest_package(&plain)
+        ));
+        assert!(os_eq(
+            memo.nearest_package(&doubled),
+            StdFs.nearest_package(&doubled)
+        ));
+        assert_ne!(
+            memo.nearest_package(&plain).unwrap().1.as_os_str(),
+            memo.nearest_package(&doubled).unwrap().1.as_os_str()
+        );
+    }
+
+    #[test]
+    fn memo_snapshot_resolve_is_keyed_by_importer_dir_and_config() {
+        let root = memo_fixture("resolve");
+        let memo = MemoFs::snapshot();
+        let a = root.join("pkg/src/b/two.ts");
+        let b = root.join("pkg/src/b/other.ts");
+        let with_root = ResolveConfig {
+            aliases: None,
+            root_dir: Some(&root),
+        };
+        let expected = StdFs.resolve_import("./tokens.stylex", &a, with_root);
+        assert!(expected.is_some());
+        assert_eq!(
+            memo.resolve_import("./tokens.stylex", &a, with_root),
+            expected
+        );
+        assert_eq!(
+            memo.resolve_import("./tokens.stylex", &b, with_root),
+            expected
+        );
+        assert_eq!(
+            memo.resolve_import("./tokens.stylex", &b, ResolveConfig::default()),
+            expected
+        );
+        let memos = read_lock(&memo.resolve);
+        let by_dir = &memos[path_key(&root.join("pkg/src/b"))];
+        assert_eq!(by_dir.len(), 2, "one memo per distinct config");
+        assert!(by_dir.iter().all(|m| m.by_specifier.len() == 1));
+        assert_eq!(memos.len(), 1, "one importer directory");
     }
 }

@@ -4,7 +4,7 @@
 // Span invariant: synthesized nodes carry the replaced node's span (generated
 // runtime imports an empty one — codegen skips those); clones keep their own.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use oxc_allocator::{Allocator, CloneIn, Vec as ArenaVec};
@@ -14,9 +14,10 @@ use oxc_ast::ast::{
     FormalParameter, FormalParameterKind, FormalParameters, IdentifierName, ImportDeclaration,
     ImportDeclarationSpecifier, ImportDefaultSpecifier, ImportNamespaceSpecifier,
     ImportOrExportKind, ImportSpecifier, JSXAttribute, JSXAttributeItem, JSXAttributeName,
-    JSXAttributeValue, JSXOpeningElement, JSXSpreadAttribute, ModuleExportName, NumberBase,
-    ObjectExpression, ObjectProperty, ObjectPropertyKind, Program, PropertyKey, PropertyKind,
-    Statement, StringLiteral, VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
+    JSXAttributeValue, JSXElement, JSXOpeningElement, JSXSpreadAttribute, ModuleExportName,
+    NumberBase, ObjectExpression, ObjectProperty, ObjectPropertyKind, Program, PropertyKey,
+    PropertyKind, Statement, StringLiteral, VariableDeclaration, VariableDeclarationKind,
+    VariableDeclarator,
 };
 use oxc_ast::builder::AstBuilder;
 use oxc_ast_visit::{Visit, VisitMut, walk, walk_mut};
@@ -362,7 +363,7 @@ impl<'a> Synth<'a> {
         )])
     }
 
-    /// Mirrors js_out::print_class_segments: an unfolded `+` chain.
+    /// Mirrors js_out::write_class_segments: an unfolded `+` chain.
     fn class_segments(&self, segments: &[String]) -> Expression<'a> {
         let mut iter = segments.iter();
         let Some(first) = iter.next() else {
@@ -776,7 +777,7 @@ impl<'a> Synth<'a> {
         ))
     }
 
-    /// Mirrors js_out::print_inject_arg (fixed key order, numeric constVal).
+    /// Mirrors js_out::inject_call_text (fixed key order, numeric constVal).
     fn inject_call(&self, callee: &str, rule: &StylexRule) -> Statement<'a> {
         let mut props = vec![self.prop(self.prop_key("ltr"), self.string(&rule.ltr))];
         if let Some(rtl) = &rule.rtl {
@@ -849,19 +850,57 @@ impl<'a> Visit<'a> for SpanCloner<'_, 'a> {
     }
 }
 
-fn clone_expr_in_program<'a>(
+/// [`SpanCloner`] over a span set in one walk: outermost match per span.
+struct SpanSetCloner<'x, 'a> {
+    alloc: &'a Allocator,
+    targets: &'x BTreeSet<SpanKey>,
+    found: &'x mut BTreeMap<SpanKey, Expression<'a>>,
+}
+
+impl<'a> Visit<'a> for SpanSetCloner<'_, 'a> {
+    fn visit_statement(&mut self, it: &Statement<'a>) {
+        if span_set_within(self.targets, it.span()) {
+            walk::walk_statement(self, it);
+        }
+    }
+
+    fn visit_expression(&mut self, it: &Expression<'a>) {
+        let span = it.span();
+        if !span_set_within(self.targets, span) {
+            return;
+        }
+        let k = key(span);
+        if self.targets.contains(&k) && !self.found.contains_key(&k) {
+            self.found.insert(k, it.clone_in(self.alloc));
+        }
+        walk::walk_expression(self, it);
+    }
+}
+
+fn clone_exprs_in_program<'a>(
     alloc: &'a Allocator,
     program: &Program<'a>,
-    span: Span,
-) -> Option<Expression<'a>> {
-    let mut found = None;
-    let mut cloner = SpanCloner {
-        alloc,
-        target: span,
-        found: &mut found,
-    };
-    cloner.visit_program(program);
+    targets: &BTreeSet<SpanKey>,
+) -> BTreeMap<SpanKey, Expression<'a>> {
+    let mut found = BTreeMap::new();
+    if !targets.is_empty() {
+        let mut cloner = SpanSetCloner {
+            alloc,
+            targets,
+            found: &mut found,
+        };
+        cloner.visit_program(program);
+    }
     found
+}
+
+/// Node spans nest, so a key starting inside `span` names a node inside it.
+fn span_range(span: Span) -> std::ops::RangeInclusive<SpanKey> {
+    (span.start, 0)..=(span.end, u32::MAX)
+}
+
+fn span_set_within(set: &BTreeSet<SpanKey>, span: Span) -> bool {
+    set.range(span_range(span)).next().is_some()
 }
 
 fn clone_expr_within<'a>(
@@ -941,6 +980,12 @@ impl<'a> Applier<'a> {
                     span.start, span.end
                 ))
             })
+    }
+
+    fn pending_within(&self, span: Span) -> bool {
+        self.error.is_none()
+            && (self.replace.range(span_range(span)).next().is_some()
+                || self.jsx.range(span_range(span)).next().is_some())
     }
 
     /// `old` is child-mutated before cloning, so table tests carry nested
@@ -1062,8 +1107,20 @@ impl<'a> Applier<'a> {
 }
 
 impl<'a> VisitMut<'a> for Applier<'a> {
+    fn visit_statement(&mut self, stmt: &mut Statement<'a>) {
+        if self.pending_within(stmt.span()) {
+            walk_mut::walk_statement(self, stmt);
+        }
+    }
+
+    fn visit_jsx_element(&mut self, el: &mut JSXElement<'a>) {
+        if self.pending_within(el.span) {
+            walk_mut::walk_jsx_element(self, el);
+        }
+    }
+
     fn visit_expression(&mut self, expr: &mut Expression<'a>) {
-        if self.error.is_some() {
+        if !self.pending_within(expr.span()) {
             return;
         }
         // Post-order: nested replacements land before enclosing ones, so a
@@ -1118,30 +1175,40 @@ fn retarget_comments(comments: &mut ArenaVec<'_, Comment>, from: u32, to: Option
 pub fn apply_plan<'a>(
     allocator: &'a Allocator,
     program: &mut Program<'a>,
-    plan: &AstPlan,
+    plan: AstPlan,
 ) -> Result<(), StylexError> {
+    if plan.is_empty() {
+        return Ok(());
+    }
+    let AstPlan {
+        replace_exprs,
+        jsx_ops,
+        inserts: insert_ops,
+        removes: remove_ops,
+        import_sources,
+    } = plan;
     // Collect the pre-mutation clones every dynamic arrow needs.
-    let mut wanted: Vec<Span> = Vec::new();
+    let mut wanted: BTreeSet<SpanKey> = BTreeSet::new();
     let mut collect_dynamic = |dynamic: &[DynamicEntry]| {
         for entry in dynamic {
             for var in &entry.compiled.inline_vars {
-                wanted.push(var.expr);
+                wanted.insert(key(var.expr));
             }
             for (_, parts) in &entry.compiled.conditional_props {
                 for part in parts {
                     if let ClassPart::Guarded { expr, .. } = part {
-                        wanted.push(*expr);
+                        wanted.insert(key(*expr));
                     }
                 }
             }
         }
     };
-    for (_, synth_expr) in &plan.replace_exprs {
+    for (_, synth_expr) in &replace_exprs {
         if let SynthExpr::CreateObject { dynamic, .. } = synth_expr {
             collect_dynamic(dynamic);
         }
     }
-    for insert in &plan.inserts {
+    for insert in &insert_ops {
         if let SynthStmt::ConstDecl {
             value: HoistValue::CreateObject { dynamic, .. },
             ..
@@ -1150,19 +1217,11 @@ pub fn apply_plan<'a>(
             collect_dynamic(dynamic);
         }
     }
-    let mut preclones: BTreeMap<SpanKey, Expression<'a>> = BTreeMap::new();
-    for span in wanted {
-        if preclones.contains_key(&key(span)) {
-            continue;
-        }
-        if let Some(cloned) = clone_expr_in_program(allocator, program, span) {
-            preclones.insert(key(span), cloned);
-        }
-    }
+    let preclones = clone_exprs_in_program(allocator, program, &wanted);
 
     // parity: the source literal is retargeted in place (Program.exit), so the
     // raw text carries the splice backend's exact quoting.
-    for (span, value) in &plan.import_sources {
+    for (span, value) in &import_sources {
         for statement in &mut program.body {
             if let Statement::ImportDeclaration(decl) = statement
                 && decl.source.span == *span
@@ -1175,15 +1234,13 @@ pub fn apply_plan<'a>(
 
     let mut applier = Applier {
         alloc: allocator,
-        replace: plan
-            .replace_exprs
-            .iter()
-            .map(|(span, synth_expr)| (key(*span), synth_expr.clone()))
+        replace: replace_exprs
+            .into_iter()
+            .map(|(span, synth_expr)| (key(span), synth_expr))
             .collect(),
-        jsx: plan
-            .jsx_ops
-            .iter()
-            .map(|(span, op)| (key(*span), op.clone()))
+        jsx: jsx_ops
+            .into_iter()
+            .map(|(span, op)| (key(span), op))
             .collect(),
         preclones,
         error: None,
@@ -1206,12 +1263,11 @@ pub fn apply_plan<'a>(
     }
 
     // Statement surgery: removals + anchored insertions over program.body.
-    let removes: BTreeMap<SpanKey, &RemoveOp> = plan
-        .removes
+    let removes: BTreeMap<SpanKey, &RemoveOp> = remove_ops
         .iter()
         .map(|remove| (key(remove.stmt_span), remove))
         .collect();
-    let mut inserts: Vec<&InsertOp> = plan.inserts.iter().collect();
+    let mut inserts: Vec<&InsertOp> = insert_ops.iter().collect();
     inserts.sort_by_key(|insert| (insert.anchor, insert.seq));
     let mut inserts = inserts.into_iter().peekable();
 

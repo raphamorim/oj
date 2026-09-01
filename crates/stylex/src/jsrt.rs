@@ -1,14 +1,30 @@
 use std::cmp::Ordering;
 
-pub fn js_number_to_string(x: f64) -> String {
+fn non_finite_text(x: f64) -> Option<&'static str> {
     if x.is_nan() {
-        return "NaN".to_string();
+        Some("NaN")
+    } else if x.is_infinite() {
+        Some(if x > 0.0 { "Infinity" } else { "-Infinity" })
+    } else {
+        None
     }
-    if x.is_infinite() {
-        return if x > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+}
+
+pub fn js_number_to_string(x: f64) -> String {
+    if let Some(text) = non_finite_text(x) {
+        return text.to_string();
     }
     let mut buf = ryu_js::Buffer::new();
     buf.format(x).to_string()
+}
+
+pub fn write_js_number(x: f64, out: &mut String) {
+    if let Some(text) = non_finite_text(x) {
+        out.push_str(text);
+        return;
+    }
+    let mut buf = ryu_js::Buffer::new();
+    out.push_str(buf.format(x));
 }
 
 // ES Math.round: nearest integer, ties toward +Infinity (not half-away-from-zero).
@@ -169,7 +185,7 @@ pub struct UnverifiedChar(pub char);
 
 // (primary, secondary, tertiary) per char; ranks transcribed from the pinned
 // `groups` in collation.json (gen-pins-collation.mjs, node en-US ICU).
-pub(crate) fn locale_key(c: char) -> Result<(u8, u8, u8), UnverifiedChar> {
+pub(crate) const fn locale_key(c: char) -> Result<(u8, u8, u8), UnverifiedChar> {
     let key = match c {
         ' ' => (0, 0, 0),
         '_' => (1, 0, 0),
@@ -408,6 +424,35 @@ pub(crate) fn locale_key(c: char) -> Result<(u8, u8, u8), UnverifiedChar> {
         _ => return Err(UnverifiedChar(c)),
     };
     Ok(key)
+}
+
+// 256 wide so a byte index needs no bounds check; only ASCII strings read it.
+pub(crate) static ASCII_LOCALE_KEYS: [Option<(u8, u8, u8)>; 256] = {
+    let mut table = [None; 256];
+    let mut b = 0usize;
+    while b < 128 {
+        table[b] = match locale_key(b as u8 as char) {
+            Ok(key) => Some(key),
+            Err(_) => None,
+        };
+        b += 1;
+    }
+    table
+};
+
+#[cfg(test)]
+mod ascii_locale_key_tests {
+    use super::{ASCII_LOCALE_KEYS, locale_key};
+
+    #[test]
+    fn table_matches_locale_key_for_every_byte() {
+        for b in 0..=255u8 {
+            let want = (b < 128).then(|| locale_key(b as char).ok()).flatten();
+            assert_eq!(ASCII_LOCALE_KEYS[usize::from(b)], want, "byte {b:#x}");
+        }
+        assert!(ASCII_LOCALE_KEYS[usize::from(b'a')].is_some());
+        assert!(ASCII_LOCALE_KEYS[usize::from(b'{')].is_some());
+    }
 }
 
 /// JS localeCompare as the oracle's node runs it: whole-string primary,

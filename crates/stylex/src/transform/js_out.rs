@@ -4,7 +4,7 @@
 use oxc_span::Span;
 
 use crate::eval::value::{EvalValue, JsObjectMap};
-use crate::jsrt::js_number_to_string;
+use crate::jsrt::{js_number_to_string, write_js_number};
 
 /// One text edit; `start == end` is a pure insertion.
 #[derive(Debug, Clone)]
@@ -47,7 +47,9 @@ pub fn apply_edits_tracked(
 ) -> String {
     let mut ordered: Vec<(usize, &Edit)> = edits.iter().enumerate().collect();
     ordered.sort_by_key(|(i, e)| (e.start, e.end, *i));
-    let mut out = String::with_capacity(source.len());
+    let inserted: usize = edits.iter().map(|e| e.text.len()).sum();
+    let replaced: usize = edits.iter().map(|e| (e.end - e.start) as usize).sum();
+    let mut out = String::with_capacity(source.len().saturating_sub(replaced) + inserted);
     let mut cursor = 0usize;
     for (_, edit) in ordered {
         let start = edit.start as usize;
@@ -221,9 +223,37 @@ fn json_string_literal(value: &str) -> String {
     serde_json::to_string(value).expect("string serialization is infallible")
 }
 
+/// Printed-size estimate for pre-sizing buffers: exact for keywords and
+/// ASCII strings, a typical width for numbers.
+pub fn estimate_len(value: &EvalValue) -> usize {
+    match value {
+        EvalValue::Null => 4,
+        EvalValue::Undefined => 9,
+        EvalValue::Bool(_) => 5,
+        EvalValue::Num(_) => 8,
+        EvalValue::Str(s) => s.len() + 2,
+        EvalValue::Arr(items) => {
+            2 + items
+                .iter()
+                .map(|item| estimate_len(item) + 7)
+                .sum::<usize>()
+        }
+        EvalValue::Obj(map) => estimate_object_len(map),
+    }
+}
+
+pub fn estimate_object_len(map: &JsObjectMap) -> usize {
+    2 + map
+        .entries()
+        .map(|(key, value)| {
+            key.len() + if is_identifier_key(key) { 4 } else { 6 } + estimate_len(value)
+        })
+        .sum::<usize>()
+}
+
 /// Prints an `EvalValue` as a JS expression (object/array literal shape).
 pub fn print_value(value: &EvalValue) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(estimate_len(value));
     write_value(value, &mut out);
     out
 }
@@ -233,7 +263,7 @@ pub fn write_value(value: &EvalValue, out: &mut String) {
         EvalValue::Null => out.push_str("null"),
         EvalValue::Undefined => out.push_str("undefined"),
         EvalValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        EvalValue::Num(n) => out.push_str(&js_number_to_string(*n)),
+        EvalValue::Num(n) => write_js_number(*n, out),
         EvalValue::Str(s) => write_js_string_literal(s, out),
         // parity: convertObjectToAST recurses into arrays via Object.entries,
         // printing them as index-keyed objects ({"0": …, "1": …}).
@@ -271,17 +301,21 @@ pub fn write_object(map: &JsObjectMap, out: &mut String) {
     out.push('}');
 }
 
-/// The runtime-injection call argument: `{ltr, rtl?, priority, constKey?,
-/// constVal?}`. parity: state-manager.js addStyleToInject key order.
-pub fn print_inject_arg(rule: &crate::rules::StylexRule) -> String {
-    let mut out = String::from("{ltr: ");
+/// One runtime-injection statement, `callee({ltr, rtl?, priority, constKey?,
+/// constVal?});\n`. parity: state-manager.js addStyleToInject key order.
+pub fn inject_call_text(callee: &str, rule: &crate::rules::StylexRule) -> String {
+    let mut out = String::with_capacity(
+        callee.len() + rule.ltr.len() + rule.rtl.as_ref().map_or(0, |rtl| rtl.len() + 9) + 40,
+    );
+    out.push_str(callee);
+    out.push_str("({ltr: ");
     write_js_string_literal(&rule.ltr, &mut out);
     if let Some(rtl) = &rule.rtl {
         out.push_str(", rtl: ");
         write_js_string_literal(rtl, &mut out);
     }
     out.push_str(", priority: ");
-    out.push_str(&js_number_to_string(rule.priority));
+    write_js_number(rule.priority, &mut out);
     if let Some(const_key) = &rule.const_key {
         out.push_str(", constKey: ");
         write_js_string_literal(const_key, &mut out);
@@ -290,7 +324,7 @@ pub fn print_inject_arg(rule: &crate::rules::StylexRule) -> String {
         out.push_str(", constVal: ");
         out.push_str(&print_const_val(const_val));
     }
-    out.push('}');
+    out.push_str("});\n");
     out
 }
 
@@ -333,15 +367,17 @@ pub fn const_val_string(value: &serde_json::Value) -> String {
 
 // parity: upstream builds the class list as a `+` chain of string literals
 // and never folds it, even when every operand is static.
-pub fn print_class_segments(segments: &[String]) -> String {
+fn write_class_segments(segments: &[String], out: &mut String) {
     if segments.is_empty() {
-        return js_string_literal("");
+        out.push_str("\"\"");
+        return;
     }
-    segments
-        .iter()
-        .map(|s| js_string_literal(s))
-        .collect::<Vec<_>>()
-        .join(" + ")
+    for (i, segment) in segments.iter().enumerate() {
+        if i > 0 {
+            out.push_str(" + ");
+        }
+        write_js_string_literal(segment, out);
+    }
 }
 
 /// Static chunk printer (the object upstream hoists via hoistExpression);
@@ -352,13 +388,15 @@ pub fn print_static_chunk(compiled: &crate::shared::dynamic::DynamicCompiled) ->
         if is_identifier_key(key) {
             obj.push_str(key);
         } else {
-            obj.push_str(&js_string_literal(key));
+            write_js_string_literal(key, &mut obj);
         }
         obj.push_str(": ");
-        obj.push_str(&print_class_segments(segments));
+        write_class_segments(segments, &mut obj);
         obj.push_str(", ");
     }
-    obj.push_str(&format!("\"$$css\": {}}}", print_value(&compiled.css_tag)));
+    obj.push_str("\"$$css\": ");
+    write_value(&compiled.css_tag, &mut obj);
+    obj.push('}');
     obj
 }
 
@@ -454,7 +492,7 @@ fn write_json(value: &EvalValue, out: &mut String) {
         EvalValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         EvalValue::Num(n) => {
             if n.is_finite() {
-                out.push_str(&js_number_to_string(*n));
+                write_js_number(*n, out);
             } else {
                 out.push_str(&format!(
                     "{{\"__jsnum\":{}}}",

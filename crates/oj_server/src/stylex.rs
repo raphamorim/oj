@@ -358,7 +358,7 @@ mod tests {
             ltr: String::new().into(),
             rtl: None,
             const_key: Some("--spacing".into()),
-            const_val: Some(serde_json::json!("8px")),
+            const_val: Some(Box::new(serde_json::json!("8px"))),
             priority: 0.0,
         };
         sx.register(Path::new("/app/src/tokens.stylex.ts"), &[const_rule]);

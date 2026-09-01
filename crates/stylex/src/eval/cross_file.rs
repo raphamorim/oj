@@ -1,6 +1,8 @@
 //! `.stylex` theme-file import proxies: hash-only, no file contents are read.
 // parity: evaluate-path.js createVarGroupProxy/resolveVarGroupKey/:595-654
 
+use std::rc::Rc;
+
 use crate::hash::hash;
 use crate::module_resolution::gen_file_based_identifier;
 use crate::options::ResolvedOptions;
@@ -37,15 +39,28 @@ pub fn unsupported_operator(op: &str) -> String {
 
 /// Stand-in for the upstream JS Proxy over a theme-file export: every member
 /// access resolves to a `var(--…)` string derived from hashes alone.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct VarGroupProxy {
+    group: Rc<VarGroup>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct VarGroup {
     /// Canonical theme-file name (`pkg:relPath` form).
-    pub file_name: String,
-    pub export_name: String,
-    pub var_group_hash: String,
+    file_name: String,
+    export_name: String,
+    var_group_hash: String,
     class_name_prefix: String,
     debug_class_names: bool,
 }
+
+impl PartialEq for VarGroupProxy {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.group, &other.group) || self.group == other.group
+    }
+}
+
+impl Eq for VarGroupProxy {}
 
 impl VarGroupProxy {
     pub fn new(file_name: String, export_name: String, options: &ResolvedOptions) -> Self {
@@ -55,12 +70,18 @@ impl VarGroupProxy {
             hash(&gen_file_based_identifier(&file_name, &export_name, None))
         );
         VarGroupProxy {
-            file_name,
-            export_name,
-            var_group_hash,
-            class_name_prefix: options.class_name_prefix.clone(),
-            debug_class_names: options.debug && options.enable_debug_class_names,
+            group: Rc::new(VarGroup {
+                file_name,
+                export_name,
+                var_group_hash,
+                class_name_prefix: options.class_name_prefix.clone(),
+                debug_class_names: options.debug && options.enable_debug_class_names,
+            }),
         }
+    }
+
+    pub fn var_group_hash(&self) -> &str {
+        &self.group.var_group_hash
     }
 
     // parity: evaluate-path.js resolveVarGroupKey.
@@ -68,12 +89,13 @@ impl VarGroupProxy {
         if key.starts_with("--") {
             return format!("var({key})");
         }
+        let group = &*self.group;
         let hashed = hash(&gen_file_based_identifier(
-            &self.file_name,
-            &self.export_name,
+            &group.file_name,
+            &group.export_name,
             Some(key),
         ));
-        let var_name = if self.debug_class_names {
+        let var_name = if group.debug_class_names {
             let mut safe: String = key
                 .chars()
                 .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -81,9 +103,9 @@ impl VarGroupProxy {
             if key.starts_with(|c: char| c.is_ascii_digit()) {
                 safe.insert(0, '_');
             }
-            format!("{safe}-{}{hashed}", self.class_name_prefix)
+            format!("{safe}-{}{hashed}", group.class_name_prefix)
         } else {
-            format!("{}{hashed}", self.class_name_prefix)
+            format!("{}{hashed}", group.class_name_prefix)
         };
         format!("var(--{var_name})")
     }
@@ -106,7 +128,7 @@ mod tests {
         // Pinned live against @stylexjs/babel-plugin 0.19.0 (probe 2026-08-27).
         let options = ResolvedOptions::default();
         let p = proxy(&options);
-        assert_eq!(p.var_group_hash, "x73pkp7");
+        assert_eq!(p.var_group_hash(), "x73pkp7");
         assert_eq!(p.resolve_key("accent"), "var(--x8fssgy)");
         assert_eq!(p.resolve_key("--raw"), "var(--raw)");
     }

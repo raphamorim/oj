@@ -7,6 +7,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use memchr::memmem;
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, BindingPattern, CallExpression, ChainElement, ClassElement,
     Declaration, ExportDefaultDeclarationKind, Expression, ForStatementInit, ForStatementLeft,
@@ -24,7 +25,7 @@ use crate::eval::functions::{
 use crate::eval::value::{EvalValue, JsObjectMap};
 use crate::eval::{
     EvalOutcome, Evaluator, FunctionRegistry, JsValue, evaluate_stylex_create_arg, from_eval_value,
-    is_nullish, to_eval_value, unwrap_parens, validate_create_arg,
+    into_eval_value, into_js_value, is_nullish, to_eval_value, unwrap_parens, validate_create_arg,
 };
 use crate::imports::StylexNamedImport;
 use crate::jsrt::js_number_to_string;
@@ -48,7 +49,7 @@ use crate::shared::position_try::{position_try, position_try_shared};
 use crate::shared::types::create_css_type;
 use crate::shared::view_transition::view_transition_class;
 use crate::shared::when::{WhenRelation, when_selector};
-use crate::state::CompileState;
+use crate::state::{CompileState, climb_parens, member_object_span};
 use crate::transform::ast_backend::{
     AstPlan, DynamicEntry, HoistValue, InsertOp, JsxOp, PrologueStmt, RemoveOp, SynthExpr,
     SynthStmt,
@@ -56,8 +57,9 @@ use crate::transform::ast_backend::{
 use crate::transform::atoms::{AtomStyle, dynamic_style, static_style};
 use crate::transform::dce::{DceAction, compute_vars_to_keep, dce_action};
 use crate::transform::js_out::{
-    Edit, SpliceMap, apply_edits_tracked, is_identifier_key, js_string_literal,
-    print_dynamic_arrow, print_inject_arg, print_static_chunk, render_span, write_value,
+    Edit, SpliceMap, apply_edits_tracked, estimate_object_len, inject_call_text, is_identifier_key,
+    js_string_literal, print_dynamic_arrow, print_static_chunk, render_span, write_object,
+    write_value,
 };
 use crate::transform::merge::{
     MemberEval, MergeArg, MergeMode, MergePlan, NullableStyle, StyleVarToKeep, StyleVarsCollector,
@@ -273,6 +275,10 @@ fn call_kind(call: &CallExpression<'_>, state: &CompileState<'_>) -> Option<Call
     if !imports.is_stylex_namespace(object) {
         return None;
     }
+    member_api_kind(property)
+}
+
+fn member_api_kind(property: &str) -> Option<CallKind> {
     Some(match property {
         "create" => CallKind::Create,
         "keyframes" => CallKind::Keyframes,
@@ -352,6 +358,11 @@ enum MemberFlow {
 
 trait Hooks<'a> {
     fn done(&self) -> bool;
+    /// False when no hook of this pass can fire inside `span`: the walker
+    /// skips the subtree.
+    fn wants(&self, _span: Span) -> bool {
+        true
+    }
     fn call(&mut self, _call: &'a CallExpression<'a>, _parent: ExprParent<'_>) -> Flow {
         Flow::Walk
     }
@@ -366,7 +377,76 @@ trait Hooks<'a> {
     fn export_local(&mut self, _name: &str, _span: Span) {}
 }
 
-fn walk_program<'a>(hooks: &mut dyn Hooks<'a>, program: &'a Program<'a>) {
+/// Sorted source offsets at which a pass's hooks can fire.
+struct SiteIndex {
+    starts: Vec<u32>,
+}
+
+impl SiteIndex {
+    fn any_in(&self, span: Span) -> bool {
+        let i = self.starts.partition_point(|&s| s < span.start);
+        i < self.starts.len() && self.starts[i] < span.end
+    }
+}
+
+/// Pass A acts on `<local>(…)` for the non-props named imports and on
+/// `ns.<api>(…)`; `ns.props(…)`, `ns.attrs(…)` and bare `ns(…)` it walks past.
+fn pass_a_index(state: &CompileState<'_>, source: &str) -> SiteIndex {
+    let imports = &state.imports;
+    let names: Vec<&str> = imports
+        .named
+        .iter()
+        .filter(|(_, b)| !matches!(b, StylexNamedImport::Props | StylexNamedImport::Attrs))
+        .map(|(name, _)| name.as_str())
+        .chain(imports.stylex_namespaces.iter().map(String::as_str))
+        .collect();
+    let mut starts = state.reference_starts_where(&names, |name, nodes, node| {
+        if !imports.is_stylex_namespace(name) {
+            return true;
+        }
+        let (_, parent) = climb_parens(nodes, node);
+        match member_object_span(nodes.kind(parent)) {
+            Some((_, Some(property))) => !matches!(
+                member_api_kind(property),
+                None | Some(CallKind::Props | CallKind::Attrs)
+            ),
+            _ => false,
+        }
+    });
+    // A JSX attribute name is no reference; its source text stands in.
+    if let Some(sx) = state.options.sx_prop_name.as_deref() {
+        starts.extend(memmem::find_iter(source.as_bytes(), sx.as_bytes()).map(|i| i as u32));
+        starts.sort_unstable();
+    }
+    SiteIndex { starts }
+}
+
+fn pass_b1_index(
+    state: &CompileState<'_>,
+    style_map: &BTreeMap<String, Arc<JsObjectMap>>,
+) -> SiteIndex {
+    let names: Vec<&str> = style_map.keys().map(String::as_str).collect();
+    SiteIndex {
+        starts: state.reference_starts(&names),
+    }
+}
+
+fn pass_b2_index(state: &CompileState<'_>, sx_sites: &[SxSite<'_>]) -> SiteIndex {
+    let imports = &state.imports;
+    let names: Vec<&str> = imports
+        .named
+        .iter()
+        .filter(|(_, b)| matches!(b, StylexNamedImport::Props | StylexNamedImport::Attrs))
+        .map(|(name, _)| name.as_str())
+        .chain(imports.stylex_namespaces.iter().map(String::as_str))
+        .collect();
+    let mut starts = state.reference_starts(&names);
+    starts.extend(sx_sites.iter().map(|s| s.attr_span.start));
+    starts.sort_unstable();
+    SiteIndex { starts }
+}
+
+fn walk_program<'a, H: Hooks<'a>>(hooks: &mut H, program: &'a Program<'a>) {
     for statement in &program.body {
         walk_top_statement(hooks, statement);
         if hooks.done() {
@@ -375,17 +455,8 @@ fn walk_program<'a>(hooks: &mut dyn Hooks<'a>, program: &'a Program<'a>) {
     }
 }
 
-fn walk_top_statement<'a>(hooks: &mut dyn Hooks<'a>, statement: &'a Statement<'a>) {
+fn walk_top_statement<'a, H: Hooks<'a>>(hooks: &mut H, statement: &'a Statement<'a>) {
     match statement {
-        Statement::VariableDeclaration(decl) => {
-            walk_variable_declaration(hooks, decl, Some((false, statement.span())));
-        }
-        Statement::ExportDeclaration(export) => match &export.declaration {
-            Declaration::VariableDeclaration(decl) => {
-                walk_variable_declaration(hooks, decl, Some((true, statement.span())));
-            }
-            other => walk_declaration(hooks, other),
-        },
         Statement::ExportNamedDeclaration(export) => {
             for specifier in &export.specifiers {
                 if specifier.export_kind.is_type() {
@@ -402,12 +473,22 @@ fn walk_top_statement<'a>(hooks: &mut dyn Hooks<'a>, statement: &'a Statement<'a
                 }
             }
         }
+        _ if !hooks.wants(statement.span()) => {}
+        Statement::VariableDeclaration(decl) => {
+            walk_variable_declaration(hooks, decl, Some((false, statement.span())));
+        }
+        Statement::ExportDeclaration(export) => match &export.declaration {
+            Declaration::VariableDeclaration(decl) => {
+                walk_variable_declaration(hooks, decl, Some((true, statement.span())));
+            }
+            other => walk_declaration(hooks, other),
+        },
         other => walk_statement(hooks, other),
     }
 }
 
-fn walk_statement<'a>(hooks: &mut dyn Hooks<'a>, statement: &'a Statement<'a>) {
-    if hooks.done() {
+fn walk_statement<'a, H: Hooks<'a>>(hooks: &mut H, statement: &'a Statement<'a>) {
+    if hooks.done() || !hooks.wants(statement.span()) {
         return;
     }
     match statement {
@@ -539,7 +620,7 @@ fn walk_statement<'a>(hooks: &mut dyn Hooks<'a>, statement: &'a Statement<'a>) {
     }
 }
 
-fn walk_declaration<'a>(hooks: &mut dyn Hooks<'a>, declaration: &'a Declaration<'a>) {
+fn walk_declaration<'a, H: Hooks<'a>>(hooks: &mut H, declaration: &'a Declaration<'a>) {
     match declaration {
         Declaration::VariableDeclaration(decl) => walk_variable_declaration(hooks, decl, None),
         Declaration::FunctionDeclaration(f) => walk_function(hooks, f),
@@ -548,7 +629,7 @@ fn walk_declaration<'a>(hooks: &mut dyn Hooks<'a>, declaration: &'a Declaration<
     }
 }
 
-fn walk_for_left<'a>(hooks: &mut dyn Hooks<'a>, left: &'a ForStatementLeft<'a>) {
+fn walk_for_left<'a, H: Hooks<'a>>(hooks: &mut H, left: &'a ForStatementLeft<'a>) {
     match left {
         ForStatementLeft::VariableDeclaration(decl) => {
             walk_variable_declaration(hooks, decl, None);
@@ -561,14 +642,17 @@ fn walk_for_left<'a>(hooks: &mut dyn Hooks<'a>, left: &'a ForStatementLeft<'a>) 
     }
 }
 
-fn walk_variable_declaration<'a>(
-    hooks: &mut dyn Hooks<'a>,
+fn walk_variable_declaration<'a, H: Hooks<'a>>(
+    hooks: &mut H,
     decl: &'a VariableDeclaration<'a>,
     top: Option<(bool, Span)>,
 ) {
     let decl_spans: Option<Rc<[Span]>> =
         top.map(|_| decl.declarations.iter().map(|d| d.span).collect());
     for (i, declarator) in decl.declarations.iter().enumerate() {
+        if !hooks.wants(declarator.span) {
+            continue;
+        }
         let ctx = DeclCtx {
             name: declarator
                 .id
@@ -592,7 +676,7 @@ fn walk_variable_declaration<'a>(
     }
 }
 
-fn walk_binding_pattern<'a>(hooks: &mut dyn Hooks<'a>, pattern: &'a BindingPattern<'a>) {
+fn walk_binding_pattern<'a, H: Hooks<'a>>(hooks: &mut H, pattern: &'a BindingPattern<'a>) {
     match pattern {
         BindingPattern::BindingIdentifier(_) => {}
         BindingPattern::ObjectPattern(p) => {
@@ -623,7 +707,10 @@ fn walk_binding_pattern<'a>(hooks: &mut dyn Hooks<'a>, pattern: &'a BindingPatte
     }
 }
 
-fn walk_function<'a>(hooks: &mut dyn Hooks<'a>, function: &'a Function<'a>) {
+fn walk_function<'a, H: Hooks<'a>>(hooks: &mut H, function: &'a Function<'a>) {
+    if !hooks.wants(function.span) {
+        return;
+    }
     for param in &function.params.items {
         walk_binding_pattern(hooks, &param.pattern);
     }
@@ -637,7 +724,10 @@ fn walk_function<'a>(hooks: &mut dyn Hooks<'a>, function: &'a Function<'a>) {
     }
 }
 
-fn walk_class<'a>(hooks: &mut dyn Hooks<'a>, class: &'a oxc_ast::ast::Class<'a>) {
+fn walk_class<'a, H: Hooks<'a>>(hooks: &mut H, class: &'a oxc_ast::ast::Class<'a>) {
+    if !hooks.wants(class.span) {
+        return;
+    }
     if let Some(heritage) = &class.heritage {
         walk_expression(hooks, &heritage.expression, ExprParent::Other);
     }
@@ -676,8 +766,8 @@ fn walk_class<'a>(hooks: &mut dyn Hooks<'a>, class: &'a oxc_ast::ast::Class<'a>)
     }
 }
 
-fn walk_assignment_target<'a>(
-    hooks: &mut dyn Hooks<'a>,
+fn walk_assignment_target<'a, H: Hooks<'a>>(
+    hooks: &mut H,
     target: &'a oxc_ast::ast::AssignmentTarget<'a>,
 ) {
     use oxc_ast::ast::AssignmentTarget as At;
@@ -730,8 +820,8 @@ fn walk_assignment_target<'a>(
     }
 }
 
-fn walk_assignment_target_maybe<'a>(
-    hooks: &mut dyn Hooks<'a>,
+fn walk_assignment_target_maybe<'a, H: Hooks<'a>>(
+    hooks: &mut H,
     target: &'a oxc_ast::ast::AssignmentTargetMaybeDefault<'a>,
 ) {
     use oxc_ast::ast::AssignmentTargetMaybeDefault as Atd;
@@ -748,8 +838,8 @@ fn walk_assignment_target_maybe<'a>(
     }
 }
 
-fn walk_member_static<'a>(
-    hooks: &mut dyn Hooks<'a>,
+fn walk_member_static<'a, H: Hooks<'a>>(
+    hooks: &mut H,
     m: &'a oxc_ast::ast::StaticMemberExpression<'a>,
     expr: Option<&'a Expression<'a>>,
 ) {
@@ -766,8 +856,8 @@ fn walk_member_static<'a>(
     }
 }
 
-fn walk_member_computed<'a>(
-    hooks: &mut dyn Hooks<'a>,
+fn walk_member_computed<'a, H: Hooks<'a>>(
+    hooks: &mut H,
     m: &'a oxc_ast::ast::ComputedMemberExpression<'a>,
     expr: Option<&'a Expression<'a>>,
 ) {
@@ -785,7 +875,14 @@ fn walk_member_computed<'a>(
     walk_expression(hooks, &m.expression, ExprParent::Other);
 }
 
-fn walk_call<'a>(hooks: &mut dyn Hooks<'a>, call: &'a CallExpression<'a>, parent: ExprParent<'_>) {
+fn walk_call<'a, H: Hooks<'a>>(
+    hooks: &mut H,
+    call: &'a CallExpression<'a>,
+    parent: ExprParent<'_>,
+) {
+    if !hooks.wants(call.span) {
+        return;
+    }
     match hooks.call(call, parent) {
         Flow::Skip => return,
         Flow::Walk => walk_expression(hooks, &call.callee, ExprParent::Other),
@@ -794,7 +891,7 @@ fn walk_call<'a>(hooks: &mut dyn Hooks<'a>, call: &'a CallExpression<'a>, parent
     walk_arguments(hooks, &call.arguments);
 }
 
-fn walk_arguments<'a>(hooks: &mut dyn Hooks<'a>, arguments: &'a [Argument<'a>]) {
+fn walk_arguments<'a, H: Hooks<'a>>(hooks: &mut H, arguments: &'a [Argument<'a>]) {
     for argument in arguments {
         match argument {
             Argument::SpreadElement(spread) => {
@@ -809,8 +906,8 @@ fn walk_arguments<'a>(hooks: &mut dyn Hooks<'a>, arguments: &'a [Argument<'a>]) 
     }
 }
 
-fn walk_expression<'a>(
-    hooks: &mut dyn Hooks<'a>,
+fn walk_expression<'a, H: Hooks<'a>>(
+    hooks: &mut H,
     expr: &'a Expression<'a>,
     parent: ExprParent<'_>,
 ) {
@@ -836,6 +933,9 @@ fn walk_expression<'a>(
         }
         Expression::Identifier(id) => hooks.identifier(id.name.as_str(), id.span),
         Expression::ArrayExpression(arr) => {
+            if !hooks.wants(arr.span) {
+                return;
+            }
             for element in &arr.elements {
                 match element {
                     ArrayExpressionElement::Elision(_) => {}
@@ -851,6 +951,9 @@ fn walk_expression<'a>(
             }
         }
         Expression::ArrowFunctionExpression(arrow) => {
+            if !hooks.wants(arrow.span) {
+                return;
+            }
             for param in &arrow.params.items {
                 walk_binding_pattern(hooks, &param.pattern);
             }
@@ -905,6 +1008,9 @@ fn walk_expression<'a>(
             walk_arguments(hooks, &n.arguments);
         }
         Expression::ObjectExpression(o) => {
+            if !hooks.wants(o.span) {
+                return;
+            }
             for property in &o.properties {
                 match property {
                     ObjectPropertyKind::ObjectProperty(p) => {
@@ -977,7 +1083,7 @@ fn walk_expression<'a>(
 
 // Optional-chain tails are OptionalMemberExpression/OptionalCallExpression in
 // babel, so member/call hooks never fire for the links themselves.
-fn walk_chain<'a>(hooks: &mut dyn Hooks<'a>, element: &'a ChainElement<'a>) {
+fn walk_chain<'a, H: Hooks<'a>>(hooks: &mut H, element: &'a ChainElement<'a>) {
     match element {
         ChainElement::CallExpression(call) => {
             walk_expression(hooks, &call.callee, ExprParent::Other);
@@ -999,7 +1105,10 @@ fn walk_chain<'a>(hooks: &mut dyn Hooks<'a>, element: &'a ChainElement<'a>) {
     }
 }
 
-fn walk_jsx_element<'a>(hooks: &mut dyn Hooks<'a>, el: &'a JSXElement<'a>) {
+fn walk_jsx_element<'a, H: Hooks<'a>>(hooks: &mut H, el: &'a JSXElement<'a>) {
+    if !hooks.wants(el.span) {
+        return;
+    }
     hooks.jsx_opening(&el.opening_element);
     for item in &el.opening_element.attributes {
         match item {
@@ -1018,11 +1127,14 @@ fn walk_jsx_element<'a>(hooks: &mut dyn Hooks<'a>, el: &'a JSXElement<'a>) {
     walk_jsx_children(hooks, &el.children);
 }
 
-fn walk_jsx_fragment<'a>(hooks: &mut dyn Hooks<'a>, fragment: &'a JSXFragment<'a>) {
+fn walk_jsx_fragment<'a, H: Hooks<'a>>(hooks: &mut H, fragment: &'a JSXFragment<'a>) {
+    if !hooks.wants(fragment.span) {
+        return;
+    }
     walk_jsx_children(hooks, &fragment.children);
 }
 
-fn walk_jsx_children<'a>(hooks: &mut dyn Hooks<'a>, children: &'a [JSXChild<'a>]) {
+fn walk_jsx_children<'a, H: Hooks<'a>>(hooks: &mut H, children: &'a [JSXChild<'a>]) {
     for child in children {
         match child {
             JSXChild::Text(_) => {}
@@ -1038,7 +1150,7 @@ fn walk_jsx_children<'a>(hooks: &mut dyn Hooks<'a>, children: &'a [JSXChild<'a>]
     }
 }
 
-fn walk_jsx_attribute_value<'a>(hooks: &mut dyn Hooks<'a>, value: &'a JSXAttributeValue<'a>) {
+fn walk_jsx_attribute_value<'a, H: Hooks<'a>>(hooks: &mut H, value: &'a JSXAttributeValue<'a>) {
     match value {
         JSXAttributeValue::StringLiteral(_) => {}
         JSXAttributeValue::ExpressionContainer(container) => {
@@ -1049,7 +1161,7 @@ fn walk_jsx_attribute_value<'a>(hooks: &mut dyn Hooks<'a>, value: &'a JSXAttribu
     }
 }
 
-fn walk_jsx_expression<'a>(hooks: &mut dyn Hooks<'a>, expression: &'a JSXExpression<'a>) {
+fn walk_jsx_expression<'a, H: Hooks<'a>>(hooks: &mut H, expression: &'a JSXExpression<'a>) {
     match expression {
         JSXExpression::EmptyExpression(_) => {}
         other => {
@@ -1169,6 +1281,9 @@ struct Shared<'a, 'env> {
     /// False on the splice path: the plan would be dropped unread, and its
     /// recording clones compiled maps and object values per site.
     build_plan: bool,
+    /// Shared by every props()/attrs() evaluation: its inputs (import table,
+    /// env) are fixed for the compile.
+    props_registry: Option<FunctionRegistry>,
     error: Option<StylexError>,
 }
 
@@ -1209,17 +1324,26 @@ pub fn transform_module<'a>(
         atom_dynamic_callees: BTreeSet::new(),
         plan: AstPlan::default(),
         build_plan,
+        props_registry: None,
         error: None,
     };
+    let index = pass_a_index(shared.state, source);
     {
-        let mut pass = PassA { s: &mut shared };
+        let mut pass = PassA {
+            s: &mut shared,
+            index,
+        };
         walk_program(&mut pass, program);
     }
     if let Some(error) = shared.error.take() {
         return Err(error);
     }
+    let index = pass_b1_index(shared.state, &shared.style_map);
     {
-        let mut pass = PassB1 { s: &mut shared };
+        let mut pass = PassB1 {
+            s: &mut shared,
+            index,
+        };
         walk_program(&mut pass, program);
     }
     if !shared.state.imports.atom_imports.is_empty()
@@ -1234,8 +1358,12 @@ pub fn transform_module<'a>(
     if let Some(error) = shared.error.take() {
         return Err(error);
     }
+    let index = pass_b2_index(shared.state, &shared.sx_sites);
     {
-        let mut pass = PassB2 { s: &mut shared };
+        let mut pass = PassB2 {
+            s: &mut shared,
+            index,
+        };
         walk_program(&mut pass, program);
     }
     if let Some(error) = shared.error.take() {
@@ -1370,8 +1498,9 @@ fn prologue_text(stmt: &PrologueStmt) -> String {
 }
 
 fn print_parens(map: &JsObjectMap) -> String {
-    let mut out = String::from("(");
-    crate::transform::js_out::write_object(map, &mut out);
+    let mut out = String::with_capacity(estimate_object_len(map) + 2);
+    out.push('(');
+    write_object(map, &mut out);
     out.push(')');
     out
 }
@@ -1381,7 +1510,9 @@ fn print_create_parens(map: &JsObjectMap, dynamic: &[(String, String)]) -> Strin
     if dynamic.is_empty() {
         return print_parens(map);
     }
-    let mut out = String::from("({");
+    let arrows: usize = dynamic.iter().map(|(_, arrow)| arrow.len()).sum();
+    let mut out = String::with_capacity(estimate_object_len(map) + arrows + 2);
+    out.push_str("({");
     for (i, (key, value)) in map.entries().enumerate() {
         if i > 0 {
             out.push_str(", ");
@@ -1425,6 +1556,15 @@ impl<'a, 'env> Shared<'a, 'env> {
     fn push_edit(&mut self, edit: Edit) -> usize {
         self.edits.push(Some(edit));
         self.edits.len() - 1
+    }
+
+    /// Plan mode reads only edit spans (DCE, take_edits_within), never text.
+    fn splice_text(&self, print: impl FnOnce() -> String) -> String {
+        if self.build_plan {
+            String::new()
+        } else {
+            print()
+        }
     }
 
     fn in_dead(&self, span: Span) -> bool {
@@ -1623,10 +1763,9 @@ impl<'a, 'env> Shared<'a, 'env> {
                 None
             } else {
                 let uid = self.generate_uid("temp", call_node);
-                let idx = self.push_edit(Edit::insert(
-                    stmt_start,
-                    format!("const {uid} = {};\n", print_static_chunk(&dc)),
-                ));
+                let text =
+                    self.splice_text(|| format!("const {uid} = {};\n", print_static_chunk(&dc)));
+                let idx = self.push_edit(Edit::insert(stmt_start, text));
                 hoist_edit_idxs.push(idx);
                 if self.build_plan {
                     self.plan.inserts.push(InsertOp {
@@ -1641,10 +1780,12 @@ impl<'a, 'env> Shared<'a, 'env> {
                 }
                 Some(uid)
             };
-            dynamic.push((
-                ns.clone(),
-                print_dynamic_arrow(&dc, self.source, static_ident.as_deref()),
-            ));
+            if !self.build_plan {
+                dynamic.push((
+                    ns.clone(),
+                    print_dynamic_arrow(&dc, self.source, static_ident.as_deref()),
+                ));
+            }
             dynamic_entries.push(DynamicEntry {
                 namespace: ns.clone(),
                 compiled: dc,
@@ -1677,20 +1818,18 @@ impl<'a, 'env> Shared<'a, 'env> {
                 ));
                 plan_idx
             });
-            let edit_idx = self.push_edit(Edit::replace(
-                call.span,
-                print_create_parens(&out.compiled, &dynamic),
-            ));
+            let text = self.splice_text(|| print_create_parens(&out.compiled, &dynamic));
+            let edit_idx = self.push_edit(Edit::replace(call.span, text));
             (edit_idx, plan_idx)
         } else {
             let uid = self.generate_uid("styles", call_node);
-            let hoist_idx = self.push_edit(Edit::insert(
-                stmt_start,
+            let text = self.splice_text(|| {
                 format!(
                     "const {uid} = {};\n",
                     print_create_parens(&out.compiled, &dynamic)
-                ),
-            ));
+                )
+            });
+            let hoist_idx = self.push_edit(Edit::insert(stmt_start, text));
             if self.build_plan {
                 self.plan.inserts.push(InsertOp {
                     anchor: stmt_start,
@@ -1750,7 +1889,7 @@ impl<'a, 'env> Shared<'a, 'env> {
             evaluator.eval(arg_expr)
         };
         let value = match outcome {
-            Ok(EvalOutcome::Value(v)) => to_eval_value(&v),
+            Ok(EvalOutcome::Value(v)) => into_eval_value(v),
             Ok(EvalOutcome::NonStatic(_)) => {
                 return self.fail(StylexError::non_static_value("keyframes"));
             }
@@ -1761,7 +1900,8 @@ impl<'a, 'env> Shared<'a, 'env> {
             Err(error) => return self.fail(error),
         };
         self.register_rules(vec![rule], call);
-        self.push_edit(Edit::replace(call.span, js_string_literal(&name)));
+        let text = self.splice_text(|| js_string_literal(&name));
+        self.push_edit(Edit::replace(call.span, text));
         self.plan
             .replace_exprs
             .push((call.span, SynthExpr::Str(name.clone())));
@@ -1776,7 +1916,8 @@ impl<'a, 'env> Shared<'a, 'env> {
             return self.fail(StylexError::illegal_argument_length("defaultMarker", 0));
         }
         let object = Arc::new(default_marker_object(self.state.options));
-        self.push_edit(Edit::replace(call.span, print_parens(&object)));
+        let text = self.splice_text(|| print_parens(&object));
+        self.push_edit(Edit::replace(call.span, text));
         if self.build_plan {
             self.plan.replace_exprs.push((
                 call.span,
@@ -1809,7 +1950,8 @@ impl<'a, 'env> Shared<'a, 'env> {
             return self.fail(StylexError::cannot_generate_hash("defineMarker"));
         };
         let object = Arc::new(define_marker_object(&file, &name, self.state.options));
-        self.push_edit(Edit::replace(call.span, print_parens(&object)));
+        let text = self.splice_text(|| print_parens(&object));
+        self.push_edit(Edit::replace(call.span, text));
         if self.build_plan {
             self.plan.replace_exprs.push((
                 call.span,
@@ -1846,7 +1988,7 @@ impl<'a, 'env> Shared<'a, 'env> {
             evaluator.eval(arg_expr)
         };
         let value = match outcome {
-            Ok(EvalOutcome::Value(v)) => to_eval_value(&v),
+            Ok(EvalOutcome::Value(v)) => into_eval_value(v),
             Ok(EvalOutcome::NonStatic(_)) => {
                 return self.fail(StylexError::non_static_value("defineConsts"));
             }
@@ -1872,11 +2014,12 @@ impl<'a, 'env> Shared<'a, 'env> {
             if let EvalValue::Num(n) = source_value
                 && !n.is_finite()
             {
-                rule.const_val = non_finite_to_tag(*n);
+                rule.const_val = non_finite_to_tag(*n).map(Box::new);
             }
         }
         self.register_rules(out.rules, call);
-        self.push_edit(Edit::replace(call.span, print_parens(&out.js_output)));
+        let text = self.splice_text(|| print_parens(&out.js_output));
+        self.push_edit(Edit::replace(call.span, text));
         if self.build_plan {
             self.plan.replace_exprs.push((
                 call.span,
@@ -1930,10 +2073,8 @@ impl<'a, 'env> Shared<'a, 'env> {
             let callee = self.inject_callee(node, site_offset);
             let anchor = self.state.program_statement_start(node);
             for rule in &rules {
-                let idx = self.push_edit(Edit::insert(
-                    anchor,
-                    format!("{callee}({});\n", print_inject_arg(rule)),
-                ));
+                let text = self.splice_text(|| inject_call_text(&callee, rule));
+                let idx = self.push_edit(Edit::insert(anchor, text));
                 self.inject_edits.insert(idx);
                 if self.build_plan {
                     self.plan.inserts.push(InsertOp {
@@ -1971,7 +2112,7 @@ impl<'a, 'env> Shared<'a, 'env> {
             evaluator.eval(arg_expr)
         };
         let value = match outcome {
-            Ok(EvalOutcome::Value(v)) => to_eval_value(&v),
+            Ok(EvalOutcome::Value(v)) => into_eval_value(v),
             Ok(EvalOutcome::NonStatic(_)) => {
                 return self.fail(StylexError::non_static_value("positionTry"));
             }
@@ -1982,12 +2123,8 @@ impl<'a, 'env> Shared<'a, 'env> {
             Err(error) => return self.fail(error),
         };
         self.register_rules(vec![rule], call);
-        self.finish_replacement(
-            ctx,
-            call.span,
-            EvalValue::Str(name.clone()),
-            js_string_literal(&name),
-        );
+        let text = self.splice_text(|| js_string_literal(&name));
+        self.finish_replacement(ctx, call.span, EvalValue::Str(name), text);
     }
 
     fn transform_view_transition(&mut self, call: &'a CallExpression<'a>, ctx: &DeclCtx) {
@@ -2013,7 +2150,7 @@ impl<'a, 'env> Shared<'a, 'env> {
             evaluator.eval(arg_expr)
         };
         let value = match outcome {
-            Ok(EvalOutcome::Value(v)) => to_eval_value(&v),
+            Ok(EvalOutcome::Value(v)) => into_eval_value(v),
             Ok(EvalOutcome::NonStatic(_)) => {
                 return self.fail(StylexError::non_static_value("viewTransitionClass"));
             }
@@ -2024,12 +2161,8 @@ impl<'a, 'env> Shared<'a, 'env> {
             Err(error) => return self.fail(error),
         };
         self.drain_injected_then(vec![rule], call);
-        self.finish_replacement(
-            ctx,
-            call.span,
-            EvalValue::Str(name.clone()),
-            js_string_literal(&name),
-        );
+        let text = self.splice_text(|| js_string_literal(&name));
+        self.finish_replacement(ctx, call.span, EvalValue::Str(name), text);
     }
 
     fn transform_define_vars(&mut self, call: &'a CallExpression<'a>, parent: ExprParent<'_>) {
@@ -2074,7 +2207,7 @@ impl<'a, 'env> Shared<'a, 'env> {
             }
         };
         self.drain_injected_then(output.rules, call);
-        let text = print_parens(&output.js_output);
+        let text = self.splice_text(|| print_parens(&output.js_output));
         self.finish_replacement(
             &ctx,
             call.span,
@@ -2108,7 +2241,7 @@ impl<'a, 'env> Shared<'a, 'env> {
             self.state.options,
         );
         self.drain_injected_then(output.rules, call);
-        let text = print_parens(&js_output);
+        let text = self.splice_text(|| print_parens(&js_output));
         self.finish_replacement(&ctx, call.span, EvalValue::Obj(Arc::new(js_output)), text);
     }
 
@@ -2230,7 +2363,7 @@ impl<'a, 'env> Shared<'a, 'env> {
         };
         let js_output = nest_define_vars_js_output(&output.js_output);
         self.drain_injected_then(output.rules, call);
-        let text = print_parens(&js_output);
+        let text = self.splice_text(|| print_parens(&js_output));
         self.finish_replacement(&ctx, call.span, EvalValue::Obj(Arc::new(js_output)), text);
     }
 
@@ -2263,7 +2396,7 @@ impl<'a, 'env> Shared<'a, 'env> {
             evaluator.eval(arg_expr)
         };
         let value = match outcome {
-            Ok(EvalOutcome::Value(v)) => to_eval_value(&v),
+            Ok(EvalOutcome::Value(v)) => into_eval_value(v),
             Ok(EvalOutcome::NonStatic(_)) => {
                 return self.fail(StylexError::non_static_value(API));
             }
@@ -2285,12 +2418,12 @@ impl<'a, 'env> Shared<'a, 'env> {
                 if let EvalValue::Num(n) = source_value
                     && !n.is_finite()
                 {
-                    rule.const_val = non_finite_to_tag(*n);
+                    rule.const_val = non_finite_to_tag(*n).map(Box::new);
                 }
             }
         }
         self.register_rules(output.rules, call);
-        let text = print_parens(&output.js_output);
+        let text = self.splice_text(|| print_parens(&output.js_output));
         self.finish_replacement(
             &ctx,
             call.span,
@@ -2336,7 +2469,7 @@ impl<'a, 'env> Shared<'a, 'env> {
         };
         // parity: the __varGroupHash__ check runs before the overrides evaluate.
         let var_group_hash = match &theme_vars {
-            JsValue::Proxy(proxy) => proxy.var_group_hash.clone(),
+            JsValue::Proxy(proxy) => proxy.var_group_hash().to_string(),
             JsValue::Obj(obj) => match obj.get("__varGroupHash__") {
                 Some(JsValue::Str(s)) if !s.is_empty() => s.clone(),
                 _ => return self.fail(StylexError::nested_theme_invalid_vars()),
@@ -2399,8 +2532,8 @@ impl<'a, 'env> Shared<'a, 'env> {
             Err(error) => return self.fail(error),
         };
         let output = match create_theme(
-            &from_eval_value(&EvalValue::Obj(Arc::new(flat_theme_vars))),
-            &from_eval_value(&EvalValue::Obj(Arc::new(flat_overrides))),
+            &into_js_value(EvalValue::Obj(Arc::new(flat_theme_vars))),
+            &into_js_value(EvalValue::Obj(Arc::new(flat_overrides))),
             self.state.options,
         ) {
             Ok(out) => out,
@@ -2413,7 +2546,7 @@ impl<'a, 'env> Shared<'a, 'env> {
             self.state.options,
         );
         self.drain_injected_then(output.rules, call);
-        let text = print_parens(&js_output);
+        let text = self.splice_text(|| print_parens(&js_output));
         self.finish_replacement(&ctx, call.span, EvalValue::Obj(Arc::new(js_output)), text);
     }
 
@@ -2459,7 +2592,8 @@ impl<'a, 'env> Shared<'a, 'env> {
             ));
             plan_idx
         });
-        let edit_idx = self.push_edit(Edit::replace(info.span, print_parens(&compiled)));
+        let text = self.splice_text(|| print_parens(&compiled));
+        let edit_idx = self.push_edit(Edit::replace(info.span, text));
         self.dead_spans.push(info.span);
         self.atom_static_sites.push(AtomStaticSite {
             span: info.span,
@@ -2503,17 +2637,18 @@ impl<'a, 'env> Shared<'a, 'env> {
         let (prop_key, class_name) = (prop_key.to_string(), class_name.clone());
         let uid = self.generate_uid("temp", node);
         let anchor = self.state.program_statement_start(node);
-        let hoist_idx = self.push_edit(Edit::insert(
-            anchor,
+        let text = self.splice_text(|| {
             format!(
                 "const {uid} = {{{property}: _v => [{{{key}: _v != null ? {class} : _v, \"$$css\": true}}, {{{var}: _v != null ? _v : undefined}}]}};\n",
                 key = js_string_literal(&prop_key),
                 class = js_string_literal(&class_name),
                 var = js_string_literal(&var_name),
-            ),
-        ));
+            )
+        });
+        let hoist_idx = self.push_edit(Edit::insert(anchor, text));
         let callee_span = call.callee.span();
-        self.push_edit(Edit::replace(callee_span, format!("{uid}.{property}")));
+        let text = self.splice_text(|| format!("{uid}.{property}"));
+        self.push_edit(Edit::replace(callee_span, text));
         self.atom_dynamic_callees.insert(callee_span);
         if self.build_plan {
             self.plan.inserts.push(InsertOp {
@@ -2655,15 +2790,19 @@ impl<'a, 'env> Shared<'a, 'env> {
     fn push_prologue_group(&mut self, site_offset: u32, group: Vec<PrologueStmt>) {
         self.prologue_groups.push((site_offset, group));
         let offset = self.import_insert_offset;
-        let mut block: String = self
-            .prologue_statements()
-            .iter()
-            .map(prologue_text)
-            .collect();
-        // Empty program body: land on a fresh line after the directive prologue.
-        if offset > 0 && !self.source[..offset as usize].ends_with('\n') {
-            block = format!("\n{block}");
-        }
+        let block = self.splice_text(|| {
+            let block: String = self
+                .prologue_statements()
+                .iter()
+                .map(prologue_text)
+                .collect();
+            // Empty program body: land on a fresh line after the directive prologue.
+            if offset > 0 && !self.source[..offset as usize].ends_with('\n') {
+                format!("\n{block}")
+            } else {
+                block
+            }
+        });
         let idx = self.prologue_edit.expect("slot 0 is reserved at init");
         self.edits[idx] = Some(Edit::insert(offset, block));
     }
@@ -2686,9 +2825,12 @@ impl<'a, 'env> Shared<'a, 'env> {
     // ---- pass B2: props()/attrs() and the sx spread ------------------------
 
     fn props_eval(&mut self, expr: &'a Expression<'a>) -> Result<EvalOutcome, StylexError> {
-        let registry = FunctionRegistry::for_props(&self.state.imports, &self.state.options.env);
+        let _t = crate::timings::start(crate::timings::Stage::Eval);
+        let registry = self.props_registry.get_or_insert_with(|| {
+            FunctionRegistry::for_props(&self.state.imports, &self.state.options.env)
+        });
         let mut evaluator =
-            Evaluator::with_registry(&mut *self.state, self.fs, &RealCallables, registry, true);
+            Evaluator::with_registry_ref(&mut *self.state, self.fs, &RealCallables, registry, true);
         evaluator.eval(expr)
     }
 
@@ -2731,7 +2873,7 @@ impl<'a, 'env> Shared<'a, 'env> {
             EvalOutcome::NonStatic(_) => Ok(NullableStyle::Other),
             EvalOutcome::Value(JsValue::Proxy(_)) => Ok(NullableStyle::Other),
             EvalOutcome::Value(v) => {
-                let value = to_eval_value(&v);
+                let value = into_eval_value(v);
                 match &value {
                     EvalValue::Obj(map)
                         if map.get("__IS_PROXY") == Some(&EvalValue::Bool(true)) =>
@@ -2848,27 +2990,27 @@ impl<'a, 'env> Shared<'a, 'env> {
     }
 
     fn table_text(&self, entries: &[(u32, EvalValue)], tests: &[Span], inner: &[Edit]) -> String {
+        use std::fmt::Write;
         let n = tests.len();
-        let body: Vec<String> = entries
-            .iter()
-            .map(|(key, leaf)| {
-                let mut out = format!("{key}: ");
-                write_value(leaf, &mut out);
-                out
-            })
-            .collect();
-        let lookup: Vec<String> = tests
-            .iter()
-            .enumerate()
-            .map(|(i, span)| {
-                format!(
-                    "!!({}) << {}",
-                    render_span(self.source, *span, inner),
-                    n - 1 - i
-                )
-            })
-            .collect();
-        format!("({{{}}}[{}])", body.join(", "), lookup.join(" | "))
+        let mut out = String::from("({");
+        for (i, (key, leaf)) in entries.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            let _ = write!(out, "{key}: ");
+            write_value(leaf, &mut out);
+        }
+        out.push_str("}[");
+        for (i, span) in tests.iter().enumerate() {
+            if i > 0 {
+                out.push_str(" | ");
+            }
+            out.push_str("!!(");
+            out.push_str(&render_span(self.source, *span, inner));
+            let _ = write!(out, ") << {}", n - 1 - i);
+        }
+        out.push_str("])");
+        out
     }
 
     fn process_props_call(
@@ -2906,13 +3048,15 @@ impl<'a, 'env> Shared<'a, 'env> {
                     && !map.is_empty()
                 {
                     let _ = self.take_edits_within(attr_span);
-                    self.push_edit(Edit::replace(attr_span, jsx_attrs_text(&map)));
+                    let text = self.splice_text(|| jsx_attrs_text(&map));
+                    self.push_edit(Edit::replace(attr_span, text));
                     if self.build_plan {
                         self.plan.jsx_ops.push((attr_span, JsxOp::Attrs(map)));
                     }
                 } else {
                     let _ = self.take_edits_within(call.span);
-                    self.push_edit(Edit::replace(call.span, print_parens(&map)));
+                    let text = self.splice_text(|| print_parens(&map));
+                    self.push_edit(Edit::replace(call.span, text));
                     if self.build_plan {
                         self.plan.replace_exprs.push((
                             call.span,
@@ -2925,7 +3069,8 @@ impl<'a, 'env> Shared<'a, 'env> {
             MergePlan::Table(entries) => {
                 let entries = object_leaves(entries);
                 let inner = self.take_edits_within(call.span);
-                let text = self.table_text(&entries, &classified.tests, &inner);
+                let text =
+                    self.splice_text(|| self.table_text(&entries, &classified.tests, &inner));
                 self.push_edit(Edit::replace(call.span, text));
                 if self.build_plan {
                     self.plan.replace_exprs.push((
@@ -2962,7 +3107,8 @@ impl<'a, 'env> Shared<'a, 'env> {
             }
             MergePlan::Inlined(class_name) => {
                 let _ = self.take_edits_within(call.span);
-                self.push_edit(Edit::replace(call.span, js_string_literal(&class_name)));
+                let text = self.splice_text(|| js_string_literal(&class_name));
+                self.push_edit(Edit::replace(call.span, text));
                 if self.build_plan {
                     self.plan
                         .replace_exprs
@@ -2976,7 +3122,8 @@ impl<'a, 'env> Shared<'a, 'env> {
                     .map(|(key, class_name)| (key, EvalValue::Str(class_name)))
                     .collect();
                 let inner = self.take_edits_within(call.span);
-                let text = self.table_text(&entries, &classified.tests, &inner);
+                let text =
+                    self.splice_text(|| self.table_text(&entries, &classified.tests, &inner));
                 self.push_edit(Edit::replace(call.span, text));
                 if self.build_plan {
                     self.plan.replace_exprs.push((
@@ -3023,11 +3170,13 @@ impl<'a, 'env> Shared<'a, 'env> {
             }
             MergePlan::Inlined(map) => {
                 let _ = self.take_edits_within(attr_span);
-                let text = if map.is_empty() {
-                    "{...({})}".to_string()
-                } else {
-                    jsx_attrs_text(&map)
-                };
+                let text = self.splice_text(|| {
+                    if map.is_empty() {
+                        "{...({})}".to_string()
+                    } else {
+                        jsx_attrs_text(&map)
+                    }
+                });
                 self.push_edit(Edit::replace(attr_span, text));
                 if self.build_plan {
                     let op = if map.is_empty() {
@@ -3042,8 +3191,11 @@ impl<'a, 'env> Shared<'a, 'env> {
             MergePlan::Table(entries) => {
                 let entries = object_leaves(entries);
                 let inner = self.take_edits_within(attr_span);
-                let table = self.table_text(&entries, &classified.tests, &inner);
-                self.push_edit(Edit::replace(attr_span, format!("{{...{table}}}")));
+                let text = self.splice_text(|| {
+                    let table = self.table_text(&entries, &classified.tests, &inner);
+                    format!("{{...{table}}}")
+                });
+                self.push_edit(Edit::replace(attr_span, text));
                 if self.build_plan {
                     self.plan.jsx_ops.push((
                         attr_span,
@@ -3078,10 +3230,9 @@ impl<'a, 'env> Shared<'a, 'env> {
                     (site.span, site.node_id, site.edit_idx, site.plan_idx);
                 let compiled = site.compiled.clone();
                 let uid = self.generate_uid("temp", node_id);
-                let hoist_idx = self.push_edit(Edit::insert(
-                    anchor,
-                    format!("const {uid} = {};\n", print_parens(&compiled)),
-                ));
+                let text =
+                    self.splice_text(|| format!("const {uid} = {};\n", print_parens(&compiled)));
+                let hoist_idx = self.push_edit(Edit::insert(anchor, text));
                 self.edits[edit_idx] = Some(Edit::replace(span, uid.clone()));
                 if self.build_plan {
                     if let Some(plan_idx) = plan_idx {
@@ -3158,7 +3309,7 @@ impl<'a, 'env> Shared<'a, 'env> {
             EvalOutcome::Value(JsValue::Proxy(_)) => Ok(MemberEval::NonStatic),
             EvalOutcome::Value(v) if is_nullish(&v) => Ok(MemberEval::NonStatic),
             EvalOutcome::Value(v) => {
-                let value = to_eval_value(&v);
+                let value = into_eval_value(v);
                 if let EvalValue::Obj(map) = &value
                     && map.get("__IS_PROXY") == Some(&EvalValue::Bool(true))
                 {
@@ -3175,11 +3326,11 @@ impl<'a, 'env> Shared<'a, 'env> {
         let sites = std::mem::take(&mut self.sx_sites);
         for site in sites.iter().filter(|s| s.bailed.get()) {
             let inner = self.take_edits_within(site.attr_span);
-            let rendered = render_span(self.source, site.expr.span(), &inner);
-            self.push_edit(Edit::replace(
-                site.attr_span,
-                format!("{{...{}.props({})}}", site.local, rendered),
-            ));
+            let text = self.splice_text(|| {
+                let rendered = render_span(self.source, site.expr.span(), &inner);
+                format!("{{...{}.props({})}}", site.local, rendered)
+            });
+            self.push_edit(Edit::replace(site.attr_span, text));
             if self.build_plan {
                 self.plan.jsx_ops.push((
                     site.attr_span,
@@ -3215,13 +3366,10 @@ impl<'a, 'env> Shared<'a, 'env> {
             match dce_action(name, &site.compiled, site.exported, &vars, &self.tuples) {
                 DceAction::KeepAll => {}
                 DceAction::Prune(map) => {
-                    if let Some(slot) = self.edits.get_mut(site.edit_idx)
-                        && slot.is_some()
-                    {
-                        *slot = Some(Edit::replace(
-                            site.span,
-                            print_create_parens(&map, &site.dynamic),
-                        ));
+                    let live = self.edits.get(site.edit_idx).is_some_and(Option::is_some);
+                    if live {
+                        let text = self.splice_text(|| print_create_parens(&map, &site.dynamic));
+                        self.edits[site.edit_idx] = Some(Edit::replace(site.span, text));
                         if let Some(plan_idx) = site.plan_idx
                             && let Some((_, synth)) = self.plan.replace_exprs.get_mut(plan_idx)
                         {
@@ -3304,7 +3452,7 @@ impl<'a, 'env> Shared<'a, 'env> {
                     rewritten
                 }
             };
-            let text = js_string_literal(&rewritten);
+            let text = self.splice_text(|| js_string_literal(&rewritten));
             self.push_edit(Edit::replace(decl.source.span, text));
             if self.build_plan {
                 self.plan.import_sources.push((decl.source.span, rewritten));
@@ -3318,11 +3466,14 @@ impl<'a, 'env> Shared<'a, 'env> {
     fn insert_treeshake_imports(&mut self, rewrites: &BTreeMap<String, String>) {
         let imports = self.state.treeshake_imports.clone();
         for import in imports {
-            let raw = match rewrites.get(&import.specifier) {
-                Some(rewritten) => js_string_literal(rewritten),
-                None => render_span(self.source, import.source_span, &[]),
-            };
-            let idx = self.push_edit(Edit::insert(import.decl_start, format!("import {raw};\n")));
+            let text = self.splice_text(|| {
+                let raw = match rewrites.get(&import.specifier) {
+                    Some(rewritten) => js_string_literal(rewritten),
+                    None => render_span(self.source, import.source_span, &[]),
+                };
+                format!("import {raw};\n")
+            });
+            let idx = self.push_edit(Edit::insert(import.decl_start, text));
             if self.build_plan {
                 self.plan.inserts.push(InsertOp {
                     anchor: import.decl_start,
@@ -3444,11 +3595,16 @@ fn flatten_into<'a>(expr: &'a Expression<'a>, flat: &mut Vec<FlatArg<'a>>) {
 
 struct PassA<'w, 'a, 'env> {
     s: &'w mut Shared<'a, 'env>,
+    index: SiteIndex,
 }
 
 impl<'a> Hooks<'a> for PassA<'_, 'a, '_> {
     fn done(&self) -> bool {
         self.s.error.is_some()
+    }
+
+    fn wants(&self, span: Span) -> bool {
+        self.index.any_in(span)
     }
 
     fn call(&mut self, call: &'a CallExpression<'a>, parent: ExprParent<'_>) -> Flow {
@@ -3570,11 +3726,16 @@ impl<'a> Hooks<'a> for PassA<'_, 'a, '_> {
 
 struct PassB1<'w, 'a, 'env> {
     s: &'w mut Shared<'a, 'env>,
+    index: SiteIndex,
 }
 
 impl<'a> Hooks<'a> for PassB1<'_, 'a, '_> {
     fn done(&self) -> bool {
         false
+    }
+
+    fn wants(&self, span: Span) -> bool {
+        self.index.any_in(span)
     }
 
     fn call(&mut self, call: &'a CallExpression<'a>, _parent: ExprParent<'_>) -> Flow {
@@ -3697,11 +3858,16 @@ impl<'a> Hooks<'a> for PassAtoms<'_, 'a, '_> {
 
 struct PassB2<'w, 'a, 'env> {
     s: &'w mut Shared<'a, 'env>,
+    index: SiteIndex,
 }
 
 impl<'a> Hooks<'a> for PassB2<'_, 'a, '_> {
     fn done(&self) -> bool {
         self.s.error.is_some()
+    }
+
+    fn wants(&self, span: Span) -> bool {
+        self.index.any_in(span)
     }
 
     fn call(&mut self, call: &'a CallExpression<'a>, parent: ExprParent<'_>) -> Flow {
@@ -3831,5 +3997,188 @@ mod tests {
                 assert!(pair[0].end <= pair[1].start, "overlap: {spans:?}");
             }
         }
+    }
+
+    struct IdentifierRecorder {
+        index: Option<SiteIndex>,
+        seen: Vec<(String, u32)>,
+    }
+
+    impl Hooks<'_> for IdentifierRecorder {
+        fn done(&self) -> bool {
+            false
+        }
+
+        fn wants(&self, span: Span) -> bool {
+            self.index.as_ref().is_none_or(|index| index.any_in(span))
+        }
+
+        fn identifier(&mut self, name: &str, span: Span) {
+            self.seen.push((name.to_string(), span.start));
+        }
+    }
+
+    fn corpus_sources() -> Vec<(String, String)> {
+        let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../conformance"));
+        let mut out = Vec::new();
+        // Vendored copies of this crate ship without the conformance corpus.
+        let Ok(dirs) = std::fs::read_dir(root.join("corpus")) else {
+            return out;
+        };
+        for dir in dirs {
+            let Ok(entries) = std::fs::read_dir(dir.unwrap().path()) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if !path.to_string_lossy().ends_with(".jobs.json") {
+                    continue;
+                }
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                for job in parsed["jobs"].as_array().expect("jobs array") {
+                    // `sourceFile` corpora are fetched on demand; skip what is absent.
+                    let source = match job.get("source").and_then(|s| s.as_str()) {
+                        Some(source) => source.to_string(),
+                        None => match std::fs::read_to_string(
+                            root.join(job["sourceFile"].as_str().expect("source or sourceFile")),
+                        ) {
+                            Ok(source) => source,
+                            Err(_) => continue,
+                        },
+                    };
+                    let filename = job["filename"].as_str().unwrap_or("input.tsx");
+                    out.push((filename.to_string(), source));
+                }
+            }
+        }
+        out
+    }
+
+    struct PassACallRecorder<'s, 'a> {
+        state: &'s CompileState<'a>,
+        spans: Vec<Span>,
+    }
+
+    impl<'a> Hooks<'a> for PassACallRecorder<'_, 'a> {
+        fn done(&self) -> bool {
+            false
+        }
+
+        fn call(&mut self, call: &'a CallExpression<'a>, _parent: ExprParent<'_>) -> Flow {
+            if !matches!(
+                call_kind(call, self.state),
+                None | Some(CallKind::Props | CallKind::Attrs | CallKind::LegacyMerge)
+            ) {
+                self.spans.push(call.span);
+            }
+            Flow::Walk
+        }
+    }
+
+    /// Pass A's index, filtered to API-member callees, still opens every call
+    /// its hook acts on.
+    #[test]
+    fn pass_a_index_opens_every_pass_a_call() {
+        let options = crate::options::CompilerOptions::from_json(&serde_json::json!({}))
+            .unwrap()
+            .resolve()
+            .unwrap();
+        let mut checked = 0usize;
+        let sources = corpus_sources();
+        if sources.is_empty() {
+            eprintln!(
+                "skipping pass_a_index_opens_every_pass_a_call: conformance corpus not vendored"
+            );
+            return;
+        }
+        for (filename, source) in sources {
+            let allocator = oxc_allocator::Allocator::default();
+            let Ok(program) = crate::api::parse_program(&allocator, &source, &filename) else {
+                continue;
+            };
+            let Ok(state) = CompileState::build(&program, &options, None, String::new()) else {
+                continue;
+            };
+            let index = pass_a_index(&state, &source);
+            let mut recorder = PassACallRecorder {
+                state: &state,
+                spans: Vec::new(),
+            };
+            walk_program(&mut recorder, &program);
+            for span in recorder.spans {
+                assert!(
+                    index.any_in(span),
+                    "{filename}: pass-A call at {} is not indexed",
+                    span.start
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 500, "only {checked} calls checked");
+    }
+
+    /// A walk pruned by one name's reference index fires the identifier hook
+    /// for that name exactly where the unpruned walk does.
+    #[test]
+    fn pruned_walk_reaches_every_identifier_of_the_indexed_name() {
+        let options = crate::options::CompilerOptions::from_json(&serde_json::json!({}))
+            .unwrap()
+            .resolve()
+            .unwrap();
+        let mut checked = 0usize;
+        let sources = corpus_sources();
+        if sources.is_empty() {
+            eprintln!(
+                "skipping pruned_walk_reaches_every_identifier_of_the_indexed_name: conformance corpus not vendored"
+            );
+            return;
+        }
+        for (filename, source) in sources {
+            let allocator = oxc_allocator::Allocator::default();
+            let Ok(program) = crate::api::parse_program(&allocator, &source, &filename) else {
+                continue;
+            };
+            let state = CompileState::build_with_imports(
+                &program,
+                &options,
+                None,
+                String::new(),
+                crate::imports::ImportTable::default(),
+            );
+            let mut full = IdentifierRecorder {
+                index: None,
+                seen: Vec::new(),
+            };
+            walk_program(&mut full, &program);
+            let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+            for (name, _) in &full.seen {
+                *counts.entry(name.as_str()).or_default() += 1;
+            }
+            let mut names: Vec<(&str, usize)> = counts.into_iter().collect();
+            names.sort_by_key(|&(name, count)| (count, name));
+            for (name, _) in names.into_iter().take(30) {
+                let mut pruned = IdentifierRecorder {
+                    index: Some(SiteIndex {
+                        starts: state.reference_starts(&[name]),
+                    }),
+                    seen: Vec::new(),
+                };
+                walk_program(&mut pruned, &program);
+                let of_name = |seen: &[(String, u32)]| -> Vec<u32> {
+                    seen.iter()
+                        .filter(|(n, _)| n == name)
+                        .map(|(_, start)| *start)
+                        .collect()
+                };
+                assert_eq!(
+                    of_name(&pruned.seen),
+                    of_name(&full.seen),
+                    "{filename}: pruned walk misses `{name}`"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 1_000, "only {checked} names checked");
     }
 }

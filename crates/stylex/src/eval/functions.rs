@@ -129,9 +129,7 @@ pub fn vars_registry(imports: &ImportTable, env: &EvalValue) -> FunctionRegistry
             ("positionTry", StylexCallable::PositionTry),
             ("unstable_conditional", StylexCallable::Conditional),
         ] {
-            registry
-                .member_callables
-                .insert((namespace.clone(), name.to_string()), callable);
+            registry.add_member_callable(namespace, name, callable);
         }
     }
     registry
@@ -144,7 +142,7 @@ pub fn register_self_reference(
     export_name: &str,
     proxy: VarGroupProxy,
 ) {
-    ev.registry.identifiers.insert(
+    ev.registry.to_mut().identifiers.insert(
         export_name.to_string(),
         RegistryEntry::Value(JsValue::proxy(proxy)),
     );
@@ -435,18 +433,20 @@ impl<'p> DepTracker<'p> {
             let value = args.get(i).cloned().unwrap_or(JsValue::Undefined);
             let previous = ev
                 .registry
+                .to_mut()
                 .identifiers
                 .insert(name.clone(), RegistryEntry::Value(value));
             saved.push((name.clone(), previous));
         }
         let result = self.walk(ev, body);
+        let identifiers = &mut ev.registry.to_mut().identifiers;
         for (name, previous) in saved.into_iter().rev() {
             match previous {
                 Some(entry) => {
-                    ev.registry.identifiers.insert(name, entry);
+                    identifiers.insert(name, entry);
                 }
                 None => {
-                    ev.registry.identifiers.remove(&name);
+                    identifiers.remove(&name);
                 }
             }
         }
@@ -502,8 +502,8 @@ impl<'p> DepTracker<'p> {
                 let object_name = object.name.as_str();
                 let is_member_callable = ev
                     .registry
-                    .member_callables
-                    .contains_key(&(object_name.to_string(), property.clone()));
+                    .member_callable(object_name, &property)
+                    .is_some();
                 if !is_member_callable
                     && is_valid_callee(object_name)
                     && !is_invalid_method(&property)
