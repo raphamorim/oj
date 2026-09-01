@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, isAbsolute, join, resolve as pathResolve } from "node:path";
 import readline from "node:readline";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { EventEmitter } from "node:events";
 
 const pluginsPath = process.argv[2];
 const initial = JSON.parse(process.argv[3] ?? "{}");
@@ -630,6 +631,33 @@ async function buildEnvironments(server) {
   return environments;
 }
 
+// On a source edit oj POSTs the changed paths to /__oj_invalidate; invalidate the
+// affected modules in each DevEnvironment's graph and tell its runner to reload,
+// so the plugin's Miniflare/workerd re-fetches changed modules (Vite's watcher
+// does this itself; oj drives it since it owns the file watcher).
+function invalidateEnvironments(environments, watcher, paths) {
+  for (const file of paths) {
+    try { watcher.emit("change", file); } catch {}
+  }
+  if (!environments) return;
+  for (const env of Object.values(environments)) {
+    if (!env) continue;
+    try {
+      const mg = env.moduleGraph;
+      for (const file of paths) {
+        if (mg && typeof mg.getModulesByFile === "function") {
+          const mods = mg.getModulesByFile(file);
+          if (mods) for (const m of mods) mg.invalidateModule && mg.invalidateModule(m);
+        }
+        if (mg && typeof mg.onFileChange === "function") mg.onFileChange(file);
+      }
+      if (env.hot && typeof env.hot.send === "function") env.hot.send({ type: "full-reload" });
+    } catch (e) {
+      process.stderr.write(`${OJ} plugin host: invalidate failed: ${(e && e.message) || e}\n`);
+    }
+  }
+}
+
 async function setupConfigureServer() {
   const stack = [];
   function runStack(req, res, done) {
@@ -672,13 +700,14 @@ async function setupConfigureServer() {
   };
   middlewares.stack = stack;
   const noop = () => {};
+  const fileWatcher = Object.assign(new EventEmitter(), { add: noop, unwatch: noop, close: noop });
   const server = {
     config: resolvedConfig,
     middlewares,
     httpServer: null,
     ws: wsApi,
     hot: wsApi,
-    watcher: { on: noop, off: noop, add: noop, unwatch: noop, close: noop, emit: () => true, removeAllListeners: noop },
+    watcher: fileWatcher,
     moduleGraph: { getModuleById: () => null, getModulesByFile: () => null, invalidateModule: noop, onFileChange: noop },
     restart: async () => {},
     close: async () => {},
@@ -718,7 +747,21 @@ async function setupConfigureServer() {
   }
   if (stack.length === 0) return;
 
-  const srv = http.createServer((req, res) => middlewares(req, res));
+  const srv = http.createServer((req, res) => {
+    if (req.method === "POST" && req.url === "/__oj_invalidate") {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        let paths = [];
+        try { paths = JSON.parse(body || "{}").paths || []; } catch {}
+        invalidateEnvironments(server.environments, fileWatcher, paths);
+        res.statusCode = 204;
+        res.end();
+      });
+      return;
+    }
+    middlewares(req, res);
+  });
   await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
   middlewarePort = srv.address().port;
   process.stderr.write(`${OJ} plugin host: configureServer middleware on :${middlewarePort}\n`);

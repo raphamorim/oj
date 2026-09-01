@@ -1474,6 +1474,21 @@ async fn forward_to_plugin_middleware(
 // middleware falls through (x-oj-fallthrough), so the caller can fall back to
 // SSR. Used by the TanStack start path, where GET requests are otherwise
 // SSR'd and would never reach editor endpoints (the dev-server bridge).
+// Tell a plugin's configureServer middleware server that source files changed,
+// so it can invalidate the DevEnvironments' module graphs and reload the worker
+// runner (the Cloudflare-plugin HMR path). Fire-and-forget.
+pub async fn notify_plugin_mw_invalidate(port: u16, paths: &[String]) {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = CLIENT.get_or_init(reqwest::Client::new);
+    let body = serde_json::json!({ "paths": paths }).to_string();
+    let _ = client
+        .post(format!("http://127.0.0.1:{port}/__oj_invalidate"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await;
+}
+
 // Method+body version of forward_get_to_plugin_mw, for the /_serverFn/ path so
 // server functions reach a Cloudflare plugin's worker (Miniflare) like documents
 // do, instead of running in the Node runner without the real runtime/bindings.

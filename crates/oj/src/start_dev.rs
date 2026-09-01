@@ -330,6 +330,10 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             let _ = state.ws_tx.send(oj_server::update_progress_frame(
                 batch, "watch", 0, 0, None, false,
             ));
+            let changed_paths: Vec<String> = paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
             rt.block_on(async {
                 let (r, c) = (root.clone(), cache.clone());
                 let client = tokio::task::spawn_blocking(move || {
@@ -341,6 +345,11 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
                         None => oj_cache::start_bundle::PinnedBundle::from_build_dir(&c),
                     }
                 });
+                // Invalidate the plugin's worker DevEnvironments so a Cloudflare
+                // app re-renders with the changed modules (not stale SSR).
+                if let Some(port) = state.plugin_mw_port {
+                    oj_server::notify_plugin_mw_invalidate(port, &changed_paths).await;
+                }
                 let (pinned, _) = tokio::join!(client, reload_runner(&state));
                 if let Ok(Some(pinned)) = pinned {
                     *state.bundle.write().unwrap() = Arc::new(pinned);
