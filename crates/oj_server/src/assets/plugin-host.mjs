@@ -624,7 +624,7 @@ async function buildEnvironments(server) {
     }
   }
   for (const [name, ei] of Object.entries(environments)) {
-    try { if (ei && typeof ei.init === "function") await ei.init(); }
+    try { if (ei && typeof ei.init === "function") await ei.init({ watcher: server.watcher }); }
     catch (e) { process.stderr.write(`${OJ} plugin host: env.init(${name}) failed: ${(e && e.message) || e}\n`); }
   }
   return environments;
@@ -682,7 +682,7 @@ async function setupConfigureServer() {
     moduleGraph: { getModuleById: () => null, getModulesByFile: () => null, invalidateModule: noop, onFileChange: noop },
     restart: async () => {},
     close: async () => {},
-    transformIndexHtml: async (_p, html) => html,
+    transformIndexHtml: async (_url, html) => transformIndexHtml(html),
     transformRequest: async () => null,
     ssrLoadModule: async () => {
       throw new Error("oj: server.ssrLoadModule is not available in configureServer");
