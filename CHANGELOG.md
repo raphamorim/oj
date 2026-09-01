@@ -5,7 +5,7 @@ All notable changes to oj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.11] - 2026-09-01
 
 ### Changed
 - Cloudflare (TanStack Start) apps are now served by honoring the app's own `@cloudflare/vite-plugin` through Vite's dev Environment API, instead of oj driving `workerd` itself. oj's native workerd driver is removed (the `workerd`/`workerd_dev` modules, the HTTP module-fallback server, the plugin-loader sidecar, and the `wrangler` config parser). When `@cloudflare/vite-plugin` is present, the Node plugin host loads the app's installed Vite (oj takes no Vite dependency of its own), builds real `DevEnvironment`s via each environment's `dev.createEnvironment`, and lets the plugin drive Miniflare/workerd; documents and server functions both run in the worker with real vars/bindings, exactly as `vite dev` runs it. Without the plugin, SSR runs in the Node runner sidecar. Known limitations of the plugin path: a source edit does not yet invalidate the worker's module runner (server-side changes need an `oj dev` restart; client changes reload normally), and worker WebSocket upgrades are not proxied.
