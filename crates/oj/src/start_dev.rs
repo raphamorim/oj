@@ -113,10 +113,12 @@ pub async fn start_dev(
     } else {
         None
     };
-    let workerd = spawn_workerd_if_cloudflare(&root, &cache).await;
-    let worker_url = workerd.as_ref().map(|w| w.session.worker_url());
-    let worker_reload = workerd.as_ref().map(|w| w.session.reload.clone());
-    let worker_cache = workerd.as_ref().map(|w| w.session.cache.clone());
+    if oj_server::workerd::is_cloudflare_app(&root) {
+        eprintln!("oj: cloudflare app; serving SSR through the node runner sidecar");
+    }
+    let worker_url: Option<String> = None;
+    let worker_reload: Option<Arc<oj_server::workerd_dev::WorkerReload>> = None;
+    let worker_cache: Option<Arc<oj_server::workerd::ModuleCache>> = None;
     let state = Arc::new(StartState {
         proxy_prefixes: built.proxy_prefixes.clone(),
         plugin_mw_port: built.plugin_mw_port,
@@ -595,83 +597,6 @@ fn run_node(root: &Path, script: &Path, what: &str) -> anyhow::Result<()> {
 
 async fn spawn_start_runner(root: &Path, cache: &Path) -> anyhow::Result<Runner> {
     spawn_node_service(root, &cache.join("runner.mjs")).await
-}
-
-struct WorkerdGuard {
-    session: oj_server::workerd_dev::WorkerdSession,
-    _loader: tokio::process::Child,
-}
-
-async fn spawn_workerd_if_cloudflare(root: &Path, cache: &Path) -> Option<WorkerdGuard> {
-    if !oj_server::workerd::is_cloudflare_app(root) {
-        return None;
-    }
-    let Some(bin) = oj_server::workerd::find_workerd(root) else {
-        eprintln!("oj: cloudflare app detected but no workerd binary found; using node ssr");
-        return None;
-    };
-    let (loader_child, loader_url) = match spawn_plugin_loader(root, cache).await {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("oj: workerd plugin-loader failed to start ({e}); using node ssr");
-            return None;
-        }
-    };
-    let aliases = oj_server::workerd_dev::start_aliases(root, cache);
-    let cfg = oj_server::wrangler::load(root);
-    let entry = cache.join("server-entry.tsx");
-    let opts = oj_server::workerd_dev::WorkerdSpawn::from_wrangler(
-        cfg,
-        entry.to_string_lossy().into_owned(),
-    );
-    match oj_server::workerd_dev::spawn(root, &bin, cache, aliases, Some(loader_url), opts).await {
-        Ok(session) => {
-            eprintln!("oj: cloudflare dev via native workerd at {}", session.worker_url());
-            Some(WorkerdGuard { session, _loader: loader_child })
-        }
-        Err(e) => {
-            eprintln!("oj: workerd failed to start ({e}); using node ssr");
-            None
-        }
-    }
-}
-
-async fn spawn_plugin_loader(
-    root: &Path,
-    cache: &Path,
-) -> anyhow::Result<(tokio::process::Child, String)> {
-    let mut cmd = tokio::process::Command::new("node");
-    cmd.arg(cache.join("workerd-plugin-loader.mjs"))
-        .arg("0")
-        .env("OJ_APP_ROOT", root)
-        .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
-        .env("NODE_ENV", "development")
-        .env("OJ_SSR_BRIDGE_DIR", oj_server::plugins::ssr_bridge_dir(root))
-        .current_dir(root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true);
-    let mut child = cmd.spawn()?;
-    let Some(stdout) = child.stdout.take() else {
-        anyhow::bail!("plugin loader stdout was not piped");
-    };
-    let mut lines = BufReader::new(stdout).lines();
-    let port = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        while let Ok(Some(line)) = lines.next_line().await {
-            if let Some(p) = line.strip_prefix("OJ_LOADER_PORT=") {
-                return p.trim().parse::<u16>().ok();
-            }
-        }
-        None
-    })
-    .await
-    .ok()
-    .flatten();
-    tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
-    match port {
-        Some(p) => Ok((child, format!("http://127.0.0.1:{p}/"))),
-        None => anyhow::bail!("plugin loader did not report a port"),
-    }
 }
 
 async fn spawn_node_service(root: &Path, script: &Path) -> anyhow::Result<Runner> {
