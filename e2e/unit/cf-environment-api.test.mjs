@@ -101,3 +101,45 @@ test("cloudflare-style plugin gets server.environments (built from the app's Vit
     fx.cleanup();
   }
 });
+
+test("a non-cloudflare plugin set does not trigger environment construction (normal apps unaffected)", async () => {
+  const fx = tmpProject({ prefix: "oj-cf-noenv-" });
+  // No Vite in node_modules and no cloudflare plugin: buildEnvironments must not
+  // run, server.environments stays undefined, and nothing throws.
+  fx.write(
+    "oj.plugins.mjs",
+    `let seen = {};
+     export default [{
+       name: "plain-plugin",
+       configureServer(server) {
+         seen.environmentsUndefined = server.environments === undefined;
+         seen.middlewaresCallable = typeof server.middlewares === "function";
+       },
+       transform(code, id) {
+         if (id.endsWith("probe.js")) return "export default " + JSON.stringify(seen) + ";";
+         return null;
+       },
+     }];\n`,
+  );
+  const host = rpcSidecar("plugin-host.mjs", {
+    args: [
+      path.join(fx.root, "oj.plugins.mjs"),
+      JSON.stringify({
+        config: { root: fx.root },
+        env: { command: "serve", mode: "development" },
+        environment: { name: "client" },
+      }),
+    ],
+    env: { OJ_CACHE_ROOT: fx.root },
+    cwd: fx.root,
+  });
+  try {
+    const res = await host.send({ id: 1, hook: "transform", args: ["", path.join(fx.root, "probe.js")] });
+    const seen = JSON.parse(JSON.parse(res.result).code.replace(/^export default /, "").replace(/;$/, ""));
+    assert.equal(seen.environmentsUndefined, true, "no environments built for a non-cloudflare app");
+    assert.equal(seen.middlewaresCallable, true, "callable middlewares still provided to every app");
+  } finally {
+    host.close();
+    fx.cleanup();
+  }
+});
