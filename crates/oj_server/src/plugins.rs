@@ -601,8 +601,9 @@ impl PluginHost {
         &self,
         code: &str,
         id: &str,
+        resolved: &str,
     ) -> Result<(String, Vec<String>, Vec<String>, Vec<ChunkEmit>), String> {
-        let Some(raw) = self.call("transform", &[code, id]).await? else {
+        let Some(raw) = self.call("transform", &[code, id, resolved]).await? else {
             return Ok((code.to_string(), Vec::new(), Vec::new(), Vec::new()));
         };
         match serde_json::from_str::<serde_json::Value>(&raw) {
@@ -811,6 +812,16 @@ impl PluginHost {
             .flatten()
             .map(|s| s == "true")
             .unwrap_or(true)
+    }
+
+    /// The `filter.code` include patterns of every object-form transform hook, as
+    /// regex source strings. oj gates dependency transforms on these so it only
+    /// hands a dep to the transform RPC when a transform's own filter wants it.
+    pub async fn dep_transform_filters(&self) -> Vec<String> {
+        let Ok(Some(raw)) = self.call("getDepTransformFilters", &[]).await else {
+            return Vec::new();
+        };
+        serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default()
     }
 
     /// Which HMR hooks any active plugin defines: (watchChange, handleHotUpdate).

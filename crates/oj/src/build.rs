@@ -557,7 +557,7 @@ impl Plugin for OjCssPlugin {
                     .get_or_init(|| async { host.has_transform().await })
                     .await;
                 if on {
-                    if let Ok((out, _, _, _)) = host.transform(&source, &id).await {
+                    if let Ok((out, _, _, _)) = host.transform(&source, &id, "{}").await {
                         source = out;
                     }
                 }
@@ -1040,7 +1040,7 @@ impl Plugin for OjUserPlugin {
         let code = args.code.to_string();
         let id = args.id.to_string();
         async move {
-            match host.transform(&code, &id).await {
+            match host.transform(&code, &id, "{}").await {
                 Ok((out, _, _, chunks)) => {
                     forward_emitted_chunks(&ctx.inner, &chunks, &emit);
                     if out != code {

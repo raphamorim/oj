@@ -1938,6 +1938,7 @@ dependencies = [
  "oj_env",
  "oj_graph",
  "oj_resolver",
+ "regex",
  "reqwest",
  "rolldown",
  "rolldown_common",

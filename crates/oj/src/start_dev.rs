@@ -654,8 +654,10 @@ async fn compile_css(host: &Arc<tokio::sync::Mutex<Runner>>, path: &Path) -> Opt
     v.get("css").and_then(|c| c.as_str()).map(|s| s.to_owned())
 }
 
+#[derive(Debug, PartialEq)]
 enum Route {
     Document,
+    Api,
     Pass,
 }
 
@@ -673,7 +675,7 @@ fn classify(req: &Request, proxy_prefixes: &[String]) -> Route {
     }
     match *req.method() {
         Method::GET => Route::Document,
-        _ => Route::Pass,
+        _ => Route::Api,
     }
 }
 
@@ -716,36 +718,7 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
         return serve_client_chunk(&state, name).await;
     }
     if req.uri().path().starts_with("/_serverFn/") {
-        let method = req.method().to_string();
-        let url = req
-            .uri()
-            .path_and_query()
-            .map(|p| p.as_str())
-            .unwrap_or("/")
-            .to_string();
-        let header_map = req.headers().clone();
-        let body_bytes = axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024)
-            .await
-            .ok();
-        // A Cloudflare-plugin app's Miniflare handles every request; route server
-        // functions through it so they run in the worker (real runtime/bindings),
-        // like documents do. Falls back to the Node runner otherwise.
-        if let Some(port) = state.plugin_mw_port {
-            if let Some(resp) = oj_server::forward_to_plugin_mw(
-                port,
-                &method,
-                &url,
-                &header_map,
-                body_bytes.as_ref().map(|b| b.to_vec()),
-            )
-            .await
-            {
-                return resp;
-            }
-        }
-        let headers = collect_headers(&header_map);
-        let body = body_bytes.map(|b| String::from_utf8_lossy(&b).into_owned());
-        return forward(&state.runner, method, url, headers, body).await;
+        return forward_with_body(&state, req).await;
     }
     match classify(&req, &state.proxy_prefixes) {
         Route::Document => {
@@ -768,8 +741,39 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
             }
             forward(&state.runner, "GET".into(), document_url(&raw), vec![], None).await
         }
+        Route::Api => forward_with_body(&state, req).await,
         Route::Pass => next.run(req).await,
     }
+}
+
+async fn forward_with_body(state: &Arc<StartState>, req: Request) -> Response {
+    let method = req.method().to_string();
+    let url = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/")
+        .to_string();
+    let header_map = req.headers().clone();
+    let body_bytes = axum::body::to_bytes(req.into_body(), 100 * 1024 * 1024)
+        .await
+        .ok();
+    if let Some(port) = state.plugin_mw_port {
+        if let Some(resp) = oj_server::forward_to_plugin_mw(
+            port,
+            &method,
+            &url,
+            &header_map,
+            body_bytes.as_ref().map(|b| b.to_vec()),
+        )
+        .await
+        {
+            return resp;
+        }
+    }
+    let headers = collect_headers(&header_map);
+    let body = body_bytes.map(|b| String::from_utf8_lossy(&b).into_owned());
+    forward(&state.runner, method, url, headers, body).await
 }
 
 async fn serve_client_chunk(state: &StartState, name: &str) -> Response {
@@ -1169,12 +1173,28 @@ mod tests {
             Route::Pass
         ));
         assert!(matches!(
-            classify(&req("POST", "/about"), &no_proxy),
+            classify(&req("POST", "/api/auth/session-v2"), &no_proxy),
+            Route::Api
+        ));
+        assert!(matches!(
+            classify(&req("PUT", "/api/thing"), &no_proxy),
+            Route::Api
+        ));
+        assert!(matches!(
+            classify(&req("DELETE", "/api/thing"), &no_proxy),
+            Route::Api
+        ));
+        assert!(matches!(
+            classify(&req("POST", "/main.js"), &no_proxy),
             Route::Pass
         ));
         let proxy = vec!["/api".to_string()];
         assert!(matches!(
             classify(&req("GET", "/api/users"), &proxy),
+            Route::Pass
+        ));
+        assert!(matches!(
+            classify(&req("POST", "/api/users"), &proxy),
             Route::Pass
         ));
     }

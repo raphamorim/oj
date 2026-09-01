@@ -410,6 +410,10 @@ const moduleInfoCache = new Map();
 
 const watchedFiles = new Set();
 const transformWatchStore = new AsyncLocalStorage();
+// Per-transform map of oj-resolved imports (spec -> id) the Rust side computes and
+// passes in, so a plugin's `this.resolve` during transform is a local lookup rather
+// than a host round-trip. ctx.resolve consults it first.
+const transformResolveStore = new AsyncLocalStorage();
 const seenIds = new Set();
 
 // this.parse is synchronous in Rollup, so resolve Vite's parseAst (re-exported
@@ -430,6 +434,12 @@ const ctx = {
     throw typeof m === "string" ? new Error(m) : m;
   },
   async resolve(source, importer) {
+    if (source === "/@react-refresh") return { id: "/@oj/refresh-runtime.js" };
+    const map = transformResolveStore.getStore();
+    if (map && map.has(source)) {
+      const id = map.get(source);
+      return id == null ? null : { id };
+    }
     const id = await ctxRpc("resolve", [source, importer ?? ""]);
     return id == null ? null : { id };
   },
@@ -708,7 +718,7 @@ async function setupConfigureServer() {
     ws: wsApi,
     hot: wsApi,
     watcher: fileWatcher,
-    moduleGraph: { getModuleById: () => null, getModulesByFile: () => null, invalidateModule: noop, onFileChange: noop },
+    moduleGraph: { getModuleById: () => null, getModuleByUrl: async () => null, getModulesByFile: () => null, invalidateModule: noop, onFileChange: noop },
     restart: async () => {},
     close: async () => {},
     transformIndexHtml: async (_url, html) => transformIndexHtml(html),
@@ -795,38 +805,49 @@ if (ssrBridgeDir) {
   })();
 }
 
-async function transform(code, id) {
+async function transform(code, id, resolvedJson) {
   const bucket = new Set();
   const chunkBucket = [];
+  let resolveMap = null;
+  if (resolvedJson) {
+    try {
+      resolveMap = new Map(Object.entries(JSON.parse(resolvedJson)));
+    } catch {}
+  }
+  const runLoop = async () => {
+    if (id) seenIds.add(id);
+    let current = code;
+    const maps = [];
+    const transformOptions = { ssr: environment && environment.name === "ssr" };
+    for (const p of plugins) {
+      const handler = hookHandler(p.transform);
+      if (!handler || !hookTransformMatches(p.transform, id, current)) continue;
+      const r = await handler.call(ctx, current, id, transformOptions);
+      if (r == null) continue;
+      if (typeof r === "string") {
+        current = r;
+        continue;
+      }
+      if (r.code != null) current = r.code;
+      if (r.map != null) maps.push(typeof r.map === "string" ? r.map : JSON.stringify(r.map));
+    }
+    const info = { id, code: current, importedIds: [] };
+    moduleInfoCache.set(id, info);
+    seenIds.add(id);
+    for (const p of plugins) {
+      if (typeof p.moduleParsed === "function") await p.moduleParsed.call(ctx, info);
+    }
+    return JSON.stringify({
+      code: current,
+      watchFiles: [...bucket],
+      maps,
+      emittedChunks: chunkBucket,
+    });
+  };
   return transformWatchStore.run(bucket, () =>
-    transformEmitStore.run(chunkBucket, async () => {
-      if (id) seenIds.add(id);
-      let current = code;
-      const maps = [];
-      for (const p of plugins) {
-        if (typeof p.transform !== "function") continue;
-        const r = await p.transform.call(ctx, current, id);
-        if (r == null) continue;
-        if (typeof r === "string") {
-          current = r;
-          continue;
-        }
-        if (r.code != null) current = r.code;
-        if (r.map != null) maps.push(typeof r.map === "string" ? r.map : JSON.stringify(r.map));
-      }
-      const info = { id, code: current, importedIds: [] };
-      moduleInfoCache.set(id, info);
-      seenIds.add(id);
-      for (const p of plugins) {
-        if (typeof p.moduleParsed === "function") await p.moduleParsed.call(ctx, info);
-      }
-      return JSON.stringify({
-        code: current,
-        watchFiles: [...bucket],
-        maps,
-        emittedChunks: chunkBucket,
-      });
-    }),
+    transformEmitStore.run(chunkBucket, () =>
+      transformResolveStore.run(resolveMap, runLoop),
+    ),
   );
 }
 
@@ -849,10 +870,55 @@ async function watchChange(id, event) {
   return null;
 }
 
+// resolveId/load can be a bare function or Vite's object form { filter, handler }
+// (createVirtualModule, import-protection, and others use it). Unwrap the handler
+// and honor filter.id so a hook only runs for the ids it opts into, as Vite does.
+function hookHandler(hook) {
+  if (typeof hook === "function") return hook;
+  if (hook && typeof hook.handler === "function") return hook.handler;
+  return null;
+}
+
+function matchOne(pattern, id) {
+  if (pattern instanceof RegExp) return pattern.test(id);
+  if (typeof pattern === "string") return pattern === id;
+  return false;
+}
+
+function matchList(patterns, id) {
+  if (patterns == null) return false;
+  return (Array.isArray(patterns) ? patterns : [patterns]).some((p) => matchOne(p, id));
+}
+
+function stringFilterMatches(spec, value) {
+  if (spec == null) return true;
+  if (spec instanceof RegExp || typeof spec === "string" || Array.isArray(spec)) {
+    return matchList(spec, value);
+  }
+  if (spec.exclude != null && matchList(spec.exclude, value)) return false;
+  if (spec.include != null) return matchList(spec.include, value);
+  return true;
+}
+
+function hookIdMatches(hook, id) {
+  const f = hook && typeof hook === "object" ? hook.filter : null;
+  return !f || stringFilterMatches(f.id, id);
+}
+
+function hookTransformMatches(hook, id, code) {
+  const f = hook && typeof hook === "object" ? hook.filter : null;
+  if (!f) return true;
+  if (!stringFilterMatches(f.id, id)) return false;
+  if (f.code != null && !stringFilterMatches(f.code, code)) return false;
+  return true;
+}
+
 async function resolveId(source, importer) {
+  const options = { scan: false, isEntry: false, custom: {}, attributes: {} };
   for (const p of plugins) {
-    if (typeof p.resolveId !== "function") continue;
-    const r = await p.resolveId.call(ctx, source, importer || undefined);
+    const handler = hookHandler(p.resolveId);
+    if (!handler || !hookIdMatches(p.resolveId, source)) continue;
+    const r = await handler.call(ctx, source, importer || undefined, options);
     if (r == null) continue;
     return typeof r === "string" ? r : (r.id ?? null);
   }
@@ -861,8 +927,9 @@ async function resolveId(source, importer) {
 
 async function load(id) {
   for (const p of plugins) {
-    if (typeof p.load !== "function") continue;
-    const r = await p.load.call(ctx, id);
+    const handler = hookHandler(p.load);
+    if (!handler || !hookIdMatches(p.load, id)) continue;
+    const r = await handler.call(ctx, id);
     if (r == null) continue;
     return typeof r === "string" ? r : (r.code ?? null);
   }
@@ -1047,7 +1114,7 @@ async function run(hook, args) {
     } catch {}
     return null;
   }
-  if (hook === "transform") return transform(args[0], args[1]);
+  if (hook === "transform") return transform(args[0], args[1], args[2]);
   if (hook === "resolveId") return resolveId(args[0], args[1]);
   if (hook === "load") return load(args[0]);
   if (hook === "handleHotUpdate") return handleHotUpdate(args[0], args[1], args[2], args[3]);
@@ -1085,6 +1152,27 @@ async function run(hook, args) {
       if (ssrEnvBase[k] !== v) delta[k] = v;
     }
     return JSON.stringify(delta);
+  }
+  if (hook === "getDepTransformFilters") {
+    // A transform's own `filter.code` include patterns. A dep is only worth
+    // transforming when its source matches one of these, so oj gates dep
+    // transforms on them (like Vite runs a transform only where its filter
+    // matches). Transforms with no code filter are app-scoped here (they no-op
+    // on deps), which keeps oj from an RPC per dependency module.
+    const pats = [];
+    for (const p of plugins) {
+      const t = p && p.transform;
+      const f = t && typeof t === "object" ? t.filter : null;
+      let inc = f && f.code;
+      if (inc && typeof inc === "object" && !(inc instanceof RegExp) && !Array.isArray(inc)) {
+        inc = inc.include;
+      }
+      for (const r of Array.isArray(inc) ? inc : inc != null ? [inc] : []) {
+        if (r instanceof RegExp) pats.push(r.source);
+        else if (typeof r === "string") pats.push(r.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+      }
+    }
+    return JSON.stringify(pats);
   }
   if (hook === "getHasTransform") {
     const has = plugins.some((p) => {
