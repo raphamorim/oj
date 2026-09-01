@@ -5,6 +5,11 @@ All notable changes to oj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- Cloudflare (TanStack Start) apps now render SSR through oj's Node runner sidecar, the same model Vite uses for dev SSR, instead of a native `workerd` process. The `workerd` driver, its HTTP module-fallback server, the plugin-loader sidecar, and the `wrangler` config parser are removed. The Node runner loads the app graph (including `node_modules`) natively, which boots faster and lighter than driving a separate workerd runtime; Cloudflare bindings that require the real runtime are not available in dev.
+
 ## [0.1.10] - 2026-09-01
 
 ### Fixed

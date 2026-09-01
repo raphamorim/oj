@@ -35,9 +35,6 @@ struct StartState {
     // only drives the app iframe's live reload).
     ws_tx: broadcast::Sender<String>,
     css_host: Option<Arc<tokio::sync::Mutex<Runner>>>,
-    worker_url: Option<String>,
-    worker_reload: Option<Arc<oj_server::workerd_dev::WorkerReload>>,
-    worker_cache: Option<Arc<oj_server::workerd::ModuleCache>>,
 }
 
 pub async fn start_dev(
@@ -113,12 +110,6 @@ pub async fn start_dev(
     } else {
         None
     };
-    if oj_server::workerd::is_cloudflare_app(&root) {
-        eprintln!("oj: cloudflare app; serving SSR through the node runner sidecar");
-    }
-    let worker_url: Option<String> = None;
-    let worker_reload: Option<Arc<oj_server::workerd_dev::WorkerReload>> = None;
-    let worker_cache: Option<Arc<oj_server::workerd::ModuleCache>> = None;
     let state = Arc::new(StartState {
         proxy_prefixes: built.proxy_prefixes.clone(),
         plugin_mw_port: built.plugin_mw_port,
@@ -130,9 +121,6 @@ pub async fn start_dev(
         reload_tx: reload_tx.clone(),
         ws_tx: built.reload_tx.clone(),
         css_host,
-        worker_url,
-        worker_reload,
-        worker_cache,
     });
 
     spawn_start_watcher(root.clone(), cache.clone(), Arc::clone(&state));
@@ -358,12 +346,6 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
                     *state.bundle.write().unwrap() = Arc::new(pinned);
                 }
             });
-            if let Some(cache) = &state.worker_cache {
-                oj_server::workerd::invalidate(cache, paths.iter().cloned());
-            }
-            if let Some(reload) = &state.worker_reload {
-                reload.bump();
-            }
             let _ = state.reload_tx.send(());
             let modules = client_module_count(&cache);
             let _ = state.ws_tx.send(oj_server::update_progress_frame(
@@ -736,19 +718,6 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
         let body_bytes = axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024)
             .await
             .ok();
-        if let Some(worker_url) = &state.worker_url {
-            if let Some(resp) = oj_server::forward_to_worker(
-                worker_url,
-                &method,
-                &url,
-                &header_map,
-                body_bytes.as_ref().map(|b| b.to_vec()),
-            )
-            .await
-            {
-                return resp;
-            }
-        }
         let headers = collect_headers(&header_map);
         let body = body_bytes.map(|b| String::from_utf8_lossy(&b).into_owned());
         return forward(&state.runner, method, url, headers, body).await;
@@ -768,13 +737,6 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
             if let Some(port) = state.plugin_mw_port {
                 if let Some(resp) =
                     oj_server::forward_get_to_plugin_mw(port, &raw, req.headers()).await
-                {
-                    return resp;
-                }
-            }
-            if let Some(worker_url) = &state.worker_url {
-                if let Some(resp) =
-                    oj_server::forward_get_to_worker(worker_url, &raw, req.headers()).await
                 {
                     return resp;
                 }
