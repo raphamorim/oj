@@ -718,6 +718,22 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
         let body_bytes = axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024)
             .await
             .ok();
+        // A Cloudflare-plugin app's Miniflare handles every request; route server
+        // functions through it so they run in the worker (real runtime/bindings),
+        // like documents do. Falls back to the Node runner otherwise.
+        if let Some(port) = state.plugin_mw_port {
+            if let Some(resp) = oj_server::forward_to_plugin_mw(
+                port,
+                &method,
+                &url,
+                &header_map,
+                body_bytes.as_ref().map(|b| b.to_vec()),
+            )
+            .await
+            {
+                return resp;
+            }
+        }
         let headers = collect_headers(&header_map);
         let body = body_bytes.map(|b| String::from_utf8_lossy(&b).into_owned());
         return forward(&state.runner, method, url, headers, body).await;
