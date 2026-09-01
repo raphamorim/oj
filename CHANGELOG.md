@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- Cloudflare (TanStack Start) apps now render SSR through oj's Node runner sidecar, the same model Vite uses for dev SSR, instead of a native `workerd` process. The `workerd` driver, its HTTP module-fallback server, the plugin-loader sidecar, and the `wrangler` config parser are removed. The Node runner loads the app graph (including `node_modules`) natively, which boots faster and lighter than driving a separate workerd runtime; Cloudflare bindings that require the real runtime are not available in dev.
+- Cloudflare (TanStack Start) apps are now served by honoring the app's own `@cloudflare/vite-plugin` through Vite's dev Environment API, instead of oj driving `workerd` itself. oj's native workerd driver is removed (the `workerd`/`workerd_dev` modules, the HTTP module-fallback server, the plugin-loader sidecar, and the `wrangler` config parser). When `@cloudflare/vite-plugin` is present, the Node plugin host loads the app's installed Vite (oj takes no Vite dependency of its own), builds real `DevEnvironment`s via each environment's `dev.createEnvironment`, and lets the plugin drive Miniflare/workerd; documents and server functions both run in the worker with real vars/bindings, exactly as `vite dev` runs it. Without the plugin, SSR runs in the Node runner sidecar. Known limitations of the plugin path: a source edit does not yet invalidate the worker's module runner (server-side changes need an `oj dev` restart; client changes reload normally), and worker WebSocket upgrades are not proxied.
 
 ## [0.1.10] - 2026-09-01
 
