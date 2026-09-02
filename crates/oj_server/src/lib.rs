@@ -1756,6 +1756,20 @@ async fn serve_path(
         let url = format!("{}?react", url_of(&state.root, &file));
         return serve_compiled(&state, &file, &url, None, &headers).await;
     }
+    // A plain `.svg` import (no `?react`, no `?url`) goes through the compile path so
+    // a configured `vite-plugin-svgr` can turn it into a React component (this app
+    // sets svgrOptions.exportType "default" + an include list, so every matching svg
+    // is imported as `import Icon from "./x.svg"`). serve_compiled runs the svgr
+    // transform; svgs the plugin does not match fall back to a URL asset there. A raw
+    // browser request (the Accept header wants the image) still serves the file.
+    if ext == "svg"
+        && state.plugins_have_transform
+        && query_asset_kind(uri.query()).is_none()
+        && !wants_raw_resource(&headers)
+    {
+        let url = url_of(&state.root, &file);
+        return serve_compiled(&state, &file, &url, uri.query(), &headers).await;
+    }
     if ext == "json" && !file.starts_with(&state.public_dir) {
         let url = url_of(&state.root, &file);
         return serve_compiled(&state, &file, &url, uri.query(), &headers).await;
@@ -1911,6 +1925,16 @@ async fn ensure_module(
             .split_once('?')
             .is_some_and(|(_, q)| q.split('&').any(|kv| kv == "react"));
     let is_svelte = file.extension().and_then(|e| e.to_str()) == Some("svelte");
+    // A plain `.svg` (no explicit `?url`/`?raw`) reaches here when a transform
+    // plugin might componentize it (vite-plugin-svgr). Route it through the transform
+    // pipeline instead of short-circuiting to a URL asset; the svgr transform decides
+    // per its own include filter, and an svg it does not match falls back to a URL
+    // asset after the transform runs.
+    let svgr_candidate = !react_svg
+        && !state.bundle
+        && state.plugins_have_transform
+        && file.extension().and_then(|e| e.to_str()) == Some("svg")
+        && query_asset_kind(url.split_once('?').map(|(_, q)| q)).is_none();
 
     if !react_svg && state.bundle {
         if let Some(kind) = query_asset_kind(url.split_once('?').map(|(_, q)| q)) {
@@ -1972,7 +1996,7 @@ async fn ensure_module(
         }
     }
 
-    if !react_svg && is_asset_path(file) {
+    if !react_svg && !svgr_candidate && is_asset_path(file) {
         let clean = url.split('?').next().unwrap_or(url);
         let default = format!(
             "export default {};\n",
@@ -2215,6 +2239,30 @@ async fn ensure_module(
     } else {
         source
     };
+    // The svgr plugin transform (if any) has run by now. If a plain `.svg` candidate
+    // is still raw markup, the plugin did not match it (not in its include list), so
+    // serve it as a URL asset like Vite; otherwise it is now component code compiled
+    // as `.svg.tsx` below.
+    let svgr_componentized = svgr_candidate && !source.trim_start().starts_with('<');
+    if svgr_candidate && !svgr_componentized {
+        let clean = url.split('?').next().unwrap_or(url);
+        let module = Arc::new(CachedModule {
+            is_boundary: false,
+            kind: String::new(),
+            code: format!(
+                "export default {};\n",
+                serde_json::Value::String(clean.to_string())
+            ),
+            map_data_url: None,
+            imports: Vec::new(),
+            require_map: Vec::new(),
+            css_exports: Vec::new(),
+            fs_allow: Vec::new(),
+            watch_files: Vec::new(),
+        });
+        register_in_graph(state, url, &module);
+        return Ok((String::new(), module));
+    }
     let source = if is_svelte {
         run_svelte_sidecar(state, url, &source)
             .await
@@ -2231,7 +2279,7 @@ async fn ensure_module(
         state.virtual_modules.keys().cloned().collect();
     let jsx_overrides = state.jsx_overrides.clone();
     let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
-    let file_owned = if react_svg {
+    let file_owned = if react_svg || svgr_componentized {
         file.with_extension("svg.tsx")
     } else if is_svelte {
         file.with_extension("svelte.js")
@@ -2242,6 +2290,7 @@ async fn ensure_module(
     let sass_data = sass_additional_data_for(state, &url_owned);
     let bundle = state.bundle;
     let plugin_fallback = state.plugins.is_some() && !bundle;
+    let svgr_active = state.plugins_have_transform && !bundle;
     let importer_abs = file.to_string_lossy().into_owned();
     let ext = file.extension().and_then(|e| e.to_str());
     let is_css = ext.is_some_and(is_style_ext);
@@ -2308,6 +2357,16 @@ async fn ensure_module(
             if let Some(url) =
                 rewrite_specifier(&root, &dir, &resolver, &fs_allow, &dir_cache, spec, !bundle)
             {
+                // `.svg` resolves to `<url>?url` (asset). When a transform plugin is
+                // active (vite-plugin-svgr), leave the svg unmarked instead so it
+                // routes through the compile path and svgr can componentize it, as
+                // Vite does (it marks svg imports `?import`, not `?url`); an svg svgr
+                // does not match falls back to a URL asset there.
+                if svgr_active {
+                    if let Some(base) = url.strip_suffix(".svg?url") {
+                        return Some(format!("{base}.svg"));
+                    }
+                }
                 return Some(url);
             }
             if plugin_fallback && is_bare_specifier(spec) {
