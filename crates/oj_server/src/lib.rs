@@ -1479,8 +1479,12 @@ async fn forward_to_plugin_middleware(
     }
     let status = resp.status();
     let resp_headers = resp.headers().clone();
-    let bytes = resp.bytes().await.unwrap_or_default();
-    let mut response = Response::new(Body::from(bytes));
+    // Stream the worker/plugin response through instead of buffering it. TanStack
+    // Start streams its dehydrated data (queryStream + deferred promises) into the
+    // HTML; buffering with resp.bytes() withholds the whole document until the SSR
+    // stream closes, so the client's hydration never sees it progressively. Vite
+    // pipes the worker Response body through (Readable.fromWeb); this is the same.
+    let mut response = Response::new(Body::from_stream(resp.bytes_stream()));
     *response.status_mut() = status;
     for (name, value) in resp_headers.iter() {
         if name == header::TRANSFER_ENCODING || name == header::CONTENT_LENGTH {
@@ -1540,8 +1544,12 @@ pub async fn forward_to_plugin_mw(
     }
     let status = resp.status();
     let resp_headers = resp.headers().clone();
-    let bytes = resp.bytes().await.unwrap_or_default();
-    let mut response = Response::new(Body::from(bytes));
+    // Stream the worker/plugin response through instead of buffering it. TanStack
+    // Start streams its dehydrated data (queryStream + deferred promises) into the
+    // HTML; buffering with resp.bytes() withholds the whole document until the SSR
+    // stream closes, so the client's hydration never sees it progressively. Vite
+    // pipes the worker Response body through (Readable.fromWeb); this is the same.
+    let mut response = Response::new(Body::from_stream(resp.bytes_stream()));
     *response.status_mut() = status;
     for (name, value) in resp_headers.iter() {
         if name == header::TRANSFER_ENCODING || name == header::CONTENT_LENGTH {
@@ -1573,8 +1581,12 @@ pub async fn forward_get_to_plugin_mw(
     }
     let status = resp.status();
     let resp_headers = resp.headers().clone();
-    let bytes = resp.bytes().await.unwrap_or_default();
-    let mut response = Response::new(Body::from(bytes));
+    // Stream the worker/plugin response through instead of buffering it. TanStack
+    // Start streams its dehydrated data (queryStream + deferred promises) into the
+    // HTML; buffering with resp.bytes() withholds the whole document until the SSR
+    // stream closes, so the client's hydration never sees it progressively. Vite
+    // pipes the worker Response body through (Readable.fromWeb); this is the same.
+    let mut response = Response::new(Body::from_stream(resp.bytes_stream()));
     *response.status_mut() = status;
     for (name, value) in resp_headers.iter() {
         if name == header::TRANSFER_ENCODING || name == header::CONTENT_LENGTH {

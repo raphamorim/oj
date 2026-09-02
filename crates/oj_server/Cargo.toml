@@ -23,7 +23,7 @@ blake3.workspace = true
 simdutf8.workspace = true
 glob = "0.3.4"
 regex = "1.11"
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 rolldown = "1.2.5"
 rolldown_common = "1.2.5"
 rolldown_plugin = "1.2.5"
