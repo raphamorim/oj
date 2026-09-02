@@ -3096,18 +3096,48 @@ fn handle_client_message(state: &Arc<ServerState>, text: &str) {
     }
 }
 
+/// The id a module's hot context and Fast Refresh registration use: its url with
+/// oj's HMR cache-busting `t=<timestamp>` removed but every other query kept, so a
+/// `?tsr-shared=1` variant stays a distinct module while the id is stable across
+/// updates. It must match the clean path the server names in its update messages;
+/// a timestamped id would never match, so accept callbacks would never fire.
+/// Mirrors Vite's `removeTimestampQuery`.
+fn strip_hmr_timestamp(url: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|kv| {
+            !(kv.starts_with("t=") && kv.len() > 2 && kv[2..].bytes().all(|b| b.is_ascii_digit()))
+        })
+        .collect();
+    if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    }
+}
+
 fn hot_glue(url: &str, query: Option<&str>, is_boundary: bool) -> String {
     if !is_boundary {
         return String::new();
     }
+    // serve_compiled keys modules per full url, so `url` usually already carries
+    // its query and `query` repeats it; it can also arrive clean with the query
+    // separate. Either way the self-import must name exactly the module being
+    // served (keeping its `t=` so the browser dedupes to the running instance) and
+    // must never re-append a query the url already has. Doing so once per edit
+    // grew the url without bound (`?t=X?t=Y...`) until hyper answered 414.
     let self_specifier = match query {
-        Some(q) if !q.is_empty() => format!("{url}?{q}"),
+        Some(q) if !q.is_empty() && !url.contains('?') => format!("{url}?{q}"),
         _ => url.to_string(),
     };
+    let id = strip_hmr_timestamp(&self_specifier);
     format!(
         r#"
 import {{ createHotContext as __oj_createHotContext }} from "/@oj/client.js";
-import.meta.hot = __oj_createHotContext({url:?});
+import.meta.hot = __oj_createHotContext({id:?});
 import * as RefreshRuntime from "/@oj/refresh-runtime.js";
 import * as __oj_currentExports from {self_specifier:?};
 if (import.meta.hot) {{
@@ -3115,14 +3145,14 @@ if (import.meta.hot) {{
     throw new Error("oj: Fast Refresh preamble missing; was index.html served by oj?");
   }}
   const currentExports = __oj_currentExports;
-  RefreshRuntime.registerExportsForReactRefresh({url:?}, currentExports);
+  RefreshRuntime.registerExportsForReactRefresh({id:?}, currentExports);
   import.meta.hot.accept((nextExports) => {{
     if (!nextExports) return;
-    const invalidateMessage = RefreshRuntime.validateRefreshBoundaryAndEnqueueUpdate({url:?}, currentExports, nextExports);
+    const invalidateMessage = RefreshRuntime.validateRefreshBoundaryAndEnqueueUpdate({id:?}, currentExports, nextExports);
     if (invalidateMessage) import.meta.hot.invalidate(invalidateMessage);
   }});
 }}
-function $RefreshReg$(type, id) {{ return RefreshRuntime.register(type, {url:?} + " " + id); }}
+function $RefreshReg$(type, id) {{ return RefreshRuntime.register(type, {id:?} + " " + id); }}
 function $RefreshSig$() {{ return RefreshRuntime.createSignatureFunctionForTransform(); }}
 "#
     )
@@ -5472,6 +5502,35 @@ mod tests {
         assert!(glue.contains(r#"from "/src/App.tsx?t=123""#), "{glue}");
         assert!(glue.contains("validateRefreshBoundaryAndEnqueueUpdate"));
         assert!(glue.contains("function $RefreshReg$"));
+    }
+
+    #[test]
+    fn glue_never_doubles_a_query_the_url_already_carries() {
+        // serve_compiled keys per full url, so the real call hands hot_glue a url
+        // that already has its query AND the same query again. The self-import
+        // must not grow (`?t=X?t=X` grew per edit until hyper answered 414) and
+        // the hot-context id must stay the clean path the server sends updates for.
+        let glue = hot_glue("/src/App.tsx?t=123", Some("t=123"), true);
+        assert!(glue.contains(r#"createHotContext("/src/App.tsx")"#), "{glue}");
+        assert!(glue.contains(r#"from "/src/App.tsx?t=123""#), "{glue}");
+        assert!(!glue.contains("?t=123?t=123"), "{glue}");
+        assert!(glue.contains(r#"registerExportsForReactRefresh("/src/App.tsx","#), "{glue}");
+        // Only the hmr timestamp is stripped from the id; a semantic query that
+        // makes a distinct module (router `?tsr-shared=1`) is kept in both.
+        let v = hot_glue("/src/r.tsx?tsr-shared=1&t=9", Some("tsr-shared=1&t=9"), true);
+        assert!(v.contains(r#"createHotContext("/src/r.tsx?tsr-shared=1")"#), "{v}");
+        assert!(v.contains(r#"from "/src/r.tsx?tsr-shared=1&t=9""#), "{v}");
+    }
+
+    #[test]
+    fn strip_hmr_timestamp_removes_only_the_t_param() {
+        assert_eq!(strip_hmr_timestamp("/src/App.tsx"), "/src/App.tsx");
+        assert_eq!(strip_hmr_timestamp("/src/App.tsx?t=123"), "/src/App.tsx");
+        assert_eq!(strip_hmr_timestamp("/a.tsx?tsr-shared=1&t=9"), "/a.tsx?tsr-shared=1");
+        assert_eq!(strip_hmr_timestamp("/a.tsx?t=9&tsr-shared=1"), "/a.tsx?tsr-shared=1");
+        // `t=` with a non-numeric value is not oj's timestamp; keep it.
+        assert_eq!(strip_hmr_timestamp("/a.tsx?t=abc"), "/a.tsx?t=abc");
+        assert_eq!(strip_hmr_timestamp("/a.tsx?type=x"), "/a.tsx?type=x");
     }
 
     #[test]
