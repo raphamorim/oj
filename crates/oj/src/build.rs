@@ -403,6 +403,28 @@ impl Plugin for OjCssPlugin {
                     ..Default::default()
                 }));
             }
+            // A plain `.svg` (no query) goes through the plugin transform chain
+            // (vite-plugin-svgr) so it becomes a React component in the prod build
+            // too, matching dev and Vite. Run the transform on the raw svg; if a
+            // plugin componentizes it, emit JSX. An svg no plugin matches leaves the
+            // markup unchanged and falls through to the asset pipeline below. The
+            // transform hook skips `.svg` (it already ran here) to avoid running it
+            // twice on the componentized output.
+            if !id.contains('?') && id.ends_with(".svg") {
+                if let Some(host) = &host {
+                    let svg = std::fs::read_to_string(&id)
+                        .map_err(|e| anyhow::anyhow!("cannot read {id}: {e}"))?;
+                    if let Ok((out, _, _, _)) = host.transform(&svg, &id, "{}").await {
+                        if out != svg && !out.trim_start().starts_with('<') {
+                            return Ok(Some(rolldown_plugin::HookLoadOutput {
+                                code: arcstr::ArcStr::from(out),
+                                module_type: Some(rolldown_common::ModuleType::Jsx),
+                                ..Default::default()
+                            }));
+                        }
+                    }
+                }
+            }
             if !id.contains('?') && is_build_asset(&id) {
                 let bytes =
                     std::fs::read(&id).map_err(|e| anyhow::anyhow!("cannot read {id}: {e}"))?;
@@ -1040,6 +1062,13 @@ impl Plugin for OjUserPlugin {
         let code = args.code.to_string();
         let id = args.id.to_string();
         async move {
+            // A `.svg` is componentized (or left as an asset) in the load hook, where
+            // the plugin transform chain already ran on the raw markup. Re-running it
+            // here would feed svgr its own component output (or an `export default`
+            // asset stub) and corrupt it, so skip svg ids.
+            if id.split('?').next().unwrap_or(&id).ends_with(".svg") {
+                return Ok(None);
+            }
             match host.transform(&code, &id, "{}").await {
                 Ok((out, _, _, chunks)) => {
                     forward_emitted_chunks(&ctx.inner, &chunks, &emit);

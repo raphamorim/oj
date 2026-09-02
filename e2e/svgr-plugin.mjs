@@ -71,18 +71,19 @@ fs.writeFileSync(
   `<!doctype html><html><head><title>t</title></head><body><script type="module" src="/src/main.tsx"></script></body></html>`,
 );
 
-async function check(port) {
-  // The importer must NOT carry a `?url` marker on the componentized svg.
+async function checkSource(port) {
+  // Dev only: the importer must NOT carry a `?url` marker on the componentized
+  // svg, and the svg module itself must serve component JS, not raw markup.
   const mainSrc = await (await fetch(`http://localhost:${port}/src/main.tsx`)).text();
   const iconImport = mainSrc.match(/import Icon from "([^"]*)"/);
   if (!iconImport) throw new Error("icon import not found in served main.tsx");
   if (/\?url/.test(iconImport[1])) throw new Error(`componentized svg was marked ?url: ${iconImport[1]}`);
-
-  // The svg module itself serves component JS, not raw markup.
   const iconMod = await (await fetch(`http://localhost:${port}${iconImport[1]}`)).text();
   if (/^\s*<svg|^\s*<\?xml/.test(iconMod)) throw new Error("svg served as raw markup, not a component");
   if (!/data-svgr/.test(iconMod)) throw new Error("plugin transform did not run on the svg");
+}
 
+async function checkRender(port) {
   const browser = await chromium.launch();
   const page = await browser.newPage();
   const errors = [];
@@ -92,9 +93,10 @@ async function check(port) {
     const el = await page.waitForSelector("#root svg[data-svgr]", { timeout: 10000 });
     const outer = await page.evaluate((e) => e.outerHTML, el);
     if (!/class="added"/.test(outer)) throw new Error(`props not spread onto component svg: ${outer.slice(0, 80)}`);
-    // The excluded svg is a URL asset: its default export is the served path string.
+    // The excluded svg is a URL asset: its default export is a served/emitted path
+    // (dev) or an inlined data: URL (prod), never a rendered component.
     const photo = await page.evaluate(() => document.getElementById("photo").textContent);
-    if (!/photo\.svg/.test(photo) || /<svg/.test(photo)) {
+    if (!/(\.svg|data:image\/svg)/.test(photo) || /\bfunction\b|\[object/.test(photo)) {
       throw new Error(`excluded svg did not fall back to a URL asset: ${photo}`);
     }
     if (errors.length) throw new Error(`page errors: ${errors.join("|")}`);
@@ -103,19 +105,33 @@ async function check(port) {
   }
 }
 
+async function mode(label, args, port, build) {
+  fs.rmSync(path.join(app, ".oj-cache"), { recursive: true, force: true });
+  if (build) {
+    fs.rmSync(path.join(app, "dist"), { recursive: true, force: true });
+    execSync(`${oj} build ${app}`, { stdio: "ignore" });
+  }
+  const srv = spawn(oj, args, { stdio: "ignore" });
+  try {
+    for (let i = 0; i < 100; i++) { try { if ((await fetch(`http://localhost:${port}/`)).ok) break; } catch {} await sleep(200); }
+    if (!build) await checkSource(port);
+    await checkRender(port);
+    console.log(`[${label}] plain-svg svgr OK`);
+  } finally {
+    srv.kill("SIGKILL");
+    await sleep(300);
+  }
+}
+
 let failed = false;
-const port = 5396;
-const srv = spawn(oj, ["dev", app, "--port", String(port)], { stdio: "ignore" });
 try {
-  for (let i = 0; i < 100; i++) { try { if ((await fetch(`http://localhost:${port}/`)).ok) break; } catch {} await sleep(200); }
-  await check(port);
+  await mode("dev", ["dev", app, "--port", "5396"], 5396, false);
+  await mode("prod", ["preview", app, "--port", "5398"], 5398, true);
   console.log("SVGR-PLUGIN E2E PASSED");
 } catch (err) {
   failed = true;
   console.error("SVGR-PLUGIN E2E FAILED:", err.message);
 } finally {
-  srv.kill("SIGKILL");
-  await sleep(300);
   fs.rmSync(app, { recursive: true, force: true });
 }
 process.exit(failed ? 1 : 0);
