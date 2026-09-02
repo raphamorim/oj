@@ -192,16 +192,30 @@ function clearOverlay() {
 function swapCss(update) {
   const links = [...document.querySelectorAll("link[rel=stylesheet]")];
   const link = links.find((l) => new URL(l.href).pathname === update.path);
-  if (!link) {
-    console.log(`[oj] no <link> for ${update.path}, reloading`);
-    location.reload();
+  if (link) {
+    const next = link.cloneNode();
+    next.href = update.path + "?t=" + update.timestamp;
+    next.addEventListener("load", () => link.remove());
+    link.after(next);
+    console.log(`[oj] css updated ${update.path}`);
     return;
   }
-  const next = link.cloneNode();
-  next.href = update.path + "?t=" + update.timestamp;
-  next.addEventListener("load", () => link.remove());
-  link.after(next);
-  console.log(`[oj] css updated ${update.path}`);
+  // A stylesheet imported from JS (`import "./index.css"`) lives in a <style> tag
+  // that its module wrapper wrote via updateStyle. Re-import the wrapper with a
+  // fresh timestamp so it re-runs against the recompiled css and swaps the tag in
+  // place, as Vite's client does for a css-update; reloading here would drop all
+  // component state on every edit in a Tailwind app.
+  if (styleTags.has(update.path)) {
+    import(update.path + "?import&t=" + update.timestamp)
+      .then(() => console.log(`[oj] css updated ${update.path}`))
+      .catch((err) => {
+        console.log(`[oj] css re-import failed for ${update.path}, reloading`, err);
+        location.reload();
+      });
+    return;
+  }
+  console.log(`[oj] no <link> or <style> for ${update.path}, reloading`);
+  location.reload();
 }
 
 let socket = null;
