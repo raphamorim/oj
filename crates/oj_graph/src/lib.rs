@@ -9,6 +9,11 @@ pub struct ModuleNode {
     pub importers: HashSet<PathBuf>,
     pub imports: HashSet<PathBuf>,
     pub is_self_accepting: bool,
+    /// When this module was last invalidated by an HMR update (Vite's
+    /// `lastHMRTimestamp`); 0 until the first update touches it. An importer
+    /// re-fetched during HMR appends `?t=<timestamp>` to its import of a stamped
+    /// module, so the browser loads the new version instead of its cached one.
+    pub last_hmr_timestamp: u64,
 }
 
 #[derive(Debug, Default)]
@@ -97,6 +102,43 @@ impl ModuleGraph {
 
     pub fn node(&self, path: &Path) -> Option<&ModuleNode> {
         self.modules.get(path)
+    }
+
+    /// Record an HMR update of `changed`: stamp it and every module it dirties
+    /// (its importers up to and including the accepting boundaries) with
+    /// `timestamp`, and return that dirty set. Mirrors Vite's
+    /// `moduleGraph.invalidateModule` walking importers.
+    pub fn stamp_update(&mut self, changed: &Path, timestamp: u64) -> Vec<PathBuf> {
+        let dirty = self.dirty_closure(changed);
+        for path in &dirty {
+            if let Some(node) = self.modules.get_mut(path) {
+                node.last_hmr_timestamp = timestamp;
+            }
+        }
+        dirty
+    }
+
+    pub fn hmr_timestamp(&self, path: &Path) -> u64 {
+        self.modules
+            .get(path)
+            .map(|n| n.last_hmr_timestamp)
+            .unwrap_or(0)
+    }
+
+    /// The newest HMR timestamp among a module's direct imports: part of the
+    /// module's compile cache key, so a cached importer is recompiled (and its
+    /// import specifiers re-stamped) after one of its imports updates.
+    pub fn imports_timestamp(&self, path: &Path) -> u64 {
+        self.modules
+            .get(path)
+            .map(|n| {
+                n.imports
+                    .iter()
+                    .map(|i| self.hmr_timestamp(i))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
     }
 
     pub fn propagate_from_seeds(&self, seeds: &[&Path]) -> HmrDecision {
@@ -260,6 +302,48 @@ enum Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stamp_update_marks_the_chain_up_to_the_boundary() {
+        // main -> App (boundary) -> hooks -> utils
+        let mut g = ModuleGraph::new();
+        let (main, app, hooks, utils) = (
+            Path::new("/src/main.tsx"),
+            Path::new("/src/App.tsx"),
+            Path::new("/src/hooks.ts"),
+            Path::new("/src/utils.ts"),
+        );
+        g.add_import(main, app);
+        g.add_import(app, hooks);
+        g.add_import(hooks, utils);
+        g.set_self_accepting(app, true);
+
+        let mut dirty = g.stamp_update(utils, 7);
+        dirty.sort();
+        assert_eq!(dirty, vec![app.to_path_buf(), hooks.to_path_buf(), utils.to_path_buf()]);
+        assert_eq!(g.hmr_timestamp(utils), 7);
+        assert_eq!(g.hmr_timestamp(hooks), 7);
+        assert_eq!(g.hmr_timestamp(app), 7, "the boundary is re-fetched, so it is stamped");
+        assert_eq!(g.hmr_timestamp(main), 0, "above the boundary nothing is re-fetched");
+        assert_eq!(g.hmr_timestamp(Path::new("/nope.ts")), 0);
+    }
+
+    #[test]
+    fn imports_timestamp_is_the_newest_direct_import_stamp() {
+        let mut g = ModuleGraph::new();
+        let (app, a, b) = (Path::new("/App.tsx"), Path::new("/a.ts"), Path::new("/b.ts"));
+        g.add_import(app, a);
+        g.add_import(app, b);
+        g.set_self_accepting(app, true);
+        assert_eq!(g.imports_timestamp(app), 0);
+        g.stamp_update(a, 3);
+        g.stamp_update(b, 9);
+        assert_eq!(g.imports_timestamp(app), 9);
+        // A later update of `a` moves the key again even though `b` is newer than 3 was.
+        g.stamp_update(a, 12);
+        assert_eq!(g.imports_timestamp(app), 12);
+        assert_eq!(g.imports_timestamp(a), 0, "leaf has no imports");
+    }
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)

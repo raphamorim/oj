@@ -5,6 +5,13 @@ All notable changes to oj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- `oj build` now evaluates `vite.config` as a build: the config is loaded with the real `command` (`build`) and `mode` (`production`, or `--mode`), so a config exported as a function (`defineConfig(({ command, mode }) => ...)`) takes its build branch, and the `build` block's `outDir`, `sourcemap`, `minify`, `cssCodeSplit`, `target` and `ssr` are honored where `oj.config` leaves them unset. Previously the config was always evaluated as `serve`/`development` and only `rollupOptions`/`assetsInlineLimit` were read from `build`.
+- A stylesheet imported from JavaScript (`import "./index.css"`, the standard Tailwind layout) now hot-swaps on a source edit. The HMR client re-imports the css module wrapper on a `css-update` so the injected `<style>` is replaced in place; it used to reload the page (losing component state) because it only knew how to swap `<link>` tags.
+- Editing a module that is not itself an HMR boundary (a `.ts` util imported by a component) now reaches the page. The module graph records Vite's `lastHMRTimestamp` for the invalidated chain, the re-fetched boundary's imports of those modules carry `?t=<timestamp>` (and the importer's compile key folds the stamp in, so a cached importer recompiles), so the browser loads the dependency's new version instead of its cached instance. Previously only the boundary was re-fetched and it kept importing the stale dependency.
+
 ## [0.1.11] - 2026-09-01
 
 ### Changed
