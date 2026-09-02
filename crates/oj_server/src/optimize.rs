@@ -212,9 +212,23 @@ async fn run_optimizer(
         .await
         .ok()?;
     if !out.status.success() {
+        eprintln!(
+            "oj: optimizer exited {:?}\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
         return None;
     }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let v: serde_json::Value = match serde_json::from_slice(&out.stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "oj: optimizer stdout not JSON: {e}\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return None;
+        }
+    };
     let metadata = v.get("metadata")?;
     let map = parse_metadata(metadata)?;
     let manifest = serde_json::json!({ "hash": hash, "metadata": metadata });
