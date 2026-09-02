@@ -182,6 +182,33 @@ function extractOptimizeDeps(od) {
   return Object.keys(out).length ? out : null;
 }
 
+// `build` values oj's build honors. `resolveConfig` returns Vite's defaults for
+// anything the user left unset (outDir "dist", minify "oxc", sourcemap false,
+// cssCodeSplit true, target "baseline-widely-available"); the boolean/string
+// shapes oj adopts match its own defaults for those, and the special target
+// names (which rolldown's transform does not parse) are skipped so oj's default
+// lowering stands.
+function extractBuild(b) {
+  if (!b || typeof b !== "object") return null;
+  const out = {};
+  if (typeof b.outDir === "string") out.outDir = b.outDir;
+  if (typeof b.sourcemap === "boolean") out.sourcemap = b.sourcemap;
+  else if (typeof b.sourcemap === "string") {
+    warn(`build.sourcemap "${b.sourcemap}" is applied as a regular sourcemap`);
+    out.sourcemap = true;
+  }
+  if (typeof b.minify === "boolean") out.minify = b.minify;
+  else if (typeof b.minify === "string") out.minify = true;
+  if (typeof b.cssCodeSplit === "boolean") out.cssCodeSplit = b.cssCodeSplit;
+  if (typeof b.target === "string") {
+    if (b.target !== "modules" && b.target !== "baseline-widely-available") out.target = b.target;
+  } else if (Array.isArray(b.target)) {
+    warn("build.target array form is not applied; set a single target");
+  }
+  if (typeof b.ssr === "string") out.ssr = b.ssr;
+  return Object.keys(out).length ? out : null;
+}
+
 function warnUnsupported(c) {
   if (c.css?.preprocessorOptions) warn("css.preprocessorOptions is not applied yet");
   if (c.esbuild && typeof c.esbuild === "object") warn("esbuild options are not applied");
@@ -225,6 +252,7 @@ if (isMainRun) try {
         ? c.resolve.dedupe.filter((x) => typeof x === "string")
         : null,
       optimizeDeps: extractOptimizeDeps(c.optimizeDeps),
+      build: extractBuild(c.build),
     }),
   );
 } catch (e) {

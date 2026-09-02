@@ -190,9 +190,18 @@ pub struct ViteValues {
     pub proxy: Option<serde_json::Value>,
     pub dedupe: Option<Vec<String>>,
     pub optimize_deps: Option<serde_json::Value>,
+    /// The `build` block as the extractor normalized it (`outDir`, `sourcemap`,
+    /// `minify`, `cssCodeSplit`, `target`, `ssr`); see `extractBuild` in
+    /// vite-extract.mjs for the shapes it admits.
+    pub build: Option<serde_json::Value>,
 }
 
-pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
+/// Evaluate the app's `vite.config` for `command` ("serve" | "build") and `mode`.
+/// A config exported as a function (`defineConfig(({ command, mode }) => ...)`)
+/// branches on both, so a build must be extracted as a build: evaluating it as
+/// `serve`/`development` silently picks the dev branch of `base`, `define`,
+/// `build.outDir` and friends in production output.
+pub fn extract_vite_values(root: &Path, command: &str, mode: &str) -> Option<ViteValues> {
     if plugins_file(root).is_some() {
         return None;
     }
@@ -205,7 +214,7 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
             blake3::hash(VITE_EXTRACT_JS.as_bytes()).to_hex()
         ),
     );
-    if let Some(hit) = store.lookup(&vite, "serve", "development") {
+    if let Some(hit) = store.lookup(&vite, command, mode) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&hit.output) {
             if !hit.stderr.is_empty() {
                 eprint!("{}", hit.stderr);
@@ -222,8 +231,8 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
         .arg(&script)
         .arg(&vite)
         .arg(root)
-        .arg("serve")
-        .arg("development")
+        .arg(command)
+        .arg(mode)
         .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
         .env("NODE_COMPILE_CACHE", crate::node_compile_cache(root))
         .current_dir(root)
@@ -246,8 +255,8 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
             .unwrap_or_default();
         store.store(
             &vite,
-            "serve",
-            "development",
+            command,
+            mode,
             &deps,
             &String::from_utf8_lossy(&out.stdout),
             &stderr,
@@ -291,12 +300,18 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
                 .collect()
         }),
         optimize_deps: json.get("optimizeDeps").filter(|v| !v.is_null()).cloned(),
+        build: json.get("build").filter(|v| !v.is_null()).cloned(),
     }
 }
 
 #[inline]
-pub fn adopt_vite_config_values(config: &mut oj_config::OjConfig, root: &Path) {
-    let Some(v) = extract_vite_values(root) else {
+pub fn adopt_vite_config_values(
+    config: &mut oj_config::OjConfig,
+    root: &Path,
+    command: &str,
+    mode: &str,
+) {
+    let Some(v) = extract_vite_values(root, command, mode) else {
         return;
     };
     merge_vite_values(config, v);
@@ -395,6 +410,29 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
             if let Ok(parsed) = serde_json::from_value::<oj_config::OptimizeDepsConfig>(od) {
                 config.optimize_deps = Some(parsed);
             }
+        }
+    }
+    if let Some(vb) = v.build.as_ref().and_then(|b| b.as_object()) {
+        let build = config.build.get_or_insert_with(Default::default);
+        let str_of = |k: &str| vb.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        let bool_of = |k: &str| vb.get(k).and_then(|v| v.as_bool());
+        if build.out_dir.is_none() {
+            build.out_dir = str_of("outDir");
+        }
+        if build.sourcemap.is_none() {
+            build.sourcemap = bool_of("sourcemap");
+        }
+        if build.minify.is_none() {
+            build.minify = bool_of("minify");
+        }
+        if build.css_code_split.is_none() {
+            build.css_code_split = bool_of("cssCodeSplit");
+        }
+        if build.target.is_none() {
+            build.target = str_of("target");
+        }
+        if build.ssr.is_none() {
+            build.ssr = str_of("ssr");
         }
     }
 }
@@ -1010,6 +1048,7 @@ mod vite_values_tests {
             proxy: None,
             dedupe: None,
             optimize_deps: None,
+            build: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/vite-base/"));
@@ -1037,6 +1076,7 @@ mod vite_values_tests {
             proxy: None,
             dedupe: None,
             optimize_deps: None,
+            build: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/oj-base/"));
@@ -1076,5 +1116,56 @@ mod vite_values_tests {
                 .and_then(|v| v.as_str()),
             Some("x/[name].js")
         );
+    }
+
+    #[test]
+    fn parse_reads_build_block() {
+        let v = parse_vite_values(&serde_json::json!({
+            "build": { "outDir": "out", "sourcemap": true, "minify": false,
+                       "cssCodeSplit": false, "target": "es2020", "ssr": "src/entry-server.ts" }
+        }));
+        let b = v.build.unwrap();
+        assert_eq!(b["outDir"], "out");
+        assert_eq!(b["sourcemap"], true);
+        assert_eq!(b["ssr"], "src/entry-server.ts");
+        assert!(parse_vite_values(&serde_json::json!({ "build": null })).build.is_none());
+    }
+
+    #[test]
+    fn merge_adopts_build_fields_only_when_unset() {
+        let mut config = oj_config::OjConfig::default();
+        config.build = Some(oj_config::BuildConfig {
+            out_dir: Some("oj-out".into()),
+            ..Default::default()
+        });
+        let v = ViteValues {
+            build: Some(serde_json::json!({
+                "outDir": "vite-out", "sourcemap": true, "minify": false,
+                "cssCodeSplit": false, "target": "es2020", "ssr": "src/server.ts"
+            })),
+            ..Default::default()
+        };
+        merge_vite_values(&mut config, v);
+        let b = config.build.unwrap();
+        assert_eq!(b.out_dir.as_deref(), Some("oj-out"), "oj.config wins");
+        assert_eq!(b.sourcemap, Some(true));
+        assert_eq!(b.minify, Some(false));
+        assert_eq!(b.css_code_split, Some(false));
+        assert_eq!(b.target.as_deref(), Some("es2020"));
+        assert_eq!(b.ssr.as_deref(), Some("src/server.ts"));
+    }
+
+    #[test]
+    fn merge_ignores_build_values_of_the_wrong_shape() {
+        let mut config = oj_config::OjConfig::default();
+        let v = ViteValues {
+            build: Some(serde_json::json!({ "outDir": 3, "sourcemap": "inline", "target": ["es2020"] })),
+            ..Default::default()
+        };
+        merge_vite_values(&mut config, v);
+        let b = config.build.unwrap();
+        assert!(b.out_dir.is_none());
+        assert!(b.sourcemap.is_none());
+        assert!(b.target.is_none());
     }
 }
