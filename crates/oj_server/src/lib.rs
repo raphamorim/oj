@@ -356,7 +356,7 @@ impl DevServer {
         boot_phase("build_app begin");
         prepare_cache_root(&root);
         let mut config = oj_config::load(&root).map_err(|e| anyhow::anyhow!("{e}"))?;
-        plugins::adopt_vite_config_values(&mut config, &root);
+        plugins::adopt_vite_config_values(&mut config, &root, "serve", "development");
         boot_phase("vite config values adopted");
 
         // Feed optimizeDeps.include/exclude/needsInterop into partial bundling so
@@ -1852,14 +1852,15 @@ async fn serve_compiled(
     // Key and transform per full url incl. query: the same file yields different
     // modules per query (TanStack router `?tsr-shared`/`?tsr-split` variants), so
     // the query must reach ensure_module's cache key and the plugin transform id.
-    let url_with_query;
-    let url = match query {
-        Some(q) => {
-            url_with_query = format!("{url}?{q}");
-            url_with_query.as_str()
-        }
-        None => url,
+    // The HMR cache-buster `t=<timestamp>` is not part of the module's identity,
+    // though: it is stripped so a re-fetched module keys (and registers in the
+    // graph) as itself, and freshness comes from the graph's HMR stamps instead.
+    let base_url = url;
+    let url_with_query = match query {
+        Some(q) => strip_hmr_timestamp(&format!("{url}?{q}")),
+        None => url.to_string(),
     };
+    let url = url_with_query.as_str();
     let (key, module) = match ensure_module(state, file, url).await {
         Ok(pair) => pair,
         Err(err) => {
@@ -1895,7 +1896,7 @@ async fn serve_compiled(
         module.code.clone()
     };
     if !state.bundle && module.kind != "svelte" {
-        body.push_str(&hot_glue(url, query, module.is_boundary));
+        body.push_str(&hot_glue(base_url, query, module.is_boundary));
     }
     if let Some(map_url) = &module.map_data_url {
         body.push_str(&format!("\n//# sourceMappingURL={map_url}\n"));
@@ -2115,7 +2116,20 @@ async fn ensure_module(
     } else {
         "dev"
     };
-    let key = state.cache.key(source.as_bytes(), url, mode);
+    // Fold the newest HMR stamp among this module's imports into the key: after a
+    // dependency updates, the (unchanged) importer must recompile so its import of
+    // that dependency carries the new `?t=`, or the browser keeps the stale one.
+    let imports_stamp = if state.bundle {
+        0
+    } else {
+        state.graph.lock().unwrap().imports_timestamp(Path::new(url))
+    };
+    let mode_key = if imports_stamp > 0 {
+        format!("{mode}@{imports_stamp}")
+    } else {
+        mode.to_string()
+    };
+    let key = state.cache.key(source.as_bytes(), url, &mode_key);
     if let Some((mtime, size)) = stamp {
         state
             .mtime_keys
@@ -2286,6 +2300,7 @@ async fn ensure_module(
     let url_owned = url.to_string();
     let sass_data = sass_additional_data_for(state, &url_owned);
     let bundle = state.bundle;
+    let hmr_state = Arc::clone(state);
     let plugin_fallback = state.plugins.is_some() && !bundle;
     let svgr_active = state.plugins_have_transform && !bundle;
     let importer_abs = file.to_string_lossy().into_owned();
@@ -2364,7 +2379,19 @@ async fn ensure_module(
                         return Some(format!("{base}.svg"));
                     }
                 }
-                return Some(url);
+                if bundle {
+                    return Some(url);
+                }
+                // Vite's importAnalysis appends `?t=<lastHMRTimestamp>` to an import
+                // of a module an HMR update invalidated, so the re-fetched importer
+                // loads the dependency's new version instead of the browser's cached
+                // instance (only boundaries are named in the update itself).
+                let stamp = hmr_state
+                    .graph
+                    .lock()
+                    .unwrap()
+                    .hmr_timestamp(Path::new(url.split('?').next().unwrap_or(&url)));
+                return Some(stamp_import_url(&url, stamp));
             }
             if plugin_fallback && is_bare_specifier(spec) {
                 return Some(format!(
@@ -3112,16 +3139,42 @@ fn strip_hmr_timestamp(url: &str) -> String {
     let Some((base, query)) = url.split_once('?') else {
         return url.to_string();
     };
+    // oj's HMR timestamp is `now_millis()`: exactly 13 digits. Match only that,
+    // as Vite's `timestampRE` (`/\bt=\d{13}&?\b/`) does, so a user's own short or
+    // non-numeric `t=` query is never mistaken for it and stripped.
     let kept: Vec<&str> = query
         .split('&')
         .filter(|kv| {
-            !(kv.starts_with("t=") && kv.len() > 2 && kv[2..].bytes().all(|b| b.is_ascii_digit()))
+            !(kv.starts_with("t=") && kv.len() == 15 && kv[2..].bytes().all(|b| b.is_ascii_digit()))
         })
         .collect();
     if kept.is_empty() {
         base.to_string()
     } else {
         format!("{base}?{}", kept.join("&"))
+    }
+}
+
+/// Append the HMR timestamp to a served module url when its module has one. Only
+/// compilable modules are stamped: asset (`?url`, `?raw`), style (`?import`) and
+/// oj-internal (`/@oj-deps/`, `/@fs/`, `/@id/`, ...) urls are left alone, since
+/// their routes parse the query and deps never take part in HMR.
+fn stamp_import_url(url: &str, timestamp: u64) -> String {
+    if timestamp == 0 || url.starts_with("/@") || !url.starts_with('/') {
+        return url.to_string();
+    }
+    let (path, query) = url.split_once('?').unwrap_or((url, ""));
+    let ext = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("");
+    if !COMPILABLE.contains(&ext) {
+        return url.to_string();
+    }
+    if query.split('&').any(|kv| kv.starts_with("t=")) {
+        return url.to_string();
+    }
+    if query.is_empty() {
+        format!("{path}?t={timestamp}")
+    } else {
+        format!("{url}&t={timestamp}")
     }
 }
 
@@ -5248,6 +5301,21 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
             HmrDecision::Update { boundaries } => {
                 println!("oj: change {url} -> update {boundaries:?}");
                 let timestamp = now_millis() as u64;
+                // Stamp the invalidated chain so re-fetched importers point at the
+                // new versions of their (unchanged-on-disk) dependencies, and drop
+                // those importers' mtime fast-path keys so they recompile with the
+                // stamps rather than serving the cached code.
+                let dirty = state
+                    .graph
+                    .lock()
+                    .unwrap()
+                    .stamp_update(Path::new(&url), timestamp);
+                {
+                    let mut keys = state.mtime_keys.lock().unwrap();
+                    for d in &dirty {
+                        keys.remove(&d.display().to_string());
+                    }
+                }
                 updates.extend(boundaries.iter().map(|b| {
                     let mut path = format!("{}", b.display());
                     if is_style_url(&path) {
@@ -5551,9 +5619,9 @@ mod tests {
     #[test]
     fn glue_only_added_for_boundary_modules() {
         assert!(hot_glue("/src/util.ts", None, false).is_empty());
-        let glue = hot_glue("/src/App.tsx", Some("t=123"), true);
+        let glue = hot_glue("/src/App.tsx", Some("t=1700000000000"), true);
         assert!(glue.contains(r#"createHotContext("/src/App.tsx")"#));
-        assert!(glue.contains(r#"from "/src/App.tsx?t=123""#), "{glue}");
+        assert!(glue.contains(r#"from "/src/App.tsx?t=1700000000000""#), "{glue}");
         assert!(glue.contains("validateRefreshBoundaryAndEnqueueUpdate"));
         assert!(glue.contains("function $RefreshReg$"));
     }
@@ -5564,25 +5632,51 @@ mod tests {
         // that already has its query AND the same query again. The self-import
         // must not grow (`?t=X?t=X` grew per edit until hyper answered 414) and
         // the hot-context id must stay the clean path the server sends updates for.
-        let glue = hot_glue("/src/App.tsx?t=123", Some("t=123"), true);
+        let glue = hot_glue("/src/App.tsx?t=1700000000000", Some("t=1700000000000"), true);
         assert!(glue.contains(r#"createHotContext("/src/App.tsx")"#), "{glue}");
-        assert!(glue.contains(r#"from "/src/App.tsx?t=123""#), "{glue}");
-        assert!(!glue.contains("?t=123?t=123"), "{glue}");
+        assert!(glue.contains(r#"from "/src/App.tsx?t=1700000000000""#), "{glue}");
+        assert!(!glue.contains("?t=1700000000000?t=1700000000000"), "{glue}");
         assert!(glue.contains(r#"registerExportsForReactRefresh("/src/App.tsx","#), "{glue}");
         // Only the hmr timestamp is stripped from the id; a semantic query that
         // makes a distinct module (router `?tsr-shared=1`) is kept in both.
-        let v = hot_glue("/src/r.tsx?tsr-shared=1&t=9", Some("tsr-shared=1&t=9"), true);
+        let v = hot_glue(
+            "/src/r.tsx?tsr-shared=1&t=1700000000000",
+            Some("tsr-shared=1&t=1700000000000"),
+            true,
+        );
         assert!(v.contains(r#"createHotContext("/src/r.tsx?tsr-shared=1")"#), "{v}");
-        assert!(v.contains(r#"from "/src/r.tsx?tsr-shared=1&t=9""#), "{v}");
+        assert!(v.contains(r#"from "/src/r.tsx?tsr-shared=1&t=1700000000000""#), "{v}");
+    }
+
+    #[test]
+    fn stamp_import_url_marks_only_compilable_module_urls() {
+        assert_eq!(stamp_import_url("/src/utils.ts", 5), "/src/utils.ts?t=5");
+        assert_eq!(stamp_import_url("/src/r.tsx?tsr-shared=1", 5), "/src/r.tsx?tsr-shared=1&t=5");
+        assert_eq!(stamp_import_url("/src/utils.ts", 0), "/src/utils.ts", "unstamped module");
+        assert_eq!(stamp_import_url("/src/utils.ts?t=3", 5), "/src/utils.ts?t=3", "never doubled");
+        assert_eq!(stamp_import_url("/src/a.css?import", 5), "/src/a.css?import");
+        assert_eq!(stamp_import_url("/logo.svg?url", 5), "/logo.svg?url");
+        assert_eq!(stamp_import_url("/@oj-deps/react.js", 5), "/@oj-deps/react.js");
+        assert_eq!(stamp_import_url("/@fs/x/node_modules/a/index.js", 5), "/@fs/x/node_modules/a/index.js");
     }
 
     #[test]
     fn strip_hmr_timestamp_removes_only_the_t_param() {
         assert_eq!(strip_hmr_timestamp("/src/App.tsx"), "/src/App.tsx");
-        assert_eq!(strip_hmr_timestamp("/src/App.tsx?t=123"), "/src/App.tsx");
-        assert_eq!(strip_hmr_timestamp("/a.tsx?tsr-shared=1&t=9"), "/a.tsx?tsr-shared=1");
-        assert_eq!(strip_hmr_timestamp("/a.tsx?t=9&tsr-shared=1"), "/a.tsx?tsr-shared=1");
-        // `t=` with a non-numeric value is not oj's timestamp; keep it.
+        assert_eq!(strip_hmr_timestamp("/src/App.tsx?t=1700000000000"), "/src/App.tsx");
+        assert_eq!(
+            strip_hmr_timestamp("/a.tsx?tsr-shared=1&t=1700000000000"),
+            "/a.tsx?tsr-shared=1"
+        );
+        assert_eq!(
+            strip_hmr_timestamp("/a.tsx?t=1700000000000&tsr-shared=1"),
+            "/a.tsx?tsr-shared=1"
+        );
+        // Only a 13-digit millisecond timestamp is oj's `t=` (Vite's timestampRE is
+        // /\bt=\d{13}&?\b/). A short numeric or non-numeric `t=` is a user's own
+        // query and must be kept.
+        assert_eq!(strip_hmr_timestamp("/a.tsx?t=9"), "/a.tsx?t=9");
+        assert_eq!(strip_hmr_timestamp("/a.tsx?t=123"), "/a.tsx?t=123");
         assert_eq!(strip_hmr_timestamp("/a.tsx?t=abc"), "/a.tsx?t=abc");
         assert_eq!(strip_hmr_timestamp("/a.tsx?type=x"), "/a.tsx?type=x");
     }
