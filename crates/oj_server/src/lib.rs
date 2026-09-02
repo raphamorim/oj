@@ -1648,15 +1648,12 @@ async fn serve_path(
     }
 
     let file = if let Some(abs) = uri.path().strip_prefix("/@fs") {
-        let candidate = PathBuf::from(urldecode(abs));
-        let allowed = {
-            let allow = state.fs_allow.lock().unwrap();
-            allow.iter().any(|root| candidate.starts_with(root))
-        };
-        if !allowed {
-            return (StatusCode::FORBIDDEN, "oj: /@fs path not allow-listed").into_response();
+        match fs_gate(&state, &PathBuf::from(urldecode(abs))) {
+            Some(real) => real,
+            None => {
+                return (StatusCode::FORBIDDEN, "oj: /@fs path not allow-listed").into_response();
+            }
         }
-        candidate
     } else {
         match locate(&state.root, &state.public_dir, rel) {
             Some(file) => file,
@@ -2670,11 +2667,20 @@ fn path_is_denied(file: &Path, root: &Path, deny: &[(glob::Pattern, bool)]) -> b
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    // Match case-insensitively: a deny list is a security control, and on a
+    // case-insensitive filesystem (macOS, Windows) `.ENV` opens the same bytes
+    // as `.env`, so a case-sensitive glob would leak the file. Denying a
+    // superset on case-sensitive filesystems is the safe direction. Other
+    // options stay at glob's defaults, so only case behavior changes.
+    let opts = glob::MatchOptions {
+        case_sensitive: false,
+        ..glob::MatchOptions::new()
+    };
     for (pat, base_only) in deny {
         let hit = if *base_only {
-            pat.matches(&base)
+            pat.matches_with(&base, opts)
         } else {
-            pat.matches(&rel_str) || pat.matches(&abs_str)
+            pat.matches_with(&rel_str, opts) || pat.matches_with(&abs_str, opts)
         };
         if hit {
             return true;
@@ -4067,10 +4073,43 @@ async fn serve_worker_chunk(State(state): State<Arc<ServerState>>, uri: Uri) -> 
     }
 }
 
+// The single gate for serving an absolute (`/@fs`) path. Decide on the
+// canonical target so neither `..` traversal nor a symlink can escape an
+// allow-listed root (component-wise `starts_with` on a raw path does not
+// collapse `..`, and does not follow symlinks): require the real path to be
+// inside a root and not denied. A path that cannot be canonicalized (missing,
+// or a broken symlink) is refused. On success, return the ORIGINAL candidate,
+// not the canonical path, so a caller running with `preserveSymlinks` keeps the
+// module identity it asked for; both resolve to the same bytes.
+fn fs_gate(state: &ServerState, candidate: &Path) -> Option<PathBuf> {
+    let real = std::fs::canonicalize(candidate).ok()?;
+    let allowed = {
+        let allow = state.fs_allow.lock().unwrap();
+        allow.iter().any(|root| {
+            // Fast path: roots are normally already canonical (the resolver
+            // realpaths them). Fall back to canonicalizing the root so a
+            // symlinked or /var-vs-/private/var root still matches.
+            real.starts_with(root)
+                || std::fs::canonicalize(root)
+                    .map(|r| real.starts_with(r))
+                    .unwrap_or(false)
+        })
+    };
+    if !allowed || path_is_denied(&real, &state.root, &state.fs_deny) {
+        return None;
+    }
+    Some(candidate.to_path_buf())
+}
+
 fn locate_url(state: &ServerState, url: &str) -> Result<PathBuf, String> {
     let base = url.split('?').next().unwrap_or(url);
     if let Some(abs) = base.strip_prefix("/@fs") {
-        Ok(PathBuf::from(abs))
+        // Bundle routes (lazy/patch/worker) resolve here too: gate them exactly
+        // like the top-level /@fs route so they cannot read outside the roots.
+        // These callers already pass a decoded path (the lazy route urldecodes
+        // its id, the worker route hex-decodes, patch URLs come from url_of), so
+        // do not decode again here.
+        fs_gate(state, &PathBuf::from(abs)).ok_or_else(|| format!("forbidden: {url}"))
     } else {
         let rel = base.trim_start_matches('/');
         locate(&state.root, &state.public_dir, rel).ok_or_else(|| format!("no such module: {url}"))
@@ -4992,6 +5031,21 @@ mod tests {
         assert!(path_is_denied(&root.join("secrets/token.txt"), root, &deny));
         assert!(path_is_denied(&root.join("id_rsa.key"), root, &deny));
         assert!(!path_is_denied(&root.join("public/logo.svg"), root, &deny));
+    }
+
+    #[test]
+    fn fs_deny_is_case_insensitive() {
+        // On a case-insensitive filesystem `.ENV` opens the same bytes as
+        // `.env`, so a case-sensitive deny glob would leak it. Every case
+        // variant of a denied name (base-name and path patterns) must be denied.
+        let root = Path::new("/proj");
+        let deny = compile_fs_deny(&["secrets/**".to_string(), "*.key".to_string()]);
+        assert!(path_is_denied(&root.join(".ENV"), root, &deny));
+        assert!(path_is_denied(&root.join(".Env.Production"), root, &deny));
+        assert!(path_is_denied(&root.join("certs/SERVER.PEM"), root, &deny));
+        assert!(path_is_denied(&root.join(".GIT/config"), root, &deny));
+        assert!(path_is_denied(&root.join("Secrets/token.txt"), root, &deny));
+        assert!(path_is_denied(&root.join("id_rsa.KEY"), root, &deny));
     }
 
     #[test]
