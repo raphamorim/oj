@@ -1820,6 +1820,17 @@ async fn serve_compiled(
     query: Option<&str>,
     headers: &HeaderMap,
 ) -> Response {
+    // Key and transform per full url incl. query: the same file yields different
+    // modules per query (TanStack router `?tsr-shared`/`?tsr-split` variants), so
+    // the query must reach ensure_module's cache key and the plugin transform id.
+    let url_with_query;
+    let url = match query {
+        Some(q) => {
+            url_with_query = format!("{url}?{q}");
+            url_with_query.as_str()
+        }
+        None => url,
+    };
     let (key, module) = match ensure_module(state, file, url).await {
         Ok(pair) => pair,
         Err(err) => {
@@ -2817,6 +2828,12 @@ fn resolved_imports_json(
     let dir = file.parent().unwrap_or(file);
     let mut map = serde_json::Map::new();
     for spec in oj_compiler::imports(source, file) {
+        // Node builtins never resolve to a file (they're browser-externalized via
+        // interop); skip them so the resolver doesn't log a "cannot resolve" warning
+        // per app module. A plugin's this.resolve falls back to the host for these.
+        if is_node_builtin(&spec) {
+            continue;
+        }
         let val = match resolver.resolve(dir, &spec) {
             Ok(p) => {
                 // The map hands these ids to the plugin transform; if the transform
@@ -3207,7 +3224,11 @@ fn rewrite_specifier(
             // to miss the on-disk resolver; the caller's plugin fallback serves
             // them, so a "cannot resolve" line here is just misleading noise.
             let plugin_virtual = spec.starts_with("virtual:") || spec.starts_with('\0');
-            if !(spec.starts_with("./") || spec.starts_with("../") || plugin_virtual) {
+            if !(spec.starts_with("./")
+                || spec.starts_with("../")
+                || plugin_virtual
+                || is_node_builtin(spec))
+            {
                 eprintln!("oj: cannot resolve '{spec}': {err}");
             }
             None

@@ -881,7 +881,10 @@ function hookHandler(hook) {
 
 function matchOne(pattern, id) {
   if (pattern instanceof RegExp) return pattern.test(id);
-  if (typeof pattern === "string") return pattern === id;
+  // Vite/rolldown match a string id/code filter as a substring, not exact -- e.g.
+  // the router code-splitter excludes `'tsr-shared'`/`'tsr-split'` to skip those
+  // query variants, which only works as a contains check on the query-bearing id.
+  if (typeof pattern === "string") return id.includes(pattern);
   return false;
 }
 
