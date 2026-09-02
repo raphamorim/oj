@@ -55,8 +55,16 @@ function resolveEsbuild() {
   try {
     return req.resolve("esbuild");
   } catch {}
-  const vitePkg = req.resolve("vite/package.json");
-  return createRequire(vitePkg).resolve("esbuild");
+  // A Vite app rarely depends on esbuild directly but always has it transitively
+  // through Vite, so resolve it from Vite's own directory. When neither is
+  // present there is nothing to pre-bundle with: fail with a clear message (oj
+  // then serves deps natively) instead of a misleading "cannot find
+  // vite/package.json" from an app that simply has no Vite.
+  try {
+    return createRequire(req.resolve("vite/package.json")).resolve("esbuild");
+  } catch {
+    throw new Error("esbuild not found (neither directly nor via vite); dep pre-bundling skipped");
+  }
 }
 const esbuild = await import(pathToFileURL(resolveEsbuild()).href).then((m) => m.default ?? m);
 
