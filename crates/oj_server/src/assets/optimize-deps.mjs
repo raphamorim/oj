@@ -255,20 +255,18 @@ for (const dep of deps) {
     nameOf[last] = name;
     continue;
   }
+  // A package.json `#imports` subpath (e.g. `#shared/i18n/compiled/messages`)
+  // resolves to a file INSIDE the project, not a node_modules dep. Vite's optimizer
+  // targets node_modules; it does not pre-bundle project source, and neither should
+  // oj. These are served as source and handled by the app's own plugins (the
+  // i18n-dev `load` hook collapses the message barrel into grouped virtual modules),
+  // so pre-bundling them would both fight that plugin and split the module instance
+  // between SSR and client.
+  if (dep.startsWith("#")) continue;
   let entry;
   try {
     entry = req.resolve(dep);
   } catch {
-    // An explicit include can be an extensionless subpath import (a package.json
-    // `#imports` alias to a barrel, e.g. `#shared/i18n/compiled/messages`) that
-    // Node's resolver rejects but esbuild resolves (extensions + browser
-    // conditions). Force-bundle it via the bare specifier; skipping it here is what
-    // left thousands of tiny re-exported files served individually.
-    if (include.includes(dep)) {
-      const name = dep.replace(/^@/, "").replace(/[^\w.-]/g, "_");
-      entryPoints[name] = dep;
-      nameOf[dep] = name;
-    }
     continue;
   }
   // Skip linked / workspace packages (symlinked into node_modules): pre-bundling
