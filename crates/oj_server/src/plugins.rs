@@ -814,6 +814,19 @@ impl PluginHost {
             .unwrap_or(true)
     }
 
+    /// Whether any active plugin has a `load` hook. Vite runs `load` hooks before
+    /// the filesystem read, so a plugin can replace an on-disk file's contents; oj
+    /// gates that load-first pass on this so apps with no `load` hook pay nothing.
+    /// Defaults to false on RPC failure (the fs read alone is always correct).
+    pub async fn has_load(&self) -> bool {
+        self.call("getHasLoad", &[])
+            .await
+            .ok()
+            .flatten()
+            .map(|s| s == "true")
+            .unwrap_or(false)
+    }
+
     /// The `filter.code` include patterns of every object-form transform hook, as
     /// regex source strings. oj gates dependency transforms on these so it only
     /// hands a dep to the transform RPC when a transform's own filter wants it.

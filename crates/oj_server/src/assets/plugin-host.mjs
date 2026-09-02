@@ -1185,6 +1185,10 @@ async function run(hook, args) {
     });
     return String(has);
   }
+  if (hook === "getHasLoad") {
+    const has = plugins.some((p) => typeof hookHandler(p.load) === "function");
+    return String(has);
+  }
   if (hook === "getHmrHooks") {
     const watchChangeHook = plugins.some((p) => typeof p.watchChange === "function");
     const hotUpdateHook = plugins.some((p) => typeof p.handleHotUpdate === "function");

@@ -269,6 +269,7 @@ struct ServerState {
     plugin_watched: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
     plugins_use_module_parsed: bool,
     plugins_have_transform: bool,
+    plugins_have_load: bool,
     // A dep is transformed only when its source matches one of these (the plugins'
     // own transform `filter.code` patterns); app source always goes through.
     dep_transform_res: Vec<regex::Regex>,
@@ -565,6 +566,10 @@ impl DevServer {
             Some(host) => host.has_transform().await,
             None => false,
         };
+        let plugins_have_load = match &plugin_host {
+            Some(host) => host.has_load().await,
+            None => false,
+        };
         let dep_transform_res: Vec<regex::Regex> = match &plugin_host {
             Some(host) => host
                 .dep_transform_filters()
@@ -715,6 +720,7 @@ impl DevServer {
             plugin_watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             plugins_use_module_parsed,
             plugins_have_transform,
+            plugins_have_load,
             dep_transform_res,
             plugins_watch_change,
             plugins_hot_update,
@@ -2027,12 +2033,41 @@ async fn ensure_module(
         }
     }
 
-    let source = bytes_to_string(
-        tokio::fs::read(file)
-            .await
-            .map_err(|err| format!("read error for {url}: {err}"))?,
-    )
-    .map_err(|err| format!("read error for {url}: {err}"))?;
+    let is_dep_early = is_dep_module(url, file);
+
+    // Vite runs plugin `load` hooks before the filesystem read (its fs read is the
+    // last-resort `vite:load-fallback` plugin), so a plugin can replace an on-disk
+    // file's contents. The i18n-dev plugin relies on this: its `load` collapses the
+    // generated 8k-line message barrel (`_index.js`) into a handful of grouped
+    // virtual modules, so the browser fetches a few groups instead of thousands of
+    // individual re-exported files. oj mirrors the ordering here: give a matching
+    // plugin `load` the first say, fall back to the disk read when none loads. It is
+    // gated to app source (deps in node_modules never need it) and reached only on a
+    // cold module (the mtime cache above short-circuits warm ones), so it adds no
+    // per-request RPC on the warm path, and nothing at all when no plugin has `load`.
+    let plugin_loaded = if state.plugins_have_load && !is_dep_early {
+        match &state.plugins {
+            Some(host) => {
+                let load_id = match url.split_once('?') {
+                    Some((_, q)) => format!("{}?{}", file.display(), q),
+                    None => file.to_string_lossy().into_owned(),
+                };
+                host.load(&load_id).await.ok().flatten()
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let source = match plugin_loaded {
+        Some(code) => code,
+        None => bytes_to_string(
+            tokio::fs::read(file)
+                .await
+                .map_err(|err| format!("read error for {url}: {err}"))?,
+        )
+        .map_err(|err| format!("read error for {url}: {err}"))?,
+    };
     if file.extension().and_then(|e| e.to_str()) == Some("css") && is_tailwind_css(&source) {
         let css = compile_tailwind(state, url, &source).await?;
         let module = Arc::new(CachedModule {
@@ -2050,7 +2085,6 @@ async fn ensure_module(
         return Ok((String::new(), module));
     }
 
-    let is_dep_early = is_dep_module(url, file);
     let is_server = is_server_module(file) && !is_dep_early && !state.bundle;
 
     let mode = if state.bundle {
@@ -3629,9 +3663,28 @@ async fn serve_plugin_id(state: &Arc<ServerState>, spec: &str, importer: &str) -
     let resolver = Arc::clone(&state.resolver);
     let fs_allow = Arc::clone(&state.fs_allow);
     let dir_cache = Arc::clone(&state.dir_cache);
+    let plugin_fallback = !state.bundle;
+    let importer_id = id.clone();
     let compiled = tokio::task::spawn_blocking(move || {
-        let mut rewrite =
-            |s: &str| rewrite_specifier(&root, &root, &resolver, &fs_allow, &dir_cache, s, true);
+        let mut rewrite = |s: &str| {
+            if let Some(u) =
+                rewrite_specifier(&root, &root, &resolver, &fs_allow, &dir_cache, s, true)
+            {
+                return Some(u);
+            }
+            // A plugin-loaded virtual can import another plugin virtual (the i18n
+            // message groups import their `virtual:i18n-facade/*` counterpart). Route
+            // bare specifiers back through the plugin like the on-disk compile path
+            // does, instead of leaving `virtual:...` for the browser to fetch and fail.
+            if plugin_fallback && is_bare_specifier(s) {
+                return Some(format!(
+                    "/@id/{}?importer={}",
+                    hex_encode(s),
+                    hex_encode(&importer_id)
+                ));
+            }
+            None
+        };
         let source = interop_node_builtins(&source, Path::new("plugin.tsx")).unwrap_or(source);
         oj_compiler::compile_module(
             Path::new("plugin.tsx"),
@@ -3787,9 +3840,28 @@ async fn serve_plugin_load_fallback(state: &Arc<ServerState>, uri: &Uri) -> Opti
     let resolver = Arc::clone(&state.resolver);
     let fs_allow = Arc::clone(&state.fs_allow);
     let dir_cache = Arc::clone(&state.dir_cache);
+    let plugin_fallback = !state.bundle;
+    let importer_id = id.clone();
     let compiled = tokio::task::spawn_blocking(move || {
-        let mut rewrite =
-            |s: &str| rewrite_specifier(&root, &root, &resolver, &fs_allow, &dir_cache, s, true);
+        let mut rewrite = |s: &str| {
+            if let Some(u) =
+                rewrite_specifier(&root, &root, &resolver, &fs_allow, &dir_cache, s, true)
+            {
+                return Some(u);
+            }
+            // A plugin-loaded virtual can import another plugin virtual (the i18n
+            // message groups import their `virtual:i18n-facade/*` counterpart). Route
+            // bare specifiers back through the plugin like the on-disk compile path
+            // does, instead of leaving `virtual:...` for the browser to fetch and fail.
+            if plugin_fallback && is_bare_specifier(s) {
+                return Some(format!(
+                    "/@id/{}?importer={}",
+                    hex_encode(s),
+                    hex_encode(&importer_id)
+                ));
+            }
+            None
+        };
         let source = interop_node_builtins(&source, Path::new("plugin.tsx")).unwrap_or(source);
         oj_compiler::compile_module(
             Path::new("plugin.tsx"),
