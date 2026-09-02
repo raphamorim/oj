@@ -212,6 +212,35 @@ pub fn exports(source_text: &str, path: &Path) -> Vec<String> {
     names
 }
 
+// Static import/export-from specifiers, in source order (deduped). Used to
+// pre-resolve a module's imports before a plugin transform so a plugin's
+// `this.resolve` is a local lookup instead of a per-import host round-trip.
+pub fn imports(source_text: &str, path: &Path) -> Vec<String> {
+    let Ok(source_type) = SourceType::from_path(path) else {
+        return Vec::new();
+    };
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source_text, source_type).parse();
+    if parsed.panicked {
+        return Vec::new();
+    }
+    let mut specs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push = |s: &str, specs: &mut Vec<String>| {
+        if seen.insert(s.to_string()) {
+            specs.push(s.to_string());
+        }
+    };
+    for stmt in &parsed.program.body {
+        match stmt {
+            Statement::ImportDeclaration(decl) => push(decl.source.value.as_str(), &mut specs),
+            Statement::ExportAllDeclaration(decl) => push(decl.source.value.as_str(), &mut specs),
+            _ => {}
+        }
+    }
+    specs
+}
+
 pub fn compile_module(
     path: &Path,
     source_text: &str,
@@ -460,6 +489,24 @@ impl<'a> oxc_ast_visit::VisitMut<'a> for DynamicImportRewriter<'a, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imports_collects_static_specifiers_deduped() {
+        let src = r#"
+            import { a } from "react";
+            import b from "./b";
+            import "react";
+            export * from "./c";
+            const x = await import("./dynamic");
+        "#;
+        let got = imports(src, Path::new("m.tsx"));
+        assert_eq!(got, vec!["react".to_string(), "./b".to_string(), "./c".to_string()]);
+    }
+
+    #[test]
+    fn imports_empty_for_no_imports() {
+        assert!(imports("export const x = 1;", Path::new("m.ts")).is_empty());
+    }
 
     #[test]
     fn compose_two_traces_served_position_back_to_original_source() {

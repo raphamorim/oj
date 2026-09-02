@@ -48,7 +48,25 @@ function detectEntries() {
 const entryList = entries && entries.length ? entries : detectEntries();
 
 const req = createRequire(path.join(root, "package.json"));
-const esbuild = await import(pathToFileURL(req.resolve("esbuild")).href).then((m) => m.default ?? m);
+// Vite 8 apps use rolldown for optimizeDeps and don't depend on esbuild directly,
+// but esbuild is still a Vite transitive dep -- resolve it from the app's Vite when
+// the app itself doesn't expose it, so the dep pre-bundler still runs.
+function resolveEsbuild() {
+  try {
+    return req.resolve("esbuild");
+  } catch {}
+  // A Vite app rarely depends on esbuild directly but always has it transitively
+  // through Vite, so resolve it from Vite's own directory. When neither is
+  // present there is nothing to pre-bundle with: fail with a clear message (oj
+  // then serves deps natively) instead of a misleading "cannot find
+  // vite/package.json" from an app that simply has no Vite.
+  try {
+    return createRequire(req.resolve("vite/package.json")).resolve("esbuild");
+  } catch {
+    throw new Error("esbuild not found (neither directly nor via vite); dep pre-bundling skipped");
+  }
+}
+const esbuild = await import(pathToFileURL(resolveEsbuild()).href).then((m) => m.default ?? m);
 
 const NODE_BUILTINS = new Set([...builtinModules.builtinModules, ...builtinModules.builtinModules.map((m) => "node:" + m)]);
 const isBare = (id) => id && !id.startsWith(".") && !id.startsWith("/") && !id.startsWith("\0") && !NODE_BUILTINS.has(id);
@@ -222,6 +240,37 @@ const deps = [...scanned].filter((d) => !excludeSet.has(d));
 const entryPoints = {};
 const nameOf = {};
 for (const dep of deps) {
+  // Vite's nested-dependency syntax: "a > b" pre-bundles the copy of `b` nested
+  // inside `a` (each segment resolved from the previous one's directory). The
+  // optimized dep registers under the LAST segment, which is what the app imports;
+  // esbuild gets the concrete resolved file for that nested copy. A broken nested
+  // include is dropped, not allowed to fail the whole pre-bundle.
+  if (dep.includes(">")) {
+    const parts = dep.split(">").map((s) => s.trim()).filter(Boolean);
+    let resolved;
+    let fromDir;
+    try {
+      for (const part of parts) {
+        resolved = fromDir ? req.resolve(part, { paths: [fromDir] }) : req.resolve(part);
+        fromDir = path.dirname(resolved);
+      }
+    } catch {
+      continue;
+    }
+    const last = parts[parts.length - 1];
+    const name = last.replace(/^@/, "").replace(/[^\w.-]/g, "_");
+    entryPoints[name] = resolved;
+    nameOf[last] = name;
+    continue;
+  }
+  // A package.json `#imports` subpath (e.g. `#shared/i18n/compiled/messages`)
+  // resolves to a file INSIDE the project, not a node_modules dep. Vite's optimizer
+  // targets node_modules; it does not pre-bundle project source, and neither should
+  // oj. These are served as source and handled by the app's own plugins (the
+  // i18n-dev `load` hook collapses the message barrel into grouped virtual modules),
+  // so pre-bundling them would both fight that plugin and split the module instance
+  // between SSR and client.
+  if (dep.startsWith("#")) continue;
   let entry;
   try {
     entry = req.resolve(dep);
@@ -254,7 +303,7 @@ for (const dep of deps) {
   if (/\.(css|scss|sass|less|styl|woff2?|ttf|otf|eot|svg|png|jpe?g|gif|webp|avif|mp4|webm|wasm)$/i.test(entry)) {
     continue;
   }
-  const name = dep.replace(/^@/, "").replace(/[/@]/g, "_");
+  const name = dep.replace(/^@/, "").replace(/[^\w.-]/g, "_");
   // Hand esbuild the BARE specifier, not the Node-resolved path: `req.resolve`
   // picks the `require`/`node` condition (uuid's ./dist/cjs, which `require`s
   // node crypto), and bundling that fixed file skips browser resolution. A bare

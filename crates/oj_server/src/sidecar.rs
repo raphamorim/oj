@@ -74,6 +74,17 @@ fn at_directive_position(source: &str, index: usize) -> bool {
         .is_none_or(|c| matches!(c, '\n' | '\r' | '}' | '{' | ';'))
 }
 
+fn absolute_from(base: &str, from: &str) -> String {
+    let clean = from.split(['?', '#']).next().unwrap_or(from);
+    if let Some(fs) = clean.strip_prefix("/@fs") {
+        return fs.to_string();
+    }
+    if let Some(rel) = clean.strip_prefix('/') {
+        return Path::new(base).join(rel).display().to_string();
+    }
+    Path::new(base).join(clean).display().to_string()
+}
+
 pub struct Sidecar {
     stdin: tokio::sync::Mutex<tokio::process::ChildStdin>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<String, String>>>>,
@@ -173,6 +184,7 @@ impl Sidecar {
         let id = self.counter.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
+        let from = absolute_from(&self.base, from);
         let request = serde_json::json!({ "id": id, "base": self.base, "css": css, "from": from });
         {
             let mut stdin = self.stdin.lock().await;
@@ -208,6 +220,26 @@ impl Sidecar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absolute_from_roots_urls_at_base() {
+        assert_eq!(
+            absolute_from("/app/web", "/src/styles/globals.css"),
+            "/app/web/src/styles/globals.css"
+        );
+        assert_eq!(
+            absolute_from("/app/web", "/src/styles/globals.css?direct"),
+            "/app/web/src/styles/globals.css"
+        );
+        assert_eq!(
+            absolute_from("/app/web", "/@fs/pkg/dist/theme.css"),
+            "/pkg/dist/theme.css"
+        );
+        assert_eq!(
+            absolute_from("/app/web", "relative/x.css"),
+            "/app/web/relative/x.css"
+        );
+    }
 
     #[test]
     fn tailwind_imports_are_detected_in_every_written_form() {

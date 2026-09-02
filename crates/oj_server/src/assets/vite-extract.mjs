@@ -46,6 +46,24 @@ async function loadConfig() {
   if (vitePath) {
     try {
       const vite = await import(pathToFileURL(vitePath).href);
+      // resolveConfig runs the plugins' config hooks, so plugin-injected values
+      // (e.g. TanStack Start's resolve.alias for `#tanstack-router-entry`) are
+      // present. loadConfigFromFile only reads the raw user config and misses them.
+      if (typeof vite.resolveConfig === "function") {
+        try {
+          const resolved = await vite.resolveConfig(
+            { root: appRoot, configFile: configPath, mode },
+            command,
+            mode,
+            mode,
+          );
+          if (resolved) {
+            return { config: resolved, deps: absDeps(resolved.configFileDependencies) };
+          }
+        } catch {
+          // fall through to the raw loader below
+        }
+      }
       if (typeof vite.loadConfigFromFile === "function") {
         const loaded = await vite.loadConfigFromFile({ command, mode }, configPath, appRoot);
         if (loaded && loaded.config) {

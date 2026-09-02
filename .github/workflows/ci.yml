@@ -151,6 +151,10 @@ jobs:
         run: node e2e/plugin-load-jsx.mjs
       - name: plugin transform runs on CSS sources before compile
         run: node e2e/css-plugin-transform.mjs
+      - name: plugin load runs before the disk read (load-first)
+        run: node e2e/plugin-load-first.mjs
+      - name: plain .svg import goes through the svgr plugin transform
+        run: node e2e/svgr-plugin.mjs
       - name: vite:css-post shim routes plugin CSS into output (UnoCSS pattern)
         run: node e2e/vite-css-post-shim.mjs
       - name: .vite/manifest.json is present in the generateBundle bundle

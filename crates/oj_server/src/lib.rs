@@ -269,6 +269,10 @@ struct ServerState {
     plugin_watched: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
     plugins_use_module_parsed: bool,
     plugins_have_transform: bool,
+    plugins_have_load: bool,
+    // A dep is transformed only when its source matches one of these (the plugins'
+    // own transform `filter.code` patterns); app source always goes through.
+    dep_transform_res: Vec<regex::Regex>,
     plugins_watch_change: bool,
     plugins_hot_update: bool,
     html_env: std::collections::BTreeMap<String, String>,
@@ -562,6 +566,19 @@ impl DevServer {
             Some(host) => host.has_transform().await,
             None => false,
         };
+        let plugins_have_load = match &plugin_host {
+            Some(host) => host.has_load().await,
+            None => false,
+        };
+        let dep_transform_res: Vec<regex::Regex> = match &plugin_host {
+            Some(host) => host
+                .dep_transform_filters()
+                .await
+                .iter()
+                .filter_map(|s| regex::Regex::new(s).ok())
+                .collect(),
+            None => Vec::new(),
+        };
         // Same idea for HMR: a host without watchChange/handleHotUpdate hooks (the
         // tagger case) doesn't need those per-save stdio round-trips.
         let (plugins_watch_change, plugins_hot_update) = match &plugin_host {
@@ -659,8 +676,8 @@ impl DevServer {
             has_postcss: has_postcss_config(&root),
             scss_additional_data: oj_config::css_additional_data(&config, "scss"),
             sass_additional_data: oj_config::css_additional_data(&config, "sass"),
-            fs_allow: Arc::new(Mutex::new(
-                server_cfg
+            fs_allow: Arc::new(Mutex::new({
+                let mut set: std::collections::HashSet<PathBuf> = server_cfg
                     .fs
                     .as_ref()
                     .and_then(|f| f.allow.as_ref())
@@ -677,8 +694,13 @@ impl DevServer {
                             })
                             .collect()
                     })
-                    .unwrap_or_default(),
-            )),
+                    .unwrap_or_default();
+                // Vite defaults server.fs.allow to [searchForWorkspaceRoot(root)], so
+                // workspace packages (shared UI, fonts) are served without an explicit
+                // allow entry. Match that instead of allow-listing package-by-package.
+                set.insert(workspace_root(&root));
+                set
+            })),
             fs_deny: compile_fs_deny(&oj_config::server_fs_deny(&config)),
             dir_cache: Arc::new(Mutex::new(DirCache::new())),
             patch_seq: std::sync::atomic::AtomicU64::new(0),
@@ -698,6 +720,8 @@ impl DevServer {
             plugin_watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             plugins_use_module_parsed,
             plugins_have_transform,
+            plugins_have_load,
+            dep_transform_res,
             plugins_watch_change,
             plugins_hot_update,
             html_env,
@@ -935,11 +959,14 @@ async fn ssr_module(
         };
     }
     let source = match ssr_plugin_host(&state).await {
-        Some(host) => host
-            .transform(&source, id)
-            .await
-            .map(|(code, _, _, _)| code)
-            .unwrap_or(source),
+        Some(host) => {
+            let resolved =
+                resolved_imports_json(&state.resolver, &state.fs_allow, &source, Path::new(id));
+            host.transform(&source, id, &resolved)
+                .await
+                .map(|(code, _, _, _)| code)
+                .unwrap_or(source)
+        }
         None => source,
     };
     let compile_path: PathBuf = if from_plugin {
@@ -1346,7 +1373,7 @@ async fn proxy_middleware(
                 if name == header::TRANSFER_ENCODING || name == header::CONTENT_LENGTH {
                     continue;
                 }
-                response.headers_mut().insert(name, value.clone());
+                response.headers_mut().append(name, value.clone());
             }
             response
         }
@@ -1458,14 +1485,18 @@ async fn forward_to_plugin_middleware(
     }
     let status = resp.status();
     let resp_headers = resp.headers().clone();
-    let bytes = resp.bytes().await.unwrap_or_default();
-    let mut response = Response::new(Body::from(bytes));
+    // Stream the worker/plugin response through instead of buffering it. TanStack
+    // Start streams its dehydrated data (queryStream + deferred promises) into the
+    // HTML; buffering with resp.bytes() withholds the whole document until the SSR
+    // stream closes, so the client's hydration never sees it progressively. Vite
+    // pipes the worker Response body through (Readable.fromWeb); this is the same.
+    let mut response = Response::new(Body::from_stream(resp.bytes_stream()));
     *response.status_mut() = status;
     for (name, value) in resp_headers.iter() {
         if name == header::TRANSFER_ENCODING || name == header::CONTENT_LENGTH {
             continue;
         }
-        response.headers_mut().insert(name, value.clone());
+        response.headers_mut().append(name, value.clone());
     }
     Some(response)
 }
@@ -1519,14 +1550,18 @@ pub async fn forward_to_plugin_mw(
     }
     let status = resp.status();
     let resp_headers = resp.headers().clone();
-    let bytes = resp.bytes().await.unwrap_or_default();
-    let mut response = Response::new(Body::from(bytes));
+    // Stream the worker/plugin response through instead of buffering it. TanStack
+    // Start streams its dehydrated data (queryStream + deferred promises) into the
+    // HTML; buffering with resp.bytes() withholds the whole document until the SSR
+    // stream closes, so the client's hydration never sees it progressively. Vite
+    // pipes the worker Response body through (Readable.fromWeb); this is the same.
+    let mut response = Response::new(Body::from_stream(resp.bytes_stream()));
     *response.status_mut() = status;
     for (name, value) in resp_headers.iter() {
         if name == header::TRANSFER_ENCODING || name == header::CONTENT_LENGTH {
             continue;
         }
-        response.headers_mut().insert(name, value.clone());
+        response.headers_mut().append(name, value.clone());
     }
     Some(response)
 }
@@ -1552,14 +1587,18 @@ pub async fn forward_get_to_plugin_mw(
     }
     let status = resp.status();
     let resp_headers = resp.headers().clone();
-    let bytes = resp.bytes().await.unwrap_or_default();
-    let mut response = Response::new(Body::from(bytes));
+    // Stream the worker/plugin response through instead of buffering it. TanStack
+    // Start streams its dehydrated data (queryStream + deferred promises) into the
+    // HTML; buffering with resp.bytes() withholds the whole document until the SSR
+    // stream closes, so the client's hydration never sees it progressively. Vite
+    // pipes the worker Response body through (Readable.fromWeb); this is the same.
+    let mut response = Response::new(Body::from_stream(resp.bytes_stream()));
     *response.status_mut() = status;
     for (name, value) in resp_headers.iter() {
         if name == header::TRANSFER_ENCODING || name == header::CONTENT_LENGTH {
             continue;
         }
-        response.headers_mut().insert(name, value.clone());
+        response.headers_mut().append(name, value.clone());
     }
     Some(response)
 }
@@ -1637,12 +1676,12 @@ async fn serve_path(
         return serve_plugin_resolve(&state, &id).await;
     }
 
-    if let Some(hex) = uri.path().strip_prefix("/@id/") {
-        let spec = hex_decode(hex).unwrap_or_default();
+    if let Some(seg) = uri.path().strip_prefix("/@id/") {
+        let spec = decode_at_id(seg);
         let importer = uri
             .query()
             .and_then(|q| q.strip_prefix("importer="))
-            .and_then(hex_decode)
+            .map(decode_at_id)
             .unwrap_or_default();
         return serve_plugin_id(&state, &spec, &importer).await;
     }
@@ -1713,6 +1752,20 @@ async fn serve_path(
     {
         let url = format!("{}?react", url_of(&state.root, &file));
         return serve_compiled(&state, &file, &url, None, &headers).await;
+    }
+    // A plain `.svg` import (no `?react`, no `?url`) goes through the compile path so
+    // a configured `vite-plugin-svgr` can turn it into a React component (this app
+    // sets svgrOptions.exportType "default" + an include list, so every matching svg
+    // is imported as `import Icon from "./x.svg"`). serve_compiled runs the svgr
+    // transform; svgs the plugin does not match fall back to a URL asset there. A raw
+    // browser request (the Accept header wants the image) still serves the file.
+    if ext == "svg"
+        && state.plugins_have_transform
+        && query_asset_kind(uri.query()).is_none()
+        && !wants_raw_resource(&headers)
+    {
+        let url = url_of(&state.root, &file);
+        return serve_compiled(&state, &file, &url, uri.query(), &headers).await;
     }
     if ext == "json" && !file.starts_with(&state.public_dir) {
         let url = url_of(&state.root, &file);
@@ -1796,6 +1849,17 @@ async fn serve_compiled(
     query: Option<&str>,
     headers: &HeaderMap,
 ) -> Response {
+    // Key and transform per full url incl. query: the same file yields different
+    // modules per query (TanStack router `?tsr-shared`/`?tsr-split` variants), so
+    // the query must reach ensure_module's cache key and the plugin transform id.
+    let url_with_query;
+    let url = match query {
+        Some(q) => {
+            url_with_query = format!("{url}?{q}");
+            url_with_query.as_str()
+        }
+        None => url,
+    };
     let (key, module) = match ensure_module(state, file, url).await {
         Ok(pair) => pair,
         Err(err) => {
@@ -1858,6 +1922,16 @@ async fn ensure_module(
             .split_once('?')
             .is_some_and(|(_, q)| q.split('&').any(|kv| kv == "react"));
     let is_svelte = file.extension().and_then(|e| e.to_str()) == Some("svelte");
+    // A plain `.svg` (no explicit `?url`/`?raw`) reaches here when a transform
+    // plugin might componentize it (vite-plugin-svgr). Route it through the transform
+    // pipeline instead of short-circuiting to a URL asset; the svgr transform decides
+    // per its own include filter, and an svg it does not match falls back to a URL
+    // asset after the transform runs.
+    let svgr_candidate = !react_svg
+        && !state.bundle
+        && state.plugins_have_transform
+        && file.extension().and_then(|e| e.to_str()) == Some("svg")
+        && query_asset_kind(url.split_once('?').map(|(_, q)| q)).is_none();
 
     if !react_svg && state.bundle {
         if let Some(kind) = query_asset_kind(url.split_once('?').map(|(_, q)| q)) {
@@ -1919,7 +1993,7 @@ async fn ensure_module(
         }
     }
 
-    if !react_svg && is_asset_path(file) {
+    if !react_svg && !svgr_candidate && is_asset_path(file) {
         let clean = url.split('?').next().unwrap_or(url);
         let default = format!(
             "export default {};\n",
@@ -1980,12 +2054,41 @@ async fn ensure_module(
         }
     }
 
-    let source = bytes_to_string(
-        tokio::fs::read(file)
-            .await
-            .map_err(|err| format!("read error for {url}: {err}"))?,
-    )
-    .map_err(|err| format!("read error for {url}: {err}"))?;
+    let is_dep_early = is_dep_module(url, file);
+
+    // Vite runs plugin `load` hooks before the filesystem read (its fs read is the
+    // last-resort `vite:load-fallback` plugin), so a plugin can replace an on-disk
+    // file's contents. The i18n-dev plugin relies on this: its `load` collapses the
+    // generated 8k-line message barrel (`_index.js`) into a handful of grouped
+    // virtual modules, so the browser fetches a few groups instead of thousands of
+    // individual re-exported files. oj mirrors the ordering here: give a matching
+    // plugin `load` the first say, fall back to the disk read when none loads. It is
+    // gated to app source (deps in node_modules never need it) and reached only on a
+    // cold module (the mtime cache above short-circuits warm ones), so it adds no
+    // per-request RPC on the warm path, and nothing at all when no plugin has `load`.
+    let plugin_loaded = if state.plugins_have_load && !is_dep_early {
+        match &state.plugins {
+            Some(host) => {
+                let load_id = match url.split_once('?') {
+                    Some((_, q)) => format!("{}?{}", file.display(), q),
+                    None => file.to_string_lossy().into_owned(),
+                };
+                host.load(&load_id).await.ok().flatten()
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let source = match plugin_loaded {
+        Some(code) => code,
+        None => bytes_to_string(
+            tokio::fs::read(file)
+                .await
+                .map_err(|err| format!("read error for {url}: {err}"))?,
+        )
+        .map_err(|err| format!("read error for {url}: {err}"))?,
+    };
     if file.extension().and_then(|e| e.to_str()) == Some("css") && is_tailwind_css(&source) {
         let css = compile_tailwind(state, url, &source).await?;
         let module = Arc::new(CachedModule {
@@ -2003,7 +2106,6 @@ async fn ensure_module(
         return Ok((String::new(), module));
     }
 
-    let is_dep_early = is_dep_module(url, file);
     let is_server = is_server_module(file) && !is_dep_early && !state.bundle;
 
     let mode = if state.bundle {
@@ -2087,9 +2189,19 @@ async fn ensure_module(
     let is_dep = is_dep_module(url, file);
     let mut plugin_watch_files: Vec<String> = Vec::new();
     let mut plugin_maps: Vec<String> = Vec::new();
+    let dep_wants_transform =
+        is_dep && state.dep_transform_res.iter().any(|re| re.is_match(&source));
     let source = match &state.plugins {
-        Some(host) if !is_dep && state.plugins_have_transform => {
-            match host.transform(&source, &file.to_string_lossy()).await {
+        Some(host) if state.plugins_have_transform && (!is_dep || dep_wants_transform) => {
+            let resolved =
+                resolved_imports_json(&state.resolver, &state.fs_allow, &source, file);
+            // Pass the id WITH its query (e.g. `?tsr-shared=1`), like Vite: the router
+            // code-splitter emits a different variant per query, keyed off the id.
+            let transform_id = match url.split_once('?') {
+                Some((_, q)) => format!("{}?{}", file.display(), q),
+                None => file.to_string_lossy().into_owned(),
+            };
+            match host.transform(&source, &transform_id, &resolved).await {
                 Ok((code, watches, maps, _)) => {
                     plugin_watch_files = watches;
                     plugin_maps = maps;
@@ -2124,6 +2236,30 @@ async fn ensure_module(
     } else {
         source
     };
+    // The svgr plugin transform (if any) has run by now. If a plain `.svg` candidate
+    // is still raw markup, the plugin did not match it (not in its include list), so
+    // serve it as a URL asset like Vite; otherwise it is now component code compiled
+    // as `.svg.tsx` below.
+    let svgr_componentized = svgr_candidate && !source.trim_start().starts_with('<');
+    if svgr_candidate && !svgr_componentized {
+        let clean = url.split('?').next().unwrap_or(url);
+        let module = Arc::new(CachedModule {
+            is_boundary: false,
+            kind: String::new(),
+            code: format!(
+                "export default {};\n",
+                serde_json::Value::String(clean.to_string())
+            ),
+            map_data_url: None,
+            imports: Vec::new(),
+            require_map: Vec::new(),
+            css_exports: Vec::new(),
+            fs_allow: Vec::new(),
+            watch_files: Vec::new(),
+        });
+        register_in_graph(state, url, &module);
+        return Ok((String::new(), module));
+    }
     let source = if is_svelte {
         run_svelte_sidecar(state, url, &source)
             .await
@@ -2140,7 +2276,7 @@ async fn ensure_module(
         state.virtual_modules.keys().cloned().collect();
     let jsx_overrides = state.jsx_overrides.clone();
     let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
-    let file_owned = if react_svg {
+    let file_owned = if react_svg || svgr_componentized {
         file.with_extension("svg.tsx")
     } else if is_svelte {
         file.with_extension("svelte.js")
@@ -2151,6 +2287,7 @@ async fn ensure_module(
     let sass_data = sass_additional_data_for(state, &url_owned);
     let bundle = state.bundle;
     let plugin_fallback = state.plugins.is_some() && !bundle;
+    let svgr_active = state.plugins_have_transform && !bundle;
     let importer_abs = file.to_string_lossy().into_owned();
     let ext = file.extension().and_then(|e| e.to_str());
     let is_css = ext.is_some_and(is_style_ext);
@@ -2217,6 +2354,16 @@ async fn ensure_module(
             if let Some(url) =
                 rewrite_specifier(&root, &dir, &resolver, &fs_allow, &dir_cache, spec, !bundle)
             {
+                // `.svg` resolves to `<url>?url` (asset). When a transform plugin is
+                // active (vite-plugin-svgr), leave the svg unmarked instead so it
+                // routes through the compile path and svgr can componentize it, as
+                // Vite does (it marks svg imports `?import`, not `?url`); an svg svgr
+                // does not match falls back to a URL asset there.
+                if svgr_active {
+                    if let Some(base) = url.strip_suffix(".svg?url") {
+                        return Some(format!("{base}.svg"));
+                    }
+                }
                 return Some(url);
             }
             if plugin_fallback && is_bare_specifier(spec) {
@@ -2229,10 +2376,11 @@ async fn ensure_module(
             None
         };
         if bundle {
+            let bundle_interop = interop_node_builtins(&source, &file_owned);
             let factory = oj_compiler::bundle::compile_factory(
                 &file_owned,
                 &url_owned,
-                &source,
+                bundle_interop.as_deref().unwrap_or(&source),
                 &mut rewrite,
             )
             .map_err(|err| format!("compile error:\n{err}"))?;
@@ -2252,10 +2400,22 @@ async fn ensure_module(
             })
         } else {
             let output = if is_dep {
-                oj_compiler::cjs::compile_dep(&file_owned, &url_owned, &source, &mut rewrite)
+                let dep_interop = interop_node_builtins(&source, &file_owned);
+                oj_compiler::cjs::compile_dep(
+                    &file_owned,
+                    &url_owned,
+                    dep_interop.as_deref().unwrap_or(&source),
+                    &mut rewrite,
+                )
             } else {
                 let interopped =
                     oj_compiler::interop::rewrite_cjs_interop(&source, &file_owned, &|spec| {
+                        // node builtins are browser-externalized to a stub with no
+                        // named exports; interop so `import { X } from "node:..."`
+                        // reads X off it (undefined) instead of failing to link.
+                        if is_node_builtin(spec) {
+                            return Some(format!("/@id/{}", hex_encode(spec)));
+                        }
                         // lingui macro entrypoints go to the shim (which has real
                         // named exports), never through default-access interop.
                         if is_lingui_macro_specifier(spec) {
@@ -2722,13 +2882,93 @@ pub(crate) fn is_node_builtin(spec: &str) -> bool {
     let base = name.split('/').next().unwrap_or(name);
     matches!(
         base,
-        "assert" | "buffer" | "child_process" | "cluster" | "console" | "constants"
-            | "crypto" | "dgram" | "diagnostics_channel" | "dns" | "domain" | "events"
+        "assert" | "async_hooks" | "buffer" | "child_process" | "cluster" | "console"
+            | "constants" | "crypto" | "dgram" | "diagnostics_channel" | "dns" | "domain" | "events"
             | "fs" | "http" | "http2" | "https" | "inspector" | "module" | "net" | "os"
             | "path" | "perf_hooks" | "process" | "punycode" | "querystring" | "readline"
             | "repl" | "stream" | "string_decoder" | "sys" | "timers" | "tls" | "trace_events"
             | "tty" | "url" | "util" | "v8" | "vm" | "wasi" | "worker_threads" | "zlib"
     )
+}
+
+// Vite's searchForWorkspaceRoot: walk up from the app root and stop at the first
+// workspace marker (pnpm-workspace.yaml / lerna.json / .git, or a package.json with
+// a `workspaces` field); otherwise the farthest ancestor that still has a
+// package.json. oj seeds server.fs.allow with this, matching Vite's default.
+fn workspace_root(root: &Path) -> PathBuf {
+    let mut pkg_root = root.to_path_buf();
+    let mut dir = root;
+    loop {
+        if dir.join("pnpm-workspace.yaml").exists()
+            || dir.join("lerna.json").exists()
+            || dir.join(".git").exists()
+        {
+            return dir.to_path_buf();
+        }
+        if dir.join("package.json").exists() {
+            if let Ok(txt) = std::fs::read_to_string(dir.join("package.json")) {
+                if txt.contains("\"workspaces\"") {
+                    return dir.to_path_buf();
+                }
+            }
+            pkg_root = dir.to_path_buf();
+        }
+        match dir.parent() {
+            Some(p) => dir = p,
+            None => return pkg_root,
+        }
+    }
+}
+
+// Rewrite `import { X } from "node:builtin"` to read X off the browser-externalized
+// stub (undefined) instead of a native named import that fails to link, matching
+// Vite's importAnalysis interop for browser-external modules. Returns None when the
+// source imports no node builtins. Applied on every compile path so deps, bundled
+// factories, and app source all interop consistently.
+// Pre-resolve a module's static imports (same resolver ctx.resolve uses) into a
+// {spec: id|null} JSON map, handed to the plugin transform so a plugin's per-import
+// `this.resolve` is a local lookup instead of a host round-trip. This is what keeps
+// import-protection's transform (a resolve per import) from being thousands of IPC
+// round-trips per page.
+fn resolved_imports_json(
+    resolver: &OjResolver,
+    fs_allow: &Mutex<std::collections::HashSet<PathBuf>>,
+    source: &str,
+    file: &Path,
+) -> String {
+    let dir = file.parent().unwrap_or(file);
+    let mut map = serde_json::Map::new();
+    for spec in oj_compiler::imports(source, file) {
+        // Node builtins never resolve to a file (they're browser-externalized via
+        // interop); skip them so the resolver doesn't log a "cannot resolve" warning
+        // per app module. A plugin's this.resolve falls back to the host for these.
+        if is_node_builtin(&spec) {
+            continue;
+        }
+        let val = match resolver.resolve(dir, &spec) {
+            Ok(p) => {
+                // The map hands these ids to the plugin transform; if the transform
+                // keeps the import, the browser fetches it from /@fs, so allow-list
+                // its package root now (rewrite_specifier does the same on its path).
+                if p.components().any(|c| c.as_os_str() == "node_modules") || !p.starts_with(dir) {
+                    fs_allow.lock().unwrap().insert(package_root(&p));
+                }
+                serde_json::Value::String(p.display().to_string())
+            }
+            Err(_) => serde_json::Value::Null,
+        };
+        map.insert(spec, val);
+    }
+    serde_json::Value::Object(map).to_string()
+}
+
+fn interop_node_builtins(source: &str, file: &Path) -> Option<String> {
+    if !source.contains("node:") {
+        return None;
+    }
+    oj_compiler::interop::rewrite_cjs_interop(source, file, &|spec| {
+        is_node_builtin(spec).then(|| format!("/@id/{}", hex_encode(spec)))
+    })
 }
 
 fn is_style_url(url: &str) -> bool {
@@ -2862,18 +3102,48 @@ fn handle_client_message(state: &Arc<ServerState>, text: &str) {
     }
 }
 
+/// The id a module's hot context and Fast Refresh registration use: its url with
+/// oj's HMR cache-busting `t=<timestamp>` removed but every other query kept, so a
+/// `?tsr-shared=1` variant stays a distinct module while the id is stable across
+/// updates. It must match the clean path the server names in its update messages;
+/// a timestamped id would never match, so accept callbacks would never fire.
+/// Mirrors Vite's `removeTimestampQuery`.
+fn strip_hmr_timestamp(url: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|kv| {
+            !(kv.starts_with("t=") && kv.len() > 2 && kv[2..].bytes().all(|b| b.is_ascii_digit()))
+        })
+        .collect();
+    if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    }
+}
+
 fn hot_glue(url: &str, query: Option<&str>, is_boundary: bool) -> String {
     if !is_boundary {
         return String::new();
     }
+    // serve_compiled keys modules per full url, so `url` usually already carries
+    // its query and `query` repeats it; it can also arrive clean with the query
+    // separate. Either way the self-import must name exactly the module being
+    // served (keeping its `t=` so the browser dedupes to the running instance) and
+    // must never re-append a query the url already has. Doing so once per edit
+    // grew the url without bound (`?t=X?t=Y...`) until hyper answered 414.
     let self_specifier = match query {
-        Some(q) if !q.is_empty() => format!("{url}?{q}"),
+        Some(q) if !q.is_empty() && !url.contains('?') => format!("{url}?{q}"),
         _ => url.to_string(),
     };
+    let id = strip_hmr_timestamp(&self_specifier);
     format!(
         r#"
 import {{ createHotContext as __oj_createHotContext }} from "/@oj/client.js";
-import.meta.hot = __oj_createHotContext({url:?});
+import.meta.hot = __oj_createHotContext({id:?});
 import * as RefreshRuntime from "/@oj/refresh-runtime.js";
 import * as __oj_currentExports from {self_specifier:?};
 if (import.meta.hot) {{
@@ -2881,14 +3151,14 @@ if (import.meta.hot) {{
     throw new Error("oj: Fast Refresh preamble missing; was index.html served by oj?");
   }}
   const currentExports = __oj_currentExports;
-  RefreshRuntime.registerExportsForReactRefresh({url:?}, currentExports);
+  RefreshRuntime.registerExportsForReactRefresh({id:?}, currentExports);
   import.meta.hot.accept((nextExports) => {{
     if (!nextExports) return;
-    const invalidateMessage = RefreshRuntime.validateRefreshBoundaryAndEnqueueUpdate({url:?}, currentExports, nextExports);
+    const invalidateMessage = RefreshRuntime.validateRefreshBoundaryAndEnqueueUpdate({id:?}, currentExports, nextExports);
     if (invalidateMessage) import.meta.hot.invalidate(invalidateMessage);
   }});
 }}
-function $RefreshReg$(type, id) {{ return RefreshRuntime.register(type, {url:?} + " " + id); }}
+function $RefreshReg$(type, id) {{ return RefreshRuntime.register(type, {id:?} + " " + id); }}
 function $RefreshSig$() {{ return RefreshRuntime.createSignatureFunctionForTransform(); }}
 "#
     )
@@ -2988,7 +3258,26 @@ fn rewrite_specifier(
     spec: &str,
     css_import_marker: bool,
 ) -> Option<String> {
-    if spec.starts_with('/') || spec.contains("://") {
+    if spec.starts_with('/') {
+        // A root-relative URL (/src/x) is already servable. But a plugin can emit an
+        // absolute filesystem path under root -- TanStack's dev client entry, and the
+        // router code-splitter's `?tsr-shared=1` imports -- so rewrite that to its
+        // root-relative URL (preserving any query), as Vite's import analysis does.
+        let (base, query) = match spec.split_once('?') {
+            Some((b, q)) => (b, Some(q)),
+            None => (spec, None),
+        };
+        let p = Path::new(base);
+        if p.starts_with(root) && is_file_cached(dir_cache, p) {
+            let url = url_of(root, p);
+            return Some(match query {
+                Some(q) => format!("{url}?{q}"),
+                None => url,
+            });
+        }
+        return None;
+    }
+    if spec.contains("://") {
         return None;
     }
 
@@ -3076,7 +3365,11 @@ fn rewrite_specifier(
             // to miss the on-disk resolver; the caller's plugin fallback serves
             // them, so a "cannot resolve" line here is just misleading noise.
             let plugin_virtual = spec.starts_with("virtual:") || spec.starts_with('\0');
-            if !(spec.starts_with("./") || spec.starts_with("../") || plugin_virtual) {
+            if !(spec.starts_with("./")
+                || spec.starts_with("../")
+                || plugin_virtual
+                || is_node_builtin(spec))
+            {
                 eprintln!("oj: cannot resolve '{spec}': {err}");
             }
             None
@@ -3397,6 +3690,7 @@ async fn serve_plugin_resolve(state: &Arc<ServerState>, id: &str) -> Response {
             }
             None
         };
+        let source = interop_node_builtins(&source, Path::new("plugin.tsx")).unwrap_or(source);
         oj_compiler::compile_module(
             Path::new("plugin.tsx"),
             &source,
@@ -3464,9 +3758,29 @@ async fn serve_plugin_id(state: &Arc<ServerState>, spec: &str, importer: &str) -
     let resolver = Arc::clone(&state.resolver);
     let fs_allow = Arc::clone(&state.fs_allow);
     let dir_cache = Arc::clone(&state.dir_cache);
+    let plugin_fallback = !state.bundle;
+    let importer_id = id.clone();
     let compiled = tokio::task::spawn_blocking(move || {
-        let mut rewrite =
-            |s: &str| rewrite_specifier(&root, &root, &resolver, &fs_allow, &dir_cache, s, true);
+        let mut rewrite = |s: &str| {
+            if let Some(u) =
+                rewrite_specifier(&root, &root, &resolver, &fs_allow, &dir_cache, s, true)
+            {
+                return Some(u);
+            }
+            // A plugin-loaded virtual can import another plugin virtual (the i18n
+            // message groups import their `virtual:i18n-facade/*` counterpart). Route
+            // bare specifiers back through the plugin like the on-disk compile path
+            // does, instead of leaving `virtual:...` for the browser to fetch and fail.
+            if plugin_fallback && is_bare_specifier(s) {
+                return Some(format!(
+                    "/@id/{}?importer={}",
+                    hex_encode(s),
+                    hex_encode(&importer_id)
+                ));
+            }
+            None
+        };
+        let source = interop_node_builtins(&source, Path::new("plugin.tsx")).unwrap_or(source);
         oj_compiler::compile_module(
             Path::new("plugin.tsx"),
             &source,
@@ -3621,9 +3935,29 @@ async fn serve_plugin_load_fallback(state: &Arc<ServerState>, uri: &Uri) -> Opti
     let resolver = Arc::clone(&state.resolver);
     let fs_allow = Arc::clone(&state.fs_allow);
     let dir_cache = Arc::clone(&state.dir_cache);
+    let plugin_fallback = !state.bundle;
+    let importer_id = id.clone();
     let compiled = tokio::task::spawn_blocking(move || {
-        let mut rewrite =
-            |s: &str| rewrite_specifier(&root, &root, &resolver, &fs_allow, &dir_cache, s, true);
+        let mut rewrite = |s: &str| {
+            if let Some(u) =
+                rewrite_specifier(&root, &root, &resolver, &fs_allow, &dir_cache, s, true)
+            {
+                return Some(u);
+            }
+            // A plugin-loaded virtual can import another plugin virtual (the i18n
+            // message groups import their `virtual:i18n-facade/*` counterpart). Route
+            // bare specifiers back through the plugin like the on-disk compile path
+            // does, instead of leaving `virtual:...` for the browser to fetch and fail.
+            if plugin_fallback && is_bare_specifier(s) {
+                return Some(format!(
+                    "/@id/{}?importer={}",
+                    hex_encode(s),
+                    hex_encode(&importer_id)
+                ));
+            }
+            None
+        };
+        let source = interop_node_builtins(&source, Path::new("plugin.tsx")).unwrap_or(source);
         oj_compiler::compile_module(
             Path::new("plugin.tsx"),
             &source,
@@ -3734,6 +4068,16 @@ fn hex_decode(s: &str) -> Option<String> {
         out.push((hi * 16 + lo) as u8);
     }
     String::from_utf8(out).ok()
+}
+
+// oj hex-encodes its own /@id/ links, but a Vite plugin's client entry ships a
+// raw /@id/<id> URL (Vite's convention: \0 shown as __x00__). Decode hex when the
+// segment is valid hex, else fall back to the raw id so both forms resolve.
+fn decode_at_id(seg: &str) -> String {
+    if let Some(s) = hex_decode(seg) {
+        return s;
+    }
+    urldecode(seg).replace("__x00__", "\0")
 }
 
 fn is_asset_ext(ext: &str) -> bool {
@@ -4933,6 +5277,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dep_transform_gate_matches_only_marker_sources() {
+        // The plugins' own transform code-filter patterns (getDepTransformFilters).
+        let res: Vec<regex::Regex> = [r"\bcreateServerFn\b|\.\s*handler\s*\(", "createIsomorphicFn"]
+            .iter()
+            .map(|s| regex::Regex::new(s).unwrap())
+            .collect();
+        let wants = |src: &str| res.iter().any(|re| re.is_match(src));
+        assert!(wants("export const f = createIsomorphicFn().client(() => 1)"));
+        assert!(wants("const x = createServerFn()"));
+        assert!(wants("route.handler ( () => {} )"));
+        assert!(!wants("export const x = 1;"));
+        assert!(!wants("import { getStartContext } from '@tanstack/start-storage-context'"));
+    }
+
+    #[test]
+    fn decode_at_id_handles_hex_and_raw_vite_ids() {
+        assert_eq!(decode_at_id(&hex_encode("virtual:x")), "virtual:x");
+        assert_eq!(
+            decode_at_id("virtual:tanstack-start-dev-client-entry"),
+            "virtual:tanstack-start-dev-client-entry"
+        );
+        assert_eq!(decode_at_id("__x00__virtual:foo"), "\0virtual:foo");
+    }
+
+    #[test]
     fn parse_hmr_filter_reads_filter_module_urls() {
         let seeds =
             parse_hmr_filter(r#"{"action":"filter","modules":["/src/a.tsx","/src/b.tsx"]}"#).unwrap();
@@ -5187,6 +5556,35 @@ mod tests {
         assert!(glue.contains(r#"from "/src/App.tsx?t=123""#), "{glue}");
         assert!(glue.contains("validateRefreshBoundaryAndEnqueueUpdate"));
         assert!(glue.contains("function $RefreshReg$"));
+    }
+
+    #[test]
+    fn glue_never_doubles_a_query_the_url_already_carries() {
+        // serve_compiled keys per full url, so the real call hands hot_glue a url
+        // that already has its query AND the same query again. The self-import
+        // must not grow (`?t=X?t=X` grew per edit until hyper answered 414) and
+        // the hot-context id must stay the clean path the server sends updates for.
+        let glue = hot_glue("/src/App.tsx?t=123", Some("t=123"), true);
+        assert!(glue.contains(r#"createHotContext("/src/App.tsx")"#), "{glue}");
+        assert!(glue.contains(r#"from "/src/App.tsx?t=123""#), "{glue}");
+        assert!(!glue.contains("?t=123?t=123"), "{glue}");
+        assert!(glue.contains(r#"registerExportsForReactRefresh("/src/App.tsx","#), "{glue}");
+        // Only the hmr timestamp is stripped from the id; a semantic query that
+        // makes a distinct module (router `?tsr-shared=1`) is kept in both.
+        let v = hot_glue("/src/r.tsx?tsr-shared=1&t=9", Some("tsr-shared=1&t=9"), true);
+        assert!(v.contains(r#"createHotContext("/src/r.tsx?tsr-shared=1")"#), "{v}");
+        assert!(v.contains(r#"from "/src/r.tsx?tsr-shared=1&t=9""#), "{v}");
+    }
+
+    #[test]
+    fn strip_hmr_timestamp_removes_only_the_t_param() {
+        assert_eq!(strip_hmr_timestamp("/src/App.tsx"), "/src/App.tsx");
+        assert_eq!(strip_hmr_timestamp("/src/App.tsx?t=123"), "/src/App.tsx");
+        assert_eq!(strip_hmr_timestamp("/a.tsx?tsr-shared=1&t=9"), "/a.tsx?tsr-shared=1");
+        assert_eq!(strip_hmr_timestamp("/a.tsx?t=9&tsr-shared=1"), "/a.tsx?tsr-shared=1");
+        // `t=` with a non-numeric value is not oj's timestamp; keep it.
+        assert_eq!(strip_hmr_timestamp("/a.tsx?t=abc"), "/a.tsx?t=abc");
+        assert_eq!(strip_hmr_timestamp("/a.tsx?type=x"), "/a.tsx?type=x");
     }
 
     #[test]
