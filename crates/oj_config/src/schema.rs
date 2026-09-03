@@ -41,6 +41,16 @@ pub struct OjConfig {
     /// entries may be strings, globs, RegExps (extracted as `{ regex }`) or
     /// `true`. See `ssr_externals`.
     pub ssr: Option<serde_json::Value>,
+    /// Vite's `html` block (`cspNonce`).
+    pub html: Option<HtmlConfig>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct HtmlConfig {
+    /// `html.cspNonce`: the nonce every injected/served `<script>`, `<style>`
+    /// and stylesheet/preload `<link>` carries, plus a `csp-nonce` meta tag.
+    pub csp_nonce: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

@@ -493,6 +493,7 @@ if (isMainRun) try {
       allowedHosts: extractAllowedHosts(c.server?.allowedHosts),
       preview: extractPreview(c.preview),
       appType: typeof c.appType === "string" ? c.appType : null,
+      html: typeof c.html?.cspNonce === "string" ? { cspNonce: c.html.cspNonce } : null,
     }),
   );
 } catch (e) {

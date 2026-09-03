@@ -279,6 +279,8 @@ struct ServerState {
     scss_additional_data: Option<String>,
     sass_additional_data: Option<String>,
     css_config: Option<oj_config::CssConfig>,
+    /// `html.cspNonce`: stamped on every served page's script/style/link tags.
+    csp_nonce: Option<String>,
     /// `resolve.alias`, root and public dir as seen by `@import`/`@use`/`url()`
     /// specifiers inside stylesheets (Vite's CSS resolvers).
     css_resolve: oj_css::CssResolveConfig,
@@ -788,6 +790,7 @@ impl DevServer {
             sass_additional_data: oj_config::css_additional_data(&config, "sass"),
             css_config: config.css.clone(),
             css_resolve,
+            csp_nonce: oj_config::html_csp_nonce(&config),
             fs_allow: Arc::new(Mutex::new({
                 // Vite: `allow: raw?.fs?.allow ?? [searchForWorkspaceRoot(root)]`. The
                 // workspace root is the DEFAULT, not an addition: a user allow list
@@ -2410,12 +2413,77 @@ async fn serve_html(state: &ServerState, bytes: Vec<u8>, url: &str, file: &Path)
             }
         }
     }
-    let html = if state.bundle {
+    let mut html = if state.bundle {
         inject_bundle_scripts(raw)
     } else {
         inject_module_preloads(inject_dev_scripts(raw), state)
     };
+    if let Some(nonce) = &state.csp_nonce {
+        html = inject_csp_nonce(&html, nonce);
+    }
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
+}
+
+/// Vite's `html.cspNonce` (injectNonceAttributeTagHook + injectCspNonceMetaTagHook):
+/// every `<script>`, `<style>` and stylesheet/modulepreload/preload `<link>`
+/// without a `nonce` gets `nonce="<nonce>"`, and `<head>` gets a
+/// `<meta property="csp-nonce" nonce="<nonce>">` the runtime reads back.
+pub fn inject_csp_nonce(html: &str, nonce: &str) -> String {
+    let mut out = String::with_capacity(html.len() + 256);
+    let mut rest = html;
+    while let Some(lt) = rest.find('<') {
+        let (before, at) = rest.split_at(lt);
+        out.push_str(before);
+        let name_end = at[1..]
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+            .map(|i| i + 1)
+            .unwrap_or(at.len());
+        let name = at[1..name_end].to_ascii_lowercase();
+        let Some(gt) = at.find('>') else {
+            out.push_str(at);
+            return out;
+        };
+        let tag = &at[..gt];
+        let wants = match name.as_str() {
+            "script" | "style" => true,
+            "link" => html_tag_attr(tag, "rel").is_some_and(|rel| {
+                rel.split_whitespace()
+                    .any(|r| matches!(r.to_ascii_lowercase().as_str(), "stylesheet" | "modulepreload" | "preload"))
+            }),
+            _ => false,
+        };
+        if wants && html_tag_attr(tag, "nonce").is_none() {
+            let body = tag.trim_end_matches('/').trim_end();
+            let self_closing = tag.trim_end().ends_with('/');
+            out.push_str(body);
+            out.push_str(&format!(" nonce=\"{nonce}\""));
+            out.push_str(if self_closing { " />" } else { ">" });
+        } else {
+            out.push_str(&at[..=gt]);
+        }
+        rest = &at[gt + 1..];
+        // Skip raw text content so a `<` inside a script or style body is not
+        // read as a tag.
+        if matches!(name.as_str(), "script" | "style") && !tag.trim_end().ends_with('/') {
+            let close = format!("</{name}");
+            if let Some(end) = rest.to_ascii_lowercase().find(&close) {
+                out.push_str(&rest[..end]);
+                rest = &rest[end..];
+            }
+        }
+    }
+    out.push_str(rest);
+    if !out.contains("property=\"csp-nonce\"") {
+        let meta = format!("<meta property=\"csp-nonce\" nonce=\"{nonce}\">");
+        out = match out.find("<head>") {
+            Some(i) => {
+                let at = i + "<head>".len();
+                format!("{}\n{meta}{}", &out[..at], &out[at..])
+            }
+            None => format!("{meta}\n{out}"),
+        };
+    }
+    out
 }
 
 async fn serve_index_html(state: &ServerState) -> Response {
@@ -8018,6 +8086,29 @@ mod tests {
         assert_eq!(html_entry_src("https://cdn/x.js"), None);
         assert_eq!(html_entry_src("//cdn/x.js"), None);
         assert_eq!(html_entry_src("data:text/js,1"), None);
+    }
+
+    #[test]
+    fn csp_nonce_stamps_scripts_styles_and_preload_links_once() {
+        let html = "<html><head>\
+            <link rel=\"stylesheet\" href=\"/a.css\">\
+            <link rel=\"icon\" href=\"/i.png\">\
+            <link rel=\"modulepreload\" href=\"/m.js\" />\
+            <style>.a{color:red}</style>\
+            <script nonce=\"keep\">if (1 < 2) {}</script>\
+            </head><body><script type='module' src='/main.js'></script><p>a < b</p></body></html>";
+        let out = inject_csp_nonce(html, "n0nce");
+        assert!(out.contains("<link rel=\"stylesheet\" href=\"/a.css\" nonce=\"n0nce\">"), "{out}");
+        assert!(out.contains("<link rel=\"icon\" href=\"/i.png\">"), "non-preload links untouched: {out}");
+        assert!(out.contains("<link rel=\"modulepreload\" href=\"/m.js\" nonce=\"n0nce\" />"), "{out}");
+        assert!(out.contains("<style nonce=\"n0nce\">.a{color:red}</style>"), "{out}");
+        assert!(out.contains("<script nonce=\"keep\">if (1 < 2) {}</script>"), "existing nonce kept: {out}");
+        assert!(out.contains("<script type='module' src='/main.js' nonce=\"n0nce\">"), "{out}");
+        assert!(out.contains("<head>\n<meta property=\"csp-nonce\" nonce=\"n0nce\">"), "{out}");
+        assert!(out.contains("<p>a < b</p>"), "{out}");
+        assert_eq!(out.matches("csp-nonce").count(), 1);
+        // Idempotent: a second pass adds nothing.
+        assert_eq!(inject_csp_nonce(&out, "n0nce"), out);
     }
 
     #[test]

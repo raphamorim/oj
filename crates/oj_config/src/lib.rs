@@ -104,6 +104,15 @@ pub fn css_modules(config: &OjConfig) -> CssModulesSettings {
     }
 }
 
+/// `html.cspNonce`, when set and non-empty.
+pub fn html_csp_nonce(config: &OjConfig) -> Option<String> {
+    config
+        .html
+        .as_ref()
+        .and_then(|h| h.csp_nonce.clone())
+        .filter(|n| !n.is_empty())
+}
+
 /// The public directory, absolute: Vite's `publicDir` (default `<root>/public`),
 /// or None when the config sets `publicDir: false`.
 pub fn public_dir(config: &OjConfig, root: &Path) -> Option<PathBuf> {

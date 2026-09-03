@@ -224,6 +224,8 @@ pub struct ViteValues {
     pub preview: Option<serde_json::Value>,
     /// `appType` (`spa` | `mpa` | `custom`).
     pub app_type: Option<String>,
+    /// `html` block (`cspNonce`).
+    pub html: Option<serde_json::Value>,
 }
 
 /// Why a run of the extractor produced nothing usable, or None when it did.
@@ -422,6 +424,7 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
         allowed_hosts: json.get("allowedHosts").filter(|v| !v.is_null()).cloned(),
         preview: json.get("preview").filter(|v| !v.is_null()).cloned(),
         app_type: json.get("appType").and_then(|v| v.as_str()).map(str::to_string),
+        html: json.get("html").filter(|v| !v.is_null()).cloned(),
     }
 }
 
@@ -704,6 +707,9 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
     }
     if config.oxc.is_none() {
         config.oxc = v.oxc;
+    }
+    if config.html.is_none() {
+        config.html = v.html.and_then(|h| serde_json::from_value(h).ok());
     }
     if config.esbuild.is_none() {
         config.esbuild = v.esbuild;
@@ -1612,6 +1618,7 @@ mod vite_values_tests {
             allowed_hosts: None,
             preview: None,
             app_type: None,
+            html: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/vite-base/"));
@@ -1654,6 +1661,7 @@ mod vite_values_tests {
             allowed_hosts: None,
             preview: None,
             app_type: None,
+            html: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/oj-base/"));

@@ -170,6 +170,9 @@ jobs:
       - name: ?no-inline asset query (dev url module, build never inlines)
         if: matrix.mode == 'unbundled'
         run: node e2e/assets-no-inline.mjs
+      - name: html.cspNonce stamps scripts, styles and preload links (dev + build)
+        if: matrix.mode == 'unbundled'
+        run: node e2e/html-csp-nonce.mjs
 
   # i need to fix this or automate
   build:
