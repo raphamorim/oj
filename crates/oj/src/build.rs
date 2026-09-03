@@ -87,6 +87,8 @@ struct OjCssPlugin {
     /// `css.preprocessorOptions` (Sass additionalData/loadPaths, Less/Stylus
     /// options), applied the same way the dev server applies them.
     css: Option<oj_config::CssConfig>,
+    /// `resolve.alias`, root and public dir for specifiers inside stylesheets.
+    resolve: oj_css::CssResolveConfig,
     /// Inline `<script type="module">` bodies keyed by their html-proxy id.
     html_inline: Arc<Mutex<std::collections::HashMap<String, String>>>,
     /// What a `?worker&inline` bundle inherits from the app build (Vite's
@@ -104,6 +106,21 @@ struct WorkerBundleOpts {
     is_production: bool,
     define: Vec<(String, String)>,
     minify: bool,
+}
+
+/// What `@import`/`@use`/`url()` specifiers inside stylesheets resolve through,
+/// as Vite's CSS resolvers do: the environment's `resolve.alias`, the root and
+/// the public directory.
+fn css_resolve_of(root: &Path, config: &oj_config::OjConfig, env: &str) -> oj_css::CssResolveConfig {
+    oj_css::CssResolveConfig {
+        root: root.to_path_buf(),
+        public_dir: config
+            .public_dir
+            .as_ref()
+            .map(|p| root.join(p))
+            .unwrap_or_else(|| root.join("public")),
+        alias: oj_config::resolve_alias(config, env),
+    }
 }
 
 fn assets_inline_limit_of(config: &oj_config::OjConfig) -> u64 {
@@ -569,6 +586,7 @@ async fn compile_stylesheet(
     css_transform_enabled: &tokio::sync::OnceCell<bool>,
     has_postcss: bool,
     css: &Option<oj_config::CssConfig>,
+    resolve: &oj_css::CssResolveConfig,
     path: &str,
     id: &str,
 ) -> anyhow::Result<oj_css::CssOutput> {
@@ -607,6 +625,7 @@ async fn compile_stylesheet(
                 load_dir: dir,
                 additional_data: data.as_deref(),
                 load_paths: &load_paths,
+                resolve: resolve.as_ref(),
             },
         )
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -625,7 +644,8 @@ async fn compile_stylesheet(
     }
     // Plain `@import`s are inlined (postcss-import parity) so the concatenated
     // chunk stylesheet does not carry imports that 404 from `assets/`.
-    source = oj_css::inline_imports(&source, std::path::Path::new(path)).map_err(|e| anyhow::anyhow!(e))?;
+    source = oj_css::inline_imports_with(&source, std::path::Path::new(path), &resolve.as_ref())
+        .map_err(|e| anyhow::anyhow!(e))?;
     let css_id = match std::path::Path::new(path).strip_prefix(root) {
         Ok(rel) => format!("/{}", rel.display()),
         Err(_) => path.to_string(),
@@ -823,6 +843,7 @@ impl Plugin for OjCssPlugin {
         let css_transform_enabled = Arc::clone(&self.css_transform_enabled);
         let self_has_postcss = self.has_postcss;
         let css_cfg = self.css.clone();
+        let css_resolve = self.resolve.clone();
         let html_inline = Arc::clone(&self.html_inline);
         let worker = self.worker.clone();
         async move {
@@ -846,6 +867,7 @@ impl Plugin for OjCssPlugin {
                         &css_transform_enabled,
                         self_has_postcss,
                         &css_cfg,
+                        &css_resolve,
                         file,
                         &id,
                     )
@@ -963,6 +985,7 @@ impl Plugin for OjCssPlugin {
                         &css_transform_enabled,
                         self_has_postcss,
                         &css_cfg,
+                        &css_resolve,
                         file,
                         &id,
                     )
@@ -1100,6 +1123,7 @@ impl Plugin for OjCssPlugin {
                 &css_transform_enabled,
                 self_has_postcss,
                 &css_cfg,
+                &css_resolve,
                 path,
                 &id,
             )
@@ -2159,6 +2183,7 @@ pub async fn build(
         inline_limit: assets_inline_limit_of(&config),
         client: true,
         css_code_split: css_split,
+        resolve: css_resolve_of(&root, &config, "client"),
         host: plugin_host.clone(),
         css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
         css: config.css.clone(),
@@ -2292,10 +2317,12 @@ pub async fn build(
         .map(|p| root.join(p))
         .unwrap_or_else(|| root.join("public"));
     let link_css_transform_enabled: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::new();
+    let link_css_resolve = css_resolve_of(&root, &config, "client");
     let asset_names_pattern = ro_output_str(ro_opts, "assetFileNames");
     let css_asset_opts = CssAssetOpts {
         inline_limit: assets_inline_limit_of(&config),
         asset_names: asset_names_pattern.as_deref(),
+        resolve: link_css_resolve.as_ref(),
     };
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
     let mut imports_map: std::collections::HashMap<String, Vec<String>> =
@@ -2488,6 +2515,7 @@ pub async fn build(
                     &link_css_transform_enabled,
                     has_postcss,
                     &config.css,
+                    &link_css_resolve,
                     &src_str,
                     &src_str,
                 )
@@ -3244,6 +3272,7 @@ pub(crate) async fn build_ssr(
         inline_limit: assets_inline_limit_of(&config),
         client: false,
         css_code_split: false,
+        resolve: css_resolve_of(root, &config, "ssr"),
         host: plugin_host.clone(),
         css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
         css: config.css.clone(),
@@ -3396,6 +3425,7 @@ async fn build_server_fns(root: &Path, out_dir: &Path, mode: &str) -> anyhow::Re
                 has_postcss: oj_server::has_postcss_config(root),
                 inline_limit: 4096,
                 client: false,
+                resolve: css_resolve_of(root, &config, "ssr"),
                 css_code_split: false,
                 host: None,
                 css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
@@ -3769,6 +3799,7 @@ async fn build_client_entry(
         inline_limit: assets_inline_limit_of(&config),
         client: true,
         css_code_split: false,
+        resolve: css_resolve_of(root, &config, "client"),
         host: plugin_host.clone(),
         css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
         css: config.css.clone(),
@@ -3994,6 +4025,7 @@ async fn build_library(
                 has_postcss: oj_server::has_postcss_config(root),
                 inline_limit: 4096,
                 client: true,
+                resolve: css_resolve_of(root, &config, "client"),
                 css_code_split: false,
                 host: None,
                 css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
@@ -4206,6 +4238,8 @@ fn content_hash(bytes: &[u8]) -> String {
 struct CssAssetOpts<'a> {
     inline_limit: u64,
     asset_names: Option<&'a str>,
+    /// Alias and root-absolute resolution for `url()` specifiers.
+    resolve: oj_css::CssResolve<'a>,
 }
 
 /// Render Vite/rolldown `assetFileNames` placeholders (`[name]`, `[hash]`,
@@ -4239,13 +4273,24 @@ fn emit_css_url(
         || inner.starts_with("https://")
         || inner.starts_with("//")
         || inner.starts_with('#')
-        || inner.starts_with('/')
     {
         return None;
     }
     let cut = inner.find(['?', '#']).unwrap_or(inner.len());
     let (clean, suffix) = inner.split_at(cut);
-    let abs = css_dir.join(clean).canonicalize().ok()?;
+    // Vite's url resolver: a public-dir file keeps its url; an alias or a
+    // root-absolute path names a file that is emitted like a relative one.
+    let abs = if let Some(aliased) = opts.resolve.alias_path(clean) {
+        aliased
+    } else if let Some(rel) = clean.strip_prefix('/') {
+        if rel.is_empty() || opts.resolve.public_file(clean).is_some() {
+            return None;
+        }
+        opts.resolve.root_path(clean)?
+    } else {
+        css_dir.join(clean)
+    };
+    let abs = abs.canonicalize().ok()?;
     if let Some(url) = seen.get(&abs) {
         return Some(format!("{url}{suffix}"));
     }

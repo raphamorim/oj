@@ -33,6 +33,116 @@ pub struct CssOutput {
     pub exports: Option<Vec<(String, String)>>,
 }
 
+/// How specifiers inside a stylesheet resolve beyond plain relative paths, the
+/// way Vite's CSS resolvers (`createCSSResolvers`, the `url()` rewriter) do:
+/// `resolve.alias` pairs apply to `@import`, `@use` and `url()` specifiers, and
+/// a root-absolute `/src/x` resolves against the project root, with a file in
+/// the public directory taking precedence (`checkPublicFile`).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CssResolve<'a> {
+    pub root: Option<&'a Path>,
+    pub public_dir: Option<&'a Path>,
+    /// `(find, replacement)`; a replacement starting with `.` is root-relative.
+    pub alias: &'a [(String, String)],
+}
+
+/// Owned `CssResolve`, for holders that outlive a borrow (server state, build
+/// plugins); `as_ref()` borrows it for a compile.
+#[derive(Debug, Default, Clone)]
+pub struct CssResolveConfig {
+    pub root: PathBuf,
+    pub public_dir: PathBuf,
+    pub alias: Vec<(String, String)>,
+}
+
+impl CssResolveConfig {
+    pub fn as_ref(&self) -> CssResolve<'_> {
+        fn set(p: &Path) -> Option<&Path> {
+            (!p.as_os_str().is_empty()).then_some(p)
+        }
+        CssResolve {
+            root: set(&self.root),
+            public_dir: set(&self.public_dir),
+            alias: &self.alias,
+        }
+    }
+}
+
+impl CssResolve<'_> {
+    /// The specifier after `resolve.alias`, when an alias applies. Matching
+    /// follows @rollup/plugin-alias: `find` is the whole specifier or a `find/`
+    /// prefix, and only the prefix is replaced. The result is an absolute path
+    /// for a path alias, or another bare specifier for a package alias.
+    pub fn alias_spec(&self, spec: &str) -> Option<String> {
+        for (find, replacement) in self.alias {
+            if find.is_empty() {
+                continue;
+            }
+            let rest = if spec == find {
+                ""
+            } else {
+                match spec.strip_prefix(find.as_str()) {
+                    Some(rest) if rest.starts_with('/') => rest,
+                    _ => continue,
+                }
+            };
+            let target = match (replacement.starts_with('.'), self.root) {
+                (true, Some(root)) => {
+                    let mut p = root.to_path_buf();
+                    for c in Path::new(replacement).components() {
+                        match c {
+                            std::path::Component::ParentDir => {
+                                p.pop();
+                            }
+                            std::path::Component::Normal(s) => p.push(s),
+                            _ => {}
+                        }
+                    }
+                    p.to_string_lossy().into_owned()
+                }
+                _ => replacement.clone(),
+            };
+            return Some(format!("{target}{rest}"));
+        }
+        None
+    }
+
+    /// An absolute filesystem path an alias maps `spec` to (a package alias
+    /// yields None: it is still a bare specifier).
+    pub fn alias_path(&self, spec: &str) -> Option<PathBuf> {
+        let aliased = self.alias_spec(spec)?;
+        Path::new(&aliased).is_absolute().then(|| PathBuf::from(aliased))
+    }
+
+    /// The public-directory file a root-absolute `/x` names, if it exists.
+    pub fn public_file(&self, spec: &str) -> Option<PathBuf> {
+        let rel = root_absolute_rel(spec)?;
+        let p = self.public_dir?.join(rel);
+        p.is_file().then_some(p)
+    }
+
+    /// The path under the project root a root-absolute `/x` names (existence is
+    /// the caller's business, so extension probing can apply).
+    pub fn root_path(&self, spec: &str) -> Option<PathBuf> {
+        Some(self.root?.join(root_absolute_rel(spec)?))
+    }
+
+    /// The dev-server url of `file`: `/rel` inside the root, `/@fs` outside it.
+    fn dev_url(&self, file: &Path) -> String {
+        match self.root.and_then(|r| file.strip_prefix(r).ok()) {
+            Some(rel) => format!("/{}", rel.to_string_lossy().replace('\\', "/")),
+            None => format!("/@fs{}", file.display()),
+        }
+    }
+}
+
+/// `/src/x` -> `src/x`; None for anything that is not a root-absolute spec
+/// (`//cdn`, `/` alone).
+fn root_absolute_rel(spec: &str) -> Option<&str> {
+    let rel = spec.strip_prefix('/')?;
+    (!rel.is_empty() && !rel.starts_with('/')).then_some(rel)
+}
+
 pub fn is_css_module(url: &str) -> bool {
     let path = url.split('?').next().unwrap_or(url);
     path.rsplit('/')
@@ -130,7 +240,11 @@ fn index_target(p: &Path) -> Option<PathBuf> {
 // resolution match dart-sass (what Vite uses), which treats the whole basename
 // as the stylesheet name.
 #[derive(Debug)]
-struct DottedFs;
+struct DottedFs {
+    /// Alias / root-absolute rewriting for the import lines of every file read
+    /// through the fs, so nested `@use "@/x"` resolves like the entry's.
+    resolve: CssResolveConfig,
+}
 
 // grass resolves a directory import `@use "pkg"` by probing `pkg/index.scss` and
 // `pkg/_index.scss` (or `.sass`). When `pkg` is an npm package reached through
@@ -199,10 +313,65 @@ impl grass::Fs for DottedFs {
         // `@use 'colors.module.scss'` inside an imported stylesheet resolves
         // through DottedFs instead of grass probing the raw dotted+ext path.
         match String::from_utf8(bytes) {
-            Ok(text) => Ok(strip_sass_import_ext(&text).into_bytes()),
+            Ok(text) => Ok(prepare_sass_imports(&text, &self.resolve.as_ref()).into_bytes()),
             Err(e) => Ok(e.into_bytes()),
         }
     }
+}
+
+/// Whether `base` names a Sass stylesheet the way dart-sass probes it: the file
+/// itself, `.scss`/`.sass`/`.css` added, a `_partial`, or a directory index.
+fn sass_file_exists(base: &Path) -> bool {
+    if base.is_file() {
+        return true;
+    }
+    let Some(name) = base.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let parent = base.parent().unwrap_or(Path::new("."));
+    for ext in ["scss", "sass", "css"] {
+        if with_ext(base, ext).is_file() || parent.join(format!("_{name}.{ext}")).is_file() {
+            return true;
+        }
+    }
+    ["index.scss", "_index.scss", "index.sass", "_index.sass"]
+        .iter()
+        .any(|i| base.join(i).is_file())
+}
+
+/// Vite's sass importer resolves through `resolve.alias` and root-absolute
+/// paths (its idResolver); grass knows neither, so rewrite such a specifier to
+/// the absolute file path before grass sees it. A root-absolute spec is only
+/// rewritten when a stylesheet exists under the root (otherwise it may be a
+/// real absolute path).
+fn rewrite_sass_spec(spec: &str, resolve: &CssResolve<'_>) -> Option<String> {
+    if let Some(p) = resolve.alias_path(spec) {
+        return Some(p.to_string_lossy().into_owned());
+    }
+    let under_root = resolve.root_path(spec)?;
+    sass_file_exists(&under_root).then(|| under_root.to_string_lossy().into_owned())
+}
+
+/// Apply `rewrite_sass_spec` to every quoted string of an import line.
+fn rewrite_sass_line(line: &str, resolve: &CssResolve<'_>) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(open) = rest.find(['"', '\'']) {
+        let quote = rest.as_bytes()[open] as char;
+        let Some(close) = rest[open + 1..].find(quote) else {
+            break;
+        };
+        let inner = &rest[open + 1..open + 1 + close];
+        out.push_str(&rest[..=open]);
+        match rewrite_sass_spec(inner, resolve) {
+            Some(path) => out.push_str(&path),
+            None => out.push_str(inner),
+        }
+        out.push(quote);
+        rest = &rest[open + 1 + close + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 // grass also mishandles an explicit `.scss`/`.sass` extension on a dotted
@@ -211,23 +380,28 @@ impl grass::Fs for DottedFs {
 // `@import` specifiers so every import takes the bare-name path (which DottedFs
 // resolves); Sass treats `@use "x"` and `@use "x.scss"` identically. `.css` is
 // left alone (it stays a plain CSS import), as are `url(...)` lines.
+#[cfg(test)]
 fn strip_sass_import_ext(source: &str) -> String {
+    prepare_sass_imports(source, &CssResolve::default())
+}
+
+fn prepare_sass_imports(source: &str, resolve: &CssResolve<'_>) -> String {
     let mut out = String::with_capacity(source.len());
+    let has_resolve = resolve.root.is_some() || !resolve.alias.is_empty();
     for line in source.split_inclusive('\n') {
         let t = line.trim_start();
         let is_import = t.starts_with("@use") || t.starts_with("@forward") || t.starts_with("@import");
         if is_import && !line.contains("url(") {
             // `~pkg/...` is the webpack-era spelling of a node_modules import that
             // Vite's sass importer still accepts; the load paths cover it bare.
-            out.push_str(
-                &line
-                    .replace(".scss\"", "\"")
-                    .replace(".scss'", "'")
-                    .replace(".sass\"", "\"")
-                    .replace(".sass'", "'")
-                    .replace("\"~", "\"")
-                    .replace("'~", "'"),
-            );
+            let stripped = line
+                .replace(".scss\"", "\"")
+                .replace(".scss'", "'")
+                .replace(".sass\"", "\"")
+                .replace(".sass'", "'");
+            // Aliases apply before the `~` strip so a configured `~` alias wins.
+            let aliased = if has_resolve { rewrite_sass_line(&stripped, resolve) } else { stripped };
+            out.push_str(&aliased.replace("\"~", "\"").replace("'~", "'"));
         } else {
             out.push_str(line);
         }
@@ -250,6 +424,7 @@ pub fn compile_sass_with(
             load_dir,
             additional_data,
             load_paths: &[],
+            resolve: CssResolve::default(),
         },
     )
 }
@@ -257,12 +432,14 @@ pub fn compile_sass_with(
 /// How a Sass stylesheet is compiled: the importing file's directory, the
 /// configured `css.preprocessorOptions.scss.loadPaths`/`includePaths`, and the
 /// `node_modules` directories above it (so `@use "bootstrap/scss/bootstrap"` and
-/// `@use "pkg"` resolve as in Vite), plus `additionalData` prepended.
+/// `@use "pkg"` resolve as in Vite), plus `additionalData` prepended, and
+/// `resolve.alias` / root-absolute specifiers as Vite's sass importer resolves them.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SassOptions<'a> {
     pub load_dir: Option<&'a Path>,
     pub additional_data: Option<&'a str>,
     pub load_paths: &'a [PathBuf],
+    pub resolve: CssResolve<'a>,
 }
 
 /// Every `node_modules` directory from `dir` up to the filesystem root, nearest
@@ -285,7 +462,13 @@ pub fn node_modules_load_paths(dir: &Path) -> Vec<PathBuf> {
 }
 
 pub fn compile_sass_opts(source: &str, opts: &SassOptions<'_>) -> Result<String, String> {
-    let fs = DottedFs;
+    let fs = DottedFs {
+        resolve: CssResolveConfig {
+            root: opts.resolve.root.map(Path::to_path_buf).unwrap_or_default(),
+            public_dir: opts.resolve.public_dir.map(Path::to_path_buf).unwrap_or_default(),
+            alias: opts.resolve.alias.to_vec(),
+        },
+    };
     let mut options = grass::Options::default().fs(&fs);
     if let Some(dir) = opts.load_dir {
         options = options.load_path(dir);
@@ -299,7 +482,7 @@ pub fn compile_sass_opts(source: &str, opts: &SassOptions<'_>) -> Result<String,
         }
     }
     let additional_data = opts.additional_data;
-    let stripped = strip_sass_import_ext(source);
+    let stripped = prepare_sass_imports(source, &opts.resolve);
     let source = match additional_data {
         Some(data) if !data.is_empty() => format!("{data}\n{stripped}"),
         _ => stripped,
@@ -319,11 +502,11 @@ fn default_targets() -> Targets {
 }
 
 pub fn compile_css(url: &str, source: &str, minify: bool) -> Result<CssOutput, String> {
-    compile_css_impl(url, source, minify, false, false)
+    compile_css_impl(url, source, minify, false, false, &CssResolve::default())
 }
 
 pub fn compile_css_rebased(url: &str, source: &str, minify: bool) -> Result<CssOutput, String> {
-    compile_css_impl(url, source, minify, true, false)
+    compile_css_impl(url, source, minify, true, false, &CssResolve::default())
 }
 
 /// `compile_css_rebased` plus an inline source map (`css.devSourcemap`): the
@@ -331,7 +514,19 @@ pub fn compile_css_rebased(url: &str, source: &str, minify: bool) -> Result<CssO
 /// with the (preprocessed) source embedded, so devtools show the stylesheet's
 /// rules at their source lines.
 pub fn compile_css_rebased_with_map(url: &str, source: &str, minify: bool) -> Result<CssOutput, String> {
-    compile_css_impl(url, source, minify, true, true)
+    compile_css_impl(url, source, minify, true, true, &CssResolve::default())
+}
+
+/// The dev-server compile: `url()` / `@import` paths rebased to server-absolute
+/// urls, an aliased one (`@/img.png`) to the url of the file it names, as
+/// Vite's url rewriter does in dev; `source_map` adds the inline map.
+pub fn compile_css_dev(
+    url: &str,
+    source: &str,
+    source_map: bool,
+    resolve: &CssResolve<'_>,
+) -> Result<CssOutput, String> {
+    compile_css_impl(url, source, false, true, source_map, resolve)
 }
 
 fn compile_css_impl(
@@ -340,6 +535,7 @@ fn compile_css_impl(
     minify: bool,
     rebase: bool,
     source_map: bool,
+    resolve: &CssResolve<'_>,
 ) -> Result<CssOutput, String> {
     let is_module = is_css_module(url);
     let warnings = Arc::new(RwLock::new(Vec::new()));
@@ -404,7 +600,7 @@ fn compile_css_impl(
                 Dependency::Url(u) => (u.placeholder, u.url),
                 Dependency::Import(i) => (i.placeholder, i.url),
             };
-            let replacement = rebase_relative(&orig, &base).unwrap_or(orig);
+            let replacement = dev_url_of(&orig, &base, resolve);
             css = css.replace(&placeholder, &replacement);
         }
     }
@@ -431,8 +627,14 @@ fn compile_css_impl(
 /// and external urls are left as written. Every inlined file's relative `url()`
 /// and remaining `@import` paths are rebased to `file`'s directory.
 pub fn inline_imports(source: &str, file: &Path) -> Result<String, String> {
+    inline_imports_with(source, file, &CssResolve::default())
+}
+
+/// `inline_imports` with `resolve.alias` and root-absolute specifiers resolved
+/// like Vite's postcss-import resolver (public dir first, then the root).
+pub fn inline_imports_with(source: &str, file: &Path, resolve: &CssResolve<'_>) -> Result<String, String> {
     let mut stack = vec![file.to_path_buf()];
-    let out = inline_imports_depth(source, file, &mut stack)?;
+    let out = inline_imports_depth(source, file, &mut stack, resolve)?;
     Ok(if out.contains("@import") { hoist_imports(&out) } else { out })
 }
 
@@ -484,7 +686,12 @@ fn hoist_imports(css: &str) -> String {
     out
 }
 
-fn inline_imports_depth(source: &str, file: &Path, stack: &mut Vec<PathBuf>) -> Result<String, String> {
+fn inline_imports_depth(
+    source: &str,
+    file: &Path,
+    stack: &mut Vec<PathBuf>,
+    resolve: &CssResolve<'_>,
+) -> Result<String, String> {
     if !source.contains("@import") || stack.len() > 32 {
         return Ok(source.to_string());
     }
@@ -508,7 +715,7 @@ fn inline_imports_depth(source: &str, file: &Path, stack: &mut Vec<PathBuf>) -> 
             continue;
         };
         let stmt_len = 7 + consumed;
-        let resolved = resolve_css_import(&spec, dir);
+        let resolved = resolve_css_import_with(&spec, dir, resolve);
         let Some(target) = resolved.filter(|t| !stack.iter().any(|s| s == t)) else {
             out.push_str(before);
             out.push_str(&at[..stmt_len]);
@@ -518,10 +725,10 @@ fn inline_imports_depth(source: &str, file: &Path, stack: &mut Vec<PathBuf>) -> 
         let child = std::fs::read_to_string(&target)
             .map_err(|e| format!("cannot read @import {spec} ({}): {e}", target.display()))?;
         stack.push(target.clone());
-        let child = inline_imports_depth(&child, &target, stack)?;
+        let child = inline_imports_depth(&child, &target, stack, resolve)?;
         stack.pop();
         let child_dir = target.parent().unwrap_or(Path::new("."));
-        let rebased = rebase_to_dir(&child, &target, child_dir, dir)?;
+        let rebased = rebase_to_dir(&child, &target, child_dir, dir, resolve)?;
         out.push_str(before);
         match media {
             // `@import "x" print;` becomes `@media print { ... }` (postcss-import).
@@ -576,12 +783,15 @@ fn parse_plain_import(after: &str) -> Option<(String, usize, Option<String>)> {
         || spec.starts_with("data:")
         || spec.starts_with("//")
         || spec.contains("://")
-        || spec.starts_with('/')
     {
         return None;
     }
     let media = (!cond.is_empty()).then(|| cond.to_string());
     Some((spec, ws + used + semi + 1, media))
+}
+
+fn first_css_file(base: &Path) -> Option<PathBuf> {
+    css_file_candidates(base).into_iter().find(|c| c.is_file())
 }
 
 fn css_file_candidates(base: &Path) -> Vec<PathBuf> {
@@ -597,8 +807,31 @@ fn css_file_candidates(base: &Path) -> Vec<PathBuf> {
 /// node_modules package (`style`/`main` entry for a bare package, a file inside
 /// it otherwise), `~` prefix accepted.
 pub fn resolve_css_import(spec: &str, dir: &Path) -> Option<PathBuf> {
-    let spec = spec.strip_prefix('~').unwrap_or(spec);
+    resolve_css_import_with(spec, dir, &CssResolve::default())
+}
+
+/// `resolve_css_import` preceded by Vite's alias and root-absolute steps: an
+/// alias rewrites the specifier first (a path alias resolves there, a package
+/// alias continues as a bare specifier); a root-absolute `/x` is the public file
+/// when one exists, else a file under the root, else a real absolute path.
+pub fn resolve_css_import_with(spec: &str, dir: &Path, resolve: &CssResolve<'_>) -> Option<PathBuf> {
     let spec = spec.split(['?', '#']).next().unwrap_or(spec);
+    let aliased = resolve.alias_spec(spec);
+    let spec = match &aliased {
+        Some(a) if Path::new(a).is_absolute() => return first_css_file(Path::new(a)),
+        Some(a) => a.as_str(),
+        None if spec.starts_with('/') => {
+            if let Some(public) = resolve.public_file(spec) {
+                return Some(public);
+            }
+            if let Some(under_root) = resolve.root_path(spec).and_then(|p| first_css_file(&p)) {
+                return Some(under_root);
+            }
+            return first_css_file(Path::new(spec));
+        }
+        None => spec,
+    };
+    let spec = spec.strip_prefix('~').unwrap_or(spec);
     if spec.is_empty() {
         return None;
     }
@@ -657,7 +890,13 @@ fn split_package_specifier(spec: &str) -> Option<(&str, &str)> {
 
 /// Rewrite the relative `url()` / `@import` paths of a stylesheet that lives in
 /// `from_dir` so they are correct from `to_dir` (where it is being inlined).
-fn rebase_to_dir(css: &str, file: &Path, from_dir: &Path, to_dir: &Path) -> Result<String, String> {
+fn rebase_to_dir(
+    css: &str,
+    file: &Path,
+    from_dir: &Path,
+    to_dir: &Path,
+    resolve: &CssResolve<'_>,
+) -> Result<String, String> {
     if !(css.contains("url(") || css.contains("@import")) || from_dir == to_dir {
         return Ok(css.to_string());
     }
@@ -686,7 +925,9 @@ fn rebase_to_dir(css: &str, file: &Path, from_dir: &Path, to_dir: &Path) -> Resu
             Dependency::Url(u) => (u.placeholder, u.url),
             Dependency::Import(i) => (i.placeholder, i.url),
         };
-        let replacement = if rebase_relative(&orig, "/x").is_none() {
+        // Aliased specs are not relative to the file: they keep their spelling
+        // for the entry's own resolution step.
+        let replacement = if rebase_relative(&orig, "/x").is_none() || resolve.alias_spec(&orig).is_some() {
             orig
         } else {
             let (path, suffix) = match orig.find(['?', '#']) {
@@ -753,6 +994,21 @@ fn css_base_dir(url: &str) -> Option<String> {
         Some(i) => Some(path[..i].to_string()),
         None => None,
     }
+}
+
+/// The server-absolute url a `url()` / `@import` spec of a stylesheet served
+/// from `base_dir` stands for: an aliased path becomes the url of that file,
+/// a relative path is joined to `base_dir`, anything else (root-absolute,
+/// external, data:) is kept.
+fn dev_url_of(spec: &str, base_dir: &str, resolve: &CssResolve<'_>) -> String {
+    let (path, suffix) = match spec.find(['?', '#']) {
+        Some(i) => (&spec[..i], &spec[i..]),
+        None => (spec, ""),
+    };
+    if let Some(file) = resolve.alias_path(path) {
+        return format!("{}{suffix}", resolve.dev_url(&file));
+    }
+    rebase_relative(spec, base_dir).unwrap_or_else(|| spec.to_string())
 }
 
 fn rebase_relative(spec: &str, base_dir: &str) -> Option<String> {
@@ -1015,6 +1271,7 @@ mod tests {
             load_dir: Some(&base.join("src")),
             additional_data: Some("$pad: 2px;"),
             load_paths: &[base.join("styles")],
+            resolve: CssResolve::default(),
         };
         let css = compile_sass_opts("@use \"theme\";\n.a { color: theme.$accent; padding: $pad; }", &opts).unwrap();
         assert!(css.contains("#abc") && css.contains("2px"), "{css}");
@@ -1208,6 +1465,111 @@ mod tests {
             .remove(0)
             .1;
         assert_eq!(scoped, after_edit, "an edit must not rename a class");
+    }
+
+    #[test]
+    fn alias_matches_whole_specifier_or_slash_prefix_like_rollup_alias() {
+        let alias = vec![
+            ("@".to_string(), "./src".to_string()),
+            ("@components".to_string(), "/abs/components".to_string()),
+            ("react".to_string(), "preact/compat".to_string()),
+        ];
+        let r = CssResolve { root: Some(Path::new("/proj")), public_dir: None, alias: &alias };
+        assert_eq!(r.alias_spec("@/img.png").as_deref(), Some("/proj/src/img.png"));
+        assert_eq!(r.alias_spec("@").as_deref(), Some("/proj/src"));
+        // `@components/x` must not be eaten by the shorter `@` alias.
+        assert_eq!(r.alias_spec("@components/btn.css").as_deref(), Some("/abs/components/btn.css"));
+        assert_eq!(r.alias_spec("@scope/pkg/x.css"), None, "not a `find/` prefix match");
+        // A package alias stays a bare specifier (no path).
+        assert_eq!(r.alias_spec("react/x.css").as_deref(), Some("preact/compat/x.css"));
+        assert!(r.alias_path("react/x.css").is_none());
+        assert_eq!(r.alias_path("@/a.css"), Some(PathBuf::from("/proj/src/a.css")));
+    }
+
+    #[test]
+    fn dev_compile_rewrites_aliased_urls_and_keeps_root_absolute_ones() {
+        let alias = vec![("@".to_string(), "./src".to_string())];
+        let r = CssResolve { root: Some(Path::new("/proj")), public_dir: None, alias: &alias };
+        let src = ".a { background: url(@/img/bg.png?v=1); }\n\
+                   .b { background: url(/src/x.png); }\n\
+                   .c { background: url(./y.png); }\n\
+                   .d { background: url(/logo.svg#id); }";
+        let out = compile_css_dev("/src/ui/card.css", src, false, &r).unwrap().css;
+        assert!(out.contains("url(\"/src/img/bg.png?v=1\")") || out.contains("url(/src/img/bg.png?v=1)"), "aliased url -> served url of the file: {out}");
+        assert!(out.contains("/src/x.png"), "root-absolute kept: {out}");
+        assert!(!out.contains("/src/@/"), "alias must not be treated as a relative segment: {out}");
+        assert!(out.contains("/src/ui/y.png"), "relative still rebased: {out}");
+        assert!(out.contains("/logo.svg#id"), "public url kept: {out}");
+        // An alias to a file outside the root is served through /@fs.
+        let outside = vec![("~ui".to_string(), "/elsewhere/ui".to_string())];
+        let r2 = CssResolve { root: Some(Path::new("/proj")), public_dir: None, alias: &outside };
+        let out = compile_css_dev("/src/a.css", ".a { background: url(~ui/i.png) }", false, &r2).unwrap().css;
+        assert!(out.contains("/@fs/elsewhere/ui/i.png"), "{out}");
+    }
+
+    #[test]
+    fn imports_resolve_through_alias_root_and_public_dir() {
+        let base = std::env::temp_dir().join(format!("oj-css-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("src/ui")).unwrap();
+        std::fs::create_dir_all(base.join("public")).unwrap();
+        std::fs::write(base.join("src/vars.css"), ":root { --v: 1; }\n").unwrap();
+        std::fs::write(base.join("src/ui/theme.css"), ".theme { color: red; background: url(@/img.png); }\n").unwrap();
+        std::fs::write(base.join("public/vendor.css"), ".vendor { margin: 0; }\n").unwrap();
+        // A same-named file under the root must lose to the public one.
+        std::fs::write(base.join("vendor.css"), ".wrong { margin: 1px; }\n").unwrap();
+        let alias = vec![("@".to_string(), "./src".to_string())];
+        let public = base.join("public");
+        let r = CssResolve { root: Some(&base), public_dir: Some(&public), alias: &alias };
+        let dir = base.join("src/ui");
+        assert_eq!(resolve_css_import_with("@/vars.css", &dir, &r), Some(base.join("src/vars.css")));
+        assert_eq!(resolve_css_import_with("@/vars", &dir, &r), Some(base.join("src/vars.css")), "extension probed");
+        assert_eq!(resolve_css_import_with("/src/vars.css", &dir, &r), Some(base.join("src/vars.css")));
+        assert_eq!(resolve_css_import_with("/vendor.css", &dir, &r), Some(base.join("public/vendor.css")), "public dir wins");
+        assert_eq!(resolve_css_import_with("/nope.css", &dir, &r), None);
+        // Without a root the same specs stay unresolved (kept as written).
+        assert_eq!(resolve_css_import("@/vars.css", &dir), None);
+        assert_eq!(resolve_css_import("/src/vars.css", &dir), None);
+
+        let entry = base.join("src/ui/app.css");
+        let src = "@import \"@/vars.css\";\n@import \"/src/ui/theme.css\";\n@import '/vendor.css';\n.app { color: blue; }\n";
+        let out = inline_imports_with(src, &entry, &r).unwrap();
+        assert!(out.contains("--v: 1"), "aliased import inlined: {out}");
+        assert!(out.contains(".theme"), "root-absolute import inlined: {out}");
+        assert!(out.contains(".vendor") && !out.contains(".wrong"), "public import inlined: {out}");
+        assert!(out.contains("url(@/img.png)") || out.contains("url(\"@/img.png\")"), "aliased url inside an inlined file is not rebased as relative: {out}");
+        assert!(!out.contains("@import"), "{out}");
+        // The dev compile then turns the aliased url into the served path.
+        let compiled = compile_css_dev("/src/ui/app.css", &out, false, &r).unwrap().css;
+        assert!(compiled.contains("/src/img.png"), "{compiled}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sass_resolves_alias_and_root_absolute_imports() {
+        let base = std::env::temp_dir().join(format!("oj-css-sass-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("src/styles")).unwrap();
+        std::fs::create_dir_all(base.join("src/comp")).unwrap();
+        std::fs::write(base.join("src/styles/_vars.scss"), "$brand: #f00;\n").unwrap();
+        std::fs::write(base.join("src/styles/mixins.scss"), "@use \"@/styles/vars\";\n@mixin pad { padding: 4px; color: vars.$brand; }\n").unwrap();
+        std::fs::write(base.join("src/styles/theme.module.scss"), "$t: 2px;\n").unwrap();
+        let alias = vec![("@".to_string(), "./src".to_string())];
+        let opts = SassOptions {
+            load_dir: Some(&base.join("src/comp")),
+            additional_data: None,
+            load_paths: &[],
+            resolve: CssResolve { root: Some(&base), public_dir: None, alias: &alias },
+        };
+        // alias, alias with explicit extension, alias inside an imported file,
+        // root-absolute, dotted module through an alias.
+        let src = "@use \"@/styles/vars\" as v;\n@use '@/styles/mixins.scss' as m;\n@use \"/src/styles/theme.module\" as t;\n.x { color: v.$brand; margin: t.$t; @include m.pad; }";
+        let css = compile_sass_opts(src, &opts).unwrap_or_else(|e| panic!("{e}"));
+        assert!(css.contains("color: #f00") || css.contains("color: red"), "{css}");
+        assert!(css.contains("margin: 2px") && css.contains("padding: 4px"), "{css}");
+        // Without the alias the import is unresolvable, as before.
+        assert!(compile_sass(src, Some(&base.join("src/comp"))).is_err());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
