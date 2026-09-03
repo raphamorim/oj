@@ -281,6 +281,59 @@ fn emit_or_inline(
     ))
 }
 
+fn is_stylesheet_path(path: &str) -> bool {
+    path.ends_with(".css")
+        || oj_css::is_sass(path)
+        || oj_server::sidecar::is_less(path)
+        || oj_server::sidecar::is_stylus(path)
+}
+
+/// The build's stylesheet pipeline for one file: plugin transforms on the raw
+/// source, Sass/Less/Stylus, Tailwind/PostCSS, then lightningcss (minified).
+/// Shared by plain CSS imports, `?url` (emitted as a compiled `.css` asset) and
+/// `?inline` (the compiled text), so every form of importing a stylesheet ships
+/// the same CSS, as in Vite.
+async fn compile_stylesheet(
+    root: &Path,
+    host: &Option<Arc<oj_server::plugins::PluginHost>>,
+    css_transform_enabled: &tokio::sync::OnceCell<bool>,
+    has_postcss: bool,
+    path: &str,
+    id: &str,
+) -> anyhow::Result<oj_css::CssOutput> {
+    let is_less = oj_server::sidecar::is_less(path);
+    let is_stylus = oj_server::sidecar::is_stylus(path);
+    let mut source =
+        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+    // Run the plugin transform chain on the raw CSS source first, so directive
+    // transformers (UnoCSS `@apply`/`@unocss-include`, etc.) resolve before oj
+    // preprocesses and compiles it.
+    if let Some(host) = host {
+        let on = *css_transform_enabled
+            .get_or_init(|| async { host.has_transform().await })
+            .await;
+        if on {
+            if let Ok((out, _, _, _)) = host.transform(&source, id, "{}").await {
+                source = out;
+            }
+        }
+    }
+    if oj_css::is_sass(path) {
+        let dir = std::path::Path::new(path).parent();
+        source = oj_css::compile_sass(&source, dir).map_err(|e| anyhow::anyhow!(e))?;
+    } else if is_less || is_stylus {
+        source = preprocess_via_sidecar(root, std::path::Path::new(path))?;
+    }
+    if oj_server::sidecar::is_tailwind_css(&source) || (has_postcss && path.ends_with(".css")) {
+        source = expand_css_via_sidecar(root, std::path::Path::new(path))?;
+    }
+    let css_id = match std::path::Path::new(path).strip_prefix(root) {
+        Ok(rel) => format!("/{}", rel.display()),
+        Err(_) => path.to_string(),
+    };
+    oj_css::compile_css(&css_id, &source, true).map_err(|e| anyhow::anyhow!(e))
+}
+
 impl Plugin for OjCssPlugin {
     fn name(&self) -> Cow<'static, str> {
         Cow::Borrowed("oj:build")
@@ -384,8 +437,45 @@ impl Plugin for OjCssPlugin {
         let inline_limit = self.inline_limit;
         let host = self.host.clone();
         let css_transform_enabled = Arc::clone(&self.css_transform_enabled);
+        let self_has_postcss = self.has_postcss;
         async move {
             if let Some(file) = id.strip_suffix("?url") {
+                if is_stylesheet_path(file) {
+                    // `import u from './a.scss?url'`: the URL of the COMPILED
+                    // stylesheet, emitted as a `.css` asset (Vite css.ts), not the
+                    // raw preprocessor source.
+                    let out = compile_stylesheet(
+                        &root,
+                        &host,
+                        &css_transform_enabled,
+                        self_has_postcss,
+                        file,
+                        &id,
+                    )
+                    .await?;
+                    let stem = std::path::Path::new(file)
+                        .file_stem()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("style");
+                    let reference = ctx
+                        .emit_file(
+                            rolldown_common::EmittedAsset {
+                                name: Some(format!("{stem}.css")),
+                                source: rolldown_common::StrOrBytes::Str(out.css),
+                                ..Default::default()
+                            },
+                            None,
+                            None,
+                        )
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    return Ok(Some(rolldown_plugin::HookLoadOutput {
+                        code: arcstr::ArcStr::from(format!(
+                            "export default import.meta.ROLLUP_FILE_URL_{reference};"
+                        )),
+                        module_type: Some(rolldown_common::ModuleType::Js),
+                        ..Default::default()
+                    }));
+                }
                 let bytes =
                     std::fs::read(file).map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
                 let code = emit_or_inline(&ctx, file, bytes, inline_limit)?;
@@ -467,6 +557,27 @@ impl Plugin for OjCssPlugin {
                 }));
             }
             if let Some(file) = id.strip_suffix("?inline") {
+                if is_stylesheet_path(file) {
+                    // `import css from './a.css?inline'` is the compiled CSS text,
+                    // as in dev and Vite, not a base64 data URI of the source.
+                    let out = compile_stylesheet(
+                        &root,
+                        &host,
+                        &css_transform_enabled,
+                        self_has_postcss,
+                        file,
+                        &id,
+                    )
+                    .await?;
+                    return Ok(Some(rolldown_plugin::HookLoadOutput {
+                        code: arcstr::ArcStr::from(format!(
+                            "export default {};",
+                            serde_json::Value::String(out.css)
+                        )),
+                        module_type: Some(rolldown_common::ModuleType::Js),
+                        ..Default::default()
+                    }));
+                }
                 let bytes =
                     std::fs::read(file).map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
                 let ext = std::path::Path::new(file)
@@ -556,43 +667,18 @@ impl Plugin for OjCssPlugin {
                     ..Default::default()
                 }));
             }
-            let is_less = oj_server::sidecar::is_less(path);
-            let is_stylus = oj_server::sidecar::is_stylus(path);
-            if !(path.ends_with(".css") || oj_css::is_sass(path) || is_less || is_stylus) {
+            if !is_stylesheet_path(path) {
                 return Ok(None);
             }
-            let mut source = std::fs::read_to_string(path)
-                .map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
-            // Run the plugin transform chain on the raw CSS source first, so
-            // directive transformers (UnoCSS `@apply`/`@unocss-include`, etc.)
-            // resolve before oj preprocesses and compiles it.
-            if let Some(host) = &host {
-                let on = *css_transform_enabled
-                    .get_or_init(|| async { host.has_transform().await })
-                    .await;
-                if on {
-                    if let Ok((out, _, _, _)) = host.transform(&source, &id, "{}").await {
-                        source = out;
-                    }
-                }
-            }
-            if oj_css::is_sass(path) {
-                let dir = std::path::Path::new(path).parent();
-                source = oj_css::compile_sass(&source, dir).map_err(|e| anyhow::anyhow!(e))?;
-            } else if is_less || is_stylus {
-                source = preprocess_via_sidecar(&root, std::path::Path::new(path))?;
-            }
-            if oj_server::sidecar::is_tailwind_css(&source)
-                || (self.has_postcss && path.ends_with(".css"))
-            {
-                source = expand_css_via_sidecar(&root, std::path::Path::new(path))?;
-            }
-            let css_id = match std::path::Path::new(path).strip_prefix(&root) {
-                Ok(rel) => format!("/{}", rel.display()),
-                Err(_) => path.to_string(),
-            };
-            let output =
-                oj_css::compile_css(&css_id, &source, true).map_err(|e| anyhow::anyhow!(e))?;
+            let output = compile_stylesheet(
+                &root,
+                &host,
+                &css_transform_enabled,
+                self_has_postcss,
+                path,
+                &id,
+            )
+            .await?;
             let js = match &output.exports {
                 Some(exports) => {
                     let map: serde_json::Map<String, serde_json::Value> = exports

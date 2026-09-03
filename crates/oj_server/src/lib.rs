@@ -1742,12 +1742,18 @@ async fn serve_path(
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {e}")).into_response(),
         };
     }
-    if is_style_ext(ext) {
-        let import_query = uri.query().is_some_and(|q| q.contains("import"));
-        if import_query || !wants_raw_resource(&headers) {
-            let url = url_of(&state.root, &file);
-            return serve_css_wrapper(&state, &file, &url).await;
+    if is_style_ext(ext) && !file.starts_with(&state.public_dir) {
+        let url = url_of(&state.root, &file);
+        let q = uri.query();
+        let direct = q.is_some_and(|q| q.split('&').any(|kv| kv == "direct"));
+        let import_query = q.is_some_and(|q| q.split('&').any(|kv| kv == "import"));
+        if direct || (wants_raw_resource(&headers) && !import_query) {
+            // `<link href>`, `fetch()` of a `?url` stylesheet, or `?direct`: the
+            // compiled CSS text (Sass/Less/PostCSS/Tailwind applied), not the
+            // preprocessor source and not the JS wrapper.
+            return serve_css_direct(&state, &file, &url).await;
         }
+        return serve_css_wrapper(&state, &file, &url).await;
     }
     if COMPILABLE.contains(&ext) {
         let url = url_of(&state.root, &file);
@@ -1767,13 +1773,27 @@ async fn serve_path(
     // is imported as `import Icon from "./x.svg"`). serve_compiled runs the svgr
     // transform; svgs the plugin does not match fall back to a URL asset there. A raw
     // browser request (the Accept header wants the image) still serves the file.
-    if ext == "svg"
-        && state.plugins_have_transform
+    if ext.eq_ignore_ascii_case("svg")
         && query_asset_kind(uri.query()).is_none()
         && !wants_raw_resource(&headers)
     {
         let url = url_of(&state.root, &file);
-        return serve_compiled(&state, &file, &url, uri.query(), &headers).await;
+        if state.plugins_have_transform {
+            return serve_compiled(&state, &file, &url, uri.query(), &headers).await;
+        }
+        // No plugin can componentize it: a module import of an svg (relative,
+        // aliased or root-absolute) is its URL, like any other asset in Vite.
+        return match asset_module(&file, &url, "url").await {
+            Ok(js) => (
+                [
+                    (header::CONTENT_TYPE, "text/javascript"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
+                js,
+            )
+                .into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {e}")).into_response(),
+        };
     }
     if ext == "json" && !file.starts_with(&state.public_dir) {
         let url = url_of(&state.root, &file);
@@ -2760,6 +2780,26 @@ fn register_in_graph(state: &ServerState, url: &str, module: &CachedModule) {
     graph.set_self_accepting(Path::new(url), module.is_boundary);
 }
 
+/// The compiled stylesheet as `text/css` (Vite's `?direct` / raw `<link>` request).
+async fn serve_css_direct(state: &Arc<ServerState>, file: &Path, url: &str) -> Response {
+    match ensure_module(state, file, url).await {
+        Ok((_, module)) => (
+            [
+                (header::CONTENT_TYPE, "text/css"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            module.code.clone(),
+        )
+            .into_response(),
+        Err(err) => {
+            let _ = state
+                .reload_tx
+                .send(serde_json::json!({ "type": "error", "message": err.clone() }).to_string());
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {err}")).into_response()
+        }
+    }
+}
+
 async fn serve_css_wrapper(state: &Arc<ServerState>, file: &Path, url: &str) -> Response {
     let (_, module) = match ensure_module(state, file, url).await {
         Ok(pair) => pair,
@@ -3408,7 +3448,18 @@ fn rewrite_specifier(
             fs_allow.lock().unwrap().insert(package_root(&resolved));
             Some(dep_serve_url(&resolved, root))
         }
-        Ok(resolved) if resolved.starts_with(root) => Some(url_of(root, &resolved)),
+        Ok(resolved) if resolved.starts_with(root) => {
+            // An alias (`@/assets/logo.svg`) or root-absolute import of a style
+            // or asset gets the same `?import` / `?url` marks a relative one does.
+            let url = url_of(root, &resolved);
+            if css_import_marker && is_style_url(&url) {
+                return Some(format!("{url}?import"));
+            }
+            if css_import_marker && is_asset_path(&resolved) {
+                return Some(format!("{url}?url"));
+            }
+            Some(url)
+        }
         Ok(resolved) => {
             fs_allow.lock().unwrap().insert(package_root(&resolved));
             Some(dep_serve_url(&resolved, root))
@@ -3526,7 +3577,15 @@ fn worker_query_is_inline(url: &str) -> bool {
 async fn asset_module(file: &Path, url: &str, kind: &str) -> Result<String, String> {
     let clean_url = url.split('?').next().unwrap_or(url);
     match kind {
-        "url" => Ok(format!("export default {clean_url:?};\n")),
+        "url" => {
+            // A stylesheet's URL must serve its COMPILED css (Sass, PostCSS, ...)
+            // as text; `?direct` is the plain-CSS request, as in Vite.
+            let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if is_style_ext(ext) {
+                return Ok(format!("export default {:?};\n", format!("{clean_url}?direct")));
+            }
+            Ok(format!("export default {clean_url:?};\n"))
+        }
         "raw" => {
             let text = tokio::fs::read_to_string(file)
                 .await
