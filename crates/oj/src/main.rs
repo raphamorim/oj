@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Raphael Amorim
 
 mod build;
+mod native_plugins;
 mod ssr_dev;
 mod start_dev;
 
@@ -175,7 +176,7 @@ async fn run() -> anyhow::Result<()> {
                     no_cache,
                     lazy,
                     mode,
-                    native_plugins: None,
+                    native_plugins: crate::native_plugins::factory(),
                 }
                 .run()
                 .await
@@ -241,7 +242,7 @@ async fn run() -> anyhow::Result<()> {
                         ssr_manifest,
                         watch,
                     },
-                    None,
+                    crate::native_plugins::factory(),
                 )
                 .await
             }

@@ -32,3 +32,13 @@ oj_css.workspace = true
 axum.workspace = true
 notify.workspace = true
 tokio-stream = "0.1.19"
+oxc_allocator = { workspace = true, optional = true }
+oxc_ast = { workspace = true, optional = true }
+oxc_ast_visit = { workspace = true, optional = true }
+oxc_span = { workspace = true, optional = true }
+
+[features]
+# First-party native plugins are compiled in behind features (default off).
+# `example-plugin` is the in-tree proof of the seam; it activates at runtime
+# only when `oj.config` has a `marker` section or `OJ_EXAMPLE_PLUGIN=1`.
+example-plugin = ["dep:oxc_allocator", "dep:oxc_ast", "dep:oxc_ast_visit", "dep:oxc_span"]
