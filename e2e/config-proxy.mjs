@@ -20,7 +20,7 @@ const app = fs.mkdtempSync(path.join(os.tmpdir(), "oj-proxy-"));
 fs.writeFileSync(path.join(app, "package.json"), JSON.stringify({ name: "proxy-app", version: "1.0.0" }));
 fs.writeFileSync(
   path.join(app, "vite.config.mjs"),
-  `export default { server: { proxy: { "/api": "http://localhost:5361" } }, css: { preprocessorOptions: {} } };\n`,
+  `export default { server: { proxy: { "/api": "http://localhost:5361" } }, worker: { format: "es" } };\n`,
 );
 fs.writeFileSync(path.join(app, "index.html"), `<!doctype html><html><head><title>t</title></head><body>hi</body></html>`);
 
@@ -41,7 +41,7 @@ try {
 
   const logText = fs.readFileSync(log, "utf8");
   assert.match(logText, /proxy: \/api/, "oj did not adopt vite.config server.proxy");
-  assert.match(logText, /css\.preprocessorOptions is not applied/, "no warning for ignored config");
+  assert.match(logText, /worker config is not applied/, "no warning for ignored config");
 
   console.log("CONFIG-PROXY E2E PASSED");
 } catch (err) {
