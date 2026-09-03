@@ -8,7 +8,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { viteEnvDefine, makeResolver, importPkg } from "../../crates/oj_server/src/assets/start/resolve-pkg.mjs";
+import { viteEnvDefine, makeResolver, importPkg, ssrExternalRule } from "../../crates/oj_server/src/assets/start/resolve-pkg.mjs";
 
 test("viteEnvDefine builds import.meta.env with the standard flags", () => {
   process.env.VITE_ONLY_FOR_TEST = "hello";
@@ -234,6 +234,33 @@ test("importPkg rejects when the package cannot be resolved", async () => {
   try {
     writeFileSync(join(root, "package.json"), '{"name":"app"}');
     await assert.rejects(importPkg(root, "not-installed"), /cannot resolve/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("ssrExternalRule keeps explicit ssr.external deps out of the Start server bundle", () => {
+  const root = mkdtempSync(join(tmpdir(), "oj-ssr-external-"));
+  try {
+    mkdirSync(join(root, "node_modules", "installed"), { recursive: true });
+    writeFileSync(join(root, "node_modules", "installed", "package.json"), '{"name":"installed"}');
+    const none = ssrExternalRule(root, {});
+    assert.equal(none("react", undefined, false), false, "no config: everything is bundled");
+
+    const listed = ssrExternalRule(root, { OJ_SSR_EXTERNALS: JSON.stringify({ external: ["react", "@scope/pkg"] }) });
+    assert.equal(listed("react", undefined, false), true);
+    assert.equal(listed("react/jsx-runtime", undefined, false), true, "subpaths follow the package");
+    assert.equal(listed("@scope/pkg/deep", undefined, false), true);
+    assert.equal(listed("@scope/other", undefined, false), false);
+    assert.equal(listed("./react", undefined, false), false, "relative ids are never external");
+    assert.equal(listed("\0virtual:react", undefined, false), false);
+    assert.equal(listed("/abs/node_modules/react/index.js", undefined, true), false, "resolved paths are left to the bundle");
+    assert.equal(listed("installed", undefined, false), false, "an installed dep not listed is bundled");
+
+    const all = ssrExternalRule(root, { OJ_SSR_EXTERNALS: JSON.stringify({ externalAll: true, external: [] }) });
+    assert.equal(all("installed", undefined, false), true, "external: true externalizes installed deps");
+    assert.equal(all("#alias-looking-bare", undefined, false), false, "an alias that looks bare is bundled");
+    assert.equal(all("not-installed", undefined, false), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

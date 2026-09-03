@@ -125,6 +125,9 @@ jobs:
       - name: start dev applies config define to the client bundle; --mode selects .env.<mode>
         if: matrix.mode == 'unbundled'
         run: node e2e/start-define-mode.mjs
+      - name: start prod build honors ssr.external (bare imports, server still renders)
+        if: matrix.mode == 'unbundled'
+        run: node e2e/start-ssr-external.mjs
 
   # i need to fix this or automate
   build:

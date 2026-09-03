@@ -3,7 +3,7 @@
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 
 function depsOf(pkgJsonPath) {
   try {
@@ -89,6 +89,34 @@ export function viteEnvDefine({ ssr = false, mode = "development", env: envSourc
   const env = { MODE: mode, DEV: nodeEnv !== "production", PROD: nodeEnv === "production", SSR: !!ssr, BASE_URL: base };
   for (const [k, v] of Object.entries(envSource)) if (k.startsWith("VITE_")) env[k] = v;
   return { "import.meta.env": JSON.stringify(env) };
+}
+
+// Vite's `ssr.external` for the Start production server bundle (OJ_SSR_EXTERNALS
+// from oj). oj's Start server build bundles its dependencies by default (dist/
+// is self-contained, worker-ready), so `noExternal` has nothing left to do; an
+// explicit `external` entry (or `external: true`) keeps that dependency a bare
+// import of the bundle, resolved from node_modules at run time, the way Vite's
+// ssrExternal leaves it out of the server build.
+export function ssrExternalRule(appRoot, env = process.env) {
+  let cfg = null;
+  try { cfg = JSON.parse(env.OJ_SSR_EXTERNALS || "null"); } catch {}
+  const names = new Set(Array.isArray(cfg?.external) ? cfg.external : []);
+  const all = cfg?.externalAll === true;
+  if (!names.size && !all) return () => false;
+  const packageOf = (spec) => {
+    const [first, second] = spec.split("/");
+    return first.startsWith("@") ? (second ? `${first}/${second}` : null) : first || null;
+  };
+  const bare = (id) => !id.startsWith(".") && !id.startsWith("/") && !id.startsWith("\0") && !id.includes(":");
+  return (id, _importer, isResolved) => {
+    if (isResolved || !bare(id)) return false;
+    const pkg = packageOf(id);
+    if (!pkg) return false;
+    if (names.has(pkg)) return true;
+    // `external: true`: every installed dependency; an alias or a plugin virtual
+    // that merely looks bare is not one.
+    return all && existsSync(join(appRoot, "node_modules", pkg, "package.json"));
+  };
 }
 
 const SRC_EXT = /\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$/;
