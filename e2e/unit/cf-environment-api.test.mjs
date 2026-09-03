@@ -102,17 +102,19 @@ test("cloudflare-style plugin gets server.environments (built from the app's Vit
   }
 });
 
-test("a non-cloudflare plugin set does not trigger environment construction (normal apps unaffected)", async () => {
+test("a non-cloudflare plugin set gets oj-backed client/ssr stand-ins, not Vite-built environments", async () => {
   const fx = tmpProject({ prefix: "oj-cf-noenv-" });
   // No Vite in node_modules and no cloudflare plugin: buildEnvironments must not
-  // run, server.environments stays undefined, and nothing throws.
+  // run (nothing throws), yet server.environments still has client and ssr, as
+  // Vite's createServer always provides them.
   fx.write(
     "oj.plugins.mjs",
     `let seen = {};
      export default [{
        name: "plain-plugin",
        configureServer(server) {
-         seen.environmentsUndefined = server.environments === undefined;
+         seen.envNames = Object.keys(server.environments).sort();
+         seen.stubbed = server.environments.client.__ojStub === true && server.environments.ssr.__ojStub === true;
          seen.middlewaresCallable = typeof server.middlewares === "function";
        },
        transform(code, id) {
@@ -136,7 +138,8 @@ test("a non-cloudflare plugin set does not trigger environment construction (nor
   try {
     const res = await host.send({ id: 1, hook: "transform", args: ["", path.join(fx.root, "probe.js")] });
     const seen = JSON.parse(JSON.parse(res.result).code.replace(/^export default /, "").replace(/;$/, ""));
-    assert.equal(seen.environmentsUndefined, true, "no environments built for a non-cloudflare app");
+    assert.deepEqual(seen.envNames, ["client", "ssr"], "client and ssr are always exposed");
+    assert.equal(seen.stubbed, true, "they are oj stand-ins, no Vite environment construction ran");
     assert.equal(seen.middlewaresCallable, true, "callable middlewares still provided to every app");
   } finally {
     host.close();

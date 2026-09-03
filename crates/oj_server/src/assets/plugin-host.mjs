@@ -697,60 +697,83 @@ function ojServerEvent(action, data) {
   process.stdout.write(JSON.stringify({ ojServer: { action, ...(data ?? {}) } }) + "\n");
 }
 
-// A ModuleGraph stand-in for plugins that reach into `server.moduleGraph` from
-// configureServer / hotUpdate: `getModuleById(id)` hands back a node for the id
-// (Vite returns undefined for ids it has never seen; plugins guard on that and
-// then call invalidateModule, so an always-present node keeps that path working),
-// and `invalidateModule` tells oj to drop the module's compiled output and
-// propagate an update, as Vite's graph does.
-const graphNodes = new Map();
-function moduleNode(id) {
-  let n = graphNodes.get(id);
-  if (!n) {
-    n = {
-      id,
-      url: id,
-      file: String(id).split("?", 1)[0],
-      type: "js",
-      info: null,
-      importers: new Set(),
-      importedModules: new Set(),
-      acceptedHmrDeps: new Set(),
-      acceptedHmrExports: null,
-      isSelfAccepting: false,
-      lastHMRTimestamp: 0,
-      lastInvalidationTimestamp: 0,
-      transformResult: null,
-      ssrTransformResult: null,
-      ssrModule: null,
-      ssrError: null,
-    };
-    graphNodes.set(id, n);
+// A ModuleGraph stand-in for plugins that reach into `server.moduleGraph` (or an
+// environment's) from configureServer / hotUpdate. Vite's getModuleById returns
+// undefined for ids it has never seen; oj's graph lives in Rust, so the host
+// knows an id when a hook has seen it (transform / load / this.load) or when it
+// names a real file (oj serves those without telling the host), and answers
+// undefined for anything else (an unknown virtual id) so plugins guarding on it
+// take the same branch as under Vite. `invalidateModule` tells oj to drop the
+// module's compiled output and propagate an update, as Vite's graph does.
+function knownModuleId(id) {
+  if (seenIds.has(id)) return true;
+  const file = String(id).split("?", 1)[0];
+  if (!file || file.startsWith("\0") || !isAbsolute(file)) return false;
+  try {
+    return statSync(file).isFile();
+  } catch {
+    return false;
   }
-  return n;
 }
-const moduleGraph = {
-  getModuleById: (id) => (id == null ? undefined : moduleNode(String(id))),
-  getModuleByUrl: async (url) => (url == null ? undefined : moduleNode(String(url))),
-  getModulesByFile: (file) => new Set([moduleNode(String(file))]),
-  invalidateModule(mod) {
-    if (!mod) return;
-    mod.lastInvalidationTimestamp = Date.now();
-    mod.transformResult = null;
-    mod.ssrTransformResult = null;
-    ojServerEvent("invalidate", { id: mod.id });
-  },
-  invalidateAll() {
-    for (const m of graphNodes.values()) m.transformResult = null;
-    ojServerEvent("invalidateAll");
-  },
-  onFileChange(file) {
-    ojServerEvent("invalidate", { id: String(file) });
-  },
-  urlToModuleMap: graphNodes,
-  idToModuleMap: graphNodes,
-  fileToModulesMap: new Map(),
-};
+function createModuleGraph() {
+  const graphNodes = new Map();
+  const fileToModulesMap = new Map();
+  function moduleNode(id) {
+    let n = graphNodes.get(id);
+    if (!n) {
+      const file = String(id).split("?", 1)[0];
+      n = {
+        id,
+        url: id,
+        file,
+        type: "js",
+        info: null,
+        importers: new Set(),
+        importedModules: new Set(),
+        acceptedHmrDeps: new Set(),
+        acceptedHmrExports: null,
+        isSelfAccepting: false,
+        lastHMRTimestamp: 0,
+        lastInvalidationTimestamp: 0,
+        transformResult: null,
+        ssrTransformResult: null,
+        ssrModule: null,
+        ssrError: null,
+      };
+      graphNodes.set(id, n);
+      let byFile = fileToModulesMap.get(file);
+      if (!byFile) fileToModulesMap.set(file, (byFile = new Set()));
+      byFile.add(n);
+    }
+    return n;
+  }
+  return {
+    getModuleById: (id) => (id == null || !knownModuleId(String(id)) ? undefined : moduleNode(String(id))),
+    getModuleByUrl: async (url) => (url == null || !knownModuleId(String(url)) ? undefined : moduleNode(String(url))),
+    getModulesByFile: (file) =>
+      fileToModulesMap.get(String(file)) ?? (knownModuleId(String(file)) ? new Set([moduleNode(String(file))]) : undefined),
+    // Vite creates the node on demand here (used by plugins that pre-seed urls).
+    ensureEntryFromUrl: async (url) => moduleNode(String(url)),
+    invalidateModule(mod) {
+      if (!mod) return;
+      mod.lastInvalidationTimestamp = Date.now();
+      mod.transformResult = null;
+      mod.ssrTransformResult = null;
+      ojServerEvent("invalidate", { id: mod.id });
+    },
+    invalidateAll() {
+      for (const m of graphNodes.values()) m.transformResult = null;
+      ojServerEvent("invalidateAll");
+    },
+    onFileChange(file) {
+      ojServerEvent("invalidate", { id: String(file) });
+    },
+    urlToModuleMap: graphNodes,
+    idToModuleMap: graphNodes,
+    fileToModulesMap,
+  };
+}
+const moduleGraph = createModuleGraph();
 
 const wsListeners = new Map();
 function ojWsSend(event, data) {
@@ -840,7 +863,9 @@ function invalidateEnvironments(environments, watcher, paths) {
   }
   if (!environments) return;
   for (const env of Object.values(environments)) {
-    if (!env) continue;
+    // oj's own HMR already covers the stub environments; only runner-backed
+    // (real Vite) environments need their graph invalidated and a reload sent.
+    if (!env || env.__ojStub) continue;
     try {
       const mg = env.moduleGraph;
       for (const file of paths) {
@@ -855,6 +880,86 @@ function invalidateEnvironments(environments, watcher, paths) {
       process.stderr.write(`${OJ} plugin host: invalidate failed: ${(e && e.message) || e}\n`);
     }
   }
+}
+
+// Vite's `server.httpServer` is the Node http.Server oj's Rust listener stands in
+// for: plugins read `address()` for the port and wait on "listening". The
+// address is oj's, known at host spawn; "listening" is emitted once
+// configureServer has run (later `once("listening")` callers fire immediately,
+// as on an already-listening server).
+function stubHttpServer() {
+  const srvCfg = (resolvedConfig && resolvedConfig.server) || (initial.config && initial.config.server) || {};
+  const port = typeof srvCfg.port === "number" ? srvCfg.port : 0;
+  const host = typeof srvCfg.host === "string" && srvCfg.host !== "localhost" ? srvCfg.host : "127.0.0.1";
+  const s = new EventEmitter();
+  let listening = false;
+  s.on("listening", () => { listening = true; });
+  const wrap = (method) => {
+    const orig = s[method].bind(s);
+    s[method] = (event, cb) => {
+      if (event === "listening" && listening) { cb(); return s; }
+      return orig(event, cb);
+    };
+  };
+  wrap("on");
+  wrap("once");
+  wrap("addListener");
+  s.address = () => (port ? { address: host, family: host.includes(":") ? "IPv6" : "IPv4", port } : null);
+  s.listen = () => s;
+  s.close = (cb) => { if (typeof cb === "function") cb(); return s; };
+  Object.defineProperty(s, "listening", { get: () => listening });
+  return s;
+}
+
+// An oj-backed stand-in for a Vite DevEnvironment (name, config with consumer,
+// moduleGraph, hot, plugins, pluginContainer over the host's chains). The client
+// stub shares server.moduleGraph; others get their own graph. Marked so oj's
+// invalidation of runner-backed environments skips it.
+function stubEnvironment(name, server) {
+  const isClient = name === "client";
+  const base = resolvedConfig ?? {};
+  const config = isClient
+    ? base
+    : withResolvedDefaults(deepMerge(base, (base.environments ?? {})[name] ?? {}));
+  // Vite tags each environment's config with its consumer; the merge above
+  // inherits the host environment's tag, so set it per environment.
+  if (isClient) config.consumer = config.consumer ?? "client";
+  else config.consumer = (base.environments ?? {})[name]?.consumer ?? "server";
+  const mg = isClient ? moduleGraph : createModuleGraph();
+  return {
+    __ojStub: true,
+    name,
+    mode: "dev",
+    config,
+    logger: base.logger,
+    moduleGraph: mg,
+    hot: wsApi,
+    watcher: server.watcher,
+    plugins,
+    depsOptimizer: undefined,
+    pluginContainer: {
+      buildStart: async () => {},
+      close: async () => {},
+      resolveId: async (source, importer) => {
+        const id = await resolveId(source, importer);
+        return id == null ? null : { id };
+      },
+      load: async (id) => {
+        const code = await load(id);
+        return code == null ? null : { code };
+      },
+      transform: async (code, id) => ({ code: JSON.parse(await transform(code, id, null)).code }),
+    },
+    init: async () => {},
+    listen: async () => {},
+    close: async () => {},
+    transformRequest: async () => null,
+    warmupRequest: async () => {},
+    waitForRequestsIdle: async () => {},
+    fetchModule: async () => {
+      throw new Error(`oj: server.environments.${name}.fetchModule is not available`);
+    },
+  };
 }
 
 async function setupConfigureServer() {
@@ -903,7 +1008,7 @@ async function setupConfigureServer() {
   const server = {
     config: resolvedConfig,
     middlewares,
-    httpServer: null,
+    httpServer: stubHttpServer(),
     ws: wsApi,
     hot: wsApi,
     watcher: fileWatcher,
@@ -924,6 +1029,17 @@ async function setupConfigureServer() {
     } catch (e) {
       process.stderr.write(`${OJ} plugin host: buildEnvironments failed: ${(e && e.message) || e}\n`);
     }
+  }
+  // Vite's createServer always exposes `server.environments` with at least
+  // client and ssr (a DevEnvironment per config.environments entry, defaults
+  // included). Real DevEnvironments from the app's Vite are only built for
+  // plugins that drive runners (above, and that set is then the app's Vite's
+  // to define); otherwise every environment is an oj-backed stand-in so
+  // configureServer code reading server.environments.client / .ssr does not throw.
+  if (!server.environments) {
+    server.environments = {};
+    const envNames = new Set(["client", "ssr", ...Object.keys(resolvedConfig?.environments ?? {})]);
+    for (const name of envNames) server.environments[name] = stubEnvironment(name, server);
   }
   devServer = server;
   const post = [];
@@ -946,6 +1062,10 @@ async function setupConfigureServer() {
       process.stderr.write(`${OJ} plugin host: post configureServer skipped: ${(e && e.message) || e}\n`);
     }
   }
+  // oj listens as soon as the host is ready (before any hook request arrives);
+  // `httpServer.once("listening")` handlers registered in configureServer fire
+  // here like they would under Vite's listen().
+  server.httpServer.emit("listening");
   if (stack.length === 0) return;
 
   const srv = http.createServer((req, res) => {
