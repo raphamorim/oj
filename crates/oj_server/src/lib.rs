@@ -3113,7 +3113,13 @@ async fn ensure_module(
     let css_like = sass_precompiled
         || is_preprocessor(url)
         || file.extension().and_then(|e| e.to_str()) == Some("css");
+    let mut imports_inlined = false;
     let source = if state.has_postcss && css_like {
+        // postcss-import is the first plugin of Vite's PostCSS chain, so the
+        // rules of an @imported stylesheet go through the user's plugins too:
+        // inline before the sidecar, not after it.
+        let source = oj_css::inline_imports_with(&source, file, &state.css_resolve.as_ref())?;
+        imports_inlined = true;
         match run_css_sidecar(state, url, &source).await {
             Ok(out) => out,
             Err(e) => {
@@ -3240,7 +3246,11 @@ async fn ensure_module(
             };
             // Plain `@import`s are inlined (postcss-import parity) so the injected
             // stylesheet does not @import a bare specifier or a wrong-relative url.
-            let css_src = oj_css::inline_imports_with(&css_src, &file_owned, &resolve)?;
+            let css_src = if imports_inlined {
+                css_src
+            } else {
+                oj_css::inline_imports_with(&css_src, &file_owned, &resolve)?
+            };
             let output = oj_css::compile_css_dev(&url_owned, &css_src, css_dev_sourcemap, &resolve)?;
             return Ok(CachedModule {
                 is_boundary: true,
