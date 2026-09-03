@@ -246,6 +246,7 @@ export function createPluginContainer(vite, allPlugins, {
   function initializePlugins() {
     initialization ??= (async () => {
       for (const plugin of byHook(plugins, "configResolved")) {
+        if (ojReimplemented(plugin.name)) continue;
         const hook = hookHandler(plugin.configResolved);
         if (!hook) continue;
         try { await hook.call(ctx, resolvedConfig); }
@@ -400,7 +401,8 @@ function mergeConfigValues(current, update) {
 }
 
 export async function loadPluginContainer(app, opts = {}) {
-  const { command = "serve", mode = "development" } = opts;
+  // Vite's default mode follows the command (config hooks see it as env.mode).
+  const { command = "serve", mode = command === "build" ? "production" : "development" } = opts;
   const configFile = findConfig(app);
   if (!configFile) return null;
   let vite;
@@ -417,7 +419,11 @@ export async function loadPluginContainer(app, opts = {}) {
   // own plugin instances, so it must do the same for them.
   let config = loaded?.config ?? {};
   const all = (config.plugins ?? []).flat(Infinity).filter(Boolean);
+  // Only user plugins: the framework plugins oj reimplements (TanStack, Vite's
+  // own, React) never ran hooks under oj, and their config hooks have side
+  // effects (the router plugin starts its generator) that fight oj's own.
   for (const plugin of all) {
+    if (ojReimplemented(plugin.name)) continue;
     const handler = hookHandler(plugin.config);
     if (!handler || !applyMatches(plugin, command, mode)) continue;
     try {

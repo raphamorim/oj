@@ -156,8 +156,8 @@ const compileCss = await (async () => {
   return null;
 })();
 const emit = contentHashEmitter(CLIENT, compileCss);
-const clientContainer = await loadPluginContainer(APP, { command: "build", environment: "client" });
-const serverContainer = await loadPluginContainer(APP, { command: "build", environment: "ssr" });
+const clientContainer = await loadPluginContainer(APP, { command: "build", mode: MODE, environment: "client" });
+const serverContainer = await loadPluginContainer(APP, { command: "build", mode: MODE, environment: "ssr" });
 
 const clientAlias = {
   "#tanstack-router-entry": routerEntry(),

@@ -527,3 +527,41 @@ test("module info carries meta and moduleParsed sees the same record", async () 
   await container.transform("orig();", "/app.ts");
   assert.deepEqual(parsed, { id: "/app.ts", code: "changed();", importedIds: [], meta: {} });
 });
+
+test("config and configResolved hooks skip the plugins oj reimplements", async () => {
+  const ran = [];
+  const container = createPluginContainer({}, [
+    { name: "tanstack-start-core:config", configResolved() { ran.push("tanstack"); }, transform() { return null; } },
+    { name: "vite:react-babel", configResolved() { ran.push("vite"); }, transform() { return null; } },
+    { name: "app-plugin", configResolved() { ran.push("app"); }, transform() { return null; } },
+  ]);
+  await container.transform("x", "/app.ts");
+  assert.deepEqual(ran, ["app"]);
+});
+
+test("config hooks see the command's default mode when none is given", async () => {
+  const root = mkdtempSync(join(tmpdir(), "oj-config-mode-"));
+  try {
+    const vite = join(root, "node_modules", "vite");
+    mkdirSync(vite, { recursive: true });
+    writeFileSync(join(root, "package.json"), '{"name":"synthetic-app"}');
+    writeFileSync(join(root, "vite.config.mjs"), "export default {};\n");
+    writeFileSync(join(vite, "package.json"), '{"name":"vite","type":"module","main":"./index.mjs"}');
+    writeFileSync(join(vite, "index.mjs"), `
+      export async function loadConfigFromFile() {
+        let seen;
+        return { config: { plugins: [{
+          name: "mode-probe",
+          config(_c, env) { seen = env.command + ":" + env.mode; },
+          transform() { return "export default " + JSON.stringify(seen) + ";"; },
+        }] } };
+      }
+    `);
+    const build = await loadPluginContainer(root, { command: "build" });
+    assert.equal(await build.transform("", "/a.ts"), 'export default "build:production";');
+    const serve = await loadPluginContainer(root, { command: "serve" });
+    assert.equal(await serve.transform("", "/a.ts"), 'export default "serve:development";');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
