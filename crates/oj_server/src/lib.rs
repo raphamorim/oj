@@ -1531,20 +1531,30 @@ pub async fn notify_plugin_mw_invalidate(port: u16, paths: &[String]) {
 // Method+body version of forward_get_to_plugin_mw, for the /_serverFn/ path so
 // server functions reach a Cloudflare plugin's worker (Miniflare) like documents
 // do, instead of running in the Node runner without the real runtime/bindings.
-pub async fn forward_to_plugin_mw(
+/// Proxy one request to a loopback HTTP service (the plugin middleware server or
+/// the Start SSR runner) and stream its response back. Bodies are passed as
+/// bytes, so binary uploads and responses survive; the original `Host` travels
+/// as `x-forwarded-host` so the service can build the app's own absolute URLs.
+/// Stream the response through instead of buffering it: TanStack Start streams
+/// its dehydrated data (queryStream + deferred promises) into the HTML, and
+/// buffering withholds the whole document until the SSR stream closes, so the
+/// client's hydration never sees it progressively. Vite pipes the Response body
+/// through (Readable.fromWeb); this is the same.
+pub async fn proxy_to_loopback(
     port: u16,
     method: &str,
     path_and_query: &str,
     headers: &HeaderMap,
     body: Option<Vec<u8>>,
-) -> Option<Response> {
+) -> Result<Response, String> {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     let client = CLIENT.get_or_init(reqwest::Client::new);
     let target = format!("http://127.0.0.1:{port}{path_and_query}");
-    let m = reqwest::Method::from_bytes(method.as_bytes()).ok()?;
+    let m = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
     let mut out = client.request(m, &target);
     for (name, value) in headers.iter() {
         if name == header::HOST {
+            out = out.header("x-forwarded-host", value);
             continue;
         }
         out = out.header(name, value);
@@ -1552,17 +1562,9 @@ pub async fn forward_to_plugin_mw(
     if let Some(b) = body {
         out = out.body(b);
     }
-    let resp = out.send().await.ok()?;
-    if resp.headers().contains_key("x-oj-fallthrough") {
-        return None;
-    }
+    let resp = out.send().await.map_err(|e| e.to_string())?;
     let status = resp.status();
     let resp_headers = resp.headers().clone();
-    // Stream the worker/plugin response through instead of buffering it. TanStack
-    // Start streams its dehydrated data (queryStream + deferred promises) into the
-    // HTML; buffering with resp.bytes() withholds the whole document until the SSR
-    // stream closes, so the client's hydration never sees it progressively. Vite
-    // pipes the worker Response body through (Readable.fromWeb); this is the same.
     let mut response = Response::new(Body::from_stream(resp.bytes_stream()));
     *response.status_mut() = status;
     for (name, value) in resp_headers.iter() {
@@ -1570,6 +1572,22 @@ pub async fn forward_to_plugin_mw(
             continue;
         }
         response.headers_mut().append(name, value.clone());
+    }
+    Ok(response)
+}
+
+pub async fn forward_to_plugin_mw(
+    port: u16,
+    method: &str,
+    path_and_query: &str,
+    headers: &HeaderMap,
+    body: Option<Vec<u8>>,
+) -> Option<Response> {
+    let response = proxy_to_loopback(port, method, path_and_query, headers, body)
+        .await
+        .ok()?;
+    if response.headers().contains_key("x-oj-fallthrough") {
+        return None;
     }
     Some(response)
 }
@@ -1579,36 +1597,7 @@ pub async fn forward_get_to_plugin_mw(
     path_and_query: &str,
     headers: &HeaderMap,
 ) -> Option<Response> {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    let client = CLIENT.get_or_init(reqwest::Client::new);
-    let target = format!("http://127.0.0.1:{port}{path_and_query}");
-    let mut out = client.get(&target);
-    for (name, value) in headers.iter() {
-        if name == header::HOST {
-            continue;
-        }
-        out = out.header(name, value);
-    }
-    let resp = out.send().await.ok()?;
-    if resp.headers().contains_key("x-oj-fallthrough") {
-        return None;
-    }
-    let status = resp.status();
-    let resp_headers = resp.headers().clone();
-    // Stream the worker/plugin response through instead of buffering it. TanStack
-    // Start streams its dehydrated data (queryStream + deferred promises) into the
-    // HTML; buffering with resp.bytes() withholds the whole document until the SSR
-    // stream closes, so the client's hydration never sees it progressively. Vite
-    // pipes the worker Response body through (Readable.fromWeb); this is the same.
-    let mut response = Response::new(Body::from_stream(resp.bytes_stream()));
-    *response.status_mut() = status;
-    for (name, value) in resp_headers.iter() {
-        if name == header::TRANSFER_ENCODING || name == header::CONTENT_LENGTH {
-            continue;
-        }
-        response.headers_mut().append(name, value.clone());
-    }
-    Some(response)
+    forward_to_plugin_mw(port, "GET", path_and_query, headers, None).await
 }
 
 async fn serve_path(

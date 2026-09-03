@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 
 import module from "node:module";
+import http from "node:http";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { fstatSync } from "node:fs";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -35,7 +38,66 @@ process.stdout.write = process.stderr.write.bind(process.stderr);
 const flushV8 = () => { try { module.flushCompileCache?.(); } catch {} };
 let version = 0;
 let statsSent = false;
-let handler = (await import(ENTRY)).default;
+let handler = null;
+// Requests arrive over a loopback HTTP server rather than JSON lines on stdin:
+// bodies stay binary, responses stream (TanStack Start streams its dehydrated
+// data into the HTML), and requests run concurrently (a loader that fetches the
+// app's own route during SSR no longer deadlocks behind itself). stdin keeps
+// the control commands (revalidate/reload).
+let entryReady;
+const server = http.createServer(async (req, res) => {
+  try {
+    await entryReady;
+    const host = req.headers["x-forwarded-host"] || req.headers.host || "localhost";
+    const method = req.method || "GET";
+    const headers = new Headers();
+    for (const [k, v] of Object.entries(req.headers)) {
+      if (v == null || k === "x-forwarded-host") continue;
+      if (Array.isArray(v)) for (const x of v) headers.append(k, x);
+      else headers.set(k, v);
+    }
+    headers.set("host", host);
+    const init = { method, headers };
+    if (method !== "GET" && method !== "HEAD") {
+      init.body = Readable.toWeb(req);
+      init.duplex = "half";
+    }
+    const out = await handler.fetch(new Request("http://" + host + (req.url ?? "/"), init));
+    const outHeaders = {};
+    out.headers.forEach((v, k) => { if (k !== "set-cookie") outHeaders[k] = v; });
+    const cookies = out.headers.getSetCookie?.() ?? [];
+    if (cookies.length) outHeaders["set-cookie"] = cookies;
+    delete outHeaders["content-length"];
+    res.writeHead(out.status, outHeaders);
+    if (out.body) await pipeline(Readable.fromWeb(out.body), res);
+    else res.end();
+    loaderApi.flushCaches?.();
+    if (!statsSent) {
+      statsSent = true;
+      loaderApi.reportCacheStats?.();
+      flushV8();
+      if (process.env.OJ_SSR_MEM_STATS === "1") {
+        const v8 = await import("node:v8");
+        const stats = {
+          rss: process.memoryUsage.rss(),
+          heap: v8.default.getHeapStatistics(),
+          loader: loaderApi.memStats?.() ?? null,
+        };
+        process.stderr.write(`oj ssr memstats: ${JSON.stringify(stats)}\n`);
+      }
+    }
+  } catch (e) {
+    const text = String((e && e.stack) || e);
+    if (!res.headersSent) res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
+    res.end(text);
+  }
+});
+await new Promise((r) => server.listen(0, "127.0.0.1", r));
+send(JSON.stringify({ port: server.address().port }) + "\n");
+entryReady = (async () => {
+  handler = (await import(ENTRY)).default;
+})();
+await entryReady;
 phase("entry evaluated");
 flushV8();
 loaderApi.flushCaches?.();
@@ -90,31 +152,9 @@ for await (const line of rl) {
     }
     continue;
   }
-  try {
-    const init = { method: msg.method || "GET", headers: msg.headers || {} };
-    if (init.method !== "GET" && init.method !== "HEAD" && msg.body != null) init.body = msg.body;
-    const host = (msg.headers && msg.headers.host) || "localhost";
-    const res = await handler.fetch(new Request("http://" + host + (msg.url ?? "/"), init));
-    const body = await res.text();
-    const headers = {};
-    res.headers.forEach((v, k) => { headers[k] = v; });
-    send(JSON.stringify({ id: msg.id, status: res.status, headers, body }) + "\n");
-    loaderApi.flushCaches?.();
-    if (!statsSent) {
-      statsSent = true;
-      loaderApi.reportCacheStats?.();
-      flushV8();
-      if (process.env.OJ_SSR_MEM_STATS === "1") {
-        const v8 = await import("node:v8");
-        const stats = {
-          rss: process.memoryUsage.rss(),
-          heap: v8.default.getHeapStatistics(),
-          loader: loaderApi.memStats?.() ?? null,
-        };
-        process.stderr.write(`oj ssr memstats: ${JSON.stringify(stats)}\n`);
-      }
-    }
-  } catch (e) {
-    send(JSON.stringify({ id: msg.id, status: 500, headers: {}, body: String((e && e.stack) || e) }) + "\n");
+  // Requests travel over the loopback HTTP server; anything else on stdin is
+  // an unknown control command.
+  if (msg.id != null) {
+    send(JSON.stringify({ id: msg.id, status: 500, headers: {}, body: "oj start runner: requests moved to the loopback http server" }) + "\n");
   }
 }

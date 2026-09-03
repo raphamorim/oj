@@ -71,7 +71,11 @@ async function assertApp(port, label) {
     ["svgr bare .svg component", "<rect"],
     ["svgr ?react component", "<polygon"],
     ["mdx module", "mdx-content-marker"],
+    ["config define applied", "fixture-define-marker"],
   ];
+  if (!/jsenv:(development|production):true/.test(h)) {
+    throw new Error(`${label}: plain .js module did not get import.meta.env (want jsenv:<mode>:true)`);
+  }
   for (const [what, marker] of want) {
     if (!h.includes(marker)) throw new Error(`${label}: missing ${what} ("${marker}")`);
   }
@@ -112,10 +116,33 @@ async function devPhase() {
   try {
     await waitUp(port);
     await assertApp(port, "start-dev");
+    await assertDevRouting(port);
   } finally {
     srv.kill("SIGKILL");
   }
   await assertBuildStartResilient();
+}
+
+// Dev-server routing: a dotted GET that no static file owns reaches the SSR
+// handler (dotted route params, robots.txt-style server routes); static files
+// still win; requests run concurrently through the runner's loopback server.
+async function assertDevRouting(port) {
+  const dotted = await get(port, "/users/john.doe");
+  if (dotted.status !== 200 || !dotted.body.includes("user-john.doe-marker")) {
+    throw new Error(`start-dev: /users/john.doe did not SSR (status ${dotted.status})`);
+  }
+  const pub = await get(port, "/favicon.txt");
+  if (pub.status !== 200 || !pub.body.includes("public-dir-marker") || pub.body.includes("<html")) {
+    throw new Error("start-dev: a publicDir file must still be served statically");
+  }
+  const missing = await fetch(`http://localhost:${port}/no-such-file.txt`);
+  const missingBody = await missing.text();
+  if (!missingBody.includes("<html") && !missingBody.includes("<!DOCTYPE")) {
+    throw new Error(`start-dev: unowned dotted GET should reach the app's SSR handler, got ${missing.status}: ${missingBody.slice(0, 80)}`);
+  }
+  const results = await Promise.all([1, 2, 3, 4, 5, 6].map((i) => get(port, i % 2 ? "/" : "/about")));
+  for (const r of results) if (r.status !== 200) throw new Error("start-dev: concurrent SSR requests failed");
+  console.log("start-dev: dotted GET routing + concurrent SSR ok");
 }
 
 // oj's plugin context is minimal, so a plugin whose buildStart throws must NOT
