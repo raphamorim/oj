@@ -58,12 +58,27 @@ try {
 
   const main = await get("/main.js");
   assert.equal(main.status, 200);
-  assert.match(main.body, /import \* as __ojns0 from "\/@oj-deps\/cjs-lib\.mjs"/, "consumer redirected to optimized dep");
+  // Vite's ensureVersionQuery: the dep URL carries `?v=<browserHash>` so the
+  // browser may cache it forever (a re-optimize changes the hash, so the URL).
+  const depUrl = main.body.match(/import \* as __ojns0 from "(\/@oj-deps\/cjs-lib\.mjs\?v=[0-9a-f]{8})"/)?.[1];
+  assert.ok(depUrl, `consumer redirected to the versioned optimized dep:\n${main.body}`);
   assert.match(main.body, /const \{ greet[^}]*\} = __ojcjs0/, "named import destructured from the cjs value");
 
-  const dep = await get("/@oj-deps/cjs-lib.mjs");
+  const depRes = await fetch(`http://localhost:${port}${depUrl}`);
+  const dep = { status: depRes.status, body: await depRes.text() };
   assert.equal(dep.status, 200);
   assert.match(dep.body, /export default require_cjs_lib\(\)/, "optimized dep exposes module.exports as default");
+  // transform middleware: isDep -> `max-age=31536000,immutable`, plus an ETag
+  // that answers a conditional request with 304.
+  assert.equal(depRes.headers.get("cache-control"), "max-age=31536000,immutable", "versioned dep is immutable");
+  const etag = depRes.headers.get("etag");
+  assert.ok(etag && etag.startsWith('"'), `dep response carries an ETag, got ${etag}`);
+  const revalidated = await fetch(`http://localhost:${port}${depUrl}`, { headers: { "if-none-match": etag } });
+  assert.equal(revalidated.status, 304, "matching If-None-Match -> 304");
+  // The unversioned URL (a chunk imported relatively from inside the dep dir)
+  // stays revalidated on every load, as in Vite.
+  const bare = await fetch(`http://localhost:${port}/@oj-deps/cjs-lib.mjs`);
+  assert.equal(bare.headers.get("cache-control"), "no-cache", "unversioned dep URL is no-cache");
 
   const mod = await import(pathToFileURL(path.join(app, ".oj-cache", "v1", "deps", "cjs-lib.mjs")).href);
   const { greet } = mod.default;

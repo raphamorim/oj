@@ -870,6 +870,7 @@ impl DevServer {
                 )
             }),
         });
+        pkg_bundle::set_version(state.optimized.version());
         if let Some(host) = &state.plugins {
             host.set_ws_sender(state.reload_tx.clone());
             let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2504,14 +2505,7 @@ async fn serve_path(
         }
         state.optimized.ready().await;
         return match tokio::fs::read(state.optimized.dir().join(name)).await {
-            Ok(bytes) => (
-                [
-                    (header::CONTENT_TYPE, "text/javascript"),
-                    (header::CACHE_CONTROL, "no-cache"),
-                ],
-                bytes,
-            )
-                .into_response(),
+            Ok(bytes) => dep_response(&headers, has_version_query(uri.query()), bytes),
             Err(_) => (
                 StatusCode::NOT_FOUND,
                 format!("oj: no optimized dep {name}"),
@@ -2532,7 +2526,7 @@ async fn serve_path(
     }
 
     if uri.path().starts_with(pkg_bundle::PKG_PREFIX) {
-        return serve_pkg_bundle(&state, uri.path()).await;
+        return serve_pkg_bundle(&state, uri.path(), has_version_query(uri.query())).await;
     }
 
     if let Some(id) = uri.path().strip_prefix("/@virtual/") {
@@ -3400,7 +3394,7 @@ async fn ensure_module(
             }
             if let Some(meta) = dep_map.get(spec) {
                 if !meta.needs_interop {
-                    return Some(format!("/@oj-deps/{}", meta.file));
+                    return Some(meta.url.clone());
                 }
             }
             if let Some(url) =
@@ -3503,7 +3497,7 @@ async fn ensure_module(
                             return None;
                         }
                         if let Some(m) = dep_map.get(spec).filter(|m| m.needs_interop) {
-                            return Some(format!("/@oj-deps/{}", m.file));
+                            return Some(m.url.clone());
                         }
                         // A directly-served bare CJS dep (not pre-bundled): rewrite
                         // `import { x } from "dep"` to read x off the default export,
@@ -4572,13 +4566,56 @@ fn dep_serve_url(resolved: &Path, root: &Path) -> String {
         // optimizeDeps.exclude: serve this package per-file, never bundled.
         && !pkg_bundle::is_excluded(resolved)
     {
-        return format!(
-            "{}{}",
-            pkg_bundle::PKG_PREFIX,
-            hex_encode(&resolved.to_string_lossy())
-        );
+        return pkg_bundle::bundle_url_for(resolved);
     }
     url_of(root, resolved)
+}
+
+/// Vite's DEP_VERSION_RE: the request carries a `v=` query, i.e. it was reached
+/// through a versioned dep URL and may be cached forever.
+fn has_version_query(query: Option<&str>) -> bool {
+    query.is_some_and(|q| q.split('&').any(|kv| kv.starts_with("v=")))
+}
+
+/// Vite transform middleware: an optimized dep is `max-age=31536000,immutable`
+/// (its URL changes with the prebundle hash), everything else `no-cache`.
+fn dep_cache_control(versioned: bool) -> &'static str {
+    if versioned {
+        "max-age=31536000,immutable"
+    } else {
+        "no-cache"
+    }
+}
+
+/// A prebundled dep response: strong ETag over the bytes with a 304 on a matching
+/// If-None-Match (Vite's send() does the same for every transformed module), and
+/// the immutable cache policy when the URL is versioned.
+fn dep_response(headers: &HeaderMap, versioned: bool, bytes: Vec<u8>) -> Response {
+    let etag = format!("\"{}\"", &blake3::hash(&bytes).to_hex()[..16]);
+    let cache_control = dep_cache_control(versioned).to_string();
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|inm| inm.split(',').any(|t| t.trim() == etag))
+    {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag),
+                (header::CACHE_CONTROL, cache_control),
+            ],
+        )
+            .into_response();
+    }
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript".to_string()),
+            (header::CACHE_CONTROL, cache_control),
+            (header::ETAG, etag),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 fn rewrite_specifier(
@@ -5097,7 +5134,7 @@ async fn serve_plugin_resolve(state: &Arc<ServerState>, id: &str) -> Response {
             }
             if let Some(meta) = dep_map.get(spec) {
                 if !meta.needs_interop {
-                    return Some(format!("/@oj-deps/{}", meta.file));
+                    return Some(meta.url.clone());
                 }
             }
             if let Some(url) =
@@ -5300,12 +5337,12 @@ async fn serve_plugin_id(state: &Arc<ServerState>, spec: &str, importer: &str) -
 // that can't be bundled in v1 (ESM entry, unsupported files) falls back to the
 // entry's normal per-file compiled output, served at this same URL so the
 // importer's interop (which reads __cjs_exports) still resolves.
-async fn serve_pkg_bundle(state: &Arc<ServerState>, path: &str) -> Response {
+async fn serve_pkg_bundle(state: &Arc<ServerState>, path: &str, versioned: bool) -> Response {
     let js = |code: String| {
         (
             [
                 (header::CONTENT_TYPE, "text/javascript"),
-                (header::CACHE_CONTROL, "no-cache"),
+                (header::CACHE_CONTROL, dep_cache_control(versioned)),
             ],
             code,
         )

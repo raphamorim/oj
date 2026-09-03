@@ -32,8 +32,26 @@ pub enum BundleOutcome {
 
 const INTERNAL_EXTS: &[&str] = &["js", "cjs", "mjs", "jsx", "json"];
 
-fn bundle_url_for(entry_abs: &Path) -> String {
-    format!("{PKG_PREFIX}{}", hex_encode(&entry_abs.to_string_lossy()))
+pub fn bundle_url_for(entry_abs: &Path) -> String {
+    let url = format!("{PKG_PREFIX}{}", hex_encode(&entry_abs.to_string_lossy()));
+    // Same `?v=<prebundle hash>` stamp as /@oj-deps (Vite's ensureVersionQuery)
+    // so the bundle is served immutable and every importer, app source or a
+    // sibling bundle, names the one URL (one module instance).
+    match version_cell().get().filter(|v| !v.is_empty()) {
+        Some(v) => format!("{url}?v={v}"),
+        None => url,
+    }
+}
+
+fn version_cell() -> &'static std::sync::OnceLock<String> {
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    &V
+}
+
+/// Install the dep version stamped onto bundle URLs. Set once at startup (the
+/// optimizer's short hash); later calls are ignored like `configure`.
+pub fn set_version(version: &str) {
+    let _ = version_cell().set(version.to_string());
 }
 
 /// Decode a `/@oj-pkg/<hex>` request path back to the entry file.
