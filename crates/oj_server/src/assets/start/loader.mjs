@@ -118,11 +118,24 @@ const envDelta = (() => {
   }
   return fresh;
 })();
-// The config's `define` map (OJ_DEFINE, from oj) under Vite's own env defines.
+// The config's `define` map: `OJ_DEFINE` from oj (vite.config/oj.config values)
+// and the plugin container's own defines. Config defines win over Vite's env
+// defines, as in Vite's define plugin.
 const USER_DEFINE = (() => {
   try { return JSON.parse(process.env.OJ_DEFINE || "{}") || {}; } catch { return {}; }
 })();
-const DEFINE = { ...USER_DEFINE, ...viteEnvDefine({ ssr: true, env: { ...process.env, ...envDelta } }) };
+const configDefines = (() => {
+  try {
+    return Object.fromEntries(
+      Object.entries(rawContainer?.defines() ?? {})
+        .map(([key, value]) => [key, typeof value === "string" ? value : JSON.stringify(value)])
+        .filter(([, value]) => typeof value === "string"),
+    );
+  } catch {
+    return {};
+  }
+})();
+const DEFINE = { ...viteEnvDefine({ ssr: true, env: { ...process.env, ...envDelta } }), ...USER_DEFINE, ...configDefines };
 
 const cacheStats = { hits: 0, misses: 0, uncached: 0, rhits: 0, rmisses: 0 };
 const EPOCH = (() => {

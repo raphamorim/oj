@@ -83,6 +83,12 @@ if (ojStartMode && initial.ssrBridge && initial.ssrBridge.dir) {
       await ssrReady;
       try {
         if (method === "__env") return reply({ id, value: ssrEnvDelta });
+        if (method === "__define") {
+          return reply({ id, value: {
+            ...resolvedConfig.define,
+            ...resolvedConfig.environments?.ssr?.define,
+          } });
+        }
         if (method === "__heap") {
           return reply({ id, value: (await import("node:v8")).default.getHeapStatistics() });
         }

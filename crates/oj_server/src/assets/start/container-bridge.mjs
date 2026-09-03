@@ -96,6 +96,7 @@ export function loadPluginContainerSync(app, _opts) {
     transform: (code, id) => call("transform", [code, id]),
     transformUserCode: (code, id) => call("transformUserCode", [code, id]),
     env: () => call("__env", []),
+    defines: () => call("__define", []),
     heap: () => (state === "up" ? call("__heap", []) : null),
     bootstrapDone: () => existsSync(join(dir, "ready")),
   };
