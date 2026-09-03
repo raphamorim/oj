@@ -41,6 +41,9 @@ struct StartState {
     css_host: Option<Arc<tokio::sync::Mutex<Runner>>>,
     /// The dev mode (`oj dev --mode`), handed to every node script respawn.
     mode: String,
+    /// The HMR gate, when the editor drives it: rebuilds still happen at once, the
+    /// page reload waits for the flush.
+    gate: Option<oj_server::HmrGateHandle>,
 }
 
 // A --config path is resolved against the app root, the way `build` resolves
@@ -148,10 +151,22 @@ pub async fn start_dev(
         workspace_root: workspace_root(&root),
         reload_tx: reload_tx.clone(),
         ws_tx: built.reload_tx.clone(),
+        gate: built.hmr_gate.clone(),
         css_host,
         mode: mode.clone(),
     });
 
+    // A gate flush (the editor's POST /__hmr_flush, or the hold cap) releases
+    // the reload the watcher held; the rebuild itself already happened.
+    if let Some(gate) = &state.gate {
+        let mut flushes = gate.subscribe_flush();
+        let reload_tx = state.reload_tx.clone();
+        tokio::spawn(async move {
+            while flushes.recv().await.is_ok() {
+                let _ = reload_tx.send(());
+            }
+        });
+    }
     spawn_start_watcher(root.clone(), cache.clone(), Arc::clone(&state));
     {
         let (root, mode) = (root.clone(), mode.clone());
@@ -384,7 +399,11 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
                     *state.bundle.write().unwrap() = Arc::new(pinned);
                 }
             });
-            let _ = state.reload_tx.send(());
+            let path_list: Vec<PathBuf> = paths.iter().cloned().collect();
+            let held = state.gate.as_ref().is_some_and(|g| g.hold_reload(&path_list));
+            if !held {
+                let _ = state.reload_tx.send(());
+            }
             let modules = client_module_count(&cache);
             let _ = state.ws_tx.send(oj_server::update_progress_frame(
                 batch,
@@ -394,7 +413,11 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
                 Some(0),
                 true,
             ));
-            println!("  oj start: rebuilt, reloading");
+            if held {
+                println!("  oj start: rebuilt, reload held for the editor's flush");
+            } else {
+                println!("  oj start: rebuilt, reloading");
+            }
         }
     });
 }
