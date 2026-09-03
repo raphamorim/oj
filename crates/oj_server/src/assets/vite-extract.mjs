@@ -10,6 +10,9 @@ const configPath = process.argv[2];
 const appRoot = process.argv[3];
 const command = process.argv[4] || "serve";
 const mode = process.argv[5] || "development";
+// "default": the mode is the command's default, not a CLI `--mode`, so a `mode`
+// named by the config file may win (Vite: inlineConfig.mode || config.mode).
+const modeExplicit = process.argv[6] !== "default";
 
 process.env.VITE_CONFIG_NATIVE_IGNORE_WARNING ??= "true";
 
@@ -51,12 +54,9 @@ async function loadConfig() {
       // present. loadConfigFromFile only reads the raw user config and misses them.
       if (typeof vite.resolveConfig === "function") {
         try {
-          const resolved = await vite.resolveConfig(
-            { root: appRoot, configFile: configPath, mode },
-            command,
-            mode,
-            mode,
-          );
+          const inline = { root: appRoot, configFile: configPath };
+          if (modeExplicit) inline.mode = mode;
+          const resolved = await vite.resolveConfig(inline, command, mode, mode);
           if (resolved) {
             return { config: resolved, deps: absDeps(resolved.configFileDependencies) };
           }
@@ -226,8 +226,49 @@ function extractEsbuild(es) {
   return Object.keys(out).length ? out : null;
 }
 
+function extractResolve(r) {
+  if (!r || typeof r !== "object") return null;
+  const out = {};
+  const strArr = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === "string") : null);
+  for (const k of ["extensions", "mainFields", "conditions"]) {
+    const v = strArr(r[k]);
+    if (v && v.length) out[k] = v;
+  }
+  if (typeof r.preserveSymlinks === "boolean") out.preserveSymlinks = r.preserveSymlinks;
+  return Object.keys(out).length ? out : null;
+}
+function extractServerFlags(s) {
+  if (!s || typeof s !== "object") return null;
+  const out = {};
+  if (typeof s.strictPort === "boolean") out.strictPort = s.strictPort;
+  // Vite admits `open: true | string`; oj opens the served url in both cases.
+  if (s.open === true || typeof s.open === "string") out.open = true;
+  else if (s.open === false) out.open = false;
+  // `cors: object` means "enabled with these options"; oj applies its default policy.
+  if (typeof s.cors === "boolean") out.cors = s.cors;
+  else if (s.cors && typeof s.cors === "object") out.cors = true;
+  return Object.keys(out).length ? out : null;
+}
+function extractCss(css) {
+  const po = css && typeof css === "object" ? css.preprocessorOptions : null;
+  if (!po || typeof po !== "object") return null;
+  const out = {};
+  for (const [lang, opts] of Object.entries(po)) {
+    if (opts && typeof opts.additionalData === "string") out[lang] = { additionalData: opts.additionalData };
+    else if (opts && typeof opts.additionalData === "function") {
+      warn(`css.preprocessorOptions.${lang}.additionalData function form is not applied`);
+    }
+  }
+  return Object.keys(out).length ? { preprocessorOptions: out } : null;
+}
+function extractEnvPrefix(p) {
+  if (typeof p === "string") return [p];
+  if (Array.isArray(p)) return p.filter((x) => typeof x === "string");
+  return null;
+}
+
 function warnUnsupported(c) {
-  if (c.css?.preprocessorOptions) warn("css.preprocessorOptions is not applied yet");
+
   if (c.esbuild?.jsx === "preserve" || c.oxc?.jsx === "preserve") {
     warn("jsx: \"preserve\" is not supported; JSX is compiled with the automatic runtime");
   }
@@ -240,9 +281,7 @@ function warnUnsupported(c) {
   }
   if (c.worker) warn("worker config is not applied");
   if (c.ssr) warn("ssr config is not applied");
-  for (const k of ["strictPort", "open", "cors", "allowedHosts"]) {
-    if (c.server?.[k] !== undefined) warn(`server.${k} is accepted but not applied`);
-  }
+  if (c.server?.allowedHosts !== undefined) warn("server.allowedHosts is accepted but not applied");
 }
 
 const isMainRun = import.meta.url === pathToFileURL(process.argv[1] || "").href;
@@ -278,6 +317,12 @@ if (isMainRun) try {
       build: extractBuild(c.build),
       oxc: extractOxc(c.oxc),
       esbuild: extractEsbuild(c.esbuild),
+      mode: typeof c.mode === "string" ? c.mode : null,
+      resolve: extractResolve(c.resolve),
+      serverFlags: extractServerFlags(c.server),
+      css: extractCss(c.css),
+      envPrefix: extractEnvPrefix(c.envPrefix),
+      envDir: typeof c.envDir === "string" ? c.envDir : null,
     }),
   );
 } catch (e) {

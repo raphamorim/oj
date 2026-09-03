@@ -198,6 +198,16 @@ pub struct ViteValues {
     /// pragma, pragmaFrag } }`), and the `esbuild.jsx*` fields for older configs.
     pub oxc: Option<serde_json::Value>,
     pub esbuild: Option<serde_json::Value>,
+    /// A `mode` the config file itself names (resolved only when the CLI gave none).
+    pub mode: Option<String>,
+    /// `resolve.{extensions,mainFields,conditions,preserveSymlinks}`.
+    pub resolve: Option<serde_json::Value>,
+    /// `server.{strictPort,open,cors}` normalized to booleans.
+    pub server_flags: Option<serde_json::Value>,
+    /// `css.preprocessorOptions.<lang>.additionalData` (string form).
+    pub css: Option<serde_json::Value>,
+    pub env_prefix: Option<Vec<String>>,
+    pub env_dir: Option<String>,
 }
 
 /// Evaluate the app's `vite.config` for `command` ("serve" | "build") and `mode`.
@@ -206,9 +216,28 @@ pub struct ViteValues {
 /// `serve`/`development` silently picks the dev branch of `base`, `define`,
 /// `build.outDir` and friends in production output.
 pub fn extract_vite_values(root: &Path, command: &str, mode: &str) -> Option<ViteValues> {
+    extract_vite_values_with(root, command, mode, true)
+}
+
+/// `mode_explicit`: false when `mode` is only the command's default (no CLI
+/// `--mode`), which lets a `mode` named in the config file win, as in Vite.
+fn extract_vite_values_with(
+    root: &Path,
+    command: &str,
+    mode: &str,
+    mode_explicit: bool,
+) -> Option<ViteValues> {
     if plugins_file(root).is_some() {
         return None;
     }
+    // The cache is keyed per (config, command, mode); a default-mode evaluation
+    // can differ from an explicit one, so it gets its own key.
+    let mode_key = if mode_explicit {
+        mode.to_string()
+    } else {
+        format!("{mode}@default")
+    };
+    let mode_key = mode_key.as_str();
     let vite = vite_config_file(root)?;
     let store = oj_cache::config_extract::ConfigExtractStore::new(
         root,
@@ -218,7 +247,7 @@ pub fn extract_vite_values(root: &Path, command: &str, mode: &str) -> Option<Vit
             blake3::hash(VITE_EXTRACT_JS.as_bytes()).to_hex()
         ),
     );
-    if let Some(hit) = store.lookup(&vite, command, mode) {
+    if let Some(hit) = store.lookup(&vite, command, mode_key) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&hit.output) {
             if !hit.stderr.is_empty() {
                 eprint!("{}", hit.stderr);
@@ -237,6 +266,7 @@ pub fn extract_vite_values(root: &Path, command: &str, mode: &str) -> Option<Vit
         .arg(root)
         .arg(command)
         .arg(mode)
+        .arg(if mode_explicit { "explicit" } else { "default" })
         .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
         .env("NODE_COMPILE_CACHE", crate::node_compile_cache(root))
         .current_dir(root)
@@ -260,7 +290,7 @@ pub fn extract_vite_values(root: &Path, command: &str, mode: &str) -> Option<Vit
         store.store(
             &vite,
             command,
-            mode,
+            mode_key,
             &deps,
             &String::from_utf8_lossy(&out.stdout),
             &stderr,
@@ -307,6 +337,16 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
         build: json.get("build").filter(|v| !v.is_null()).cloned(),
         oxc: json.get("oxc").filter(|v| !v.is_null()).cloned(),
         esbuild: json.get("esbuild").filter(|v| !v.is_null()).cloned(),
+        mode: json.get("mode").and_then(|v| v.as_str()).map(str::to_string),
+        resolve: json.get("resolve").filter(|v| !v.is_null()).cloned(),
+        server_flags: json.get("serverFlags").filter(|v| !v.is_null()).cloned(),
+        css: json.get("css").filter(|v| !v.is_null()).cloned(),
+        env_prefix: json.get("envPrefix").and_then(|v| v.as_array()).map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        }),
+        env_dir: json.get("envDir").and_then(|v| v.as_str()).map(str::to_string),
     }
 }
 
@@ -318,6 +358,21 @@ pub fn adopt_vite_config_values(
     mode: &str,
 ) {
     let Some(v) = extract_vite_values(root, command, mode) else {
+        return;
+    };
+    merge_vite_values(config, v);
+}
+
+/// Like `adopt_vite_config_values`, for a `mode` that is only the command's
+/// default: the config file's own `mode` (if any) is honored and lands in
+/// `config.mode` so the caller can reload under it.
+pub fn adopt_vite_config_values_default_mode(
+    config: &mut oj_config::OjConfig,
+    root: &Path,
+    command: &str,
+    mode: &str,
+) {
+    let Some(v) = extract_vite_values_with(root, command, mode, false) else {
         return;
     };
     merge_vite_values(config, v);
@@ -446,6 +501,69 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
     }
     if config.esbuild.is_none() {
         config.esbuild = v.esbuild;
+    }
+    if config.mode.is_none() {
+        config.mode = v.mode;
+    }
+    if let Some(vr) = v.resolve.as_ref().and_then(|r| r.as_object()) {
+        let rc = config.resolve.get_or_insert_with(Default::default);
+        let list = |k: &str| {
+            vr.get(k).and_then(|x| x.as_array()).map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+        };
+        if rc.extensions.is_none() {
+            rc.extensions = list("extensions");
+        }
+        if rc.main_fields.is_none() {
+            rc.main_fields = list("mainFields");
+        }
+        if rc.conditions.is_none() {
+            rc.conditions = list("conditions");
+        }
+        if rc.preserve_symlinks.is_none() {
+            rc.preserve_symlinks = vr.get("preserveSymlinks").and_then(|b| b.as_bool());
+        }
+    }
+    if let Some(sf) = v.server_flags.as_ref().and_then(|s| s.as_object()) {
+        let sc = config.server.get_or_insert_with(Default::default);
+        if sc.strict_port.is_none() {
+            sc.strict_port = sf.get("strictPort").and_then(|b| b.as_bool());
+        }
+        if sc.open.is_none() {
+            sc.open = sf.get("open").and_then(|b| b.as_bool());
+        }
+        if sc.cors.is_none() {
+            sc.cors = sf.get("cors").and_then(|b| b.as_bool());
+        }
+    }
+    if let Some(po) = v
+        .css
+        .as_ref()
+        .and_then(|c| c.get("preprocessorOptions"))
+        .and_then(|p| p.as_object())
+    {
+        let css = config.css.get_or_insert_with(Default::default);
+        let map = css.preprocessor_options.get_or_insert_with(Default::default);
+        for (lang, opts) in po {
+            let Some(data) = opts.get("additionalData").and_then(|d| d.as_str()) else {
+                continue;
+            };
+            let entry = map.entry(lang.clone()).or_default();
+            if entry.additional_data.is_none() {
+                entry.additional_data = Some(data.to_string());
+            }
+        }
+    }
+    if config.env_prefix.is_none() {
+        if let Some(p) = v.env_prefix.filter(|p| !p.is_empty()) {
+            config.env_prefix = Some(oj_config::StringOrList::Many(p));
+        }
+    }
+    if config.env_dir.is_none() {
+        config.env_dir = v.env_dir;
     }
 }
 
@@ -1063,6 +1181,12 @@ mod vite_values_tests {
             build: None,
             oxc: None,
             esbuild: None,
+            mode: None,
+            resolve: None,
+            server_flags: None,
+            css: None,
+            env_prefix: None,
+            env_dir: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/vite-base/"));
@@ -1093,6 +1217,12 @@ mod vite_values_tests {
             build: None,
             oxc: None,
             esbuild: None,
+            mode: None,
+            resolve: None,
+            server_flags: None,
+            css: None,
+            env_prefix: None,
+            env_dir: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/oj-base/"));
@@ -1206,5 +1336,45 @@ mod vite_values_tests {
         };
         merge_vite_values(&mut config, v);
         assert_eq!(oj_config::jsx_settings(&config).import_source.as_deref(), Some("preact"), "oj.config wins");
+    }
+
+    #[test]
+    fn merge_adopts_resolve_server_css_env_and_mode() {
+        let mut config = oj_config::OjConfig::default();
+        let v = ViteValues {
+            mode: Some("staging".into()),
+            resolve: Some(serde_json::json!({
+                "extensions": [".ts", ".js"], "mainFields": ["module"],
+                "conditions": ["custom"], "preserveSymlinks": true
+            })),
+            server_flags: Some(serde_json::json!({ "strictPort": true, "open": true, "cors": false })),
+            css: Some(serde_json::json!({ "preprocessorOptions": { "scss": { "additionalData": "@use 'x';" } } })),
+            env_prefix: Some(vec!["VITE_".into(), "APP_".into()]),
+            env_dir: Some("env".into()),
+            ..Default::default()
+        };
+        merge_vite_values(&mut config, v);
+        assert_eq!(config.mode.as_deref(), Some("staging"));
+        let rc = config.resolve.as_ref().unwrap();
+        assert_eq!(rc.extensions.as_deref(), Some(&[".ts".to_string(), ".js".to_string()][..]));
+        assert_eq!(rc.main_fields.as_deref(), Some(&["module".to_string()][..]));
+        assert_eq!(rc.conditions.as_deref(), Some(&["custom".to_string()][..]));
+        assert_eq!(rc.preserve_symlinks, Some(true));
+        let sc = config.server.as_ref().unwrap();
+        assert_eq!(sc.strict_port, Some(true));
+        assert_eq!(sc.open, Some(true));
+        assert_eq!(sc.cors, Some(false));
+        let scss = &config.css.as_ref().unwrap().preprocessor_options.as_ref().unwrap()["scss"];
+        assert_eq!(scss.additional_data.as_deref(), Some("@use 'x';"));
+        assert_eq!(oj_config::env_prefixes(&config), vec!["VITE_".to_string(), "APP_".to_string()]);
+        assert_eq!(config.env_dir.as_deref(), Some("env"));
+
+        // oj.config values win.
+        let mut config = oj_config::OjConfig::default();
+        config.mode = Some("qa".into());
+        config.env_dir = Some("cfg".into());
+        merge_vite_values(&mut config, ViteValues { mode: Some("staging".into()), env_dir: Some("env".into()), ..Default::default() });
+        assert_eq!(config.mode.as_deref(), Some("qa"));
+        assert_eq!(config.env_dir.as_deref(), Some("cfg"));
     }
 }
