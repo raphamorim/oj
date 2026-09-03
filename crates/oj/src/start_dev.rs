@@ -827,12 +827,15 @@ fn classify(req: &Request, proxy_prefixes: &[String]) -> Route {
     if proxy_prefixes.iter().any(|p| path.starts_with(p.as_str())) {
         return Route::Pass;
     }
+    // A dotted non-GET (`POST /api/export.csv`, `PUT /files/a.b`) can only be
+    // the app's: static files and modules are GET-only, so it goes straight
+    // to the SSR handler like every other request nothing else owns.
     let last = path.rsplit('/').next().unwrap_or("");
     if last != "index.html" && last.contains('.') {
         return if *req.method() == Method::GET {
             Route::StaticOrDocument
         } else {
-            Route::Pass
+            Route::Api
         };
     }
     if proxy_prefixes.iter().any(|p| path.starts_with(p.as_str())) {
@@ -937,31 +940,31 @@ async fn forward_with_body(state: &Arc<StartState>, req: Request) -> Response {
         .map(|p| p.as_str())
         .unwrap_or("/")
         .to_string();
-    let header_map = req.headers().clone();
-    let body_bytes = axum::body::to_bytes(req.into_body(), 100 * 1024 * 1024)
-        .await
-        .ok();
-    if let Some(port) = state.plugin_mw_port {
-        if let Some(resp) = oj_server::forward_to_plugin_mw(
-            port,
-            &method,
-            &url,
-            &header_map,
-            body_bytes.as_ref().map(|b| b.to_vec()),
-        )
-        .await
-        {
-            return resp;
+    let mut headers = req.headers().clone();
+    // The body streams through as Vite pipes `req` into the app: no size cap,
+    // never held in memory. A configureServer middleware may claim the request
+    // first; since a streamed body cannot be replayed, the plugin host pipes
+    // an unclaimed request on to the runner itself (x-oj-forward-to) instead
+    // of falling through.
+    let Some(port) = state.plugin_mw_port else {
+        return forward(&state.runner, method, url, &headers, Some(req.into_body())).await;
+    };
+    if let Some(runner_port) = state.runner.lock().await.http_port {
+        if let Ok(v) = header::HeaderValue::from_str(&runner_port.to_string()) {
+            headers.insert("x-oj-forward-to", v);
         }
     }
-    forward(
-        &state.runner,
-        method,
-        url,
-        &header_map,
-        body_bytes.map(|b| b.to_vec()),
-    )
-    .await
+    match oj_server::proxy_to_loopback_streaming(port, &method, &url, &headers, Some(req.into_body()))
+        .await
+    {
+        Ok(resp) if resp.headers().contains_key("x-oj-fallthrough") => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "oj start: request fell through the plugin middleware without reaching the app",
+        )
+            .into_response(),
+        Ok(resp) => inject_reload_client(resp),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj start: {e}")).into_response(),
+    }
 }
 
 async fn serve_client_chunk(state: &StartState, name: &str) -> Response {
@@ -1118,7 +1121,7 @@ async fn forward(
     method: String,
     url: String,
     req_headers: &header::HeaderMap,
-    body: Option<Vec<u8>>,
+    body: Option<axum::body::Body>,
 ) -> Response {
     let port = match runner.lock().await.http_port {
         Some(p) => p,
@@ -1130,7 +1133,7 @@ async fn forward(
                 .into_response()
         }
     };
-    match oj_server::proxy_to_loopback(port, &method, &url, req_headers, body).await {
+    match oj_server::proxy_to_loopback_streaming(port, &method, &url, req_headers, body).await {
         Ok(resp) => inject_reload_client(resp),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj start: {e}")).into_response(),
     }
@@ -1376,9 +1379,19 @@ mod tests {
             classify(&req("DELETE", "/api/thing"), &no_proxy),
             Route::Api
         ));
+        // Dotted non-GETs are the app's (Vite hands every unowned request to
+        // it): a POST to a dotted server route or a PUT to a dotted path.
         assert!(matches!(
             classify(&req("POST", "/main.js"), &no_proxy),
-            Route::Pass
+            Route::Api
+        ));
+        assert!(matches!(
+            classify(&req("POST", "/api/export.csv"), &no_proxy),
+            Route::Api
+        ));
+        assert!(matches!(
+            classify(&req("PUT", "/files/a.b"), &no_proxy),
+            Route::Api
         ));
         let proxy = vec!["/api".to_string()];
         assert!(matches!(

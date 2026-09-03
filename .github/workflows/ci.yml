@@ -186,6 +186,9 @@ jobs:
       - name: transformIndexHtml per-page ctx (dev + build) via the css fixture
         if: matrix.mode == 'unbundled'
         run: node e2e/html-transform-ctx.mjs
+      - name: start dotted non-GET server routes, streamed bodies, set-cookie (dev + prod server)
+        if: matrix.mode == 'unbundled'
+        run: node e2e/start-server-routes.mjs
 
   # i need to fix this or automate
   build:
