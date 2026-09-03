@@ -185,9 +185,12 @@ function extractOptimizeDeps(od) {
   const inc = strArr(od.include);
   const exc = strArr(od.exclude);
   const ent = strArr(od.entries);
+  const interop = strArr(od.needsInterop);
   if (inc) out.include = inc;
   if (exc) out.exclude = exc;
   if (ent) out.entries = ent;
+  if (interop) out.needsInterop = interop;
+  if (typeof od.force === "boolean") out.force = od.force;
   return Object.keys(out).length ? out : null;
 }
 
@@ -394,7 +397,7 @@ const isMainRun = (() => {
   };
   return real(self) === real(entry);
 })();
-export { extractAlias, extractProxy };
+export { extractAlias, extractOptimizeDeps, extractProxy };
 
 if (isMainRun) try {
   const { config, deps } = (await loadConfig()) ?? {};

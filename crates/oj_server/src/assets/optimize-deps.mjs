@@ -3,11 +3,14 @@
 
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
-import { mkdirSync, rmSync, readFileSync, writeFileSync, renameSync, existsSync, realpathSync } from "node:fs";
+import { mkdirSync, rmSync, readFileSync, writeFileSync, renameSync, existsSync, realpathSync, globSync } from "node:fs";
 import path from "node:path";
 import builtinModules from "node:module";
 
-const { root, outDir, entries, include = [], exclude = [], dedupe = [], alias = [], autoDiscover = false, esbuildOptions: rawEsbuildOptions = {}, resolve: resolveSettings = {} } = JSON.parse(process.argv[2]);
+const { root, outDir, entries, include = [], exclude = [], dedupe = [], alias = [], needsInterop: needsInteropList = [], autoDiscover = false, esbuildOptions: rawEsbuildOptions = {}, resolve: resolveSettings = {} } = JSON.parse(process.argv[2]);
+// optimizeDeps.needsInterop: Vite's needsInterop() returns true for these before
+// looking at the bundle's export shape, so the metadata must say so too.
+const NEEDS_INTEROP = new Set(needsInteropList);
 // esbuild activates import/require/default itself and rejects them in `conditions`.
 const ESBUILD_IMPLICIT_CONDITIONS = new Set(["import", "require", "default"]);
 const resolveConditions = (resolveSettings.conditions ?? ["browser", "module", "import", "development"])
@@ -52,6 +55,92 @@ function detectEntries() {
 const entryList = entries && entries.length ? entries : detectEntries();
 
 const req = createRequire(path.join(root, "package.json"));
+
+// Vite's expandGlobIds (optimizer/resolve.ts): an include entry with a glob in
+// its subpath (`some-pkg/*`, `@scope/pkg/dist/**/*.js`) expands to the package
+// plus every subpath the glob matches: the package's `exports` keys when it
+// has an exports map (subpath patterns resolved through their first target),
+// otherwise the files under the package directory.
+const isDynamicPattern = (id) => /[*?[\]{}]/.test(id);
+const npmPackageName = (id) => {
+  const parts = id.split("/");
+  if (id.startsWith("@")) return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : null;
+  return parts[0] || null;
+};
+function findPackageDir(pkgName) {
+  let dir = root;
+  for (;;) {
+    const candidate = path.join(dir, "node_modules", pkgName);
+    if (existsSync(path.join(candidate, "package.json"))) return candidate;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+const firstExportString = (v) => {
+  if (typeof v === "string") return v;
+  if (Array.isArray(v)) return firstExportString(v[0]);
+  if (v && typeof v === "object") for (const k in v) return firstExportString(v[k]);
+  return undefined;
+};
+const globFiles = (pattern, cwd) => {
+  try {
+    return globSync(pattern, { cwd, exclude: (name) => name === "node_modules" }).map((p) => p.split(path.sep).join("/"));
+  } catch {
+    return [];
+  }
+};
+const matchesGlob = (subject, pattern) => {
+  try {
+    return path.posix.matchesGlob(subject, pattern.replace(/^\.\//, ""));
+  } catch {
+    return false;
+  }
+};
+function expandGlobIds(id) {
+  const pkgName = npmPackageName(id);
+  if (!pkgName) return [];
+  const pkgDir = findPackageDir(pkgName);
+  if (!pkgDir) return [];
+  let pkgJson;
+  try {
+    pkgJson = JSON.parse(readFileSync(path.join(pkgDir, "package.json"), "utf8"));
+  } catch {
+    return [];
+  }
+  const pattern = "." + id.slice(pkgName.length);
+  const exports = pkgJson.exports;
+  if (exports) {
+    if (typeof exports === "string" || Array.isArray(exports)) return [pkgName];
+    const possible = [];
+    for (const key of Object.keys(exports)) {
+      if (key[0] !== ".") continue;
+      if (key.includes("*")) {
+        const value = firstExportString(exports[key]);
+        if (!value) continue;
+        const valueRe = new RegExp(value.split("*").map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("(.*)"));
+        for (let file of globFiles(value.replace(/\*/g, "**/*"), pkgDir)) {
+          if (value.startsWith("./")) file = "./" + file;
+          const m = valueRe.exec(file);
+          if (!m) continue;
+          let same = true;
+          for (let i = 2; i < m.length; i++) if (m[i] !== m[i - 1]) { same = false; break; }
+          if (same) possible.push(key.replace("*", m[1]).slice(2));
+        }
+      } else if (exports[key] != null) {
+        possible.push(key.slice(2));
+      }
+    }
+    return [pkgName, ...possible.filter((p) => matchesGlob(p, pattern)).map((p) => path.posix.join(pkgName, p))];
+  }
+  return [pkgName, ...globFiles(pattern, pkgDir).map((m) => path.posix.join(pkgName, m))];
+}
+const includeIds = [];
+for (const inc of include) {
+  for (const id of isDynamicPattern(inc) ? expandGlobIds(inc) : [inc]) {
+    if (!includeIds.includes(id)) includeIds.push(id);
+  }
+}
 // Vite 8 apps use rolldown for optimizeDeps and don't depend on esbuild directly,
 // but esbuild is still a Vite transitive dep -- resolve it from the app's Vite when
 // the app itself doesn't expose it, so the dep pre-bundler still runs.
@@ -269,7 +358,7 @@ async function scan() {
 // can break an app, so oj's robust per-module wrap_cjs serves undiscovered deps
 // instead. See oj-native partial bundling for the eventual request-count fix.
 const scanned = autoDiscover ? await scan() : new Set();
-for (const inc of include) scanned.add(inc);
+for (const inc of includeIds) scanned.add(inc);
 const deps = [...scanned].filter((d) => !excludeSet.has(d));
 
 const entryPoints = {};
@@ -315,7 +404,7 @@ for (const dep of deps) {
   // Skip linked / workspace packages (symlinked into node_modules): pre-bundling
   // freezes their source so edits to them stop HMR-ing. Vite excludes these too.
   // An explicit optimizeDeps.include still forces optimization.
-  if (!include.includes(dep)) {
+  if (!includeIds.includes(dep)) {
     let real = entry;
     try {
       real = realpathSync(entry);
@@ -335,7 +424,9 @@ for (const dep of deps) {
   // not a JS module: esbuild would emit a stray .css and choke on the fonts its
   // @font-face rules pull in, failing the *whole* build. Vite excludes these
   // from the dep optimizer too; oj serves them directly through its CSS pipeline.
-  if (/\.(css|scss|sass|less|styl|woff2?|ttf|otf|eot|svg|png|jpe?g|gif|webp|avif|mp4|webm|wasm)$/i.test(entry)) {
+  // (`json` too: Vite's OPTIMIZABLE_ENTRY_RE admits only script entries, so an
+  // expanded `pkg/*` include never pre-bundles `pkg/package.json`.)
+  if (/\.(css|scss|sass|less|styl|woff2?|ttf|otf|eot|svg|png|jpe?g|gif|webp|avif|mp4|webm|wasm|json|html|md)$/i.test(entry)) {
     continue;
   }
   const name = dep.replace(/^@/, "").replace(/[^\w.-]/g, "_");
@@ -411,11 +502,11 @@ if (Object.keys(entryPoints).length) {
           `export const __cjs_exports = __m;\n` +
           `export const { ${names.join(", ")} } = __m;\n`;
         writeFileSync(path.join(outDir, file), proxy);
-        metadata[dep] = { file, needsInterop: false, exports: ["default", ...names] };
+        metadata[dep] = { file, needsInterop: NEEDS_INTEROP.has(dep), exports: ["default", ...names] };
         continue;
       }
     }
-    metadata[dep] = { file, needsInterop: bundledInterop, exports };
+    metadata[dep] = { file, needsInterop: bundledInterop || NEEDS_INTEROP.has(dep), exports };
   }
 }
 

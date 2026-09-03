@@ -217,3 +217,61 @@ it("optimize-deps: does NOT auto-discover by default; only the include list is p
 
   fs.rmSync(root, { recursive: true, force: true });
 });
+
+it("optimize-deps: expands include globs like Vite and honors needsInterop", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "oj-optdeps5-"));
+  fs.mkdirSync(path.join(root, "node_modules"), { recursive: true });
+  fs.symlinkSync(esbuildSrc, path.join(root, "node_modules", "esbuild"));
+  const esbuildScoped = path.join(repo, "e2e/fixtures/start-app/node_modules/@esbuild");
+  if (fs.existsSync(esbuildScoped)) fs.symlinkSync(esbuildScoped, path.join(root, "node_modules", "@esbuild"));
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "fx5" }));
+
+  // No exports map: the glob runs over the package's files (Vite expandGlobIds).
+  pkg("plainglob", root, "index.js", {
+    "index.js": `exports.root = 1;\n`,
+    "alpha.js": `exports.alpha = 1;\n`,
+    "beta.js": `exports.beta = 2;\n`,
+  });
+  // Exports map with a subpath pattern: the glob is matched against the export
+  // keys, resolved through the pattern's target files.
+  const withExports = path.join(root, "node_modules", "exportsglob");
+  fs.mkdirSync(path.join(withExports, "dist", "icons"), { recursive: true });
+  fs.writeFileSync(
+    path.join(withExports, "package.json"),
+    JSON.stringify({
+      name: "exportsglob",
+      version: "1.0.0",
+      exports: { ".": "./dist/index.js", "./icons/*": "./dist/icons/*.js", "./internal": null },
+    }),
+  );
+  fs.writeFileSync(path.join(withExports, "dist", "index.js"), `exports.idx = 1;\n`);
+  fs.writeFileSync(path.join(withExports, "dist", "icons", "sun.js"), `exports.sun = 1;\n`);
+  fs.writeFileSync(path.join(withExports, "dist", "icons", "moon.js"), `exports.moon = 1;\n`);
+  // A real ESM dep: interop is only forced through optimizeDeps.needsInterop.
+  const esm = path.join(root, "node_modules", "esmlib");
+  fs.mkdirSync(esm, { recursive: true });
+  fs.writeFileSync(path.join(esm, "package.json"), JSON.stringify({ name: "esmlib", version: "1.0.0", type: "module", main: "index.js" }));
+  fs.writeFileSync(path.join(esm, "index.js"), `export const named = 1;\nexport default { named };\n`);
+  fs.writeFileSync(path.join(root, "entry.js"), `export const out = 1;\n`);
+  const outDir = path.join(root, ".oj-cache", "deps");
+
+  const run = (extra) =>
+    JSON.parse(
+      execFileSync("node", [sidecar, JSON.stringify({ root, outDir, entries: [path.join(root, "entry.js")], ...extra })], { encoding: "utf8" }),
+    ).metadata;
+
+  const globbed = run({ include: ["plainglob/*.js", "exportsglob/icons/*"] });
+  assert.deepEqual(
+    Object.keys(globbed).sort(),
+    ["exportsglob", "exportsglob/icons/moon", "exportsglob/icons/sun", "plainglob", "plainglob/alpha.js", "plainglob/beta.js", "plainglob/index.js"],
+    "the package itself plus every subpath the glob matches",
+  );
+  for (const m of Object.values(globbed)) assert.ok(fs.existsSync(path.join(outDir, m.file)), `missing ${m.file}`);
+
+  const plain = run({ include: ["esmlib"] });
+  assert.equal(plain.esmlib.needsInterop, false, "an ESM dep with named exports needs no interop");
+  const forced = run({ include: ["esmlib"], needsInterop: ["esmlib"] });
+  assert.equal(forced.esmlib.needsInterop, true, "optimizeDeps.needsInterop forces it in the metadata");
+
+  fs.rmSync(root, { recursive: true, force: true });
+});

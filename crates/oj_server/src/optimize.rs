@@ -124,6 +124,9 @@ pub struct OptimizeInput {
     /// Vite's `--mode` (getConfigHash folds `define: NODE_ENV || mode`): a dep
     /// prebundled for `development` is not the `production` one.
     pub mode: String,
+    /// `optimizeDeps.needsInterop`: deps whose metadata must say `needsInterop:
+    /// true` whatever their bundle's export shape (Vite's needsInterop()).
+    pub needs_interop: Vec<String>,
 }
 
 /// Vite's lockfileFormats (optimizer/index.ts): the lockfile a package manager
@@ -197,6 +200,7 @@ fn lockfile_hash(root: &Path, version: &str, input: &OptimizeInput) -> String {
         (b"\0x".as_slice(), &input.exclude),
         (b"\0e".as_slice(), &input.entries),
         (b"\0d".as_slice(), &input.dedupe),
+        (b"\0n".as_slice(), &input.needs_interop),
     ] {
         for entry in list {
             hasher.update(tag);
@@ -301,6 +305,7 @@ async fn run_optimizer(
         "exclude": input.exclude,
         "dedupe": input.dedupe,
         "alias": alias,
+        "needsInterop": input.needs_interop,
         "autoDiscover": auto_discover,
         "esbuildOptions": input.bundler_options,
         "resolve": {
@@ -379,6 +384,12 @@ mod tests {
         assert_ne!(base, key(&input(&[], &["react"], &[], &[])), "include vs exclude");
         assert_ne!(base, key(&input(&[], &[], &["react"], &[])), "include vs entries");
         assert_ne!(base, key(&input(&[], &[], &[], &["react"])), "include vs dedupe");
+        let forced = OptimizeInput {
+            include: vec!["react".into()],
+            needs_interop: vec!["react".into()],
+            ..Default::default()
+        };
+        assert_ne!(base, key(&forced), "needsInterop is part of the key");
         // ...and neither may a list boundary that merely moves an item across it.
         assert_ne!(
             key(&input(&["a"], &["b"], &[], &[])),

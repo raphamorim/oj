@@ -866,6 +866,7 @@ impl DevServer {
                             .unwrap_or_else(oj_resolver::default_extensions),
                         preserve_symlinks: oj_config::resolve_preserve_symlinks(&config),
                         mode: dev_mode.clone(),
+                        needs_interop: oj_config::optimize_deps_needs_interop(&config),
                     },
                 )
             }),

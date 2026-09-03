@@ -2,7 +2,20 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { extractAlias, extractProxy } from "../../crates/oj_server/src/assets/vite-extract.mjs";
+import { extractAlias, extractOptimizeDeps, extractProxy } from "../../crates/oj_server/src/assets/vite-extract.mjs";
+
+test("optimizeDeps carries needsInterop and force alongside the lists", () => {
+  const out = extractOptimizeDeps({
+    include: ["a", "pkg/*"],
+    exclude: "b",
+    needsInterop: ["cjs-ish", 42],
+    force: true,
+    esbuildOptions: { target: "es2020" },
+  });
+  assert.deepEqual(out, { include: ["a", "pkg/*"], exclude: ["b"], needsInterop: ["cjs-ish"], force: true });
+  assert.equal(extractOptimizeDeps({ force: "yes" }), null, "non-boolean force is ignored");
+  assert.equal(extractOptimizeDeps(undefined), null);
+});
 
 test("string aliases pass through unchanged", () => {
   const out = extractAlias({ "@app": "/src", "~": "/src/lib" });
