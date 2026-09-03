@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 //
-// Verifies the TanStack start dev server emits the Lovable editor narration
+// Verifies the TanStack start dev server emits the editor narration
 // frames on /__ws (the channel the editor reads): lovable:dev-server-mode and
 // lovable:boot-progress on connect, and lovable:update-progress (open done:false
 // -> close done:true, trigger "watch") around the rebuild triggered by a source
@@ -60,7 +60,7 @@ let srv, ws;
 try {
   srv = spawn(oj, ["dev", app, "--port", String(port)], {
     stdio: "ignore",
-    env: { ...process.env, LOVABLE_DEV_SERVER: "true" },
+    env: { ...process.env, OJ_HMR_GATE: "1" },
   });
   if (!(await up())) throw new Error("start dev server did not come up");
 

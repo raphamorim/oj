@@ -369,7 +369,7 @@ pub struct BuiltApp {
     pub plugin_mw_port: Option<u16>,
     pub root: PathBuf,
     pub started: Instant,
-    /// Sender for the `/__ws` broadcast — the channel the Lovable editor reads
+    /// Sender for the `/__ws` broadcast — the channel the editor reads
     /// HMR + narration frames from. The start path pushes narration here.
     pub reload_tx: broadcast::Sender<String>,
     /// The client plugin host, for the shutdown hooks (buildEnd, closeBundle).
@@ -724,11 +724,15 @@ impl DevServer {
         };
 
         let hmr_gate = {
+            let env_on = |name: &str| matches!(std::env::var(name).as_deref(), Ok("1") | Ok("true"));
             let enabled = server_cfg.hmr_gate == Some(true)
-                || std::env::var("LOVABLE_DEV_SERVER").as_deref() == Ok("true");
+                || env_on("OJ_HMR_GATE")
+                || env_on("LOVABLE_DEV_SERVER");
             if enabled {
-                let full_reload =
-                    std::env::var("LOVABLE_HMR_FULL_RELOAD").as_deref() != Ok("false");
+                let full_reload = std::env::var("OJ_HMR_FULL_RELOAD")
+                    .or_else(|_| std::env::var("LOVABLE_HMR_FULL_RELOAD"))
+                    .as_deref()
+                    != Ok("false");
                 println!(
                     "  hmr gate: on ({})",
                     if full_reload {

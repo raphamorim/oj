@@ -30,7 +30,7 @@ const port = 5488;
 let failed = false;
 const srv = spawn(oj, ["dev", app, "--port", String(port)], {
   stdio: "ignore",
-  env: { ...process.env, LOVABLE_DEV_SERVER: "true" },
+  env: { ...process.env, OJ_HMR_GATE: "1" },
 });
 try {
   for (let i = 0; i < 100; i++) {

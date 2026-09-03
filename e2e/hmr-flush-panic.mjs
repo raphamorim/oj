@@ -34,7 +34,7 @@ try {
     cwd: app,
     stdio: "ignore",
     // gate ON + GRANULAR (not full-reload) so flush routes through decide().
-    env: { ...process.env, LOVABLE_DEV_SERVER: "true", LOVABLE_HMR_FULL_RELOAD: "false" },
+    env: { ...process.env, OJ_HMR_GATE: "1", OJ_HMR_FULL_RELOAD: "false" },
   });
   const up = async () => {
     for (let i = 0; i < 300; i++) {

@@ -34,7 +34,7 @@ struct StartState {
     live_reload: PathBuf,
     workspace_root: PathBuf,
     reload_tx: broadcast::Sender<()>,
-    // The oj_server /__ws broadcast: the channel the Lovable editor reads boot +
+    // The oj_server /__ws broadcast: the channel the editor reads boot +
     // update narration frames from (the start path's own /@oj-start/hmr socket
     // only drives the app iframe's live reload).
     ws_tx: broadcast::Sender<String>,

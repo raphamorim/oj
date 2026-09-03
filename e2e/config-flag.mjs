@@ -16,11 +16,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 execSync("cargo build -p oj", { cwd: repo, stdio: "inherit" });
 
 const app = fs.mkdtempSync(path.join(os.tmpdir(), "oj-config-"));
-fs.mkdirSync(path.join(app, ".lovable"), { recursive: true });
+fs.mkdirSync(path.join(app, ".config"), { recursive: true });
 fs.writeFileSync(path.join(app, "package.json"), JSON.stringify({ name: "cfg-app", version: "1.0.0" }));
 fs.writeFileSync(path.join(app, "vite.config.mjs"), `export default { plugins: [] };\n`);
 fs.writeFileSync(
-  path.join(app, ".lovable", "vite.config.mjs"),
+  path.join(app, ".config", "vite.config.mjs"),
   `import base from "../vite.config.mjs";
    export default {
      ...base,
@@ -57,7 +57,7 @@ try {
   assert.ok(!/window\.__OVR = 1/.test(base), "root config has no override plugin");
 
   const overridden = await htmlWith(
-    ["dev", app, "--port", "5492", "--config", ".lovable/vite.config.mjs"],
+    ["dev", app, "--port", "5492", "--config", ".config/vite.config.mjs"],
     5492,
   );
   assert.match(overridden, /window\.__OVR = 1/, "--config loads plugins from the override config");
@@ -65,7 +65,7 @@ try {
   // A --config that names a file that does not exist is an error (Vite: "Could
   // not resolve config file"), not a silent fallback to the root config.
   const { spawnSync } = await import("node:child_process");
-  const missing = spawnSync(oj, ["build", app, "--config", ".lovable/nope.config.mjs"], { cwd: app, encoding: "utf8" });
+  const missing = spawnSync(oj, ["build", app, "--config", ".config/nope.config.mjs"], { cwd: app, encoding: "utf8" });
   assert.notEqual(missing.status, 0, "build with a missing --config must fail");
   assert.match(missing.stderr + missing.stdout, /failed to load config from .*nope\.config\.mjs/, `missing --config error:\n${missing.stderr}`);
 

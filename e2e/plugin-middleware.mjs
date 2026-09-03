@@ -27,7 +27,7 @@ fs.writeFileSync(
       server.moduleGraph.onFileChange("/x");
       server.ws.on("connection", () => {});
       server.middlewares.use((req, res, next) => {
-        if (req.method === "POST" && req.url === "/__lovable/echo") {
+        if (req.method === "POST" && req.url === "/__plugin/echo") {
           let body = "";
           req.on("data", (c) => (body += c));
           req.on("end", () => {
@@ -62,7 +62,7 @@ try {
 
   // POST body forwarded to configureServer middleware, response returned
   const echo = await (
-    await fetch(`http://localhost:${port}/__lovable/echo`, {
+    await fetch(`http://localhost:${port}/__plugin/echo`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ hi: 1, nested: { a: "b" } }),
