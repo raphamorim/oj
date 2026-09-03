@@ -166,11 +166,18 @@ struct MemoFile {
 
 impl StartBundleStore {
     pub fn new(root: &Path, tool_version: &str, verify: VerifyMode) -> Self {
+        Self::for_mode(root, tool_version, verify, "development")
+    }
+
+    /// A store keyed by the dev mode too: `.env.<mode>` feeds the client bundle's
+    /// import.meta.env, so `oj dev --mode staging` must not restore a bundle
+    /// built for `development` (or the other way round).
+    pub fn for_mode(root: &Path, tool_version: &str, verify: VerifyMode, mode: &str) -> Self {
         Self {
             dir: crate::cache_root(root).join("start-bundle"),
             salt: format!(
-                "{tool_version}:{START_BUNDLE_FORMAT}:start-bundle:{}",
-                epoch(root)
+                "{tool_version}:{START_BUNDLE_FORMAT}:start-bundle:{mode}:{}",
+                epoch(root, mode)
             ),
             verify,
         }
@@ -485,8 +492,9 @@ impl StartBundleStore {
     }
 }
 
-fn epoch(root: &Path) -> String {
+fn epoch(root: &Path, mode: &str) -> String {
     let mut hasher = blake3::Hasher::new();
+    let mode_env = [format!(".env.{mode}"), format!(".env.{mode}.local")];
     for name in [
         "package-lock.json",
         "yarn.lock",
@@ -504,8 +512,8 @@ fn epoch(root: &Path) -> String {
         "oj.config.mjs",
         ".env",
         ".env.local",
-        ".env.development",
-        ".env.development.local",
+        mode_env[0].as_str(),
+        mode_env[1].as_str(),
     ] {
         if let Ok(bytes) = fs::read(root.join(name)) {
             hasher.update(name.as_bytes());
@@ -948,6 +956,27 @@ mod tests {
         let other_version =
             StartBundleStore::new(&fx.root, "9.9.9", VerifyMode::Standard).persist(&fx.start);
         assert_ne!(other_version.unwrap().0, key, "tool version salts the key");
+    }
+
+    #[test]
+    fn dev_mode_and_its_env_file_change_the_key() {
+        let fx = Fixture::new("mode");
+        let staging = |root: &Path| {
+            StartBundleStore::for_mode(root, "0.0.1-test", VerifyMode::Standard, "staging")
+        };
+        let (dev_key, _) = fx.store().persist(&fx.start).unwrap();
+        let (staging_key, _) = staging(&fx.root).persist(&fx.start).unwrap();
+        assert_ne!(staging_key, dev_key, "the mode salts the key");
+        fs::write(fx.root.join(".env.staging"), b"VITE_FLAVOR=staging\n").unwrap();
+        match staging(&fx.root).restore(&fx.start) {
+            Err(Miss::NoEntryForKey(k)) => assert_ne!(k, staging_key, ".env.<mode> is a key input"),
+            other => panic!("expected key miss, got {other:?}"),
+        }
+        fs::write(fx.root.join(".env.development"), b"VITE_FLAVOR=dev\n").unwrap();
+        match fx.store().restore(&fx.start) {
+            Err(Miss::NoEntryForKey(k)) => assert_ne!(k, dev_key),
+            other => panic!("expected key miss, got {other:?}"),
+        }
     }
 
     #[test]

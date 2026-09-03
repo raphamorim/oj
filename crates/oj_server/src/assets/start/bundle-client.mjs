@@ -13,6 +13,8 @@ const APP = process.env.OJ_APP_ROOT ?? process.cwd();
 const { build } = await importPkg(APP, "rolldown", ["vite", "@tanstack/react-start"]);
 const WORKSPACE = workspaceRoot(APP);
 const SERVER_FN_BASE = process.env.TSS_SERVER_FN_BASE ?? "/_serverFn/";
+// Vite's `--mode` (OJ_MODE from oj; `development` for `oj dev` without one).
+const MODE = process.env.OJ_MODE || "development";
 // The config's `define` map (OJ_DEFINE from oj). Vite's define plugin applies
 // it to the client environment exactly as to SSR, so a define a component
 // references must not render on the server and then throw on hydration.
@@ -71,7 +73,7 @@ function routerEntry() {
   return resolve(APP, "src/router.tsx");
 }
 
-const container = await loadPluginContainer(APP, { command: "serve", environment: "client" });
+const container = await loadPluginContainer(APP, { command: "serve", mode: MODE, environment: "client" });
 
 const cssUrls = [];
 
@@ -111,7 +113,7 @@ const result = await build({
     define: {
       "process.env": JSON.stringify({ NODE_ENV: "development", TSS_SERVER_FN_BASE: SERVER_FN_BASE }),
       global: "globalThis",
-      ...viteEnvDefine({ ssr: false }),
+      ...viteEnvDefine({ ssr: false, mode: MODE }),
       ...USER_DEFINE,
       ...(container?.defines?.() ?? {}),
     },
