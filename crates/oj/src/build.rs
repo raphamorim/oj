@@ -71,6 +71,103 @@ fn ro_external(ro: Option<&serde_json::Value>) -> Vec<String> {
     }
 }
 
+/// The `rollupOptions.output` settings Vite spreads into rolldown's output
+/// options and oj forwards for its (single) output: format, banner/footer/
+/// intro/outro strings, globals and paths maps, umd/iife `name` and `extend`,
+/// `inlineDynamicImports` / `codeSplitting: false`.
+#[derive(Debug, Default)]
+struct OutputOverrides {
+    format: Option<OutputFormat>,
+    banner: Option<String>,
+    footer: Option<String>,
+    intro: Option<String>,
+    outro: Option<String>,
+    globals: Option<std::collections::HashMap<String, String>>,
+    paths: Option<std::collections::HashMap<String, String>>,
+    name: Option<String>,
+    extend: Option<bool>,
+    inline_dynamic_imports: bool,
+}
+
+fn ro_output_overrides(ro: Option<&serde_json::Value>) -> OutputOverrides {
+    let mut ov = OutputOverrides::default();
+    if let Some(arr) = ro.and_then(|r| r.get("output")).and_then(|o| o.as_array()) {
+        if arr.len() > 1 {
+            eprintln!(
+                "oj build: (!) build.rollupOptions.output lists {} outputs; oj builds the first one only.",
+                arr.len()
+            );
+        }
+    }
+    let Some(out) = ro_output(ro) else { return ov };
+    if out.get("file").is_some_and(|v| !v.is_null()) {
+        eprintln!(
+            "oj build: (!) build.rollupOptions.output.file is not supported (Vite rejects it too);              use build.outDir and output.entryFileNames."
+        );
+    }
+    if out.get("sourcemap").is_some_and(|v| !v.is_null()) {
+        eprintln!("oj build: (!) build.rollupOptions.output.sourcemap is ignored; use build.sourcemap instead (as in Vite).");
+    }
+    if out.get("plugins").is_some_and(|v| !v.is_null()) {
+        eprintln!("oj build: (!) build.rollupOptions.output.plugins is not supported; output plugins are ignored.");
+    }
+    ov.format = match out.get("format").and_then(|v| v.as_str()) {
+        None | Some("es") | Some("esm") | Some("module") => None,
+        Some("cjs") | Some("commonjs") => Some(OutputFormat::Cjs),
+        Some("umd") => Some(OutputFormat::Umd),
+        Some("iife") => Some(OutputFormat::Iife),
+        Some(other) => {
+            eprintln!("oj build: (!) build.rollupOptions.output.format \"{other}\" is not supported; building es.");
+            None
+        }
+    };
+    let addon = |key: &str| -> Option<String> {
+        let v = out.get(key)?;
+        if is_fn_marker(v) {
+            warn_fn_option(&format!("output.{key}"), "Use a string.");
+            return None;
+        }
+        v.as_str().map(String::from)
+    };
+    ov.banner = addon("banner");
+    ov.footer = addon("footer");
+    ov.intro = addon("intro");
+    ov.outro = addon("outro");
+    let str_map = |key: &str| -> Option<std::collections::HashMap<String, String>> {
+        let v = out.get(key)?;
+        if is_fn_marker(v) {
+            warn_fn_option(&format!("output.{key}"), "Use an object of specifier -> value.");
+            return None;
+        }
+        let obj = v.as_object()?;
+        Some(
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect(),
+        )
+    };
+    ov.globals = str_map("globals");
+    ov.paths = str_map("paths");
+    ov.name = out.get("name").and_then(|v| v.as_str()).map(String::from);
+    ov.extend = out.get("extend").and_then(|v| v.as_bool());
+    ov.inline_dynamic_imports = out.get("inlineDynamicImports").and_then(|v| v.as_bool()) == Some(true)
+        || out.get("codeSplitting").and_then(|v| v.as_bool()) == Some(false)
+        || matches!(ov.format, Some(OutputFormat::Umd) | Some(OutputFormat::Iife));
+    ov
+}
+
+/// `rollupOptions.treeshake: false` turns rolldown's tree shaking off.
+fn ro_treeshake(ro: Option<&serde_json::Value>) -> rolldown_common::TreeshakeOptions {
+    match ro.and_then(|r| r.get("treeshake")) {
+        Some(serde_json::Value::Bool(false)) => rolldown_common::TreeshakeOptions::Boolean(false),
+        _ => rolldown_common::TreeshakeOptions::default(),
+    }
+}
+
+fn addon_option(s: Option<String>) -> Option<rolldown_common::AddonOutputOption> {
+    s.map(|s| rolldown_common::AddonOutputOption::String(Some(s)))
+}
+
 #[derive(Debug)]
 struct OjCssPlugin {
     collected: Arc<Mutex<Vec<(String, String)>>>,
@@ -2372,12 +2469,35 @@ pub async fn build(
         })),
         css_minify: oj_config::build_css_minify(&config),
     }));
+    let out_ov = ro_output_overrides(ro_opts);
+    // Vite's build import analysis (preload wrapping, polyfill) only applies to
+    // es output; umd/iife/cjs bundles cannot use `import.meta.url`.
+    let es_output = out_ov.format.is_none();
+    let out_banner = out_ov.banner.clone();
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
         .with_options(BundlerOptions {
             input: Some(inputs),
             transform: transform_options(&config, is_production),
-            code_splitting: manual_chunks(ro_opts, &root),
+            code_splitting: if out_ov.inline_dynamic_imports {
+                Some(rolldown_common::CodeSplittingMode::Bool(false))
+            } else {
+                manual_chunks(ro_opts, &root)
+            },
+            format: out_ov.format,
+            banner: addon_option(out_ov.banner),
+            footer: addon_option(out_ov.footer),
+            intro: addon_option(out_ov.intro),
+            outro: addon_option(out_ov.outro),
+            globals: out_ov
+                .globals
+                .map(|g| rolldown_common::GlobalsOutputOption::FxHashMap(g.into_iter().collect())),
+            paths: out_ov
+                .paths
+                .map(|p| rolldown_common::PathsOutputOption::FxHashMap(p.into_iter().collect())),
+            name: out_ov.name,
+            extend: out_ov.extend,
+            treeshake: ro_treeshake(ro_opts),
             cwd: Some(root.clone()),
             dir: Some(out_dir.display().to_string()),
             resolve: rolldown_resolve(&root, &config, "client"),
@@ -2820,16 +2940,19 @@ pub async fn build(
     // lazy chunk's own dependencies and stylesheets load in parallel (and its
     // CSS is applied before it runs), inject the modulepreload polyfill into
     // page entries, and give async-only chunks a stylesheet fallback.
-    apply_preload_helper(
-        &output,
-        &out_dir,
-        &base,
-        &imports_map,
-        &chunk_css,
-        &all_sync_chunks,
-        &page_entry_files,
-        oj_config::module_preload_polyfill(&config),
-    )?;
+    if es_output {
+        apply_preload_helper(
+            &output,
+            &out_dir,
+            &base,
+            &imports_map,
+            &chunk_css,
+            &all_sync_chunks,
+            &page_entry_files,
+            oj_config::module_preload_polyfill(&config),
+            out_banner.as_deref(),
+        )?;
+    }
 
     // Vite writes the manifest only when `build.manifest` is set (a name or `true`).
     if let Some(name) = oj_config::build_manifest_name(&config) {
@@ -4732,6 +4855,7 @@ fn apply_preload_helper(
     sync_chunks: &std::collections::BTreeSet<String>,
     page_entries: &[String],
     polyfill: bool,
+    banner: Option<&str>,
 ) -> anyhow::Result<()> {
     let css_of: std::collections::HashMap<&str, &str> = chunk_css
         .iter()
@@ -4847,7 +4971,13 @@ fn apply_preload_helper(
         }
 
         if !prefix.is_empty() {
-            fs::write(&path, format!("{prefix}{code}"))?;
+            // `output.banner` stays the first thing in the file (a license
+            // header, a `"use client"` directive) ahead of oj's helpers.
+            let (head, body) = match banner {
+                Some(b) if !b.is_empty() && code.starts_with(b) => (b, &code[b.len()..]),
+                _ => ("", code.as_str()),
+            };
+            fs::write(&path, format!("{head}{prefix}{body}"))?;
         }
     }
     Ok(())
@@ -5814,6 +5944,41 @@ mod tests {
         assert_eq!(oj_config::build_assets_dir(&config), "static");
         assert_eq!(oj_config::build_manifest_name(&config).as_deref(), Some(".vite/manifest.json"));
         assert_eq!(oj_config::ssr_manifest_name(&config).as_deref(), Some("ssr.json"));
+    }
+
+    #[test]
+    fn rollup_output_options_are_forwarded() {
+        let ro = serde_json::json!({
+            "treeshake": false,
+            "output": {
+                "format": "iife", "name": "App", "extend": true,
+                "banner": "/* b */", "footer": "/* f */", "intro": "i;", "outro": "o;",
+                "globals": { "react": "React" }, "paths": { "react": "https://esm.sh/react" },
+                "entryFileNames": "__oj_fn__"
+            }
+        });
+        let ov = ro_output_overrides(Some(&ro));
+        assert!(matches!(ov.format, Some(OutputFormat::Iife)));
+        assert_eq!(ov.name.as_deref(), Some("App"));
+        assert_eq!(ov.extend, Some(true));
+        assert_eq!(ov.banner.as_deref(), Some("/* b */"));
+        assert_eq!(ov.footer.as_deref(), Some("/* f */"));
+        assert_eq!(ov.intro.as_deref(), Some("i;"));
+        assert_eq!(ov.outro.as_deref(), Some("o;"));
+        assert_eq!(ov.globals.as_ref().unwrap()["react"], "React");
+        assert_eq!(ov.paths.as_ref().unwrap()["react"], "https://esm.sh/react");
+        assert!(ov.inline_dynamic_imports, "iife implies a single chunk (Vite: codeSplitting false)");
+        assert!(matches!(ro_treeshake(Some(&ro)), rolldown_common::TreeshakeOptions::Boolean(false)));
+
+        // es stays rolldown's default; `inlineDynamicImports` and `codeSplitting: false` both fold chunks.
+        let es = serde_json::json!({ "output": [{ "format": "es", "inlineDynamicImports": true }, { "format": "cjs" }] });
+        let ov = ro_output_overrides(Some(&es));
+        assert!(ov.format.is_none());
+        assert!(ov.inline_dynamic_imports);
+        let cs = serde_json::json!({ "output": { "codeSplitting": false } });
+        assert!(ro_output_overrides(Some(&cs)).inline_dynamic_imports);
+        assert!(!ro_output_overrides(None).inline_dynamic_imports);
+        assert!(matches!(ro_treeshake(None), rolldown_common::TreeshakeOptions::Option(_)));
     }
 
     #[test]
