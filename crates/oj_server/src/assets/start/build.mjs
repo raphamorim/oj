@@ -9,6 +9,7 @@ import {
 } from "./rolldown-assets.mjs";
 import { loadPluginContainer } from "./vite-plugin-bridge.mjs";
 import { transformGlob } from "./glob-transform.mjs";
+import { cloudflareEnvironment, cloudflareWorkerPlugin, workerOutDir, CLOUDFLARE_WORKER_ENTRY } from "./cf-build.mjs";
 
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
 // Set by `oj build` per Vite's NODE_ENV rule (shell wins, else .env NODE_ENV=development, else production).
@@ -183,7 +184,14 @@ const compileCss = await (async () => {
 })();
 const emit = contentHashEmitter(CLIENT, compileCss, BASE);
 const clientContainer = await loadPluginContainer(APP, { command: "build", mode: MODE, environment: "client" });
-const serverContainer = await loadPluginContainer(APP, { command: "build", mode: MODE, environment: "ssr" });
+let serverContainer = await loadPluginContainer(APP, { command: "build", mode: MODE, environment: "ssr" });
+// With @cloudflare/vite-plugin the server build is the Worker environment the
+// plugin declared (its name comes from the wrangler config, or the plugin's
+// `viteEnvironment.name`); the plugin's hooks must see that environment.
+const cfEnv = cloudflareEnvironment(serverContainer?.config);
+if (cfEnv && cfEnv.name !== "ssr") {
+  serverContainer = await loadPluginContainer(APP, { command: "build", mode: MODE, environment: cfEnv.name });
+}
 
 const clientAlias = {
   "#tanstack-router-entry": routerEntry(),
@@ -258,61 +266,128 @@ writeFileSync(
   `export const tsrStartManifest = () => (${JSON.stringify({ routes: { __root__: rootManifest } })});\n`,
 );
 
-const server = await build({
-  input: { "server-bundle": join(HERE, "server-entry.tsx") },
-  platform: "node",
-  // Vite's `ssr.external`: those dependencies stay bare imports of the bundle.
-  external: ssrExternalRule(APP),
-  transform: {
-    jsx: jsxTransformOptions(NODE_ENV !== "production"),
-    define: {
-      ...USER_DEFINE,
-      "process.env.NODE_ENV": JSON.stringify(NODE_ENV), "process.env.TSS_SERVER_FN_BASE": '"/_serverFn/"',
-      ...viteEnvDefine({ ssr: true, mode: MODE, base: BASE }),
-    },
+const serverDefine = {
+  ...USER_DEFINE,
+  "process.env.NODE_ENV": JSON.stringify(NODE_ENV), "process.env.TSS_SERVER_FN_BASE": '"/_serverFn/"',
+  ...viteEnvDefine({ ssr: true, mode: MODE, base: BASE }),
+};
+const serverAlias = {
+  ...clientAlias,
+  "#tanstack-start-server-fn-resolver": join(HERE, "server-fn-resolver.mjs"),
+};
+const serverPlugins = () => [
+  makeVitePlugins({ container: serverContainer, fallback: clientContainer, appRoot: APP, mode: "prod", emit }),
+  {
+    name: "oj-server-render-chunk",
+    renderChunk: (code, chunk) => serverContainer?.renderChunk(code, chunk) ?? null,
   },
-  resolve: {
-    alias: {
-      ...clientAlias,
-      "#tanstack-start-server-fn-resolver": join(HERE, "server-fn-resolver.mjs"),
-      "@cloudflare/vite-plugin/server": join(HERE, "cf-server.mjs"),
-    },
-  },
-  plugins: [
-    makeVitePlugins({ container: serverContainer, fallback: clientContainer, appRoot: APP, mode: "prod", emit }),
-    {
-      name: "oj-server-render-chunk",
-      renderChunk: (code, chunk) => serverContainer?.renderChunk(code, chunk) ?? null,
-    },
-    serverFnPlugin,
-    assetsPlugin({ mode: "prod", server: true, emit }),
-  ],
-  output: {
-    dir: DIST,
-    format: "esm",
-    minify: MINIFY,
-    sourcemap: SOURCEMAP,
-    entryFileNames: "[name].mjs",
-    chunkFileNames: "chunks/[name]-[hash].mjs",
-    banner: "import { createRequire as ___cr } from 'node:module'; const require = ___cr(import.meta.url || 'file:///worker.js');",
-  },
-});
-// Vite runs writeBundle for the server environment as well, once its files exist.
-if (serverContainer) {
-  await serverContainer.writeBundle(Object.fromEntries(server.output.map((output) => [output.fileName, output])));
-}
+  serverFnPlugin,
+  assetsPlugin({ mode: "prod", server: true, emit }),
+];
 
-writeFileSync(join(DIST, "server.mjs"), SERVER);
-writeFileSync(join(DIST, "worker.mjs"), WORKER);
-cpSync(join(HERE, "cf-server.mjs"), join(DIST, "cf-server.mjs"));
-writeFileSync(
-  join(DIST, "cf-loader.mjs"),
-  'export async function resolve(spec, ctx, next) {\n' +
-    '  if (spec === "@cloudflare/vite-plugin/server")\n' +
-    '    return { url: new URL("./cf-server.mjs", import.meta.url).href, shortCircuit: true };\n' +
-    '  return next(spec, ctx);\n' +
-    '}\n',
-);
+let workerDir = null;
+if (cfEnv) {
+  // The Worker environment build, as `vite build` runs it for the Cloudflare
+  // plugin: dist/<environment>/index.js bundled for workerd (neutral platform,
+  // the runtime's built-ins external, no Node server wrapper), the plugin's
+  // virtual Worker entry wrapping oj's server entry, and the plugin's
+  // generateBundle/writeBundle emitting wrangler.json and the deploy config.
+  workerDir = workerOutDir(cfEnv, APP, DIST, serverContainer.config);
+  const serverEntry = join(HERE, "server-entry.tsx");
+  const worker = await build({
+    input: { index: CLOUDFLARE_WORKER_ENTRY },
+    platform: "neutral",
+    transform: {
+      jsx: jsxTransformOptions(NODE_ENV !== "production"),
+      ...(cfEnv.target ? { target: cfEnv.target } : {}),
+      define: {
+        ...serverDefine,
+        // The environment's own define (the plugin's process.env replacements).
+        ...serverContainer.defines(),
+        "import.meta.hot": "undefined",
+      },
+    },
+    resolve: {
+      conditionNames: [...cfEnv.conditions, "import", NODE_ENV === "production" ? "production" : "development"],
+      alias: {
+        ...serverAlias,
+        "@tanstack/react-start/server-entry": serverEntry,
+        "@cloudflare/vite-plugin/server": join(HERE, "cf-server-worker.mjs"),
+      },
+    },
+    plugins: [
+      cloudflareWorkerPlugin({ container: serverContainer, env: cfEnv, serverEntry }),
+      ...serverPlugins(),
+      ...cfEnv.rolldownPlugins,
+    ],
+    output: {
+      dir: workerDir,
+      format: "esm",
+      minify: MINIFY,
+      sourcemap: SOURCEMAP,
+      entryFileNames: "[name].js",
+      chunkFileNames: "assets/[name]-[hash].js",
+      assetFileNames: "assets/[name]-[hash][extname]",
+    },
+  });
+  const bundle = Object.fromEntries(worker.output.map((output) => [output.fileName, output]));
+  const originalCode = new Map(worker.output.filter((o) => o.type === "chunk").map((o) => [o.fileName, o.code]));
+  await serverContainer.generateBundle(({ type, fileName, source }) => {
+    if (type !== "asset" || !fileName || source == null) return;
+    const outFile = join(workerDir, fileName);
+    mkdirSync(dirname(outFile), { recursive: true });
+    writeFileSync(outFile, source);
+  }, bundle);
+  for (const output of Object.values(bundle)) {
+    if (output.type === "chunk" && output.code !== originalCode.get(output.fileName)) {
+      writeFileSync(join(workerDir, output.fileName), output.code);
+    }
+  }
+  await serverContainer.writeBundle(bundle);
+} else {
+  const server = await build({
+    input: { "server-bundle": join(HERE, "server-entry.tsx") },
+    platform: "node",
+    // Vite's `ssr.external`: those dependencies stay bare imports of the bundle.
+    external: ssrExternalRule(APP),
+    transform: {
+      jsx: jsxTransformOptions(NODE_ENV !== "production"),
+      define: serverDefine,
+    },
+    resolve: {
+      alias: {
+        ...serverAlias,
+        "@cloudflare/vite-plugin/server": join(HERE, "cf-server.mjs"),
+      },
+    },
+    plugins: serverPlugins(),
+    output: {
+      dir: DIST,
+      format: "esm",
+      minify: MINIFY,
+      sourcemap: SOURCEMAP,
+      entryFileNames: "[name].mjs",
+      chunkFileNames: "chunks/[name]-[hash].mjs",
+      banner: "import { createRequire as ___cr } from 'node:module'; const require = ___cr(import.meta.url || 'file:///worker.js');",
+    },
+  });
+  // Vite runs writeBundle for the server environment as well, once its files exist.
+  if (serverContainer) {
+    await serverContainer.writeBundle(Object.fromEntries(server.output.map((output) => [output.fileName, output])));
+  }
+
+  writeFileSync(join(DIST, "server.mjs"), SERVER);
+  writeFileSync(join(DIST, "worker.mjs"), WORKER);
+  cpSync(join(HERE, "cf-server.mjs"), join(DIST, "cf-server.mjs"));
+  writeFileSync(
+    join(DIST, "cf-loader.mjs"),
+    'export async function resolve(spec, ctx, next) {\n' +
+      '  if (spec === "@cloudflare/vite-plugin/server")\n' +
+      '    return { url: new URL("./cf-server.mjs", import.meta.url).href, shortCircuit: true };\n' +
+      '  return next(spec, ctx);\n' +
+      '}\n',
+  );
+}
 
 if (clientContainer?.publicDir !== false) {
   const publicDir = resolve(APP, clientContainer?.publicDir ?? "public");
@@ -320,7 +395,10 @@ if (clientContainer?.publicDir !== false) {
 }
 
 const prerender = (process.env.OJ_PRERENDER || "").split(",").map((s) => s.trim()).filter(Boolean);
-if (prerender.length) {
+if (prerender.length && cfEnv) {
+  // The Worker bundle imports the runtime's own modules; it does not run under Node.
+  process.stderr.write(`${OJ}${_ojTTY ? "" : ":"} prerender skipped: the Cloudflare Worker bundle only runs in workerd\n`);
+} else if (prerender.length) {
   const handler = (await import(pathToFileURL(join(DIST, "server-bundle.mjs")).href)).default;
   for (const route of prerender) {
     const res = await handler.fetch(new Request("http://localhost" + route));
@@ -337,3 +415,6 @@ await clientContainer?.closeBundle();
 await serverContainer?.closeBundle();
 
 process.stderr.write(`${OJ}${_ojTTY ? "" : ":"} built dist (client ${clientUrl})\n`);
+if (workerDir) {
+  process.stderr.write(`${OJ}${_ojTTY ? "" : ":"} cloudflare worker "${cfEnv.name}" -> ${relative(APP, workerDir)}/index.js (deploy: wrangler deploy)\n`);
+}
