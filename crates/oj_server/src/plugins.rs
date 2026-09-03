@@ -1255,6 +1255,13 @@ impl PluginHost {
         self.call("wsMessage", &[event, data]).await.map(|_| ())
     }
 
+    /// An HMR client connected: the host fires `server.ws.on("connection")`
+    /// listeners (Vite's ws server emits one per accepted socket).
+    #[inline]
+    pub async fn ws_connection(&self) -> Result<(), String> {
+        self.call("wsConnection", &[]).await.map(|_| ())
+    }
+
     #[inline]
     pub async fn emitted_files(&self) -> Result<Vec<EmittedFile>, String> {
         let Some(json) = self.call("getEmittedFiles", &[]).await? else {

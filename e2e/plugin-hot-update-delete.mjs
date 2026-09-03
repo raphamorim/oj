@@ -2,8 +2,10 @@
 // Copyright (c) 2026 Raphael Amorim
 //
 // Vite dispatches hotUpdate / watchChange for a removed file with type "delete"
-// (the watcher's unlink); oj used to skip deleted files entirely and always say
-// "update" for the rest.
+// (the watcher's unlink) and for a new file with type "create" (add); oj used to
+// skip deleted files entirely and always say "update" for the rest. A throwing
+// hotUpdate is logged and sent to the client as an error payload (hmr.ts), not
+// swallowed.
 
 import { spawn, execSync } from "node:child_process";
 import fs from "node:fs";
@@ -39,14 +41,19 @@ const log = (line) => fs.appendFileSync(${JSON.stringify(marks)} + "/events", li
 export default [{
   name: "watcher",
   watchChange(id, { event }) { log("watchChange:" + id.split("/").pop() + ":" + event); },
-  hotUpdate(ctx) { log("hotUpdate:" + ctx.file.split("/").pop() + ":" + ctx.type); },
+  hotUpdate(ctx) {
+    log("hotUpdate:" + ctx.file.split("/").pop() + ":" + ctx.type);
+    if (ctx.file.endsWith("boom.js")) throw new Error("boom hook");
+  },
 }];\n`,
 );
 
 const events = () => (fs.existsSync(path.join(marks, "events")) ? fs.readFileSync(path.join(marks, "events"), "utf8").trim().split("\n") : []);
 
 let failed = false;
-const srv = spawn(oj, ["dev", app, "--port", String(PORT)], { stdio: "ignore" });
+let stderr = "";
+const srv = spawn(oj, ["dev", app, "--port", String(PORT)], { stdio: ["ignore", "ignore", "pipe"] });
+srv.stderr.on("data", (d) => (stderr += d.toString()));
 try {
   for (let i = 0; i < 100; i++) { try { if ((await fetch(`http://localhost:${PORT}/`)).ok) break; } catch {} await sleep(200); }
   await (await fetch(`http://localhost:${PORT}/src/main.js`)).text();
@@ -63,6 +70,33 @@ try {
   for (let i = 0; i < 50 && !events().some((e) => e.startsWith("hotUpdate:gone.js")); i++) await sleep(100);
   assert.ok(events().includes("hotUpdate:gone.js:delete"), `a removed file reaches hotUpdate with type delete:\n${events().join("\n")}`);
   assert.ok(events().includes("watchChange:gone.js:delete"), `watchChange sees delete:\n${events().join("\n")}`);
+
+  fs.writeFileSync(path.join(app, "src", "fresh.js"), `export const F = "f";\n`);
+  for (let i = 0; i < 50 && !events().some((e) => e.startsWith("hotUpdate:fresh.js")); i++) await sleep(100);
+  assert.ok(events().includes("hotUpdate:fresh.js:create"), `a new file reaches hotUpdate with type create:\n${events().join("\n")}`);
+  assert.ok(events().includes("watchChange:fresh.js:create"), `watchChange sees create:\n${events().join("\n")}`);
+
+  // A throwing hotUpdate: logged on the server and delivered to the client as
+  // an error payload (Vite's environment.hot.send({ type: "error" })).
+  const ws = new WebSocket(`ws://localhost:${PORT}/__ws`);
+  await new Promise((res, rej) => {
+    ws.addEventListener("open", res);
+    ws.addEventListener("error", () => rej(new Error("ws open failed")));
+  });
+  const errorFrame = new Promise((res, rej) => {
+    const timer = setTimeout(() => rej(new Error("no error frame after the throwing hotUpdate")), 8000);
+    ws.addEventListener("message", (e) => {
+      let m;
+      try { m = JSON.parse(e.data); } catch { return; }
+      if (m.type === "error") { clearTimeout(timer); res(m); }
+    });
+  });
+  fs.writeFileSync(path.join(app, "src", "boom.js"), `export const B = 1;\n`);
+  const frame = await errorFrame;
+  assert.match(frame.err.message, /\[plugin:watcher\] boom hook/, "the client error names the plugin");
+  for (let i = 0; i < 50 && !stderr.includes("hotUpdate failed"); i++) await sleep(100);
+  assert.match(stderr, /hotUpdate failed for .*boom\.js: .*boom hook/, `the server logs the hook error:\n${stderr}`);
+  ws.close();
   console.log("PLUGIN-HOT-UPDATE-DELETE E2E PASSED");
 } catch (err) {
   failed = true;
