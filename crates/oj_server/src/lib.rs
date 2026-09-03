@@ -2306,9 +2306,43 @@ async fn ensure_module(
         source
     };
 
-    let css_like = is_preprocessor(url) || file.extension().and_then(|e| e.to_str()) == Some("css");
+    // PostCSS runs on the preprocessor OUTPUT (Vite orders Sass before PostCSS),
+    // so a Sass file is compiled here first when a PostCSS config applies; the
+    // compile step below then skips Sass for it.
+    let mut sass_precompiled = false;
+    let source = if state.has_postcss && oj_css::is_sass(url) {
+        let data = sass_additional_data_for(state, url);
+        let load_paths = sass_load_paths_for(state, url);
+        let dir = file.parent().map(Path::to_path_buf);
+        let src = source.clone();
+        let compiled = tokio::task::spawn_blocking(move || {
+            oj_css::compile_sass_opts(
+                &src,
+                &oj_css::SassOptions {
+                    load_dir: dir.as_deref(),
+                    additional_data: data.as_deref(),
+                    load_paths: &load_paths,
+                },
+            )
+        })
+        .await
+        .map_err(|e| format!("sass compile task failed for {url}: {e}"))??;
+        sass_precompiled = true;
+        compiled
+    } else {
+        source
+    };
+    let css_like = sass_precompiled
+        || is_preprocessor(url)
+        || file.extension().and_then(|e| e.to_str()) == Some("css");
     let source = if state.has_postcss && css_like {
-        run_css_sidecar(state, url, &source).await.unwrap_or(source)
+        match run_css_sidecar(state, url, &source).await {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!("oj: postcss failed for {url}: {e}");
+                source
+            }
+        }
     } else {
         source
     };
@@ -2403,7 +2437,7 @@ async fn ensure_module(
             });
         }
         if is_css {
-            let css_src = if oj_css::is_sass(&url_owned) {
+            let css_src = if oj_css::is_sass(&url_owned) && !sass_precompiled {
                 oj_css::compile_sass_opts(
                     &source,
                     &oj_css::SassOptions {
@@ -2890,13 +2924,55 @@ async fn serve_css_wrapper(state: &Arc<ServerState>, file: &Path, url: &str) -> 
 }
 
 pub fn has_postcss_config(root: &Path) -> bool {
-    [
+    find_postcss_config(root).is_some()
+}
+
+/// The PostCSS config that applies to `root`, found the way postcss-load-config
+/// does (what Vite uses): `postcss.config.{js,mjs,cjs,ts,mts,cts}`, `.postcssrc`,
+/// `.postcssrc.{json,js,mjs,cjs,ts,mts,cts}` or a `package.json` with a
+/// `postcss` key, searched from `root` up to the workspace root (nearest wins).
+/// The sidecar receives the path as `OJ_POSTCSS_CONFIG`.
+pub fn find_postcss_config(root: &Path) -> Option<PathBuf> {
+    const NAMES: &[&str] = &[
         "postcss.config.js",
-        "postcss.config.cjs",
         "postcss.config.mjs",
-    ]
-    .iter()
-    .any(|f| root.join(f).is_file())
+        "postcss.config.cjs",
+        "postcss.config.ts",
+        "postcss.config.mts",
+        "postcss.config.cts",
+        ".postcssrc",
+        ".postcssrc.json",
+        ".postcssrc.js",
+        ".postcssrc.mjs",
+        ".postcssrc.cjs",
+        ".postcssrc.ts",
+        ".postcssrc.mts",
+        ".postcssrc.cts",
+    ];
+    let stop = workspace_root(root);
+    let mut dir = Some(root);
+    while let Some(d) = dir {
+        for name in NAMES {
+            let p = d.join(name);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        let pkg = d.join("package.json");
+        if let Ok(text) = std::fs::read_to_string(&pkg) {
+            if serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .is_some_and(|v| v.get("postcss").is_some_and(|p| !p.is_null()))
+            {
+                return Some(pkg);
+            }
+        }
+        if d == stop {
+            break;
+        }
+        dir = d.parent();
+    }
+    None
 }
 
 async fn run_css_sidecar(
@@ -5572,6 +5648,33 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("data:"), "binary asset stays a data URI: {out}");
+    }
+
+    #[test]
+    fn postcss_config_is_found_like_postcss_load_config() {
+        let base = std::env::temp_dir().join(format!("oj-postcss-find-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let app = base.join("packages/web");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(base.join(".git")).unwrap(); // workspace root marker
+        assert!(find_postcss_config(&app).is_none());
+        // A config at the workspace root applies to the package.
+        std::fs::write(base.join(".postcssrc.json"), r#"{"plugins":{}}"#).unwrap();
+        assert_eq!(find_postcss_config(&app), Some(base.join(".postcssrc.json")));
+        // package.json#postcss in the package itself wins (nearest first).
+        std::fs::write(app.join("package.json"), r#"{"name":"web","postcss":{"plugins":{}}}"#).unwrap();
+        assert_eq!(find_postcss_config(&app), Some(app.join("package.json")));
+        // ...and a config file in the package beats its package.json key.
+        std::fs::write(app.join("postcss.config.ts"), "export default {}").unwrap();
+        assert_eq!(find_postcss_config(&app), Some(app.join("postcss.config.ts")));
+        // A package.json without the key does not count.
+        std::fs::remove_file(app.join("postcss.config.ts")).unwrap();
+        std::fs::write(app.join("package.json"), r#"{"name":"web"}"#).unwrap();
+        assert_eq!(find_postcss_config(&app), Some(base.join(".postcssrc.json")));
+        // Nothing above the workspace root is consulted.
+        std::fs::remove_file(base.join(".postcssrc.json")).unwrap();
+        assert!(find_postcss_config(&app).is_none());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

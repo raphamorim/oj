@@ -854,9 +854,13 @@ fn run_sidecar_once(
         "options": options,
     })
     .to_string();
+    let postcss_config = oj_server::find_postcss_config(root)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let mut child = std::process::Command::new("node")
         .arg(&script)
         .env("NODE_COMPILE_CACHE", oj_server::node_compile_cache(root))
+        .env("OJ_POSTCSS_CONFIG", postcss_config)
         .current_dir(root)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

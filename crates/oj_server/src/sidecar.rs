@@ -135,9 +135,13 @@ impl Sidecar {
         }
         std::fs::write(&script, js)?;
 
+        let postcss_config = crate::find_postcss_config(root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let mut child = tokio::process::Command::new("node")
             .arg(&script)
             .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
+            .env("OJ_POSTCSS_CONFIG", postcss_config)
             .env("NODE_COMPILE_CACHE", crate::node_compile_cache(root))
             .current_dir(root)
             .stdin(Stdio::piped())
