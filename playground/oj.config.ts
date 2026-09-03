@@ -7,6 +7,7 @@ export default defineConfig({
     __OJ_DEFINE_GLOBAL__: JSON.stringify("global-define"),
   },
   build: {
+    manifest: true,
     prerender: ["/", "/about"],
   },
   environments: {

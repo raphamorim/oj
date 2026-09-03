@@ -95,6 +95,8 @@ struct OjCssPlugin {
     /// `bundleWorkerEntry` builds the worker under the app's resolved config).
     /// None: a bare browser bundle (server and library builds).
     worker: Option<Arc<WorkerBundleOpts>>,
+    /// Vite's resolved `build.cssMinify` (defaults to `build.minify`).
+    css_minify: bool,
 }
 
 /// The app build settings an inline worker bundle shares with its importer:
@@ -361,6 +363,23 @@ fn process_env_defines(node_env: &str) -> Vec<(String, String)> {
     pairs
 }
 
+/// Vite maps `build.minify: false` to rolldown's `'dce-only'`: no mangling or
+/// whitespace removal, but dead code is still dropped (rolldown's `false` would
+/// keep it).
+fn rolldown_minify(on: bool) -> RawMinifyOptions {
+    if on {
+        RawMinifyOptions::Bool(true)
+    } else {
+        RawMinifyOptions::DeadCodeEliminationOnly
+    }
+}
+
+/// Vite's define plugin sets `import.meta.hot` to `undefined` in every build,
+/// so HMR-only code is dead and minifies away.
+fn import_meta_hot_define() -> (String, String) {
+    ("import.meta.hot".to_string(), "undefined".to_string())
+}
+
 fn shell_node_env() -> Option<String> {
     std::env::var("NODE_ENV").ok().filter(|v| !v.is_empty())
 }
@@ -530,6 +549,7 @@ fn svg_data_url(text: &str) -> String {
 
 fn emit_or_inline(
     ctx: &rolldown_plugin::SharedLoadPluginContext,
+    root: &Path,
     file: &str,
     bytes: Vec<u8>,
     inline_limit: u64,
@@ -552,10 +572,17 @@ fn emit_or_inline(
         .and_then(|n| n.to_str())
         .unwrap_or("asset")
         .to_string();
+    // Vite emits the asset with its root-relative path as `originalFileName`,
+    // which keys its manifest row and links it to the importing chunk.
+    let original = Path::new(file)
+        .strip_prefix(root)
+        .ok()
+        .map(|p| p.to_string_lossy().replace('\\', "/"));
     let reference = ctx
         .emit_file(
             rolldown_common::EmittedAsset {
                 name: Some(name),
+                original_file_name: original,
                 source: rolldown_common::StrOrBytes::Bytes(bytes),
                 ..Default::default()
             },
@@ -589,6 +616,7 @@ async fn compile_stylesheet(
     resolve: &oj_css::CssResolveConfig,
     path: &str,
     id: &str,
+    minify: bool,
 ) -> anyhow::Result<oj_css::CssOutput> {
     let cfg = oj_config::OjConfig {
         css: css.clone(),
@@ -656,7 +684,7 @@ async fn compile_stylesheet(
         Ok(rel) => format!("/{}", rel.display()),
         Err(_) => path.to_string(),
     };
-    oj_css::compile_css(&css_id, &source, true).map_err(|e| anyhow::anyhow!(e))
+    oj_css::compile_css(&css_id, &source, minify).map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Split `spec?query` into the file and a normalized oj asset query, for Vite's
@@ -734,7 +762,7 @@ async fn bundle_worker_inline(
             resolve: opts.and_then(|o| rolldown_resolve(root, &o.config, "client")),
             transform: opts.and_then(|o| transform_options(&o.config, o.is_production)),
             define: opts.map(|o| o.define.iter().cloned().collect()),
-            minify: Some(RawMinifyOptions::Bool(opts.is_none_or(|o| o.minify))),
+            minify: Some(rolldown_minify(opts.is_none_or(|o| o.minify))),
             ..Default::default()
         })
         .build()
@@ -848,6 +876,7 @@ impl Plugin for OjCssPlugin {
         let host = self.host.clone();
         let css_transform_enabled = Arc::clone(&self.css_transform_enabled);
         let self_has_postcss = self.has_postcss;
+        let self_css_minify = self.css_minify;
         let css_cfg = self.css.clone();
         let css_resolve = self.resolve.clone();
         let html_inline = Arc::clone(&self.html_inline);
@@ -876,6 +905,7 @@ impl Plugin for OjCssPlugin {
                         &css_resolve,
                         file,
                         &id,
+                        self_css_minify,
                     )
                     .await?;
                     let stem = std::path::Path::new(file)
@@ -903,7 +933,7 @@ impl Plugin for OjCssPlugin {
                 }
                 let bytes =
                     std::fs::read(file).map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
-                let code = emit_or_inline(&ctx, file, bytes, inline_limit)?;
+                let code = emit_or_inline(&ctx, &root, file, bytes, inline_limit)?;
                 return Ok(Some(rolldown_plugin::HookLoadOutput {
                     code: arcstr::ArcStr::from(code),
                     module_type: Some(rolldown_common::ModuleType::Js),
@@ -935,7 +965,7 @@ impl Plugin for OjCssPlugin {
             if !id.contains('?') && is_build_asset(&id) {
                 let bytes =
                     std::fs::read(&id).map_err(|e| anyhow::anyhow!("cannot read {id}: {e}"))?;
-                let code = emit_or_inline(&ctx, &id, bytes, inline_limit)?;
+                let code = emit_or_inline(&ctx, &root, &id, bytes, inline_limit)?;
                 return Ok(Some(rolldown_plugin::HookLoadOutput {
                     code: arcstr::ArcStr::from(code),
                     module_type: Some(rolldown_common::ModuleType::Js),
@@ -994,6 +1024,7 @@ impl Plugin for OjCssPlugin {
                         &css_resolve,
                         file,
                         &id,
+                        self_css_minify,
                     )
                     .await?;
                     return Ok(Some(rolldown_plugin::HookLoadOutput {
@@ -1055,6 +1086,7 @@ impl Plugin for OjCssPlugin {
                         html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
                         worker: worker.clone(),
                         resolve: css_resolve.clone(),
+                        css_minify: self_css_minify,
                     };
                     let code = bundle_worker_inline(&root, file, worker.as_ref(), nested).await?;
                     let literal = serde_json::Value::String(code).to_string();
@@ -1133,6 +1165,7 @@ impl Plugin for OjCssPlugin {
                 &css_resolve,
                 path,
                 &id,
+                self_css_minify,
             )
             .await?;
             // A CSS module: the class map as default plus named exports per
@@ -1981,16 +2014,132 @@ async fn plugin_config_defines(host: &Option<Arc<PluginHost>>) -> Vec<(String, S
     }
 }
 
+/// `oj build` command-line options that override the config file, as Vite's
+/// CLI merges its `build.*` flags and `--base` over the resolved config.
+#[derive(Debug, Default, Clone)]
+pub struct CliOptions {
+    pub out: Option<PathBuf>,
+    pub ssr: Option<String>,
+    pub empty_out_dir: bool,
+    pub base: Option<String>,
+    pub assets_dir: Option<String>,
+    pub assets_inline_limit: Option<u64>,
+    pub target: Option<String>,
+    /// `--sourcemap [true|false|inline|hidden]`
+    pub sourcemap: Option<String>,
+    /// `--minify [true|false|oxc|esbuild|terser]`
+    pub minify: Option<String>,
+    /// `--manifest [name]`
+    pub manifest: Option<String>,
+    /// `--ssrManifest [name]`
+    pub ssr_manifest: Option<String>,
+    pub watch: bool,
+}
+
+static CLI_OPTIONS: std::sync::OnceLock<CliOptions> = std::sync::OnceLock::new();
+
+/// Vite's cac turns `--flag` into `true` and `--flag false` into `false`; a
+/// bare `--manifest` selects the default file name.
+fn cli_bool_or_str(v: &str) -> oj_config::BoolOrString {
+    match v {
+        "true" => oj_config::BoolOrString::Bool(true),
+        "false" => oj_config::BoolOrString::Bool(false),
+        s => oj_config::BoolOrString::Str(s.to_string()),
+    }
+}
+
+/// Layer the CLI options over a loaded config. Every build stage that reloads
+/// the config (SSR, client entry, server functions) applies the same layer, so
+/// `--base` and friends reach each of them.
+fn apply_cli_options(config: &mut oj_config::OjConfig) {
+    if let Some(cli) = CLI_OPTIONS.get() {
+        apply_cli_options_from(config, cli);
+    }
+}
+
+fn apply_cli_options_from(config: &mut oj_config::OjConfig, cli: &CliOptions) {
+    if let Some(base) = &cli.base {
+        config.base = Some(base.clone());
+    }
+    let has_build_flags = cli.out.is_some()
+        || cli.assets_dir.is_some()
+        || cli.assets_inline_limit.is_some()
+        || cli.target.is_some()
+        || cli.sourcemap.is_some()
+        || cli.minify.is_some()
+        || cli.manifest.is_some()
+        || cli.ssr_manifest.is_some()
+        || cli.empty_out_dir;
+    if !has_build_flags {
+        return;
+    }
+    let b = config.build.get_or_insert_with(Default::default);
+    if let Some(out) = &cli.out {
+        b.out_dir = Some(out.display().to_string());
+    }
+    if let Some(d) = &cli.assets_dir {
+        b.assets_dir = Some(d.clone());
+    }
+    if let Some(n) = cli.assets_inline_limit {
+        b.assets_inline_limit = Some(n);
+    }
+    if let Some(t) = &cli.target {
+        b.target = Some(oj_config::StringOrList::One(t.clone()));
+    }
+    if let Some(s) = &cli.sourcemap {
+        b.sourcemap = Some(cli_bool_or_str(s));
+    }
+    if let Some(m) = &cli.minify {
+        b.minify = Some(cli_bool_or_str(m));
+    }
+    if let Some(m) = &cli.manifest {
+        b.manifest = Some(cli_bool_or_str(m));
+    }
+    if let Some(m) = &cli.ssr_manifest {
+        b.ssr_manifest = Some(cli_bool_or_str(m));
+    }
+    if cli.empty_out_dir {
+        b.empty_out_dir = Some(true);
+    }
+}
+
+/// `build.*` options oj accepts for compatibility but cannot honor; each is
+/// named once so a config relying on it does not fail silently.
+fn warn_unsupported_build_options(config: &oj_config::OjConfig) {
+    let Some(b) = config.build.as_ref() else { return };
+    let warn = |what: &str, hint: &str| {
+        eprintln!("oj build: (!) build.{what} is not supported by oj and is ignored. {hint}");
+    };
+    if b.write == Some(false) {
+        warn("write: false", "oj always writes the bundle to outDir.");
+    }
+    if b.watch.as_ref().is_some_and(|w| !w.is_null() && *w != serde_json::Value::Bool(false)) {
+        warn("watch", "Run `oj build` again after changes, or use `oj dev`.");
+    }
+    if b.license.as_ref().is_some_and(|l| *l != serde_json::Value::Bool(false)) {
+        warn("license", "No LICENSE file is emitted for the bundled dependencies.");
+    }
+    if b.commonjs_options.is_some() {
+        warn("commonjsOptions", "rolldown handles CommonJS dependencies natively without configuration.");
+    }
+    if b.css_target.is_some() {
+        warn("cssTarget", "CSS is lowered with lightningcss for the JS build.target.");
+    }
+}
+
 pub async fn build(
     root: PathBuf,
-    out: Option<PathBuf>,
-    ssr: Option<String>,
     cli_mode: Option<&str>,
-    empty_out_dir_flag: bool,
+    cli: CliOptions,
 ) -> anyhow::Result<()> {
     let root = root
         .canonicalize()
         .with_context(|| format!("app root not found: {}", root.display()))?;
+    if cli.watch {
+        bail!("oj build --watch is not supported yet; run `oj build` again after changes, or use `oj dev`");
+    }
+    let ssr = cli.ssr.clone();
+    let _ = CLI_OPTIONS.set(cli);
 
     // Vite: `mode = inlineConfig.mode || config.mode || "production"`; when the
     // config file itself names a mode and the CLI did not, the config is loaded
@@ -2012,11 +2161,15 @@ pub async fn build(
         oj_server::plugins::adopt_vite_config_values(&mut config, &root, "build", &mode_owned)
             .map_err(|e| anyhow::anyhow!(e))?;
     }
+    apply_cli_options(&mut config);
+    warn_unsupported_build_options(&config);
     let mode: &str = &mode_owned;
     let build_cfg = config.build.clone().unwrap_or_default();
     let ro_opts = oj_config::rolldown_options(&config);
-    let out = out
-        .or_else(|| build_cfg.out_dir.as_ref().map(PathBuf::from))
+    let out = build_cfg
+        .out_dir
+        .as_ref()
+        .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("dist"));
     let out_dir = if out.is_absolute() {
         out
@@ -2025,11 +2178,7 @@ pub async fn build(
     };
     let minify = oj_config::build_minify(&config);
     let sourcemap = oj_config::build_sourcemap(&config);
-    let empty_out_dir = if empty_out_dir_flag {
-        Some(true)
-    } else {
-        build_cfg.empty_out_dir
-    };
+    let empty_out_dir = build_cfg.empty_out_dir;
     let loaded_env = oj_env::load(&env_dir_of(&root, &config), mode);
     let env_prefixes = env_prefixes_of(&config);
     let env_prefix_refs: Vec<&str> = env_prefixes.iter().map(String::as_str).collect();
@@ -2057,6 +2206,11 @@ pub async fn build(
     }
 
     let base = normalize_base(config.base.as_deref().unwrap_or("/"));
+    // Vite's default file names live under `build.assetsDir` (`assets/[name]-[hash].js`,
+    // `assets/[name]-[hash][extname]`); an explicit `output.*FileNames` wins.
+    let assets_dir = oj_config::build_assets_dir(&config);
+    let asset_names_pattern = ro_output_str(ro_opts, "assetFileNames")
+        .unwrap_or_else(|| format!("{assets_dir}/[name]-[hash][extname]"));
 
     prepare_out_dir(&root, &out_dir, empty_out_dir)?;
 
@@ -2189,6 +2343,7 @@ pub async fn build(
     let client_define: Vec<(String, String)> = {
         let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &env_prefix_refs);
         let mut pairs: Vec<(String, String)> = process_env_defines(&node_env);
+        pairs.push(import_meta_hot_define());
         pairs.extend(oj_env::import_meta_env_defines(
             &env, mode, !is_production, &base, &env_prefix_refs,
         ));
@@ -2215,6 +2370,7 @@ pub async fn build(
             define: client_define.clone(),
             minify: client_minify,
         })),
+        css_minify: oj_config::build_css_minify(&config),
     }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
@@ -2227,20 +2383,20 @@ pub async fn build(
             resolve: rolldown_resolve(&root, &config, "client"),
             entry_filenames: Some(
                 ro_output_str(ro_opts, "entryFileNames")
-                    .unwrap_or_else(|| "assets/[name]-[hash].js".to_string())
+                    .unwrap_or_else(|| format!("{assets_dir}/[name]-[hash].js"))
                     .into(),
             ),
             chunk_filenames: Some(
                 ro_output_str(ro_opts, "chunkFileNames")
-                    .unwrap_or_else(|| "assets/[name]-[hash].js".to_string())
+                    .unwrap_or_else(|| format!("{assets_dir}/[name]-[hash].js"))
                     .into(),
             ),
-            asset_filenames: ro_output_str(ro_opts, "assetFileNames").map(Into::into),
+            asset_filenames: Some(asset_names_pattern.clone().into()),
             external: {
                 let ext = ro_external(ro_opts);
                 (!ext.is_empty()).then(|| rolldown::IsExternal::from(ext))
             },
-            minify: Some(RawMinifyOptions::Bool(client_minify)),
+            minify: Some(rolldown_minify(client_minify)),
             sourcemap: env_sourcemap(&config, "client", sourcemap),
             define: Some(client_define.into_iter().collect()),
             ..Default::default()
@@ -2342,13 +2498,13 @@ pub async fn build(
         .unwrap_or_else(|| root.join("public"));
     let link_css_transform_enabled: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::new();
     let link_css_resolve = css_resolve_of(&root, &config, "client");
-    let asset_names_pattern = ro_output_str(ro_opts, "assetFileNames");
     let css_asset_opts = CssAssetOpts {
         inline_limit: assets_inline_limit_of(&config),
-        asset_names: asset_names_pattern.as_deref(),
+        asset_names: Some(asset_names_pattern.as_str()),
         resolve: link_css_resolve.as_ref(),
     };
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
+    let mut manifest_assets: Vec<ManifestAsset> = Vec::new();
     let mut imports_map: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     let mut entry_files: Vec<String> = Vec::new();
@@ -2397,6 +2553,7 @@ pub async fn build(
                     .map(|i| i.to_string())
                     .collect(),
                 css: Vec::new(),
+                assets: Vec::new(),
             });
             if chunk.is_entry {
                 entry_files.push(filename.clone());
@@ -2416,7 +2573,7 @@ pub async fn build(
             None
         } else {
             css_entries.sort();
-            fs::create_dir_all(out_dir.join("assets"))?;
+            let sources = css_entries.clone();
             let mut seen_assets: std::collections::HashMap<PathBuf, String> =
                 std::collections::HashMap::new();
             let combined: String = css_entries
@@ -2432,12 +2589,18 @@ pub async fn build(
                 .join("\n");
             let hash = content_hash(combined.as_bytes());
             let css_name = render_asset_name(css_asset_opts.asset_names, "style", &hash, "css");
+            if let Some(parent) = out_dir.join(&css_name).parent() {
+                fs::create_dir_all(parent)?;
+            }
             fs::write(out_dir.join(&css_name), &combined)?;
             emitted.push((css_name.clone(), combined.len()));
             for entry in &mut manifest_entries {
                 if entry.is_entry {
                     entry.css.push(css_name.clone());
                 }
+            }
+            for (src, _) in &sources {
+                push_css_manifest_row(&mut manifest_assets, &root, src, &css_name);
             }
             Some(css_name)
         }
@@ -2457,6 +2620,7 @@ pub async fn build(
             css_asset_opts,
             &mut emitted,
             &mut manifest_entries,
+            &mut manifest_assets,
         )?
     } else {
         Vec::new()
@@ -2547,6 +2711,7 @@ pub async fn build(
                     &link_css_resolve,
                     &src_str,
                     &src_str,
+                    oj_config::build_css_minify(&config),
                 )
                 .await
                 .with_context(|| format!("stylesheet {href} linked from {}", doc.out_rel))?;
@@ -2569,6 +2734,7 @@ pub async fn build(
                 }
                 fs::write(&dest, &css)?;
                 emitted.push((name.clone(), css.len()));
+                push_css_manifest_row(&mut manifest_assets, &root, &src_str, &name);
                 rewritten_html =
                     rewrite_link_hrefs(&rewritten_html, &href, &with_base(&name, &base));
             }
@@ -2665,11 +2831,18 @@ pub async fn build(
         oj_config::module_preload_polyfill(&config),
     )?;
 
-    fs::create_dir_all(out_dir.join(".vite"))?;
-    fs::write(
-        out_dir.join(".vite").join("manifest.json"),
-        serde_json::to_string_pretty(&build_manifest(&manifest_entries))?,
-    )?;
+    // Vite writes the manifest only when `build.manifest` is set (a name or `true`).
+    if let Some(name) = oj_config::build_manifest_name(&config) {
+        manifest_asset_rows(&output.assets, &mut manifest_entries, &mut manifest_assets);
+        let dest = out_dir.join(&name);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(
+            &dest,
+            serde_json::to_string_pretty(&build_manifest(&manifest_entries, &manifest_assets))?,
+        )?;
+    }
 
     if build_cfg.copy_public_dir.unwrap_or(true) {
         copy_public_dir(&public_dir, &out_dir)?;
@@ -3257,6 +3430,7 @@ pub(crate) async fn build_ssr(
         oj_config::load_with(root, "build", mode).map_err(|e| anyhow::anyhow!("{e}"))?;
     oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", mode)
         .map_err(|e| anyhow::anyhow!(e))?;
+    apply_cli_options(&mut config);
     let loaded_env = oj_env::load(&env_dir_of(root, &config), mode);
     let env_prefixes = env_prefixes_of(&config);
     let env_prefix_refs: Vec<&str> = env_prefixes.iter().map(String::as_str).collect();
@@ -3327,6 +3501,7 @@ pub(crate) async fn build_ssr(
         css: config.css.clone(),
         html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
         worker: None,
+        css_minify: oj_config::build_css_minify(&config),
     }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
@@ -3345,7 +3520,7 @@ pub(crate) async fn build_ssr(
             format: Some(OutputFormat::Esm),
             entry_filenames: Some(format!("{stem}.mjs").into()),
             chunk_filenames: Some(format!("{stem}-[hash].mjs").into()),
-            minify: Some(RawMinifyOptions::Bool(
+            minify: Some(rolldown_minify(
                 oj_config::environment_build_bool(&config, "ssr", "minify").unwrap_or(false),
             )),
             sourcemap: env_sourcemap(&config, "ssr", sourcemap),
@@ -3358,6 +3533,7 @@ pub(crate) async fn build_ssr(
                 } else {
                     node_env_defines(&node_env)
                 };
+                pairs.push(import_meta_hot_define());
                 pairs.extend(oj_env::import_meta_env_defines_with(
                     &env,
                     mode,
@@ -3454,6 +3630,7 @@ async fn build_server_fns(root: &Path, out_dir: &Path, mode: &str) -> anyhow::Re
         oj_config::load_with(root, "build", mode).map_err(|e| anyhow::anyhow!("{e}"))?;
     oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", mode)
         .map_err(|e| anyhow::anyhow!(e))?;
+    apply_cli_options(&mut config);
     let node_env =
         oj_env::resolve_node_env(shell_node_env().as_deref(), &oj_env::load(root, mode), "production");
     let is_production = node_env == "production";
@@ -3483,6 +3660,7 @@ async fn build_server_fns(root: &Path, out_dir: &Path, mode: &str) -> anyhow::Re
                 css: config.css.clone(),
                 html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 worker: None,
+                css_minify: oj_config::build_css_minify(&config),
             })])
             .with_options(BundlerOptions {
                 input: Some(vec![InputItem {
@@ -3501,6 +3679,7 @@ async fn build_server_fns(root: &Path, out_dir: &Path, mode: &str) -> anyhow::Re
                 transform: transform_options(&config, is_production),
                 define: Some({
                     let mut pairs = node_env_defines(&node_env);
+                    pairs.push(import_meta_hot_define());
                     pairs.push(("import.meta.env.SSR".to_string(), "true".to_string()));
                     pairs.into_iter().collect()
                 }),
@@ -3819,6 +3998,7 @@ async fn build_client_entry(
         oj_config::load_with(root, "build", mode).map_err(|e| anyhow::anyhow!("{e}"))?;
     oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", mode)
         .map_err(|e| anyhow::anyhow!(e))?;
+    apply_cli_options(&mut config);
     let loaded_env = oj_env::load(&env_dir_of(root, &config), mode);
     let env_prefixes = env_prefixes_of(&config);
     let env_prefix_refs: Vec<&str> = env_prefixes.iter().map(String::as_str).collect();
@@ -3856,6 +4036,7 @@ async fn build_client_entry(
         css: config.css.clone(),
         html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
         worker: None,
+        css_minify: oj_config::build_css_minify(&config),
     }));
 
     let mut bundler = BundlerBuilder::default()
@@ -3872,13 +4053,14 @@ async fn build_client_entry(
             transform: transform_options(&config, is_production),
             entry_filenames: Some("assets/[name]-[hash].js".to_string().into()),
             chunk_filenames: Some("assets/[name]-[hash].js".to_string().into()),
-            minify: Some(RawMinifyOptions::Bool(
+            minify: Some(rolldown_minify(
                 oj_config::environment_build_bool(&config, "client", "minify").unwrap_or(minify),
             )),
             sourcemap: env_sourcemap(&config, "client", sourcemap),
             define: Some({
                 let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &env_prefix_refs);
                 let mut pairs = process_env_defines(&node_env);
+                pairs.push(import_meta_hot_define());
                 pairs.extend(oj_env::import_meta_env_defines(
                     &env,
                     mode,
@@ -4068,7 +4250,7 @@ async fn build_library(
                 remove_whitespace: false,
             })
         } else {
-            RawMinifyOptions::Bool(minify)
+            rolldown_minify(minify)
         };
 
         let mut bundler = BundlerBuilder::default()
@@ -4085,6 +4267,7 @@ async fn build_library(
                 css: config.css.clone(),
                 html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 worker: None,
+                css_minify: oj_config::build_css_minify(&config),
             })])
             .with_options(BundlerOptions {
                 input: Some(
@@ -4116,6 +4299,7 @@ async fn build_library(
                 define: Some({
                     let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &env_prefix_refs);
                     let mut pairs = oj_env::import_meta_env_defines(&env, mode, !is_production, "/", &env_prefix_refs);
+                    pairs.push(import_meta_hot_define());
                     pairs.extend(oj_config::config_defines(config));
                     pairs.extend(oj_config::environment_defines(config, "client"));
                     pairs.into_iter().collect()
@@ -4218,12 +4402,13 @@ fn page_base(base: &str, out_rel: &str) -> String {
     }
 }
 
-/// URL for an emitted `assets/…` file as referenced from a stylesheet that also
-/// lives in `assets/` (all of oj's emitted CSS does): relative bases become a
-/// sibling reference, absolute bases the public path.
-fn css_asset_url(name: &str, base: &str) -> String {
+/// URL for an emitted asset as referenced from an emitted stylesheet: relative
+/// bases become a path relative to where the stylesheets land (the
+/// `assetFileNames` directory, `assets/` by default), absolute bases the public path.
+fn css_asset_url(name: &str, base: &str, asset_names: Option<&str>) -> String {
     if is_relative_base(base) {
-        format!("./{}", name.strip_prefix("assets/").unwrap_or(name))
+        let css_file = render_asset_name(asset_names, "style", "00000000", "css");
+        relative_chunk_path(&css_file, name)
     } else {
         with_base(name, base)
     }
@@ -4366,7 +4551,7 @@ fn emit_css_url(
     }
     std::fs::write(&dest, &data).ok()?;
     emitted.push((name.clone(), data.len()));
-    let url = css_asset_url(&name, base);
+    let url = css_asset_url(&name, base, opts.asset_names);
     seen.insert(abs, url.clone());
     Some(format!("{url}{suffix}"))
 }
@@ -4430,6 +4615,7 @@ fn emit_split_css_files(
     opts: CssAssetOpts<'_>,
     emitted: &mut Vec<(String, usize)>,
     manifest_entries: &mut [ManifestEntry],
+    manifest_assets: &mut Vec<ManifestAsset>,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let css_map: std::collections::HashMap<String, String> =
         collected_css.lock().unwrap().iter().cloned().collect();
@@ -4437,7 +4623,6 @@ fn emit_split_css_files(
     if css_map.is_empty() {
         return Ok(chunk_css);
     }
-    fs::create_dir_all(out_dir.join("assets"))?;
     let mut seen_assets: std::collections::HashMap<PathBuf, String> =
         std::collections::HashMap::new();
     for asset in &output.assets {
@@ -4445,9 +4630,11 @@ fn emit_split_css_files(
             continue;
         };
         let mut css = String::new();
+        let mut sources: Vec<String> = Vec::new();
         for module_id in &chunk.modules.keys {
             let mid = module_id.to_string();
             if let Some(src) = css_map.get(&mid) {
+                sources.push(mid.clone());
                 let dir = Path::new(&mid)
                     .parent()
                     .map(Path::to_path_buf)
@@ -4480,6 +4667,11 @@ fn emit_split_css_files(
             if entry.file == chunk.filename.as_str() {
                 entry.css.push(css_name.clone());
             }
+        }
+        // Vite keys the stylesheet's manifest row by each source file it was
+        // built from (the asset's `originalFileNames`).
+        for src in &sources {
+            push_css_manifest_row(manifest_assets, root, src, &css_name);
         }
         chunk_css.push((chunk.filename.to_string(), css_name));
     }
@@ -4748,6 +4940,98 @@ struct ManifestEntry {
     imports: Vec<String>,
     dynamic_imports: Vec<String>,
     css: Vec<String>,
+    /// Non-CSS asset files imported by this chunk (Vite's `importedAssets`).
+    assets: Vec<String>,
+}
+
+/// A manifest row for an emitted asset (Vite: keyed by its original file name
+/// relative to root, or `_<basename>` when unknown).
+struct ManifestAsset {
+    key: String,
+    file: String,
+    name: Option<String>,
+}
+
+/// A manifest row for an emitted stylesheet, keyed by its root-relative source
+/// path (`_<basename>` for CSS that has no file, e.g. plugin-generated).
+fn push_css_manifest_row(rows: &mut Vec<ManifestAsset>, root: &Path, src: &str, css_name: &str) {
+    let src = src.split(['?', '#']).next().unwrap_or(src);
+    let key = match Path::new(src).strip_prefix(root) {
+        Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+        Err(_) => format!(
+            "_{}",
+            Path::new(css_name).file_name().and_then(|n| n.to_str()).unwrap_or(css_name)
+        ),
+    };
+    if rows.iter().any(|r| r.key == key) {
+        return;
+    }
+    rows.push(ManifestAsset {
+        key,
+        file: css_name.to_string(),
+        name: Path::new(css_name)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string),
+    });
+}
+
+/// Asset rows for the manifest, and each chunk's `assets` list: an asset a
+/// module imported (`import url from './big.png'`) is emitted with the module's
+/// root-relative path as its original file name, so the chunk containing that
+/// module imported it (Vite's viteMetadata.importedAssets).
+fn manifest_asset_rows(
+    bundle: &[rolldown_common::Output],
+    entries: &mut [ManifestEntry],
+    rows: &mut Vec<ManifestAsset>,
+) {
+    use rolldown_common::Output;
+    let mut by_original: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    for out in bundle {
+        let Output::Asset(asset) = out else { continue };
+        if asset.names.is_empty() {
+            continue;
+        }
+        let file = asset.filename.to_string();
+        let key = match asset.original_file_names.first() {
+            Some(orig) => {
+                by_original.insert(orig.as_str(), file.clone());
+                orig.clone()
+            }
+            None => format!(
+                "_{}",
+                Path::new(&file).file_name().and_then(|n| n.to_str()).unwrap_or(&file)
+            ),
+        };
+        // A JS chunk generated from the same source keeps the key (Vite).
+        if entries.iter().any(|e| e.key == key) || rows.iter().any(|r| r.key == key) {
+            continue;
+        }
+        rows.push(ManifestAsset {
+            key,
+            file,
+            name: asset.names.first().cloned(),
+        });
+    }
+    if by_original.is_empty() {
+        return;
+    }
+    for out in bundle {
+        let Output::Chunk(chunk) = out else { continue };
+        let Some(entry) = entries.iter_mut().find(|e| e.file == chunk.filename.as_str()) else {
+            continue;
+        };
+        for id in &chunk.module_ids {
+            let id = id.as_ref();
+            let rel = id.split(['?', '#']).next().unwrap_or(id);
+            let hit = by_original.iter().find(|(orig, _)| rel.ends_with(orig.as_ref() as &str));
+            if let Some((_, file)) = hit {
+                if !entry.assets.contains(file) {
+                    entry.assets.push(file.clone());
+                }
+            }
+        }
+    }
 }
 
 // Build Vite-manifest entries directly from a bundle (chunks only; CSS is added
@@ -4791,6 +5075,7 @@ fn manifest_entries_from_bundle(
             imports: chunk.imports.iter().map(|i| i.to_string()).collect(),
             dynamic_imports: chunk.dynamic_imports.iter().map(|i| i.to_string()).collect(),
             css: Vec::new(),
+            assets: Vec::new(),
         });
     }
     entries
@@ -4801,8 +5086,10 @@ fn manifest_entries_from_bundle(
 // would under Vite (with build.manifest enabled).
 fn serialize_bundle_with_vite_manifest(bundle: &[rolldown_common::Output], root: &Path) -> String {
     let base = serialize_bundle(bundle);
-    let entries = manifest_entries_from_bundle(bundle, root);
-    let manifest = build_manifest(&entries).to_string();
+    let mut entries = manifest_entries_from_bundle(bundle, root);
+    let mut assets = Vec::new();
+    manifest_asset_rows(bundle, &mut entries, &mut assets);
+    let manifest = build_manifest(&entries, &assets).to_string();
     let mut val: serde_json::Value =
         serde_json::from_str(&base).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(obj) = val.as_object_mut() {
@@ -4819,7 +5106,7 @@ fn serialize_bundle_with_vite_manifest(bundle: &[rolldown_common::Output], root:
     val.to_string()
 }
 
-fn build_manifest(entries: &[ManifestEntry]) -> serde_json::Value {
+fn build_manifest(entries: &[ManifestEntry], assets: &[ManifestAsset]) -> serde_json::Value {
     // Vite's manifest references imports/dynamicImports by manifest KEY, not by
     // output filename, so build a filename -> key map first.
     let file_to_key: std::collections::HashMap<&str, &str> = entries
@@ -4861,7 +5148,19 @@ fn build_manifest(entries: &[ManifestEntry]) -> serde_json::Value {
         if !e.css.is_empty() {
             row.insert("css".into(), e.css.clone().into());
         }
+        if !e.assets.is_empty() {
+            row.insert("assets".into(), e.assets.clone().into());
+        }
         map.insert(e.key.clone(), serde_json::Value::Object(row));
+    }
+    for a in assets {
+        let mut row = serde_json::Map::new();
+        row.insert("file".into(), a.file.clone().into());
+        row.insert("src".into(), a.key.clone().into());
+        if let Some(name) = &a.name {
+            row.insert("name".into(), name.clone().into());
+        }
+        map.insert(a.key.clone(), serde_json::Value::Object(row));
     }
     serde_json::Value::Object(map)
 }
@@ -4976,7 +5275,7 @@ mod tests {
             .unwrap();
             fs::write(root.join("shared.js"), r#"export const shared = "ready";"#).unwrap();
 
-            build(root.clone(), None, None, Some("production"), false)
+            build(root.clone(), Some("production"), CliOptions::default())
                 .await
                 .expect("synthetic shared-chunk fixture should build");
 
@@ -5109,7 +5408,7 @@ mod tests {
             fs::write(root.join("main.js"), "window.ready = true;").unwrap();
             fs::write(root.join("public/asset.txt"), "public asset").unwrap();
 
-            build(root.clone(), None, None, Some("production"), false)
+            build(root.clone(), Some("production"), CliOptions::default())
                 .await
                 .expect("synthetic public-directory fixture should build");
 
@@ -5143,7 +5442,7 @@ mod tests {
         .unwrap();
         fs::write(root.join("server.js"), "export const flag = process.env.SOME_FLAG;\n").unwrap();
 
-        build(root.clone(), None, None, Some("production"), false)
+        build(root.clone(), Some("production"), CliOptions::default())
             .await
             .expect("client build");
         let mut client = String::new();
@@ -5202,7 +5501,7 @@ mod tests {
         .unwrap();
         fs::write(root.join("public/manifest.webmanifest"), "{}").unwrap();
 
-        build(root.clone(), None, None, Some("production"), false)
+        build(root.clone(), Some("production"), CliOptions::default())
             .await
             .expect("html asset fixture should build");
         let html = fs::read_to_string(root.join("dist/index.html")).unwrap();
@@ -5249,7 +5548,7 @@ mod tests {
             "export default { build: { lib: { entry: 'src/index.ts', name: 'MyLib' } } };",
         )
         .unwrap();
-        build(root.clone(), None, None, Some("production"), false)
+        build(root.clone(), Some("production"), CliOptions::default())
             .await
             .expect("vite.config build.lib should build");
         assert!(root.join("dist/my-lib.js").is_file(), "es output named after the unscoped package");
@@ -5269,7 +5568,7 @@ mod tests {
             "export default { build: { lib: { entry: { main: 'src/a.ts', extra: 'src/b.ts' }, cssFileName: 'theme' } } };",
         )
         .unwrap();
-        build(root.clone(), None, None, Some("production"), false)
+        build(root.clone(), Some("production"), CliOptions::default())
             .await
             .expect("multi-entry lib should build");
         for f in ["main.mjs", "extra.mjs", "main.js", "extra.js"] {
@@ -5288,7 +5587,7 @@ mod tests {
             "export default { build: { lib: { entry: 'src/index.ts', formats: ['umd'] } } };",
         )
         .unwrap();
-        let err = build(root.clone(), None, None, Some("production"), false)
+        let err = build(root.clone(), Some("production"), CliOptions::default())
             .await
             .expect_err("umd needs build.lib.name");
         assert!(err.to_string().contains("build.lib.name"), "{err}");
@@ -5326,7 +5625,7 @@ mod tests {
             r#"<html><body><script type="module" src="/src/main.js"></script></body></html>"#,
         )
         .unwrap();
-        build(root.clone(), None, None, Some("production"), false)
+        build(root.clone(), Some("production"), CliOptions::default())
             .await
             .expect("inline worker fixture should build");
         let mut code = String::new();
@@ -5385,6 +5684,7 @@ mod tests {
             imports: imports.into_iter().map(str::to_string).collect(),
             dynamic_imports: dyn_imports.into_iter().map(str::to_string).collect(),
             css: css.into_iter().map(str::to_string).collect(),
+            assets: vec![],
         };
         let m = build_manifest(&[
             mk(
@@ -5420,7 +5720,7 @@ mod tests {
                 vec![],
                 vec![],
             ),
-        ]);
+        ], &[]);
         let row = &m["src/main.tsx"];
         assert_eq!(row["file"], "assets/main-abc123.js");
         assert_eq!(row["name"], "main");
@@ -5438,6 +5738,92 @@ mod tests {
     }
 
     #[test]
+    fn manifest_asset_rows_are_keyed_by_source_and_chunks_list_assets() {
+        let root = scratch("manifest-css-rows");
+        let mut rows: Vec<ManifestAsset> = Vec::new();
+        let src = root.join("src/style.css").display().to_string();
+        push_css_manifest_row(&mut rows, &root, &src, "assets/main-abc.css");
+        // The same source twice (two chunks sharing a stylesheet) is one row.
+        push_css_manifest_row(&mut rows, &root, &format!("{src}?inline"), "assets/main-abc.css");
+        // CSS without a file under root falls back to `_<basename>`.
+        push_css_manifest_row(&mut rows, &root, "/elsewhere/__plugin_css__", "assets/gen-1.css");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].key, "src/style.css");
+        assert_eq!(rows[1].key, "_gen-1.css");
+        let m = build_manifest(
+            &[ManifestEntry {
+                key: "src/main.ts".into(),
+                name: "main".into(),
+                file: "assets/main-1.js".into(),
+                src: Some("src/main.ts".into()),
+                is_entry: true,
+                is_dynamic_entry: false,
+                imports: vec![],
+                dynamic_imports: vec![],
+                css: vec!["assets/main-abc.css".into()],
+                assets: vec!["assets/big-9.png".into()],
+            }],
+            &rows,
+        );
+        assert_eq!(m["src/main.ts"]["assets"][0], "assets/big-9.png");
+        assert_eq!(m["src/style.css"]["file"], "assets/main-abc.css");
+        assert_eq!(m["src/style.css"]["src"], "src/style.css");
+        assert_eq!(m["src/style.css"]["name"], "main-abc.css");
+        assert!(m["src/style.css"].get("isEntry").is_none());
+        assert_eq!(m["_gen-1.css"]["file"], "assets/gen-1.css");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cli_options_layer_over_the_loaded_config() {
+        // Vite's cac: a bare `--manifest` is `true`, `--minify false` is `false`,
+        // anything else stays a string (`--sourcemap inline`, `--manifest m.json`).
+        assert!(matches!(cli_bool_or_str("true"), oj_config::BoolOrString::Bool(true)));
+        assert!(matches!(cli_bool_or_str("false"), oj_config::BoolOrString::Bool(false)));
+        assert!(matches!(cli_bool_or_str("inline"), oj_config::BoolOrString::Str(s) if s == "inline"));
+        let cli = CliOptions {
+            out: Some(PathBuf::from("build-out")),
+            base: Some("/app/".into()),
+            assets_dir: Some("static".into()),
+            assets_inline_limit: Some(10),
+            sourcemap: Some("hidden".into()),
+            minify: Some("false".into()),
+            manifest: Some("true".into()),
+            ssr_manifest: Some("ssr.json".into()),
+            empty_out_dir: true,
+            ..Default::default()
+        };
+        let mut config = oj_config::OjConfig {
+            base: Some("/from-config/".into()),
+            build: Some(oj_config::BuildConfig {
+                out_dir: Some("dist".into()),
+                minify: Some(oj_config::BoolOrString::Bool(true)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        apply_cli_options_from(&mut config, &cli);
+        assert_eq!(config.base.as_deref(), Some("/app/"));
+        let b = config.build.as_ref().unwrap();
+        assert_eq!(b.out_dir.as_deref(), Some("build-out"));
+        assert_eq!(b.assets_inline_limit, Some(10));
+        assert_eq!(b.empty_out_dir, Some(true));
+        assert!(!oj_config::build_minify(&config), "--minify false wins over the config's true");
+        assert!(!oj_config::build_css_minify(&config), "cssMinify follows minify");
+        assert_eq!(oj_config::build_sourcemap(&config), oj_config::Sourcemap::Hidden);
+        assert_eq!(oj_config::build_assets_dir(&config), "static");
+        assert_eq!(oj_config::build_manifest_name(&config).as_deref(), Some(".vite/manifest.json"));
+        assert_eq!(oj_config::ssr_manifest_name(&config).as_deref(), Some("ssr.json"));
+    }
+
+    #[test]
+    fn minify_false_still_eliminates_dead_code() {
+        assert!(matches!(rolldown_minify(true), RawMinifyOptions::Bool(true)));
+        assert!(matches!(rolldown_minify(false), RawMinifyOptions::DeadCodeEliminationOnly));
+        assert_eq!(import_meta_hot_define(), ("import.meta.hot".to_string(), "undefined".to_string()));
+    }
+
+    #[test]
     fn non_entry_omits_isentry_and_empty_fields() {
         let m = build_manifest(&[ManifestEntry {
             key: "_chunk-1.js".into(),
@@ -5449,8 +5835,10 @@ mod tests {
             imports: vec![],
             dynamic_imports: vec![],
             css: vec![],
-        }]);
+            assets: vec![],
+        }], &[]);
         let row = m["_chunk-1.js"].as_object().unwrap();
+        assert!(!row.contains_key("assets"));
         assert!(!row.contains_key("isEntry"));
         assert!(!row.contains_key("isDynamicEntry"));
         assert!(!row.contains_key("imports"));
@@ -5488,8 +5876,10 @@ mod tests {
         assert_eq!(page_base("./", "index.html"), "./");
         assert_eq!(page_base("./", "nested/index.html"), "../");
         assert_eq!(page_base("./", "a/b/index.html"), "../../");
-        assert_eq!(css_asset_url("assets/img-h.png", "./"), "./img-h.png");
-        assert_eq!(css_asset_url("assets/img-h.png", "/app/"), "/app/assets/img-h.png");
+        assert_eq!(css_asset_url("assets/img-h.png", "./", None), "./img-h.png");
+        assert_eq!(css_asset_url("assets/img-h.png", "/app/", None), "/app/assets/img-h.png");
+        assert_eq!(css_asset_url("static/img-h.png", "./", Some("static/[name]-[hash][extname]")), "./img-h.png");
+        assert_eq!(css_asset_url("assets/img-h.png", "./", Some("css/[name][extname]")), "../assets/img-h.png");
         assert_eq!(relative_chunk_path("assets/main-h.js", "assets/lazy-h.js"), "./lazy-h.js");
         assert_eq!(relative_chunk_path("main-h.js", "assets/lazy-h.js"), "./assets/lazy-h.js");
         assert_eq!(relative_chunk_path("assets/a/main-h.js", "assets/lazy-h.js"), "../lazy-h.js");

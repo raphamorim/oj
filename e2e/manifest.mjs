@@ -41,7 +41,7 @@ try {
   // manualChunks forces a vendor chunk the entry statically imports.
   fs.writeFileSync(
     path.join(app, "oj.config.mjs"),
-    "export default { build: { rollupOptions: { output: { manualChunks: { vendor: [\"mylib\"] } } } } };\n",
+    "export default { build: { manifest: true, rollupOptions: { output: { manualChunks: { vendor: [\"mylib\"] } } } } };\n",
   );
 
   execFileSync(OJ, ["build", app], { stdio: "pipe" });

@@ -66,6 +66,63 @@ pub fn build_minify(config: &OjConfig) -> bool {
     }
 }
 
+/// `build.cssMinify`: Vite resolves an unset value to `!!build.minify` for the
+/// client; a minifier name (`"lightningcss"`, `"esbuild"`) means on.
+pub fn build_css_minify(config: &OjConfig) -> bool {
+    match config.build.as_ref().and_then(|b| b.css_minify.as_ref()) {
+        None => build_minify(config),
+        Some(BoolOrString::Bool(b)) => *b,
+        Some(BoolOrString::Str(s)) => s != "false",
+    }
+}
+
+/// `build.assetsDir` (Vite default `assets`), normalized without surrounding slashes.
+pub fn build_assets_dir(config: &OjConfig) -> String {
+    let dir = config
+        .build
+        .as_ref()
+        .and_then(|b| b.assets_dir.as_deref())
+        .unwrap_or("assets")
+        .trim_matches('/');
+    if dir.is_empty() {
+        "assets".to_string()
+    } else {
+        dir.to_string()
+    }
+}
+
+/// `build.manifest`: the manifest file name to write, if any (Vite writes none
+/// by default; `true` means `.vite/manifest.json`).
+pub fn build_manifest_name(config: &OjConfig) -> Option<String> {
+    match config.build.as_ref().and_then(|b| b.manifest.as_ref()) {
+        None | Some(BoolOrString::Bool(false)) => None,
+        Some(BoolOrString::Bool(true)) => Some(".vite/manifest.json".to_string()),
+        Some(BoolOrString::Str(s)) => match s.as_str() {
+            "false" => None,
+            "true" => Some(".vite/manifest.json".to_string()),
+            _ => Some(s.clone()),
+        },
+    }
+}
+
+/// `build.reportCompressedSize` (Vite default true).
+pub fn build_report_compressed_size(config: &OjConfig) -> bool {
+    config
+        .build
+        .as_ref()
+        .and_then(|b| b.report_compressed_size)
+        .unwrap_or(true)
+}
+
+/// `build.chunkSizeWarningLimit` in kB (Vite default 500).
+pub fn build_chunk_size_warning_limit(config: &OjConfig) -> f64 {
+    config
+        .build
+        .as_ref()
+        .and_then(|b| b.chunk_size_warning_limit)
+        .unwrap_or(500.0)
+}
+
 /// Vite 8's `'baseline-widely-available'` default target (constants.ts).
 pub const BASELINE_WIDELY_AVAILABLE: &[&str] =
     &["chrome111", "edge111", "firefox114", "safari16.4", "ios16.4"];
@@ -142,7 +199,11 @@ pub fn ssr_manifest_name(config: &OjConfig) -> Option<String> {
     match config.build.as_ref().and_then(|b| b.ssr_manifest.as_ref()) {
         None | Some(BoolOrString::Bool(false)) => None,
         Some(BoolOrString::Bool(true)) => Some(".vite/ssr-manifest.json".to_string()),
-        Some(BoolOrString::Str(s)) => Some(s.clone()),
+        Some(BoolOrString::Str(s)) => match s.as_str() {
+            "false" => None,
+            "true" => Some(".vite/ssr-manifest.json".to_string()),
+            _ => Some(s.clone()),
+        },
     }
 }
 
@@ -1322,7 +1383,7 @@ mod ssr_externals_tests {
 }
 
 #[cfg(test)]
-mod build_option_tests {
+mod build_option_defaults_tests {
     use super::*;
 
     fn cfg(json: &str) -> OjConfig {
@@ -1453,6 +1514,39 @@ mod preprocessor_options_tests {
         assert!(less.get("additionalData").is_none());
         assert!(css_preprocessor_json(&cfg, "stylus").is_null());
         assert!(css_load_paths(&cfg, "sass").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod build_manifest_css_minify_tests {
+    use super::*;
+
+    #[test]
+    fn manifest_css_minify_and_assets_dir_follow_vite_defaults() {
+        let cfg = OjConfig::default();
+        assert_eq!(build_manifest_name(&cfg), None, "Vite writes no manifest by default");
+        assert!(build_css_minify(&cfg), "cssMinify defaults to minify (on)");
+        assert_eq!(build_assets_dir(&cfg), "assets");
+        assert!(build_report_compressed_size(&cfg));
+        assert_eq!(build_chunk_size_warning_limit(&cfg), 500.0);
+
+        let cfg: OjConfig = serde_json::from_str(
+            r#"{"build":{"manifest":true,"minify":false,"assetsDir":"/static/","chunkSizeWarningLimit":1000,"reportCompressedSize":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(build_manifest_name(&cfg).as_deref(), Some(".vite/manifest.json"));
+        assert!(!build_css_minify(&cfg), "cssMinify unset follows minify: false");
+        assert_eq!(build_assets_dir(&cfg), "static");
+        assert_eq!(build_chunk_size_warning_limit(&cfg), 1000.0);
+        assert!(!build_report_compressed_size(&cfg));
+
+        let cfg: OjConfig = serde_json::from_str(
+            r#"{"build":{"manifest":"meta/m.json","minify":false,"cssMinify":"lightningcss","ssrManifest":"true"}}"#,
+        )
+        .unwrap();
+        assert_eq!(build_manifest_name(&cfg).as_deref(), Some("meta/m.json"));
+        assert!(build_css_minify(&cfg), "an explicit cssMinify is independent of minify");
+        assert_eq!(ssr_manifest_name(&cfg).as_deref(), Some(".vite/ssr-manifest.json"));
     }
 }
 
