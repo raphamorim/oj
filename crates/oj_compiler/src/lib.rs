@@ -167,6 +167,19 @@ pub struct CompileOutput {
     pub imports: Vec<String>,
     pub dynamic_imports: Vec<String>,
     pub is_refresh_boundary: bool,
+    /// `Some` when the module references `import.meta.hot` (it needs a hot
+    /// context injected); what its `accept` calls declared.
+    pub hot_accept: Option<HotAccept>,
+}
+
+/// The `import.meta.hot.accept(...)` forms a module uses (Vite's
+/// `lexAcceptedHmrDeps`): `accept()` / `accept(cb)` make it self-accepting,
+/// `accept('./dep', cb)` / `accept(['./a', './b'], cb)` make it the boundary for
+/// updates of those dependencies (specifiers already rewritten to served urls).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HotAccept {
+    pub self_accepting: bool,
+    pub deps: Vec<String>,
 }
 
 impl CompileOutput {
@@ -377,6 +390,7 @@ pub fn compile_module_with_maps(
 
     let (imports, dynamic_imports) =
         rewrite_module_specifiers(&allocator, &mut program, &mut rewriter);
+    let hot_accept = lex_hot_accept(&allocator, &mut program, &mut rewriter);
 
     let is_refresh_boundary = opts.refresh && detect_refresh_registrations(&program);
 
@@ -404,7 +418,106 @@ pub fn compile_module_with_maps(
         imports,
         dynamic_imports,
         is_refresh_boundary,
+        hot_accept,
     })
+}
+
+/// Find `import.meta.hot` references and lex the `accept` calls, rewriting the
+/// dependency specifiers they name with the same rewriter as the imports so the
+/// client can match them against the update's `acceptedPath`.
+fn lex_hot_accept<'a>(
+    allocator: &'a Allocator,
+    program: &mut Program<'a>,
+    rewriter: &mut Option<&mut ImportRewriter>,
+) -> Option<HotAccept> {
+    use oxc_ast::ast::{Argument, ArrayExpressionElement, CallExpression, Expression, StaticMemberExpression};
+    use oxc_ast_visit::{walk_mut, VisitMut};
+
+    fn is_import_meta_hot(e: &Expression) -> bool {
+        match e {
+            Expression::StaticMemberExpression(m) => {
+                m.property.name == "hot" && matches!(&m.object, Expression::ImportMeta(_))
+            }
+            Expression::ParenthesizedExpression(p) => is_import_meta_hot(&p.expression),
+            _ => false,
+        }
+    }
+
+    struct Lexer<'a, 'r> {
+        allocator: &'a Allocator,
+        rewriter: &'r mut ImportRewriter<'r>,
+        uses_hot: bool,
+        accept: HotAccept,
+    }
+    impl<'a> Lexer<'a, '_> {
+        fn rewrite(&mut self, lit: &mut StringLiteral<'a>) -> String {
+            if let Some(new_spec) = (self.rewriter)(lit.value.as_str()) {
+                lit.value = self.allocator.alloc_str(&new_spec).into();
+                lit.raw = None;
+            }
+            lit.value.to_string()
+        }
+    }
+    impl<'a> VisitMut<'a> for Lexer<'a, '_> {
+        fn visit_static_member_expression(&mut self, it: &mut StaticMemberExpression<'a>) {
+            if it.property.name == "hot" && matches!(&it.object, Expression::ImportMeta(_)) {
+                self.uses_hot = true;
+            }
+            walk_mut::walk_static_member_expression(self, it);
+        }
+        fn visit_call_expression(&mut self, call: &mut CallExpression<'a>) {
+            let is_accept = match &call.callee {
+                Expression::StaticMemberExpression(m) => {
+                    (m.property.name == "accept" || m.property.name == "acceptExports")
+                        && is_import_meta_hot(&m.object)
+                }
+                _ => false,
+            };
+            if is_accept {
+                self.uses_hot = true;
+                let is_exports = matches!(&call.callee, Expression::StaticMemberExpression(m) if m.property.name == "acceptExports");
+                match call.arguments.first_mut() {
+                    None => self.accept.self_accepting = true,
+                    Some(Argument::StringLiteral(lit)) if !is_exports => {
+                        let dep = self.rewrite(lit);
+                        self.accept.deps.push(dep);
+                    }
+                    Some(Argument::ArrayExpression(arr)) if !is_exports => {
+                        for el in arr.elements.iter_mut() {
+                            if let ArrayExpressionElement::StringLiteral(lit) = el {
+                                let dep = self.rewrite(lit);
+                                self.accept.deps.push(dep);
+                            }
+                        }
+                    }
+                    // accept(cb), acceptExports(names, cb), or anything dynamic
+                    Some(_) => self.accept.self_accepting = true,
+                }
+            }
+            walk_mut::walk_call_expression(self, call);
+        }
+    }
+
+    let mut noop = |_: &str| None;
+    let accept = match rewriter.as_deref_mut() {
+        Some(rw) => {
+            let mut lexer = Lexer { allocator, rewriter: rw, uses_hot: false, accept: HotAccept::default() };
+            lexer.visit_program(program);
+            (lexer.uses_hot, lexer.accept)
+        }
+        None => {
+            let mut lexer = Lexer { allocator, rewriter: &mut noop, uses_hot: false, accept: HotAccept::default() };
+            lexer.visit_program(program);
+            (lexer.uses_hot, lexer.accept)
+        }
+    };
+    let (uses_hot, mut accept) = accept;
+    if !uses_hot {
+        return None;
+    }
+    accept.deps.sort();
+    accept.deps.dedup();
+    Some(accept)
 }
 
 fn compose_input_maps_data_url(oj_map: &oxc_sourcemap::SourceMap, input_maps: &[String]) -> String {
@@ -925,6 +1038,41 @@ export const used: A extends B ? number : number = c + d;
             matches!(err, CompileError::UnsupportedFileType(_)),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn lexes_import_meta_hot_accept_forms_and_rewrites_dep_specifiers() {
+        let mut rw = |spec: &str| spec.strip_prefix("./").map(|r| format!("/src/{r}"));
+        let none = compile_module(Path::new("a.ts"), "export const x = 1;", &CompileOptions::dev(), Some(&mut rw)).unwrap();
+        assert_eq!(none.hot_accept, None);
+
+        let self_accept = compile_module(
+            Path::new("a.ts"),
+            "export const x = 1;\nif (import.meta.hot) { import.meta.hot.accept(); }",
+            &CompileOptions::dev(),
+            Some(&mut rw),
+        )
+        .unwrap();
+        assert_eq!(self_accept.hot_accept, Some(HotAccept { self_accepting: true, deps: vec![] }));
+
+        let cb = compile_module(Path::new("a.ts"), "import.meta.hot?.accept((m) => m);", &CompileOptions::dev(), Some(&mut rw)).unwrap();
+        assert!(cb.hot_accept.unwrap().self_accepting);
+
+        let deps = compile_module(
+            Path::new("a.ts"),
+            "import { v } from './util.js';\nimport.meta.hot.accept(['./util.js', './other.js'], ([u]) => u);\nimport.meta.hot.accept('./one.js', (m) => m);",
+            &CompileOptions::dev(),
+            Some(&mut rw),
+        )
+        .unwrap();
+        let hot = deps.hot_accept.unwrap();
+        assert!(!hot.self_accepting);
+        assert_eq!(hot.deps, vec!["/src/one.js", "/src/other.js", "/src/util.js"]);
+        assert!(deps.code.contains("\"/src/util.js\", \"/src/other.js\"") || deps.code.contains("\"/src/util.js\",\"/src/other.js\""), "{}", deps.code);
+        assert!(deps.code.contains("\"/src/one.js\""), "{}", deps.code);
+
+        let read_only = compile_module(Path::new("a.ts"), "console.log(import.meta.hot?.data);", &CompileOptions::dev(), Some(&mut rw)).unwrap();
+        assert_eq!(read_only.hot_accept, Some(HotAccept::default()), "referencing import.meta.hot needs a context even without accept");
     }
 
     #[test]

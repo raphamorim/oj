@@ -14,6 +14,10 @@ pub struct ModuleNode {
     /// re-fetched during HMR appends `?t=<timestamp>` to its import of a stamped
     /// module, so the browser loads the new version instead of its cached one.
     pub last_hmr_timestamp: u64,
+    /// Dependencies this module accepts updates for via
+    /// `import.meta.hot.accept(deps, cb)` (Vite's `acceptedHmrDeps`): an update
+    /// of one of them stops here with this module as the boundary.
+    pub accepted_hmr_deps: HashSet<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -55,6 +59,30 @@ impl ModuleGraph {
         self.ensure_module(path).is_self_accepting = accepting;
     }
 
+    pub fn set_accepted_deps(&mut self, path: &Path, deps: &[PathBuf]) {
+        self.ensure_module(path).accepted_hmr_deps = deps.iter().cloned().collect();
+    }
+
+    fn accepts_dep(&self, importer: &Path, dep: &Path) -> bool {
+        self.modules
+            .get(importer)
+            .is_some_and(|n| n.accepted_hmr_deps.contains(dep))
+    }
+
+    /// The update targets for a change: `(boundary, acceptedPath)` pairs. A
+    /// self-accepting boundary accepts itself; an importer that declared the
+    /// changed module (or a module on the way up) in `hot.accept(deps)` is the
+    /// boundary for that dependency. `Err` means a full reload.
+    pub fn update_targets(&self, changed: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+        if !self.modules.contains_key(changed) {
+            return Err(format!("{} is not in the module graph", changed.display()));
+        }
+        let mut targets = self.collect_boundaries(&[changed], &[])?;
+        targets.sort();
+        targets.dedup();
+        Ok(targets)
+    }
+
     pub fn set_imports(&mut self, importer: &Path, imports: &[PathBuf]) {
         let stale: Vec<PathBuf> = self
             .ensure_module(importer)
@@ -91,7 +119,8 @@ impl ModuleGraph {
             };
         }
         match self.collect_boundaries(&[changed], &[]) {
-            Ok(mut boundaries) => {
+            Ok(targets) => {
+                let mut boundaries: Vec<PathBuf> = targets.into_iter().map(|(b, _)| b).collect();
                 boundaries.sort();
                 boundaries.dedup();
                 HmrDecision::Update { boundaries }
@@ -150,7 +179,8 @@ impl ModuleGraph {
             }
         }
         match self.collect_boundaries(seeds, &[]) {
-            Ok(mut boundaries) => {
+            Ok(targets) => {
+                let mut boundaries: Vec<PathBuf> = targets.into_iter().map(|(b, _)| b).collect();
                 boundaries.sort();
                 boundaries.dedup();
                 HmrDecision::Update { boundaries }
@@ -191,6 +221,11 @@ impl ModuleGraph {
                 continue;
             }
             for importer in &node.importers {
+                // A dep-accepting importer is not re-fetched: its callback receives
+                // the new dependency module instead.
+                if self.accepts_dep(importer, &current) {
+                    continue;
+                }
                 if seen.insert(importer.clone()) {
                     dirty.push(importer.clone());
                     queue.push(importer.clone());
@@ -215,7 +250,8 @@ impl ModuleGraph {
 
         let seeds: Vec<&Path> = node.importers.iter().map(PathBuf::as_path).collect();
         match self.collect_boundaries(&seeds, &[changed]) {
-            Ok(mut boundaries) => {
+            Ok(targets) => {
+                let mut boundaries: Vec<PathBuf> = targets.into_iter().map(|(b, _)| b).collect();
                 boundaries.sort();
                 boundaries.dedup();
                 HmrDecision::Update { boundaries }
@@ -228,12 +264,12 @@ impl ModuleGraph {
         &'a self,
         seeds: &[&'a Path],
         pre_stack: &[&'a Path],
-    ) -> Result<Vec<PathBuf>, String> {
+    ) -> Result<Vec<(PathBuf, PathBuf)>, String> {
         let mut colors: HashMap<&'a Path, Color> = HashMap::new();
         for module in pre_stack {
             colors.insert(module, Color::Gray);
         }
-        let mut boundaries: Vec<PathBuf> = Vec::new();
+        let mut boundaries: Vec<(PathBuf, PathBuf)> = Vec::new();
         for seed in seeds {
             self.climb(seed, &mut colors, &mut boundaries)?;
         }
@@ -244,7 +280,7 @@ impl ModuleGraph {
         &'a self,
         seed: &'a Path,
         colors: &mut HashMap<&'a Path, Color>,
-        boundaries: &mut Vec<PathBuf>,
+        boundaries: &mut Vec<(PathBuf, PathBuf)>,
     ) -> Result<(), String> {
         enum Step<'s> {
             Enter(&'s Path),
@@ -274,7 +310,7 @@ impl ModuleGraph {
                 return Err(format!("{} is not in the module graph", current.display()));
             };
             if node.is_self_accepting {
-                boundaries.push(current.to_path_buf());
+                boundaries.push((current.to_path_buf(), current.to_path_buf()));
                 colors.insert(current, Color::Black);
                 continue;
             }
@@ -289,6 +325,12 @@ impl ModuleGraph {
             let mut importers: Vec<&Path> = node.importers.iter().map(PathBuf::as_path).collect();
             importers.sort_unstable();
             for importer in importers.into_iter().rev() {
+                // An importer that accepts `current` via hot.accept(deps) is the
+                // boundary for this change; the walk does not continue above it.
+                if self.accepts_dep(importer, current) {
+                    boundaries.push((importer.to_path_buf(), current.to_path_buf()));
+                    continue;
+                }
                 stack.push(Step::Enter(importer));
             }
         }
@@ -564,6 +606,29 @@ mod tests {
             g.propagate_update(&p("a.ts")),
             HmrDecision::Update { boundaries: vec![] }
         );
+    }
+
+    #[test]
+    fn dep_accepting_importer_is_the_boundary_for_that_dep() {
+        // main -> util ; main declares hot.accept(['/util.ts'], cb) but is not self-accepting.
+        let mut g = ModuleGraph::new();
+        g.add_import(&p("main.ts"), &p("util.ts"));
+        g.set_accepted_deps(&p("main.ts"), &[p("util.ts")]);
+        assert_eq!(
+            g.update_targets(&p("util.ts")).unwrap(),
+            vec![(p("main.ts"), p("util.ts"))]
+        );
+        assert_eq!(
+            g.propagate_update(&p("util.ts")),
+            HmrDecision::Update { boundaries: vec![p("main.ts")] }
+        );
+        // The importer is not re-fetched, so it is not dirty.
+        assert_eq!(g.stamp_update(&p("util.ts"), 1), vec![p("util.ts")]);
+        // Editing main itself still reaches the entry with no boundary.
+        assert!(matches!(g.propagate_update(&p("main.ts")), HmrDecision::FullReload { .. }));
+        // A self-accepting module reports itself as acceptedPath.
+        g.set_self_accepting(&p("main.ts"), true);
+        assert_eq!(g.update_targets(&p("main.ts")).unwrap(), vec![(p("main.ts"), p("main.ts"))]);
     }
 
     #[test]

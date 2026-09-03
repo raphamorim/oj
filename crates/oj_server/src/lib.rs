@@ -2205,6 +2205,15 @@ async fn serve_compiled(
         module.code.clone()
     };
     if !state.bundle && module.kind != "svelte" {
+        if module.hot.is_some() {
+            // The module reads import.meta.hot itself: define the context before
+            // its body runs (the React refresh glue below re-uses it).
+            let full = match query {
+                Some(q) if !q.is_empty() => format!("{base_url}?{q}"),
+                _ => base_url.to_string(),
+            };
+            body = format!("{}{}", svelte_hot_glue(&strip_hmr_timestamp(&full)), body);
+        }
         body.push_str(&hot_glue(base_url, query, module.is_boundary));
     }
     if let Some(map_url) = &module.map_data_url {
@@ -2252,6 +2261,7 @@ async fn ensure_module(
                     .map_err(|err| format!("asset module error for {url}: {err}"))?;
                 let module = Arc::new(CachedModule {
                     is_boundary: false,
+                    hot: None,
                     kind: match factory.kind {
                         oj_compiler::bundle::FactoryKind::Esm => "esm".into(),
                         oj_compiler::bundle::FactoryKind::Cjs => "cjs".into(),
@@ -2285,6 +2295,7 @@ async fn ensure_module(
                     .map_err(|err| format!("worker module error for {url}: {err}"))?;
                 let module = Arc::new(CachedModule {
                     is_boundary: false,
+                    hot: None,
                     kind: match factory.kind {
                         oj_compiler::bundle::FactoryKind::Esm => "esm".into(),
                         oj_compiler::bundle::FactoryKind::Cjs => "cjs".into(),
@@ -2315,6 +2326,7 @@ async fn ensure_module(
                 .map_err(|err| format!("asset module error for {url}: {err}"))?;
             Arc::new(CachedModule {
                 is_boundary: false,
+                hot: None,
                 kind: match factory.kind {
                     oj_compiler::bundle::FactoryKind::Esm => "esm".into(),
                     oj_compiler::bundle::FactoryKind::Cjs => "cjs".into(),
@@ -2330,6 +2342,7 @@ async fn ensure_module(
         } else {
             Arc::new(CachedModule {
                 is_boundary: false,
+                hot: None,
                 kind: String::new(),
                 code: default,
                 map_data_url: None,
@@ -2403,6 +2416,7 @@ async fn ensure_module(
         let css = compile_tailwind(state, url, &source).await?;
         let module = Arc::new(CachedModule {
             is_boundary: true,
+            hot: None,
             kind: "css".into(),
             code: css,
             map_data_url: None,
@@ -2490,6 +2504,7 @@ async fn ensure_module(
         let code = server_fn_stub(&oj_compiler::exports(&source, file), url);
         let module = Arc::new(CachedModule {
             is_boundary: false,
+            hot: None,
             kind: String::new(),
             code,
             map_data_url: None,
@@ -2568,6 +2583,7 @@ async fn ensure_module(
         let clean = url.split('?').next().unwrap_or(url);
         let module = Arc::new(CachedModule {
             is_boundary: false,
+            hot: None,
             kind: String::new(),
             code: format!(
                 "export default {};\n",
@@ -2632,6 +2648,7 @@ async fn ensure_module(
             .map_err(|err| format!("compile error:\n{err}"))?;
             return Ok(CachedModule {
                 is_boundary: false,
+                hot: None,
                 kind: if bundle { "esm".into() } else { String::new() },
                 code,
                 map_data_url: None,
@@ -2651,6 +2668,7 @@ async fn ensure_module(
             let output = oj_css::compile_css_rebased(&url_owned, &css_src, false)?;
             return Ok(CachedModule {
                 is_boundary: true,
+                hot: None,
                 kind: "css".into(),
                 code: output.css,
                 map_data_url: None,
@@ -2723,6 +2741,7 @@ async fn ensure_module(
             .map_err(|err| format!("compile error:\n{err}"))?;
             Ok(CachedModule {
                 is_boundary: factory.is_boundary(),
+                hot: None,
                 kind: match factory.kind {
                     oj_compiler::bundle::FactoryKind::Esm => "esm".into(),
                     oj_compiler::bundle::FactoryKind::Cjs => "cjs".into(),
@@ -2812,6 +2831,10 @@ async fn ensure_module(
             .map_err(|err| format!("compile error:\n{err}"))?;
             Ok(CachedModule {
                 is_boundary: is_svelte || (!is_dep && output.has_refresh_registrations()),
+                hot: output.hot_accept.map(|h| oj_cache::HotMeta {
+                    self_accept: h.self_accepting,
+                    deps: h.deps,
+                }),
                 code: output.code,
                 map_data_url: output.map_data_url,
                 fs_allow: fs_allow_from(&output.imports),
@@ -3058,7 +3081,20 @@ fn register_in_graph(state: &ServerState, url: &str, module: &CachedModule) {
         .map(|s| PathBuf::from(s.split('?').next().unwrap_or(s)))
         .collect();
     graph.set_imports(Path::new(url), &local_imports);
-    graph.set_self_accepting(Path::new(url), module.is_boundary);
+    let hot = module.hot.as_ref();
+    graph.set_self_accepting(
+        Path::new(url),
+        module.is_boundary || hot.is_some_and(|h| h.self_accept),
+    );
+    let accepted: Vec<PathBuf> = hot
+        .map(|h| {
+            h.deps
+                .iter()
+                .map(|d| PathBuf::from(d.split('?').next().unwrap_or(d)))
+                .collect()
+        })
+        .unwrap_or_default();
+    graph.set_accepted_deps(Path::new(url), &accepted);
 }
 
 async fn serve_css_wrapper(state: &Arc<ServerState>, file: &Path, url: &str) -> Response {
@@ -3508,7 +3544,7 @@ fn hot_glue(url: &str, query: Option<&str>, is_boundary: bool) -> String {
     format!(
         r#"
 import {{ createHotContext as __oj_createHotContext }} from "/@oj/client.js";
-import.meta.hot = __oj_createHotContext({id:?});
+import.meta.hot ??= __oj_createHotContext({id:?});
 import * as RefreshRuntime from "/@oj/refresh-runtime.js";
 import * as __oj_currentExports from {self_specifier:?};
 if (import.meta.hot) {{
@@ -5658,11 +5694,18 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
                 }
             }
         }
-        let decision = state
-            .graph
-            .lock()
-            .unwrap()
-            .propagate_update(Path::new(&url));
+        let decision = match state.graph.lock().unwrap().update_targets(Path::new(&url)) {
+            Ok(targets) => HmrDecision::Update {
+                boundaries: targets
+                    .iter()
+                    .map(|(b, a)| {
+                        // `boundary\0accepted` pairs travel through the existing shape.
+                        PathBuf::from(format!("{}\0{}", b.display(), a.display()))
+                    })
+                    .collect(),
+            },
+            Err(reason) => HmrDecision::FullReload { reason },
+        };
         match decision {
             HmrDecision::Update { boundaries } => {
                 println!("oj: change {url} -> update {boundaries:?}");
@@ -5686,11 +5729,18 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
                     println!("oj: change {url} -> no update (nothing loaded imports it)");
                 }
                 updates.extend(boundaries.iter().map(|b| {
-                    let mut path = format!("{}", b.display());
-                    if is_style_url(&path) {
-                        path.push_str("?import");
-                    }
-                    update_entry("js-update", &path, timestamp)
+                    let pair = b.display().to_string();
+                    let (boundary, accepted) = pair.split_once('\0').unwrap_or((&pair, &pair));
+                    let style = |p: &str| {
+                        if is_style_url(p) {
+                            format!("{p}?import")
+                        } else {
+                            p.to_string()
+                        }
+                    };
+                    let mut entry = update_entry("js-update", &style(boundary), timestamp);
+                    entry["acceptedPath"] = serde_json::Value::String(style(accepted));
+                    entry
                 }));
             }
             HmrDecision::FullReload { reason } => {

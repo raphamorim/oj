@@ -87,6 +87,17 @@ pub struct CachedModule {
     pub fs_allow: Vec<String>,
     #[serde(default)]
     pub watch_files: Vec<String>,
+    /// `Some` when the module references `import.meta.hot`: it gets a hot
+    /// context, and these are the `accept` declarations for the module graph.
+    #[serde(default)]
+    pub hot: Option<HotMeta>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct HotMeta {
+    pub self_accept: bool,
+    /// Served urls of the dependencies this module accepts updates for.
+    pub deps: Vec<String>,
 }
 
 pub struct PersistentCache {
@@ -188,6 +199,7 @@ mod tests {
             css_exports: Vec::new(),
             fs_allow: Vec::new(),
             watch_files: Vec::new(),
+            hot: None,
         }
     }
 
