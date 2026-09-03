@@ -1054,6 +1054,7 @@ impl Plugin for OjCssPlugin {
                         css: css_cfg.clone(),
                         html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
                         worker: worker.clone(),
+                        resolve: css_resolve.clone(),
                     };
                     let code = bundle_worker_inline(&root, file, worker.as_ref(), nested).await?;
                     let literal = serde_json::Value::String(code).to_string();
