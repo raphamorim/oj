@@ -7241,6 +7241,58 @@ async fn hmr_gate_status(State(state): State<Arc<ServerState>>) -> Response {
     }
 }
 
+/// Which paths of a watcher event count as a content change, by chokidar's
+/// rule: the data changed, or the modification time moved since this watcher
+/// last saw the file. An attribute-only event whose mtime is unchanged (or the
+/// first such event for a path, with nothing to compare against) is not a
+/// change. On Linux the first read of a file after it was written updates its
+/// atime under relatime, and inotify reports that as an attribute change, so a
+/// rebuild that reads every source file looked like an edit of every source
+/// file and triggered another rebuild, until the atimes settled.
+pub struct ContentChanges {
+    mtimes: std::collections::HashMap<PathBuf, std::time::SystemTime>,
+}
+
+impl Default for ContentChanges {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ContentChanges {
+    pub fn new() -> Self {
+        Self { mtimes: std::collections::HashMap::new() }
+    }
+
+    pub fn changed_paths(&mut self, ev: &notify::Event) -> Vec<PathBuf> {
+        match &ev.kind {
+            notify::EventKind::Access(_) => Vec::new(),
+            notify::EventKind::Modify(notify::event::ModifyKind::Metadata(_)) => {
+                ev.paths.iter().filter(|p| self.mtime_moved(p)).cloned().collect()
+            }
+            _ => {
+                for p in &ev.paths {
+                    if let Ok(mtime) = std::fs::metadata(p).and_then(|m| m.modified()) {
+                        self.mtimes.insert(p.clone(), mtime);
+                    }
+                }
+                ev.paths.clone()
+            }
+        }
+    }
+
+    fn mtime_moved(&mut self, p: &Path) -> bool {
+        let Ok(mtime) = std::fs::metadata(p).and_then(|m| m.modified()) else {
+            self.mtimes.remove(p);
+            return true;
+        };
+        match self.mtimes.insert(p.to_path_buf(), mtime) {
+            Some(prev) => prev != mtime,
+            None => false,
+        }
+    }
+}
+
 /// True for config / env files whose change requires a full server restart
 /// (they are read once at startup and cannot be hot-applied).
 fn is_restart_trigger(path: &Path) -> bool {
@@ -7352,13 +7404,15 @@ fn spawn_watcher(state: Arc<ServerState>) {
         // before is an edit (chokidar tracks the same distinction by its own
         // state, emitting `add` once and `change` after).
         let mut seen_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        let mut changes = ContentChanges::new();
         loop {
             let first = match rx.recv() {
                 Ok(Ok(ev)) => ev,
                 Ok(Err(_)) => continue,
                 Err(_) => break,
             };
-            if matches!(first.kind, notify::EventKind::Access(_)) {
+            let first_paths = changes.changed_paths(&first);
+            if first_paths.is_empty() {
                 continue;
             }
             // Which of the debounced paths the watcher saw come into existence:
@@ -7367,18 +7421,19 @@ fn spawn_watcher(state: Arc<ServerState>) {
             let mut created: std::collections::HashSet<PathBuf> =
                 std::collections::HashSet::new();
             if matches!(first.kind, notify::EventKind::Create(_)) {
-                created.extend(first.paths.iter().cloned());
+                created.extend(first_paths.iter().cloned());
             }
-            let mut paths: std::collections::HashSet<PathBuf> = first.paths.into_iter().collect();
+            let mut paths: std::collections::HashSet<PathBuf> = first_paths.into_iter().collect();
             loop {
                 match rx.recv_timeout(Duration::from_millis(debounce_ms)) {
-                    Ok(Ok(ev)) if !matches!(ev.kind, notify::EventKind::Access(_)) => {
+                    Ok(Ok(ev)) => {
+                        let changed = changes.changed_paths(&ev);
                         if matches!(ev.kind, notify::EventKind::Create(_)) {
-                            created.extend(ev.paths.iter().cloned());
+                            created.extend(changed.iter().cloned());
                         }
-                        paths.extend(ev.paths);
+                        paths.extend(changed);
                     }
-                    Ok(_) => {}
+                    Ok(Err(_)) => {}
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
@@ -9109,5 +9164,33 @@ mod adapter_tests {
         assert!(get("host").is_empty(), "hyper writes the loopback Host itself");
         assert_eq!(get("accept"), ["text/html"]);
         assert!(loopback_request_headers(&HeaderMap::new()).is_empty());
+    }
+
+    #[test]
+    fn content_changes_ignore_attribute_only_events_unless_the_mtime_moved() {
+        use notify::event::{AccessKind, DataChange, MetadataKind, ModifyKind};
+        let dir = std::env::temp_dir().join(format!("oj-content-changes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.ts");
+        std::fs::write(&file, "export const a = 1;").unwrap();
+        let meta = || notify::Event::new(notify::EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any))).add_path(file.clone());
+        let data = || notify::Event::new(notify::EventKind::Modify(ModifyKind::Data(DataChange::Content))).add_path(file.clone());
+        let access = || notify::Event::new(notify::EventKind::Access(AccessKind::Read)).add_path(file.clone());
+        let mut changes = ContentChanges::new();
+        assert!(changes.changed_paths(&meta()).is_empty(), "an atime update on a never-seen file is not a change");
+        assert!(changes.changed_paths(&meta()).is_empty(), "nor is a repeat with the same mtime");
+        assert!(changes.changed_paths(&access()).is_empty());
+        assert_eq!(changes.changed_paths(&data()), vec![file.clone()], "a data change always counts");
+        assert!(changes.changed_paths(&meta()).is_empty(), "the mtime the data change recorded has not moved");
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(later).unwrap();
+        assert_eq!(changes.changed_paths(&meta()), vec![file.clone()], "a moved mtime (touch) is a change, as in chokidar");
+        assert!(changes.changed_paths(&meta()).is_empty(), "and is then the new baseline");
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(changes.changed_paths(&meta()), vec![file.clone()], "a vanished file is a change");
+        let removed = notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::File)).add_path(file.clone());
+        assert_eq!(changes.changed_paths(&removed), vec![file.clone()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

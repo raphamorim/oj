@@ -5,6 +5,11 @@ All notable changes to oj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- The dev watchers treated attribute-only file events as changes. On Linux the first read of a file after it was written updates its access time, which inotify reports as an attribute change, so a rebuild that reads every source file (the TanStack Start client bundle does) looked like an edit of every source file and triggered another rebuild until the access times settled, with the HMR gate filling up with phantom changes. Both watchers now apply chokidar's rule: a change is a data change or a moved modification time; an attribute event with an unchanged mtime (or on a file never seen before) is ignored, and a `touch` still counts.
+
 ## [0.1.16] - 2026-09-03
 
 ### Added
