@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { extractAlias } from "../../crates/oj_server/src/assets/vite-extract.mjs";
+import { extractAlias, extractProxy } from "../../crates/oj_server/src/assets/vite-extract.mjs";
 
 test("string aliases pass through unchanged", () => {
   const out = extractAlias({ "@app": "/src", "~": "/src/lib" });
@@ -51,4 +51,41 @@ test("a regex too complex to express as a path alias is skipped, not mis-resolve
 test("non-string replacements are ignored", () => {
   const out = extractAlias([{ find: "@fn", replacement: () => "/x" }]);
   assert.deepEqual(out, {});
+});
+
+function captureStderr(fn) {
+  const lines = [];
+  const write = process.stderr.write;
+  process.stderr.write = (chunk) => { lines.push(String(chunk)); return true; };
+  try { fn(); } finally { process.stderr.write = write; }
+  return lines.join("");
+}
+
+test("proxy contexts pass through verbatim, regex (^) contexts included", () => {
+  const out = extractProxy({
+    "/api": "http://localhost:3000",
+    "^/re/.*": { target: "http://localhost:3001", ws: true, changeOrigin: true },
+  });
+  assert.deepEqual(out, {
+    "/api": "http://localhost:3000",
+    "^/re/.*": { target: "http://localhost:3001", ws: true, changeOrigin: true },
+  });
+});
+
+test("function-valued proxy options are dropped with a warning, the entry still proxies", () => {
+  let out;
+  const err = captureStderr(() => {
+    out = extractProxy({
+      "/api": {
+        target: "http://localhost:3000",
+        rewrite: (p) => p.replace(/^\/api/, ""),
+        configure: () => {},
+        bypass: () => null,
+      },
+    });
+  });
+  assert.deepEqual(out, { "/api": { target: "http://localhost:3000" } });
+  assert.match(err, /server\.proxy\["\/api"\]\.rewrite is a function/);
+  assert.match(err, /server\.proxy\["\/api"\]\.configure is a function and cannot cross the config bridge/);
+  assert.match(err, /server\.proxy\["\/api"\]\.bypass is a function and cannot cross the config bridge/);
 });

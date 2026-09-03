@@ -231,7 +231,16 @@ fn classify(req: &Request, proxy_prefixes: &[String]) -> Route {
     if path.rsplit('/').next().is_some_and(|seg| seg.contains('.')) {
         return Route::Pass;
     }
-    if proxy_prefixes.iter().any(|p| path.starts_with(p.as_str())) {
+    // Same rule as the dev server's proxy middleware: `^` contexts are regexes
+    // over path plus query, the rest are prefixes.
+    let url = match req.uri().query() {
+        Some(q) => format!("{path}?{q}"),
+        None => path.to_string(),
+    };
+    if proxy_prefixes
+        .iter()
+        .any(|p| oj_server::proxy_context_matches(p, &url))
+    {
         return Route::Pass;
     }
     let is_loader = req.headers().contains_key("oj-loader");

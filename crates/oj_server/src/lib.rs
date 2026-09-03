@@ -269,6 +269,9 @@ struct ServerState {
     css_config: Option<oj_config::CssConfig>,
     preload_snapshot: Vec<String>,
     proxy: Vec<(String, oj_config::ProxyEntry)>,
+    /// Per `proxy` entry: the compiled pattern of a `^` (regex) context, `None`
+    /// for a plain prefix. Built once so request matching does not recompile.
+    proxy_regex: Vec<Option<regex::Regex>>,
     http: reqwest::Client,
     /// For `server.proxy` entries with `secure: false`: accepts any certificate.
     /// Built on first use, so projects that never opt in pay nothing.
@@ -486,6 +489,8 @@ impl DevServer {
             .unwrap_or_default()
             .into_iter()
             .collect();
+        let proxy_regex: Vec<Option<regex::Regex>> =
+            proxy.iter().map(|(ctx, _)| proxy_context_regex(ctx)).collect();
 
         // TanStack Start owns its module graph and SSR; oj runs the plugin host
         // only to host configureServer middleware (the editor dev-server bridge),
@@ -765,6 +770,7 @@ impl DevServer {
             cache_writes: write_tx,
             preload_snapshot: load_graph_snapshot(&root),
             proxy,
+            proxy_regex,
             http: reqwest::Client::new(),
             http_insecure: std::sync::OnceLock::new(),
             proxy_tls: [std::sync::OnceLock::new(), std::sync::OnceLock::new()],
@@ -1732,11 +1738,13 @@ async fn proxy_middleware(
     next: axum::middleware::Next,
 ) -> Response {
     let path = req.uri().path().to_string();
-    let matched = state
-        .proxy
-        .iter()
-        .filter(|(prefix, _)| path.starts_with(prefix.as_str()))
-        .max_by_key(|(prefix, _)| prefix.len());
+    // Vite matches contexts against `req.url`, path and query together, so a
+    // `^` regex context can key off a query parameter.
+    let url = match req.uri().query() {
+        Some(q) => format!("{path}?{q}"),
+        None => path.clone(),
+    };
+    let matched = select_proxy(&state.proxy, &state.proxy_regex, &url);
     let Some((prefix, entry)) = matched else {
         return next.run(req).await;
     };
@@ -1830,6 +1838,56 @@ async fn proxy_middleware(
         )
             .into_response(),
     }
+}
+
+/// The compiled pattern of a `server.proxy` context that starts with `^` (Vite:
+/// `new RegExp(context)`); `None` for a plain prefix context. A pattern that
+/// does not compile is reported once and then behaves as a prefix, which for a
+/// `^...` string never matches, the same as Vite throwing at startup would leave
+/// it unreachable.
+fn proxy_context_regex(context: &str) -> Option<regex::Regex> {
+    if !context.starts_with('^') {
+        return None;
+    }
+    match regex::Regex::new(context) {
+        Ok(re) => Some(re),
+        Err(err) => {
+            eprintln!("oj: server.proxy context {context:?} is not a valid regex: {err}");
+            None
+        }
+    }
+}
+
+/// Vite's `doesProxyContextMatchUrl`: a `^` context is a regex tested against
+/// the request url (path plus query), any other context is a path prefix.
+pub fn proxy_context_matches(context: &str, url: &str) -> bool {
+    if let Some(re) = proxy_context_regex(context) {
+        return re.is_match(url);
+    }
+    url.starts_with(context)
+}
+
+/// The proxy entry for a request url. Vite takes the first matching context in
+/// config order; oj's config is a sorted map, so the most specific plain prefix
+/// wins and a regex context applies when no prefix matches.
+fn select_proxy<'a>(
+    entries: &'a [(String, oj_config::ProxyEntry)],
+    regexes: &[Option<regex::Regex>],
+    url: &str,
+) -> Option<(&'a str, &'a oj_config::ProxyEntry)> {
+    let prefix = entries
+        .iter()
+        .zip(regexes)
+        .filter(|((ctx, _), re)| re.is_none() && url.starts_with(ctx.as_str()))
+        .max_by_key(|((ctx, _), _)| ctx.len())
+        .map(|((ctx, entry), _)| (ctx.as_str(), entry));
+    prefix.or_else(|| {
+        entries
+            .iter()
+            .zip(regexes)
+            .find(|(_, re)| re.as_ref().is_some_and(|re| re.is_match(url)))
+            .map(|((ctx, entry), _)| (ctx.as_str(), entry))
+    })
 }
 
 fn is_websocket_upgrade(h: &HeaderMap) -> bool {
@@ -7008,6 +7066,34 @@ mod tests {
         assert_eq!(stamp_import_url("/logo.svg?url", 5), "/logo.svg?url");
         assert_eq!(stamp_import_url("/@oj-deps/react.js", 5), "/@oj-deps/react.js");
         assert_eq!(stamp_import_url("/@fs/x/node_modules/a/index.js", 5), "/@fs/x/node_modules/a/index.js");
+    }
+
+    #[test]
+    fn proxy_regex_contexts_match_path_and_query_like_vite() {
+        let entries: Vec<(String, oj_config::ProxyEntry)> = [
+            ("/api", "http://a"),
+            ("/api/v2", "http://a2"),
+            ("^/re/.*", "http://re"),
+            ("^/search\\?q=", "http://q"),
+            ("^(", "http://bad"),
+        ]
+        .iter()
+        .map(|(c, t)| (c.to_string(), oj_config::ProxyEntry::Target(t.to_string())))
+        .collect();
+        let regexes: Vec<Option<regex::Regex>> =
+            entries.iter().map(|(c, _)| proxy_context_regex(c)).collect();
+        assert!(regexes[0].is_none() && regexes[2].is_some());
+        assert!(regexes[4].is_none(), "an invalid pattern degrades to a never-matching prefix");
+        let pick = |url: &str| select_proxy(&entries, &regexes, url).map(|(_, e)| e.target().to_string());
+        assert_eq!(pick("/api/x"), Some("http://a".into()));
+        assert_eq!(pick("/api/v2/x"), Some("http://a2".into()), "longest prefix wins");
+        assert_eq!(pick("/re/anything?x=1"), Some("http://re".into()));
+        assert_eq!(pick("/search?q=oj"), Some("http://q".into()), "regex sees the query");
+        assert_eq!(pick("/search"), None);
+        assert_eq!(pick("/other"), None);
+        assert!(proxy_context_matches("^/re/.*", "/re/x"));
+        assert!(!proxy_context_matches("^/re/.*", "/api/re/x"), "anchored, not a substring");
+        assert!(proxy_context_matches("/api", "/api/x?y=1"));
     }
 
     #[test]

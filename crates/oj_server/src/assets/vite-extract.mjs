@@ -161,8 +161,15 @@ function extractProxy(proxy) {
       if (typeof v.ws === "boolean") entry.ws = v.ws;
       if (typeof v.secure === "boolean") entry.secure = v.secure;
       if (typeof v.rewriteWsOrigin === "boolean") entry.rewriteWsOrigin = v.rewriteWsOrigin;
+      // Function-valued options cannot cross the config bridge (oj reads the
+      // extracted config as JSON): the entry still proxies, without them.
       if (typeof v.rewrite === "function") {
         warn(`server.proxy["${ctx}"].rewrite is a function; oj applies only {from,to} string rewrites`);
+      }
+      for (const fn of ["configure", "bypass"]) {
+        if (typeof v[fn] === "function") {
+          warn(`server.proxy["${ctx}"].${fn} is a function and cannot cross the config bridge; ignored`);
+        }
       }
       out[ctx] = entry;
     }
@@ -373,7 +380,7 @@ const isMainRun = (() => {
   };
   return real(self) === real(entry);
 })();
-export { extractAlias };
+export { extractAlias, extractProxy };
 
 if (isMainRun) try {
   const { config, deps } = (await loadConfig()) ?? {};
