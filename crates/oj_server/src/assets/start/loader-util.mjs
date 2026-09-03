@@ -64,6 +64,22 @@ export function hasEsmSyntax(path) {
   }
 }
 
+// Vite's json plugin (json.namedExports, on by default): an object's keys that
+// are valid identifiers become named exports next to the default export, so
+// `import { version } from "./pkg.json"` works on the server as on the client.
+const IDENT = /^[A-Za-z_$][\w$]*$/;
+export function jsonToEsm(text) {
+  let data;
+  try { data = JSON.parse(text); } catch { return `export default ${text};`; }
+  if (data === null || typeof data !== "object" || Array.isArray(data)) return `export default ${text};`;
+  const named = Object.keys(data).filter((k) => IDENT.test(k) && !RESERVED.has(k));
+  let out = "";
+  for (const k of named) out += `export const ${k} = ${JSON.stringify(data[k])};\n`;
+  const rest = Object.keys(data).filter((k) => !named.includes(k));
+  const fields = [...named, ...rest.map((k) => `${JSON.stringify(k)}: ${JSON.stringify(data[k])}`)];
+  return out + `export default { ${fields.join(", ")} };\n`;
+}
+
 export function isCjsFile(path) {
   if (path.endsWith(".cjs")) return true;
   if (path.endsWith(".mjs")) return false;

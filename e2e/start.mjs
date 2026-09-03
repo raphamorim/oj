@@ -72,6 +72,7 @@ async function assertApp(port, label) {
     ["svgr ?react component", "<polygon"],
     ["mdx module", "mdx-content-marker"],
     ["config define applied", "fixture-define-marker"],
+    ["json named export", "json-named:Alpha Widget"],
   ];
   if (!/jsenv:(development|production):true/.test(h)) {
     throw new Error(`${label}: plain .js module did not get import.meta.env (want jsenv:<mode>:true)`);
