@@ -90,23 +90,75 @@ pub struct OptimizeInput {
     pub main_fields: Vec<String>,
     pub extensions: Vec<String>,
     pub preserve_symlinks: bool,
+    /// Vite's `--mode` (getConfigHash folds `define: NODE_ENV || mode`): a dep
+    /// prebundled for `development` is not the `production` one.
+    pub mode: String,
+}
+
+/// Vite's lockfileFormats (optimizer/index.ts): the lockfile a package manager
+/// writes, paired with the patch-package directory whose mtime must also
+/// invalidate the prebundle (`checkPatchesDir`).
+const LOCKFILES: &[(&str, Option<&str>)] = &[
+    ("node_modules/.pnpm/lock.yaml", None),
+    ("node_modules/.package-lock.json", Some("patches")),
+    ("node_modules/.yarn-state.yml", None),
+    ("bun.lock", Some("patches")),
+    (".rush/temp/shrinkwrap-deps.json", None),
+    ("aube-lock.yaml", None),
+    ("nub.lock", Some("patches")),
+    (".pnp.cjs", Some(".yarn/patches")),
+    (".pnp.js", Some(".yarn/patches")),
+    ("node_modules/.yarn-integrity", Some("patches")),
+    ("bun.lockb", Some("patches")),
+    // Top-level lockfiles oj has always keyed on (Vite reads the installed
+    // node_modules mirrors above instead; hashing both is a superset).
+    ("package-lock.json", Some("patches")),
+    ("yarn.lock", Some(".yarn/patches")),
+    ("pnpm-lock.yaml", None),
+    ("deno.lock", None),
+];
+
+/// Fold every lockfile found in the nearest ancestor directory that has one
+/// (Vite's lookupFile walks up from root), plus the mtime of its patch-package
+/// directory, into `hasher`.
+fn hash_lockfiles(root: &Path, hasher: &mut blake3::Hasher) {
+    let mut dir = Some(root);
+    while let Some(d) = dir {
+        let mut found = false;
+        for (name, patches) in LOCKFILES {
+            if let Ok(bytes) = std::fs::read(d.join(name)) {
+                found = true;
+                hasher.update(name.as_bytes());
+                hasher.update(&bytes);
+                if let Some(patches) = patches {
+                    if let Ok(meta) = std::fs::metadata(d.join(patches)) {
+                        if meta.is_dir() {
+                            if let Ok(mtime) = meta.modified() {
+                                hasher.update(b"\0p");
+                                hasher.update(format!("{mtime:?}").as_bytes());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if found {
+            return;
+        }
+        dir = d.parent();
+    }
 }
 
 fn lockfile_hash(root: &Path, version: &str, input: &OptimizeInput) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(version.as_bytes());
-    for name in [
-        "package-lock.json",
-        "yarn.lock",
-        "pnpm-lock.yaml",
-        "bun.lockb",
-        "package.json",
-    ] {
-        if let Ok(bytes) = std::fs::read(root.join(name)) {
-            hasher.update(name.as_bytes());
-            hasher.update(&bytes);
-        }
+    hash_lockfiles(root, &mut hasher);
+    if let Ok(bytes) = std::fs::read(root.join("package.json")) {
+        hasher.update(b"package.json");
+        hasher.update(&bytes);
     }
+    hasher.update(b"\0mode=");
+    hasher.update(input.mode.as_bytes());
     // Fold the optimizer config into the key so include/exclude/entries/dedupe/alias
     // changes invalidate a stale prebundle.
     for (tag, list) in [
@@ -324,6 +376,16 @@ mod tests {
         let after_lock = lockfile_hash(root, "0.0.1", &empty);
         assert_ne!(base, after_lock, "a lockfile change must invalidate");
 
+        let dev = OptimizeInput {
+            mode: "development".into(),
+            ..OptimizeInput::default()
+        };
+        let prod = OptimizeInput {
+            mode: "production".into(),
+            ..OptimizeInput::default()
+        };
+        assert_ne!(lockfile_hash(root, "0.0.1", &dev), lockfile_hash(root, "0.0.1", &prod), "mode");
+
         let aliased = OptimizeInput {
             alias: vec![("~".into(), "./src".into())],
             ..OptimizeInput::default()
@@ -338,6 +400,56 @@ mod tests {
             lockfile_hash(root, "0.0.1", &swapped),
             "an alias is directional"
         );
+    }
+
+    #[test]
+    fn every_vite_lockfile_format_and_the_patches_dir_key_the_prebundle() {
+        let dir = project(&[("package.json", r#"{"name":"app"}"#)]);
+        let root = dir.path();
+        let empty = OptimizeInput::default();
+        let key = || lockfile_hash(root, "v", &empty);
+        let bare = key();
+
+        // Text bun.lock and deno.lock (audit: only bun.lockb was keyed).
+        std::fs::write(root.join("bun.lock"), "{}").unwrap();
+        let bun = key();
+        assert_ne!(bare, bun, "bun.lock");
+        std::fs::write(root.join("bun.lock"), "{\"a\":1}").unwrap();
+        assert_ne!(bun, key(), "bun.lock content");
+        std::fs::remove_file(root.join("bun.lock")).unwrap();
+        std::fs::write(root.join("deno.lock"), "{}").unwrap();
+        assert_ne!(bare, key(), "deno.lock");
+        std::fs::remove_file(root.join("deno.lock")).unwrap();
+
+        // The installed mirror Vite reads (node_modules/.package-lock.json).
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        std::fs::write(root.join("node_modules/.package-lock.json"), "{}").unwrap();
+        let installed = key();
+        assert_ne!(bare, installed, "node_modules/.package-lock.json");
+
+        // patch-package: a `patches/` directory next to an npm lockfile is part
+        // of the key (Vite's checkPatchesDir), so re-patching a dep re-bundles.
+        std::fs::create_dir_all(root.join("patches")).unwrap();
+        let patched = key();
+        assert_ne!(installed, patched, "patches dir");
+        assert_eq!(patched, key(), "deterministic while nothing changes");
+    }
+
+    #[test]
+    fn the_lockfile_is_looked_up_in_ancestor_directories() {
+        // A workspace package's prebundle keys on the monorepo lockfile above it
+        // (Vite's lookupFile walks up from root).
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("packages/app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("package.json"), r#"{"name":"app"}"#).unwrap();
+        let empty = OptimizeInput::default();
+        let before = lockfile_hash(&app, "v", &empty);
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), "lockfileVersion: 9").unwrap();
+        let after = lockfile_hash(&app, "v", &empty);
+        assert_ne!(before, after, "ancestor lockfile is keyed");
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), "lockfileVersion: 10").unwrap();
+        assert_ne!(after, lockfile_hash(&app, "v", &empty), "and its content matters");
     }
 
     #[test]
