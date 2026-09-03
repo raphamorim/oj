@@ -119,6 +119,9 @@ jobs:
       - name: plugin config() define reaches dev and build compiles
         if: matrix.mode == 'unbundled'
         run: node e2e/plugin-config-define.mjs
+      - name: removed files reach hotUpdate / watchChange as delete
+        if: matrix.mode == 'unbundled'
+        run: node e2e/plugin-hot-update-delete.mjs
 
   # i need to fix this or automate
   build:
