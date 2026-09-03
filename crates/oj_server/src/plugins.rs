@@ -287,9 +287,7 @@ fn extract_vite_values_with(
     );
     if let Some(hit) = store.lookup(&vite, command, mode_key) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&hit.output) {
-            if !hit.stderr.is_empty() {
-                eprint!("{}", hit.stderr);
-            }
+            print_extraction_stderr(&hit.stderr);
             let _ = CONFIG_DEPS.set(hit.deps);
             crate::boot_phase("vite-extract cache hit");
             return Some(parse_vite_values(&json));
@@ -312,9 +310,7 @@ fn extract_vite_values_with(
         .output()
         .ok()?;
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    if !stderr.is_empty() {
-        eprint!("{stderr}");
-    }
+    print_extraction_stderr(&stderr);
     let parsed = serde_json::from_slice::<serde_json::Value>(&out.stdout);
     let parse_err = parsed.as_ref().err().map(|e| e.to_string());
     if let Some(why) = extraction_failure(out.status, &out.stdout, parse_err.as_deref()) {
@@ -351,6 +347,32 @@ fn extract_vite_values_with(
     );
     crate::boot_phase("vite-extract cache miss (subprocess ran)");
     Some(parse_vite_values(&json))
+}
+
+/// What the config extractor wrote to stderr (Vite's own notices and oj's
+/// "not applied" warnings), printed once per process. The config is loaded
+/// several times in a dev session (the Start route tree, server-fn resolver and
+/// client bundle each adopt it, and again after a rebuild), each replaying the
+/// cached stderr; Vite prints its config warnings once at startup.
+fn print_extraction_stderr(stderr: &str) {
+    let fresh = unseen_extraction_lines(stderr);
+    if !fresh.is_empty() {
+        eprint!("{fresh}");
+    }
+}
+
+fn unseen_extraction_lines(stderr: &str) -> String {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+    let mut guard = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = guard.get_or_insert_with(std::collections::HashSet::new);
+    let mut out = String::new();
+    for line in stderr.lines() {
+        if line.trim().is_empty() || seen.insert(line.to_string()) {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// The part of the process environment a vite.config can observe while it
@@ -1949,5 +1971,14 @@ mod vite_values_tests {
         merge_vite_values(&mut config, v);
         assert_eq!(oj_config::css_additional_data(&config, "scss").as_deref(), Some("$b: red;"));
         assert_eq!(oj_config::css_load_paths(&config, "scss"), vec!["styles".to_string()]);
+    }
+
+    #[test]
+    fn extraction_stderr_lines_print_once_per_process() {
+        let first = unseen_extraction_lines("oj: vite.config: worker config is not applied\nsome plugin notice\n");
+        assert_eq!(first, "oj: vite.config: worker config is not applied\nsome plugin notice\n");
+        let again = unseen_extraction_lines("oj: vite.config: worker config is not applied\nsome plugin notice\nnew line\n");
+        assert_eq!(again, "new line\n", "only lines not printed before in this process come back");
+        assert_eq!(unseen_extraction_lines(""), "");
     }
 }

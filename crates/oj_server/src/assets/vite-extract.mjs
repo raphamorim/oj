@@ -58,7 +58,15 @@ async function loadConfig() {
           if (modeExplicit) inline.mode = mode;
           const resolved = await vite.resolveConfig(inline, command, mode, mode);
           if (resolved) {
-            return { config: resolved, deps: absDeps(resolved.configFileDependencies) };
+            // The user's own file, for the "not applied" warnings: the resolved
+            // config carries Vite's defaults for every option (esbuild.jsxDev,
+            // worker, ssr.resolve, cors.origin, terserOptions...), which are not
+            // configuration oj is failing to honor.
+            let raw = null;
+            try {
+              raw = (await vite.loadConfigFromFile({ command, mode }, configPath, appRoot))?.config ?? null;
+            } catch {}
+            return { config: resolved, raw, deps: absDeps(resolved.configFileDependencies) };
           }
         } catch {
           // fall through to the raw loader below
@@ -67,7 +75,7 @@ async function loadConfig() {
       if (typeof vite.loadConfigFromFile === "function") {
         const loaded = await vite.loadConfigFromFile({ command, mode }, configPath, appRoot);
         if (loaded && loaded.config) {
-          return { config: loaded.config, deps: absDeps(loaded.dependencies) };
+          return { config: loaded.config, raw: loaded.config, deps: absDeps(loaded.dependencies) };
         }
       }
     } catch (e) {
@@ -141,6 +149,8 @@ function aliasDirFromReplacement(replacement) {
     .replace(/[\\/]index\.[a-z]+$/i, "");
 }
 
+const VITE_CLIENT_ALIAS = /^\^\\\/\?@vite\\\/(env|client)$/;
+
 function extractAlias(alias) {
   const out = {};
   if (!alias) return out;
@@ -152,6 +162,9 @@ function extractAlias(alias) {
     if (typeof find === "string") {
       if (out[find] == null) out[find] = replacement;
     } else if (find instanceof RegExp) {
+      // Vite adds these two for its own client (config.ts clientAlias); oj serves
+      // /@vite/client and /@vite/env itself, so they are not user aliases to warn about.
+      if (VITE_CLIENT_ALIAS.test(find.source)) continue;
       const key = aliasKeyFromRegex(find.source);
       if (!key || /[.*+?()[\]{}|^$]/.test(key)) {
         warn(`resolve.alias regex ${find} not convertible to a path alias; skipped`);
@@ -229,7 +242,6 @@ function extractBuild(b) {
   if (typeof b.outDir === "string") out.outDir = b.outDir;
   if (typeof b.sourcemap === "boolean" || typeof b.sourcemap === "string") out.sourcemap = b.sourcemap;
   if (typeof b.minify === "boolean" || typeof b.minify === "string") out.minify = b.minify;
-  if (b.terserOptions) warn("build.terserOptions is not applied (oj minifies with oxc)");
   if (typeof b.cssCodeSplit === "boolean") out.cssCodeSplit = b.cssCodeSplit;
   if (typeof b.target === "string") out.target = b.target;
   else if (Array.isArray(b.target)) out.target = b.target.filter((t) => typeof t === "string");
@@ -453,7 +465,14 @@ function extractCss(css) {
   }
 }
 
+// Warns about the options in the USER's config that oj does not apply. Call it
+// with the raw config file's export, not the resolved config: Vite's resolveConfig
+// fills every option with defaults (esbuild.jsxDev/charset/legalComments, worker,
+// ssr.resolve, cors.origin, optimizeDeps.esbuildOptions, terserOptions) and none of
+// those are configuration to warn about.
 function warnUnsupported(c) {
+  if (!c || typeof c !== "object") return;
+  if (c.build?.terserOptions) warn("build.terserOptions is not applied (oj minifies with oxc)");
   if (c.esbuild?.jsx === "preserve" || c.oxc?.jsx === "preserve") {
     warn("jsx: \"preserve\" is not supported; JSX is compiled with the automatic runtime");
   }
@@ -493,12 +512,12 @@ const isMainRun = (() => {
   };
   return real(self) === real(entry);
 })();
-export { extractAlias, extractOptimizeDeps, extractProxy };
+export { extractAlias, extractOptimizeDeps, extractProxy, warnUnsupported };
 
 if (isMainRun) try {
-  const { config, deps } = (await loadConfig()) ?? {};
+  const { config, raw, deps } = (await loadConfig()) ?? {};
   const c = config ?? {};
-  warnUnsupported(c);
+  warnUnsupported(raw ?? c);
   process.stdout.write(
     JSON.stringify({
       __ok: true,
