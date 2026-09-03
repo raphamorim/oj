@@ -10,6 +10,7 @@ lightningcss = "1.0.0-alpha.72"
 grass = "0.13.4"
 serde_json.workspace = true
 parcel_sourcemap = "2.1.1"
+regex = "1.11"
 
 [dev-dependencies]
 proptest.workspace = true

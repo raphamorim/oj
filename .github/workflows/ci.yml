@@ -164,6 +164,9 @@ jobs:
       - name: publicDir files served verbatim; publicDir path and false honored
         if: matrix.mode == 'unbundled'
         run: node e2e/public-dir.mjs
+      - name: css.modules options (localsConvention, generateScopedName, globalModulePaths, composes from)
+        if: matrix.mode == 'unbundled'
+        run: node e2e/css-modules-options.mjs
 
   # i need to fix this or automate
   build:

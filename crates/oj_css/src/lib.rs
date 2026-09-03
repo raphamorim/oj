@@ -38,7 +38,7 @@ pub struct CssOutput {
 /// `resolve.alias` pairs apply to `@import`, `@use` and `url()` specifiers, and
 /// a root-absolute `/src/x` resolves against the project root, with a file in
 /// the public directory taking precedence (`checkPublicFile`).
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct CssResolve<'a> {
     pub root: Option<&'a Path>,
     pub public_dir: Option<&'a Path>,
@@ -50,6 +50,44 @@ pub struct CssResolve<'a> {
     pub targets: &'a [String],
     /// `build.cssMinify`: whether a build compile minifies (dev never does).
     pub minify: bool,
+    /// Vite's `css.modules` options.
+    pub modules: &'a CssModulesOptions,
+}
+
+static DEFAULT_MODULES: CssModulesOptions = CssModulesOptions {
+    locals_convention: None,
+    generate_scoped_name: None,
+    global_scope: false,
+    global_module_paths: Vec::new(),
+};
+
+impl Default for CssResolve<'_> {
+    fn default() -> Self {
+        CssResolve {
+            root: None,
+            public_dir: None,
+            alias: &[],
+            targets: &[],
+            minify: false,
+            modules: &DEFAULT_MODULES,
+        }
+    }
+}
+
+/// Vite's `css.modules` (postcss-modules) options oj applies.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CssModulesOptions {
+    /// `localsConvention`: `camelCase`, `camelCaseOnly`, `dashes` or
+    /// `dashesOnly`; None keeps class names as written.
+    pub locals_convention: Option<String>,
+    /// `generateScopedName` as a pattern string (`[name]`, `[local]`, `[hash]`,
+    /// `[hash:base64:5]`...); the default is `[name]_[local]_[hash]`.
+    pub generate_scoped_name: Option<String>,
+    /// `scopeBehaviour: "global"`: module files are compiled unscoped.
+    pub global_scope: bool,
+    /// `globalModulePaths` regex sources: a module file whose path matches is
+    /// compiled unscoped (its export map is empty).
+    pub global_module_paths: Vec<String>,
 }
 
 /// Owned `CssResolve`, for holders that outlive a borrow (server state, build
@@ -61,6 +99,7 @@ pub struct CssResolveConfig {
     pub alias: Vec<(String, String)>,
     pub targets: Vec<String>,
     pub minify: bool,
+    pub modules: CssModulesOptions,
 }
 
 impl CssResolveConfig {
@@ -74,6 +113,7 @@ impl CssResolveConfig {
             alias: &self.alias,
             targets: &self.targets,
             minify: self.minify,
+            modules: &self.modules,
         }
     }
 }
@@ -523,6 +563,7 @@ pub fn compile_sass_opts(source: &str, opts: &SassOptions<'_>) -> Result<String,
             alias: opts.resolve.alias.to_vec(),
             targets: opts.resolve.targets.to_vec(),
             minify: opts.resolve.minify,
+            modules: opts.resolve.modules.clone(),
         },
     };
     let mut options = grass::Options::default().fs(&fs);
@@ -639,12 +680,285 @@ fn compile_css_impl(
     source_map: bool,
     resolve: &CssResolve<'_>,
 ) -> Result<CssOutput, String> {
-    let is_module = is_css_module(url);
+    compile_css_depth(url, source, minify, rebase, source_map, resolve, 0)
+}
+
+/// Whether a `.module.css` file is scoped: not under `scopeBehaviour: "global"`
+/// and not matched by a `globalModulePaths` regex (postcss-modules then runs
+/// it in global mode, exporting nothing).
+fn module_is_scoped(url: &str, resolve: &CssResolve<'_>) -> bool {
+    if resolve.modules.global_scope {
+        return false;
+    }
+    if resolve.modules.global_module_paths.is_empty() {
+        return true;
+    }
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let abs = module_file_path(url, resolve).map(|p| p.to_string_lossy().into_owned());
+    !resolve.modules.global_module_paths.iter().any(|src| {
+        regex::Regex::new(src).is_ok_and(|re| re.is_match(path) || abs.as_deref().is_some_and(|a| re.is_match(a)))
+    })
+}
+
+/// The scoped-name pattern for CSS modules: `generateScopedName` translated
+/// from postcss-modules' interpolateName tokens (`[hash:base64:5]` -> `[hash]`,
+/// `[contenthash]` -> `[content-hash]`; `[path]`/`[folder]`/`[ext]` carry no
+/// equivalent and are dropped), or oj's default.
+fn scoped_name_pattern(modules: &CssModulesOptions) -> css_modules::Pattern {
+    const DEFAULT: &str = "[name]_[local]_[hash]";
+    let Some(raw) = modules.generate_scoped_name.as_deref().filter(|s| !s.is_empty()) else {
+        return css_modules::Pattern::parse(DEFAULT).expect("static pattern");
+    };
+    let mut out = String::new();
+    let mut rest = raw;
+    while let Some(start) = rest.find('[') {
+        out.push_str(&rest[..start]);
+        let Some(end) = rest[start..].find(']') else {
+            out.push_str(&rest[start..]);
+            rest = "";
+            break;
+        };
+        let token = &rest[start + 1..start + end];
+        let lower = token.to_ascii_lowercase();
+        if lower.starts_with("contenthash") || lower.starts_with("content-hash") {
+            out.push_str("[content-hash]");
+        } else if lower.starts_with("hash") {
+            out.push_str("[hash]");
+        } else if lower == "name" || lower == "local" {
+            out.push_str(&format!("[{lower}]"));
+        }
+        rest = &rest[start + end + 1..];
+    }
+    out.push_str(rest);
+    let parsed = if out.contains("[local]") {
+        css_modules::Pattern::parse(&out).map_err(|e| format!("{e:?}"))
+    } else {
+        Err("no [local] placeholder".to_string())
+    };
+    match parsed {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("oj: css.modules.generateScopedName {raw:?} is not a supported pattern ({e}); using {DEFAULT}");
+            css_modules::Pattern::parse(DEFAULT).expect("static pattern")
+        }
+    }
+}
+
+/// The file a compile `url` names on disk: an absolute path as-is, a
+/// root-relative url under `resolve.root`.
+fn module_file_path(url: &str, resolve: &CssResolve<'_>) -> Option<PathBuf> {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let p = Path::new(path);
+    if p.is_absolute() && p.is_file() {
+        return Some(p.to_path_buf());
+    }
+    let root = resolve.root?;
+    let rel = path.trim_start_matches('/');
+    let joined = root.join(rel);
+    joined.is_file().then_some(joined)
+}
+
+/// lodash `camelCase`, as postcss-modules' `camelCase` convention applies it:
+/// words split on non-alphanumerics and lower-to-upper transitions, first
+/// word lowercased, the rest capitalized.
+fn camel_case(s: &str) -> String {
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower = false;
+    for c in s.chars() {
+        if !c.is_alphanumeric() {
+            if !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+            prev_lower = false;
+            continue;
+        }
+        if c.is_uppercase() && prev_lower && !cur.is_empty() {
+            words.push(std::mem::take(&mut cur));
+        }
+        prev_lower = c.is_lowercase() || c.is_ascii_digit();
+        cur.push(c);
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    let mut out = String::new();
+    for (i, w) in words.iter().enumerate() {
+        let lower = w.to_lowercase();
+        if i == 0 {
+            out.push_str(&lower);
+        } else {
+            let mut chars = lower.chars();
+            if let Some(first) = chars.next() {
+                out.extend(first.to_uppercase());
+                out.push_str(chars.as_str());
+            }
+        }
+    }
+    out
+}
+
+/// postcss-modules' `dashesCamelCase`: only `-x` runs become `X`.
+fn dashes_camel_case(s: &str) -> String {
+    let mut out = String::new();
+    let mut upper_next = false;
+    for c in s.chars() {
+        if c == '-' {
+            upper_next = true;
+            continue;
+        }
+        if upper_next {
+            out.extend(c.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Apply `localsConvention` to an export map (postcss-modules): `camelCase` /
+/// `dashes` add the converted key next to the original, the `*Only` forms
+/// replace it.
+fn apply_locals_convention(pairs: Vec<(String, String)>, convention: Option<&str>) -> Vec<(String, String)> {
+    let (convert, only): (fn(&str) -> String, bool) = match convention {
+        Some("camelCase") => (camel_case, false),
+        Some("camelCaseOnly") => (camel_case, true),
+        Some("dashes") => (dashes_camel_case, false),
+        Some("dashesOnly") => (dashes_camel_case, true),
+        _ => return pairs,
+    };
+    let mut out: Vec<(String, String)> = Vec::with_capacity(pairs.len() * 2);
+    for (name, value) in pairs {
+        let converted = convert(&name);
+        if !only && converted != name {
+            out.push((name, value.clone()));
+        }
+        if !out.iter().any(|(k, _)| *k == converted) {
+            out.push((converted, value));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The export values of a CSS module with `composes` resolved the way
+/// postcss-modules exports them: the scoped name followed by every composed
+/// class (locals transitively, globals as written, and `from "./other.css"`
+/// dependencies compiled from their own module file).
+fn expand_composes(
+    map: css_modules::CssModuleExports,
+    url: &str,
+    resolve: &CssResolve<'_>,
+    depth: u8,
+) -> Vec<(String, String)> {
+    use css_modules::CssModuleReference as R;
+    fn value_of(
+        map: &css_modules::CssModuleExports,
+        export: &css_modules::CssModuleExport,
+        url: &str,
+        resolve: &CssResolve<'_>,
+        depth: u8,
+        seen: &mut Vec<String>,
+    ) -> String {
+        let mut value = export.name.clone();
+        for r in &export.composes {
+            let part = match r {
+                R::Local { name } => {
+                    // Composing a local class pulls in that class' own composes.
+                    match map.values().find(|e| e.name == *name) {
+                        Some(inner) if !seen.contains(name) => {
+                            seen.push(name.clone());
+                            let v = value_of(map, inner, url, resolve, depth, seen);
+                            seen.pop();
+                            v
+                        }
+                        _ => name.clone(),
+                    }
+                }
+                R::Global { name } => name.clone(),
+                R::Dependency { name, specifier } => {
+                    match dependency_export(specifier, name, url, resolve, depth) {
+                        Some(v) => v,
+                        None => {
+                            eprintln!("oj: css module {url}: cannot resolve `composes: {name} from {specifier:?}`");
+                            continue;
+                        }
+                    }
+                }
+            };
+            if !part.is_empty() {
+                value.push(' ');
+                value.push_str(&part);
+            }
+        }
+        value
+    }
+    let mut pairs: Vec<(String, String)> = map
+        .iter()
+        .map(|(name, export)| (name.clone(), value_of(&map, export, url, resolve, depth, &mut Vec::new())))
+        .collect();
+    pairs.sort();
+    pairs
+}
+
+/// `composes: name from "spec"`: the export `name` of the module file `spec`
+/// names (relative to the composing file, root-absolute, or aliased), compiled
+/// with the same settings.
+fn dependency_export(spec: &str, name: &str, url: &str, resolve: &CssResolve<'_>, depth: u8) -> Option<String> {
+    if depth > 8 {
+        return None;
+    }
+    let file = module_file_path(url, resolve)?;
+    let dir = file.parent()?;
+    let dep = if let Some(p) = resolve.alias_path(spec) {
+        p
+    } else if let Some(rest) = spec.strip_prefix('/') {
+        resolve.root?.join(rest)
+    } else {
+        dir.join(spec)
+    };
+    // Lexical normalization only: the url (and so the `[hash]`) must be the
+    // same root-relative spelling the file gets when imported directly.
+    let mut dep_norm = PathBuf::new();
+    for c in dep.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                dep_norm.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => dep_norm.push(other),
+        }
+    }
+    let dep = dep_norm;
+    let mut source = std::fs::read_to_string(&dep).ok()?;
+    if is_sass(&dep.to_string_lossy()) {
+        source = compile_sass(&source, dep.parent()).ok()?;
+    }
+    let dep_url = match resolve.root.and_then(|r| dep.strip_prefix(r).ok()) {
+        Some(rel) => format!("/{}", rel.display()),
+        None => dep.to_string_lossy().into_owned(),
+    };
+    let out = compile_css_depth(&dep_url, &source, false, false, false, resolve, depth + 1).ok()?;
+    out.exports?.into_iter().find(|(n, _)| n == name).map(|(_, v)| v)
+}
+
+fn compile_css_depth(
+    url: &str,
+    source: &str,
+    minify: bool,
+    rebase: bool,
+    source_map: bool,
+    resolve: &CssResolve<'_>,
+    depth: u8,
+) -> Result<CssOutput, String> {
+    let is_module_file = is_css_module(url);
+    let is_module = is_module_file && module_is_scoped(url, resolve);
     let warnings = Arc::new(RwLock::new(Vec::new()));
     let options = ParserOptions {
         filename: url.to_string(),
         css_modules: is_module.then(|| css_modules::Config {
-            pattern: css_modules::Pattern::parse("[name]_[local]_[hash]").expect("static pattern"),
+            pattern: scoped_name_pattern(resolve.modules),
             ..css_modules::Config::default()
         }),
         // Vite's default pipeline (postcss) never rejects a stylesheet over a
@@ -707,14 +1021,16 @@ fn compile_css_impl(
         }
     }
 
-    let exports = result.exports.map(|map| {
-        let mut pairs: Vec<(String, String)> = map
-            .into_iter()
-            .map(|(name, export)| (name, export.name))
-            .collect();
-        pairs.sort();
-        pairs
-    });
+    let exports = match result.exports {
+        Some(map) => Some(apply_locals_convention(
+            expand_composes(map, url, resolve, depth),
+            resolve.modules.locals_convention.as_deref(),
+        )),
+        // A module file compiled in global mode still is a module to its
+        // importer: an empty class map, as postcss-modules exports for it.
+        None if is_module_file => Some(Vec::new()),
+        None => None,
+    };
 
     Ok(CssOutput { css, exports })
 }
@@ -1272,6 +1588,109 @@ mod tests {
         assert_eq!(name, "button");
         assert_ne!(scoped, "button", "class must be scoped: {scoped}");
         assert!(out.css.contains(scoped.as_str()), "{}", out.css);
+    }
+
+    fn with_modules(modules: CssModulesOptions) -> CssResolveConfig {
+        CssResolveConfig { modules, minify: true, ..Default::default() }
+    }
+
+    #[test]
+    fn css_modules_locals_convention_shapes_the_export_map() {
+        let src = ".my-class { color: red } .foo_bar { color: blue } .Plain { color: green }";
+        let keys = |conv: &str| {
+            let cfg = with_modules(CssModulesOptions { locals_convention: Some(conv.into()), ..Default::default() });
+            compile_css_with("/src/a.module.css", src, &cfg.as_ref())
+                .unwrap()
+                .exports
+                .unwrap()
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys("camelCase"), ["Plain", "fooBar", "foo_bar", "my-class", "myClass", "plain"]);
+        assert_eq!(keys("camelCaseOnly"), ["fooBar", "myClass", "plain"]);
+        assert_eq!(keys("dashes"), ["Plain", "foo_bar", "my-class", "myClass"]);
+        assert_eq!(keys("dashesOnly"), ["Plain", "foo_bar", "myClass"]);
+        // Converted keys carry the same scoped value as the original.
+        let cfg = with_modules(CssModulesOptions { locals_convention: Some("camelCase".into()), ..Default::default() });
+        let out = compile_css_with("/src/a.module.css", src, &cfg.as_ref()).unwrap().exports.unwrap();
+        let get = |k: &str| out.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap();
+        assert_eq!(get("my-class"), get("myClass"));
+    }
+
+    #[test]
+    fn css_modules_generate_scoped_name_pattern_is_honored() {
+        let cfg = with_modules(CssModulesOptions {
+            generate_scoped_name: Some("[local]__[hash:base64:5]".into()),
+            ..Default::default()
+        });
+        let out = compile_css_with("/src/Btn.module.css", ".button { color: red }", &cfg.as_ref()).unwrap();
+        let (_, scoped) = &out.exports.unwrap()[0];
+        assert!(scoped.starts_with("button__"), "{scoped}");
+        assert!(!scoped.contains("Btn"), "{scoped}");
+        let cfg = with_modules(CssModulesOptions {
+            generate_scoped_name: Some("app-[name]-[local]".into()),
+            ..Default::default()
+        });
+        let out = compile_css_with("/src/Btn.module.css", ".button { color: red }", &cfg.as_ref()).unwrap();
+        assert_eq!(out.exports.unwrap()[0].1, "app-Btn-module-button");
+        // An unsupported pattern falls back to the default instead of failing.
+        let cfg = with_modules(CssModulesOptions { generate_scoped_name: Some("[nope]".into()), ..Default::default() });
+        let out = compile_css_with("/src/Btn.module.css", ".button { color: red }", &cfg.as_ref()).unwrap();
+        assert!(out.exports.unwrap()[0].1.starts_with("Btn-module_button_"));
+    }
+
+    #[test]
+    fn css_modules_global_scope_and_global_module_paths_compile_unscoped() {
+        let cfg = with_modules(CssModulesOptions { global_scope: true, ..Default::default() });
+        let out = compile_css_with("/src/a.module.css", ".x { color: red }", &cfg.as_ref()).unwrap();
+        assert_eq!(out.css, ".x{color:red}");
+        assert_eq!(out.exports, Some(Vec::new()), "still a module to its importer, with no locals");
+
+        let cfg = with_modules(CssModulesOptions {
+            global_module_paths: vec![r"global\.module\.css$".into()],
+            ..Default::default()
+        });
+        let g = compile_css_with("/src/theme.global.module.css", ".x { color: red }", &cfg.as_ref()).unwrap();
+        assert_eq!(g.css, ".x{color:red}");
+        assert_eq!(g.exports, Some(Vec::new()));
+        let scoped = compile_css_with("/src/a.module.css", ".x { color: red }", &cfg.as_ref()).unwrap();
+        assert_ne!(scoped.css, ".x{color:red}", "non-matching modules stay scoped");
+    }
+
+    #[test]
+    fn css_modules_composes_locals_globals_and_other_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/base.module.css"), ".base { padding: 1px } .more { composes: base; margin: 0 }").unwrap();
+        let cfg = CssResolveConfig { root: dir.path().to_path_buf(), ..Default::default() };
+        std::fs::write(
+            dir.path().join("src/a.module.css"),
+            ".a { color: red } .b { composes: a; color: blue } .c { composes: g from global; } .d { composes: more from \"./base.module.css\"; }",
+        )
+        .unwrap();
+        let out = compile_css_with(
+            "/src/a.module.css",
+            &std::fs::read_to_string(dir.path().join("src/a.module.css")).unwrap(),
+            &cfg.as_ref(),
+        )
+        .unwrap();
+        let exports = out.exports.unwrap();
+        let get = |k: &str| exports.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap();
+        assert_eq!(get("b"), format!("{} {}", get("b").split(' ').next().unwrap(), get("a")));
+        assert_eq!(get("c").split(' ').nth(1), Some("g"));
+        let base = compile_css_with(
+            "/src/base.module.css",
+            &std::fs::read_to_string(dir.path().join("src/base.module.css")).unwrap(),
+            &cfg.as_ref(),
+        )
+        .unwrap()
+        .exports
+        .unwrap();
+        let base_more = base.iter().find(|(n, _)| n == "more").map(|(_, v)| v.clone()).unwrap();
+        assert!(base_more.contains(' '), "more composes base transitively: {base_more}");
+        let d = get("d");
+        assert!(d.ends_with(&base_more), "d = {d}, expected suffix {base_more}");
     }
 
     #[test]

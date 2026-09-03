@@ -392,8 +392,17 @@ function extractCss(css) {
       }
     }
   }
+  if (css.modules && typeof css.modules === "object") {
+    for (const k of ["localsConvention", "generateScopedName"]) {
+      if (typeof css.modules[k] === "function") warn(`css.modules.${k} is a function; only the string form is applied`);
+    }
+    if (typeof css.modules.getJSON === "function") warn("css.modules.getJSON is not applied");
+  }
   try {
     const out = JSON.parse(JSON.stringify(css));
+    // RegExps (globalModulePaths) and functions do not survive JSON; mark them
+    // the way rollup options are marked so Rust can read the sources.
+    if (css.modules && typeof css.modules === "object") out.modules = markFunctions(css.modules);
     return out && Object.keys(out).length ? out : null;
   } catch {
     return null;

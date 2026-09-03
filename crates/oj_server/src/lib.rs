@@ -746,6 +746,7 @@ impl DevServer {
             // are resolved once from it); dev output is never minified.
             targets: oj_config::build_css_targets(&config),
             minify: false,
+            modules: css_modules_options(&config),
         };
         let state = Arc::new(ServerState {
             persistent_cache,
@@ -1265,6 +1266,17 @@ fn ssr_css_module(root: &Path, path: &Path, source: &str) -> Result<String, Stri
         Some(exports) => oj_css::css_modules_esm(&exports),
         None => "export default {};".to_string(),
     })
+}
+
+/// Vite's `css.modules` options as the CSS compiler applies them (dev and build).
+pub fn css_modules_options(config: &oj_config::OjConfig) -> oj_css::CssModulesOptions {
+    let m = oj_config::css_modules(config);
+    oj_css::CssModulesOptions {
+        locals_convention: m.locals_convention,
+        generate_scoped_name: m.generate_scoped_name,
+        global_scope: m.global_scope,
+        global_module_paths: m.global_module_paths,
+    }
 }
 
 pub fn resolve_host(host: Option<&str>) -> std::net::IpAddr {
@@ -4039,7 +4051,9 @@ async fn serve_css_wrapper(state: &Arc<ServerState>, file: &Path, url: &str) -> 
     };
     // A CSS module exports its class map as the default plus a named export
     // per identifier-safe class (Vite's dataToEsm with namedExports).
-    let exports = if module.css_exports.is_empty() {
+    // A module file compiled unscoped (css.modules global mode) still exports
+    // its (empty) class map, as Vite does.
+    let exports = if module.css_exports.is_empty() && !oj_css::is_css_module(url) {
         "export default void 0;\n".to_string()
     } else {
         oj_css::css_modules_esm(&module.css_exports)
@@ -6249,7 +6263,7 @@ fn render_registration(url: &str, module: &CachedModule) -> String {
         .map(|(spec, target)| (spec.clone(), serde_json::Value::String(target.clone())))
         .collect();
     if module.kind == "css" {
-        let exports = if module.css_exports.is_empty() {
+        let exports = if module.css_exports.is_empty() && !oj_css::is_css_module(url) {
             "void 0".to_string()
         } else {
             let map: serde_json::Map<String, serde_json::Value> = module

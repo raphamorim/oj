@@ -66,6 +66,44 @@ pub fn build_minify(config: &OjConfig) -> bool {
     }
 }
 
+/// `css.modules` reduced to what oj applies (strings only: a function-valued
+/// `localsConvention` / `generateScopedName` cannot cross from the config
+/// and is reported by the extractor).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CssModulesSettings {
+    pub locals_convention: Option<String>,
+    pub generate_scoped_name: Option<String>,
+    pub global_scope: bool,
+    pub global_module_paths: Vec<String>,
+}
+
+pub fn css_modules(config: &OjConfig) -> CssModulesSettings {
+    let Some(m) = config.css.as_ref().and_then(|c| c.modules.as_ref()) else {
+        return CssModulesSettings::default();
+    };
+    let str_of = |v: &Option<serde_json::Value>| {
+        v.as_ref()
+            .and_then(|v| v.as_str())
+            .filter(|s| *s != "__oj_fn__")
+            .map(str::to_string)
+    };
+    CssModulesSettings {
+        locals_convention: str_of(&m.locals_convention),
+        generate_scoped_name: str_of(&m.generate_scoped_name),
+        global_scope: m.scope_behaviour.as_deref() == Some("global"),
+        global_module_paths: m
+            .global_module_paths
+            .iter()
+            .flatten()
+            .filter_map(|v| match v {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Object(o) => o.get("__oj_regex__").and_then(|r| r.as_str()).map(str::to_string),
+                _ => None,
+            })
+            .collect(),
+    }
+}
+
 /// The public directory, absolute: Vite's `publicDir` (default `<root>/public`),
 /// or None when the config sets `publicDir: false`.
 pub fn public_dir(config: &OjConfig, root: &Path) -> Option<PathBuf> {
@@ -821,15 +859,17 @@ fn evaluate(path: &Path, source: &str, command: &str, mode: &str) -> Result<Stri
             "{prelude}{script}\n\
              var __ojC = globalThis.__ojConfig;\n\
              if (typeof __ojC === 'function') __ojC = __ojC({env_arg});\n\
-             (function mark(o) {{\n\
+             function __ojMark(o) {{\n\
                if (!o || typeof o !== 'object') return;\n\
                for (var k in o) {{\n\
                  var v = o[k];\n\
                  if (typeof v === 'function') o[k] = '__oj_fn__';\n\
                  else if (v instanceof RegExp) o[k] = {{ __oj_regex__: v.source }};\n\
-                 else mark(v);\n\
+                 else __ojMark(v);\n\
                }}\n\
-             }})(__ojC && __ojC.build && (__ojC.build.rolldownOptions || __ojC.build.rollupOptions));\n\
+             }}\n\
+             __ojMark(__ojC && __ojC.build && (__ojC.build.rolldownOptions || __ojC.build.rollupOptions));\n\
+             __ojMark(__ojC && __ojC.css && __ojC.css.modules);\n\
              JSON.stringify(__ojC ?? null)"
         );
         let result: rquickjs::Value = ctx.eval(full).map_err(|e| {
@@ -1618,6 +1658,26 @@ mod public_dir_tests {
         assert!(t.contains(&"safari14".to_string()), "modules preset expands: {t:?}");
         let off: OjConfig = serde_json::from_str(r#"{"build":{"cssMinify":false}}"#).unwrap();
         assert!(!build_css_minify(&off, false));
+    }
+
+    #[test]
+    fn css_modules_settings_read_strings_and_regex_markers() {
+        let cfg: OjConfig = serde_json::from_str(
+            r#"{"css":{"modules":{
+                "localsConvention":"camelCaseOnly",
+                "generateScopedName":"__oj_fn__",
+                "scopeBehaviour":"global",
+                "globalModulePaths":[{"__oj_regex__":"global\\.css$"},"legacy"],
+                "getJSON":"__oj_fn__"
+            }}}"#,
+        )
+        .unwrap();
+        let m = css_modules(&cfg);
+        assert_eq!(m.locals_convention.as_deref(), Some("camelCaseOnly"));
+        assert_eq!(m.generate_scoped_name, None, "function form is dropped");
+        assert!(m.global_scope);
+        assert_eq!(m.global_module_paths, vec!["global\\.css$".to_string(), "legacy".to_string()]);
+        assert_eq!(css_modules(&serde_json::from_str("{}").unwrap()), CssModulesSettings::default());
     }
 
     #[test]
