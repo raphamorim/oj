@@ -88,8 +88,12 @@ const server = http.createServer(async (req, res) => {
     }
   } catch (e) {
     const text = String((e && e.stack) || e);
-    if (!res.headersSent) res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
-    res.end(text);
+    if (res.headersSent) { res.end(text); return; }
+    // Vite's errorMiddleware: a 500 HTML page carrying the message and stack
+    // (its overlay import falls back to exactly these h1/h2/pre elements).
+    const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    res.writeHead(500, { "content-type": "text/html; charset=utf-8" });
+    res.end(`<!DOCTYPE html>\n<html lang="en"><head><meta charset="UTF-8" /><title>Error</title></head>\n<body><h1>Internal Server Error</h1><h2>${esc((e && e.message) || e)}</h2><pre>${esc(text)}</pre></body></html>\n`);
   }
 });
 await new Promise((r) => server.listen(0, "127.0.0.1", r));
