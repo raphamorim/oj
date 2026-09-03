@@ -5679,6 +5679,22 @@ fn now_millis() -> u128 {
         .as_millis()
 }
 
+/// The href a graph module is preloaded under: the exact URL its importer names,
+/// so the preload and the import share one cache entry. A stylesheet is the
+/// `?import` module; an optimized dep or package bundle carries the same
+/// `?v=<version>` its import URLs do (the graph keys them without the query).
+fn preload_href(path: &str, version: &str) -> String {
+    if is_style_url(path) {
+        format!("{path}?import")
+    } else if !version.is_empty()
+        && (path.starts_with("/@oj-deps/") || path.starts_with(pkg_bundle::PKG_PREFIX))
+    {
+        format!("{path}?v={version}")
+    } else {
+        path.to_string()
+    }
+}
+
 fn inject_module_preloads(html: String, state: &ServerState) -> String {
     let paths: Vec<String> = if *state.crawl_done.borrow() {
         state
@@ -5695,15 +5711,10 @@ fn inject_module_preloads(html: String, state: &ServerState) -> String {
     if paths.is_empty() {
         return html;
     }
+    let version = state.optimized.version();
     let links: String = paths
         .iter()
-        .map(|p| {
-            if is_style_url(p) {
-                format!("<link rel=\"modulepreload\" href=\"{p}?import\" />\n")
-            } else {
-                format!("<link rel=\"modulepreload\" href=\"{p}\" />\n")
-            }
-        })
+        .map(|p| format!("<link rel=\"modulepreload\" href=\"{}\" />\n", preload_href(p, version)))
         .collect();
     match html.find("</head>") {
         Some(idx) => format!("{}{links}{}", &html[..idx], &html[idx..]),
