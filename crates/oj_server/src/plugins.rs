@@ -451,6 +451,9 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
         if build.empty_out_dir.is_none() {
             build.empty_out_dir = bool_of("emptyOutDir");
         }
+        if build.module_preload.is_none() {
+            build.module_preload = vb.get("modulePreload").filter(|v| !v.is_null()).cloned();
+        }
         if build.ssr.is_none() {
             build.ssr = str_of("ssr");
         }

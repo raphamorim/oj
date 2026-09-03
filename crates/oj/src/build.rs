@@ -1818,7 +1818,7 @@ pub async fn build(
     }
 
     // Non-split CSS is one combined stylesheet linked from every page.
-    let combined_css_link: Option<String> = if !css_split {
+    let combined_css_name: Option<String> = if !css_split {
         let mut css_entries = collected_css.lock().unwrap().clone();
         if css_entries.is_empty() {
             None
@@ -1847,14 +1847,28 @@ pub async fn build(
                     entry.css.push(css_name.clone());
                 }
             }
-            Some(format!(
-                "<link rel=\"stylesheet\" href=\"{}\" />",
-                with_base(&css_name, &base)
-            ))
+            Some(css_name)
         }
     } else {
         None
     };
+    // Split CSS is emitted once for the whole bundle; each page then links the
+    // stylesheets of its own entry chunks (a page-relative href when the base is
+    // relative).
+    let chunk_css: Vec<(String, String)> = if css_split {
+        emit_split_css_files(
+            &output,
+            &collected_css,
+            &out_dir,
+            &root,
+            &base,
+            &mut emitted,
+            &mut manifest_entries,
+        )?
+    } else {
+        Vec::new()
+    };
+    let mut all_sync_chunks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     // Pages a plugin emitted as `.html` chunks during the build are rendered
     // here alongside the statically-resolved input pages.
@@ -1865,14 +1879,19 @@ pub async fn build(
 
     for doc in &html_docs {
         let mut rewritten_html = oj_env::replace_html_env(&doc.src_html, &html_env);
+        let page_base = page_base(&base, &doc.out_rel);
         // Rewrite each `<script src>` to its hashed output chunk and collect
         // this page's own entry chunks (for modulepreload and split CSS).
         let mut doc_entry_files: Vec<String> = Vec::new();
         for s in &doc.scripts {
             if let Some(file) = facade_to_file.get(&s.abs) {
-                rewritten_html = rewritten_html.replace(&s.src, &with_base(file, &base));
+                rewritten_html = rewritten_html.replace(&s.src, &with_base(file, &page_base));
                 doc_entry_files.push(file.clone());
             }
+        }
+        for entry in &doc_entry_files {
+            all_sync_chunks.insert(entry.clone());
+            all_sync_chunks.extend(transitive_imports(entry, &imports_map));
         }
 
         // Inject <link rel="modulepreload"> for this page's transitively
@@ -1889,7 +1908,7 @@ pub async fn build(
                 .map(|f| {
                     format!(
                         "<link rel=\"modulepreload\" href=\"{}\" />",
-                        with_base(f, &base)
+                        with_base(f, &page_base)
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1916,21 +1935,17 @@ pub async fn build(
             }
         }
 
-        if let Some(link) = &combined_css_link {
-            rewritten_html = insert_before_head(&rewritten_html, link);
+        if let Some(css_name) = &combined_css_name {
+            let link = format!(
+                "<link rel=\"stylesheet\" href=\"{}\" />",
+                with_base(css_name, &page_base)
+            );
+            rewritten_html = insert_before_head(&rewritten_html, &link);
         } else if css_split {
-            emit_split_css(
-                &output,
-                &collected_css,
-                &doc_entry_files,
-                &imports_map,
-                &out_dir,
-                &root,
-                &base,
-                &mut emitted,
-                &mut manifest_entries,
-                &mut rewritten_html,
-            )?;
+            let links = split_css_links(&chunk_css, &doc_entry_files, &imports_map, &page_base);
+            if !links.is_empty() {
+                rewritten_html = insert_before_head(&rewritten_html, &links);
+            }
         }
 
         if let Some(host) = &plugin_host {
@@ -1944,6 +1959,21 @@ pub async fn build(
         }
         fs::write(&dest, rewritten_html)?;
     }
+
+    // Vite's build import analysis: wrap dynamic imports in `__vitePreload` so a
+    // lazy chunk's own dependencies and stylesheets load in parallel (and its
+    // CSS is applied before it runs), inject the modulepreload polyfill into
+    // page entries, and give async-only chunks a stylesheet fallback.
+    apply_preload_helper(
+        &output,
+        &out_dir,
+        &base,
+        &imports_map,
+        &chunk_css,
+        &all_sync_chunks,
+        &facade_to_file.values().cloned().collect::<Vec<_>>(),
+        oj_config::module_preload_polyfill(&config),
+    )?;
 
     fs::create_dir_all(out_dir.join(".vite"))?;
     fs::write(
@@ -2030,10 +2060,24 @@ fn normalize_input_entries(input: &serde_json::Value) -> Vec<(String, String)> {
 fn resolve_html_ref(src: &str, html_dir: &Path, root: &Path) -> PathBuf {
     let s = src.trim();
     let s = s.strip_prefix("./").unwrap_or(s);
-    match s.strip_prefix('/') {
+    let joined = match s.strip_prefix('/') {
         Some(rest) => root.join(rest),
         None => html_dir.join(s),
+    };
+    // Lexically resolve `..` so a page-relative `../src/x.js` matches the
+    // normalized facade id rolldown reports for the chunk (and its `<script>`
+    // tag gets rewritten).
+    let mut out = PathBuf::new();
+    for c in joined.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
     }
+    out
 }
 
 fn insert_before_head(html: &str, snippet: &str) -> String {
@@ -2847,9 +2891,12 @@ fn lib_format(fmt: &str) -> Option<(&'static str, bool)> {
     }
 }
 
+/// Vite's `base`: `""` and `"./"` mean a relative base (URLs are emitted relative
+/// to the page / stylesheet / chunk that references them, so the build can be
+/// served from any path or from `file://`); anything else is an absolute prefix.
 fn normalize_base(base: &str) -> String {
     if base.is_empty() || base == "./" {
-        return "/".to_string();
+        return "./".to_string();
     }
     let mut b = base.to_string();
     if !b.starts_with('/') {
@@ -2861,8 +2908,59 @@ fn normalize_base(base: &str) -> String {
     b
 }
 
+fn is_relative_base(base: &str) -> bool {
+    base == "./"
+}
+
+/// A public URL for an output file from a root-level page (or any consumer that
+/// sits at the outDir root).
 fn with_base(filename: &str, base: &str) -> String {
     format!("{base}{}", filename.trim_start_matches('/'))
+}
+
+/// The base to use from a page at `out_rel` (e.g. `nested/index.html`): with a
+/// relative base that is `../` per directory level, otherwise the absolute base.
+fn page_base(base: &str, out_rel: &str) -> String {
+    if !is_relative_base(base) {
+        return base.to_string();
+    }
+    let depth = out_rel.trim_start_matches('/').matches('/').count();
+    if depth == 0 {
+        "./".to_string()
+    } else {
+        "../".repeat(depth)
+    }
+}
+
+/// URL for an emitted `assets/…` file as referenced from a stylesheet that also
+/// lives in `assets/` (all of oj's emitted CSS does): relative bases become a
+/// sibling reference, absolute bases the public path.
+fn css_asset_url(name: &str, base: &str) -> String {
+    if is_relative_base(base) {
+        format!("./{}", name.strip_prefix("assets/").unwrap_or(name))
+    } else {
+        with_base(name, base)
+    }
+}
+
+/// `to` relative to the directory of `from` (both outDir-relative, `/`-separated).
+fn relative_chunk_path(from: &str, to: &str) -> String {
+    let from_dir: Vec<&str> = from.rsplit_once('/').map(|(d, _)| d.split('/').collect()).unwrap_or_default();
+    let to_parts: Vec<&str> = to.split('/').collect();
+    let common = from_dir
+        .iter()
+        .zip(to_parts.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut out = String::new();
+    for _ in common..from_dir.len() {
+        out.push_str("../");
+    }
+    if out.is_empty() {
+        out.push_str("./");
+    }
+    out.push_str(&to_parts[common..].join("/"));
+    out
 }
 
 /// All chunks reachable from `entry` via static imports (excludes `entry`).
@@ -2939,7 +3037,7 @@ fn emit_css_url(
     }
     std::fs::write(&dest, &data).ok()?;
     emitted.push((name.clone(), data.len()));
-    let url = with_base(&name, base);
+    let url = css_asset_url(&name, base);
     seen.insert(abs, url.clone());
     Some(format!("{url}{suffix}"))
 }
@@ -2988,42 +3086,29 @@ fn rebase_css_urls(
     out
 }
 
-/// `build.cssCodeSplit`: emit one stylesheet per chunk that imports CSS. The
-/// entry chunk and every chunk reachable from it via static imports get their
-/// CSS linked render-blocking in the HTML (no FOUC); async-only chunks carry a
-/// tiny injector that appends their stylesheet `<link>` when the chunk runs.
-#[allow(clippy::too_many_arguments)]
-fn emit_split_css(
+/// `build.cssCodeSplit`: emit one stylesheet per chunk that imports CSS and
+/// return `(chunk filename, css filename)` pairs. Which pages link which
+/// stylesheet render-blocking is decided per page by `split_css_links`; chunks
+/// only reached through dynamic imports get their CSS from `__vitePreload` (and
+/// a self-injecting fallback, see `apply_preload_helper`).
+fn emit_split_css_files(
     output: &rolldown::BundleOutput,
     collected_css: &Arc<Mutex<Vec<(String, String)>>>,
-    entry_files: &[String],
-    imports_map: &std::collections::HashMap<String, Vec<String>>,
     out_dir: &Path,
     root: &Path,
     base: &str,
     emitted: &mut Vec<(String, usize)>,
     manifest_entries: &mut [ManifestEntry],
-    rewritten_html: &mut String,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<(String, String)>> {
     let css_map: std::collections::HashMap<String, String> =
         collected_css.lock().unwrap().iter().cloned().collect();
+    let mut chunk_css: Vec<(String, String)> = Vec::new();
     if css_map.is_empty() {
-        return Ok(());
+        return Ok(chunk_css);
     }
     fs::create_dir_all(out_dir.join("assets"))?;
     let mut seen_assets: std::collections::HashMap<PathBuf, String> =
         std::collections::HashMap::new();
-
-    // Chunks reachable from an HTML entry through static imports only: their CSS
-    // is safe to link render-blocking. Anything else loads asynchronously.
-    let mut sync_chunks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for entry in entry_files {
-        sync_chunks.insert(entry.clone());
-        sync_chunks.extend(transitive_imports(entry, imports_map));
-    }
-
-    // chunk filename -> emitted css filename
-    let mut chunk_css: Vec<(String, String)> = Vec::new();
     for asset in &output.assets {
         let rolldown_common::Output::Chunk(chunk) = asset else {
             continue;
@@ -3067,45 +3152,180 @@ fn emit_split_css(
         }
         chunk_css.push((chunk.filename.to_string(), css_name));
     }
+    Ok(chunk_css)
+}
 
-    // Render-blocking links for entry + statically-imported chunk CSS.
+/// Render-blocking `<link rel=stylesheet>` tags for a page: the CSS of its entry
+/// chunks and of every chunk they reach through static imports (no FOUC).
+fn split_css_links(
+    chunk_css: &[(String, String)],
+    entry_files: &[String],
+    imports_map: &std::collections::HashMap<String, Vec<String>>,
+    page_base: &str,
+) -> String {
+    let mut sync_chunks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for entry in entry_files {
+        sync_chunks.insert(entry.clone());
+        sync_chunks.extend(transitive_imports(entry, imports_map));
+    }
     let mut linked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut links = String::new();
-    for (chunk_file, css_name) in &chunk_css {
+    for (chunk_file, css_name) in chunk_css {
         if sync_chunks.contains(chunk_file) && linked.insert(css_name.clone()) {
+            if !links.is_empty() {
+                links.push('\n');
+            }
             links.push_str(&format!(
-                "<link rel=\"stylesheet\" href=\"{}\" />\n",
-                with_base(css_name, base)
+                "<link rel=\"stylesheet\" href=\"{}\" />",
+                with_base(css_name, page_base)
             ));
         }
     }
-    if !links.is_empty() {
-        let links = links.trim_end();
-        *rewritten_html = match rewritten_html.find("</head>") {
-            Some(idx) => format!(
-                "{}{}\n{}",
-                &rewritten_html[..idx],
-                links,
-                &rewritten_html[idx..]
-            ),
-            None => format!("{links}\n{rewritten_html}"),
-        };
-    }
+    links
+}
 
-    // Async-only chunks self-inject their stylesheet when evaluated.
-    for (chunk_file, css_name) in &chunk_css {
-        if sync_chunks.contains(chunk_file) {
-            continue;
-        }
-        let path = out_dir.join(chunk_file);
-        let Ok(code) = fs::read_to_string(&path) else {
+/// Vite's `__vitePreload` helper (importAnalysisBuild.ts), ES2015 so it survives
+/// any `build.target`. `__vite__assetsURL` is generated per base: a relative base
+/// resolves deps against the importing chunk, an absolute base is prefixed.
+const PRELOAD_HELPER_JS: &str = r#"const __vite__scriptRel=(function(){var r=typeof document!=="undefined"&&document.createElement("link").relList;return r&&r.supports&&r.supports("modulepreload")?"modulepreload":"preload"})();const __vite__seen={};function __vitePreload(baseModule,deps,importerUrl){var promise=Promise.resolve();if(deps&&deps.length>0){var links=document.getElementsByTagName("link");var cspNonceMeta=document.querySelector("meta[property=csp-nonce]");var cspNonce=cspNonceMeta&&(cspNonceMeta.nonce||cspNonceMeta.getAttribute("nonce"));var allSettled=function(ps){return Promise.all(ps.map(function(p){return Promise.resolve(p).then(function(value){return{status:"fulfilled",value:value}},function(reason){return{status:"rejected",reason:reason}})}))};promise=allSettled(deps.map(function(dep){dep=new URL(__vite__assetsURL(dep,importerUrl),import.meta.url).href;if(dep in __vite__seen)return;__vite__seen[dep]=true;var isCss=dep.endsWith(".css");for(var i=links.length-1;i>=0;i--){var l=links[i];if(l.href===dep&&(!isCss||l.rel==="stylesheet"))return}var link=document.createElement("link");link.rel=isCss?"stylesheet":__vite__scriptRel;if(!isCss){link.as="script"}link.crossOrigin="";link.href=dep;if(cspNonce)link.setAttribute("nonce",cspNonce);document.head.appendChild(link);if(isCss){return new Promise(function(res,rej){link.addEventListener("load",res);link.addEventListener("error",function(){rej(new Error("Unable to preload CSS for "+dep))})})}}))}function handlePreloadError(err){var e=new Event("vite:preloadError",{cancelable:true});e.payload=err;window.dispatchEvent(e);if(!e.defaultPrevented)throw err}return promise.then(function(res){for(var i=0;i<(res||[]).length;i++){var item=res[i];if(item.status!=="rejected")continue;handlePreloadError(item.reason)}return baseModule().catch(handlePreloadError)})}"#;
+
+/// Vite's `vite/modulepreload-polyfill` (fetches `<link rel=modulepreload>` on
+/// browsers without native support), injected into page entry chunks.
+const MODULEPRELOAD_POLYFILL_JS: &str = r#"(function(){var relList=document.createElement("link").relList;if(relList&&relList.supports&&relList.supports("modulepreload"))return;for(var i=0,ls=document.querySelectorAll('link[rel="modulepreload"]');i<ls.length;i++)processPreload(ls[i]);new MutationObserver(function(mutations){for(var m=0;m<mutations.length;m++){var mutation=mutations[m];if(mutation.type!=="childList")continue;for(var n=0;n<mutation.addedNodes.length;n++){var node=mutation.addedNodes[n];if(node.tagName==="LINK"&&node.rel==="modulepreload")processPreload(node)}}}).observe(document,{childList:true,subtree:true});function getFetchOpts(link){var fetchOpts={};if(link.integrity)fetchOpts.integrity=link.integrity;if(link.referrerPolicy)fetchOpts.referrerPolicy=link.referrerPolicy;if(link.crossOrigin==="use-credentials")fetchOpts.credentials="include";else if(link.crossOrigin==="anonymous")fetchOpts.credentials="omit";else fetchOpts.credentials="same-origin";return fetchOpts}function processPreload(link){if(link.ep)return;link.ep=true;var fetchOpts=getFetchOpts(link);fetch(link.href,fetchOpts)}})();"#;
+
+/// Wrap each `import("./chunk.js")` in a chunk with `__vitePreload`, passing the
+/// dependency list Vite would (the lazy chunk, its statically imported chunks
+/// and their stylesheets, minus what the importer already has), prepend the
+/// modulepreload polyfill to page entries, and give async-only chunks that own
+/// CSS a self-injecting fallback link. Everything is prepended on the chunk's
+/// first line so existing sourcemap line numbers stay valid.
+#[allow(clippy::too_many_arguments)]
+fn apply_preload_helper(
+    output: &rolldown::BundleOutput,
+    out_dir: &Path,
+    base: &str,
+    imports_map: &std::collections::HashMap<String, Vec<String>>,
+    chunk_css: &[(String, String)],
+    sync_chunks: &std::collections::BTreeSet<String>,
+    page_entries: &[String],
+    polyfill: bool,
+) -> anyhow::Result<()> {
+    let css_of: std::collections::HashMap<&str, &str> = chunk_css
+        .iter()
+        .map(|(c, css)| (c.as_str(), css.as_str()))
+        .collect();
+    let relative = is_relative_base(base);
+    for asset in &output.assets {
+        let rolldown_common::Output::Chunk(chunk) = asset else {
             continue;
         };
-        let href = serde_json::Value::String(with_base(css_name, base));
-        let inject = format!(
-            "(function(){{var u={href};if(!document.querySelector('link[rel=\"stylesheet\"][href=\"'+u+'\"]')){{var l=document.createElement('link');l.rel='stylesheet';l.href=u;document.head.appendChild(l);}}}})();\n"
-        );
-        fs::write(&path, format!("{inject}{code}"))?;
+        let file = chunk.filename.to_string();
+        let path = out_dir.join(&file);
+        let Ok(mut code) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut prefix = String::new();
+
+        if polyfill && page_entries.iter().any(|e| e == &file) {
+            prefix.push_str(MODULEPRELOAD_POLYFILL_JS);
+        }
+
+        let mut dep_list: Vec<String> = Vec::new();
+        let mut wrapped = false;
+        if !chunk.dynamic_imports.is_empty() {
+            let own: std::collections::BTreeSet<String> = std::iter::once(file.clone())
+                .chain(transitive_imports(&file, imports_map))
+                .collect();
+            for target in &chunk.dynamic_imports {
+                let target = target.to_string();
+                let rel = relative_chunk_path(&file, &target);
+                let mut deps: Vec<String> = Vec::new();
+                let closure: Vec<String> = std::iter::once(target.clone())
+                    .chain(transitive_imports(&target, imports_map))
+                    .collect();
+                for c in &closure {
+                    if own.contains(c) {
+                        continue;
+                    }
+                    deps.push(c.clone());
+                    if let Some(css) = css_of.get(c.as_str()) {
+                        deps.push(css.to_string());
+                    }
+                }
+                // Only the chunk itself: `import()` fetches it anyway.
+                if deps.len() <= 1 {
+                    deps.clear();
+                }
+                let mut idx: Vec<String> = Vec::new();
+                for d in deps {
+                    let d = if relative {
+                        relative_chunk_path(&file, &d)
+                    } else {
+                        d
+                    };
+                    let i = match dep_list.iter().position(|x| x == &d) {
+                        Some(i) => i,
+                        None => {
+                            dep_list.push(d);
+                            dep_list.len() - 1
+                        }
+                    };
+                    idx.push(i.to_string());
+                }
+                // rolldown's minifier may emit the specifier in any quote style.
+                for quote in ['"', '\'', '`'] {
+                    let needle = format!("import({quote}{rel}{quote})");
+                    if code.contains(&needle) {
+                        let replacement = format!(
+                            "__vitePreload(function(){{return import({quote}{rel}{quote})}},__vite__mapDeps([{}]),import.meta.url)",
+                            idx.join(",")
+                        );
+                        code = code.replace(&needle, &replacement);
+                        wrapped = true;
+                    }
+                }
+            }
+        }
+        if wrapped {
+            let assets_url = if relative {
+                "function(dep,importerUrl){return new URL(dep,importerUrl).href}".to_string()
+            } else {
+                format!(
+                    "function(dep){{return {}+dep}}",
+                    serde_json::Value::String(base.to_string())
+                )
+            };
+            prefix.push_str(&format!(
+                "const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f={})))=>i.map(i=>d[i]);const __vite__assetsURL={assets_url};{PRELOAD_HELPER_JS}",
+                serde_json::Value::Array(
+                    dep_list
+                        .iter()
+                        .map(|d| serde_json::Value::String(d.clone()))
+                        .collect()
+                )
+            ));
+        }
+
+        // Async-only chunks with CSS: a fallback for dynamic imports the rewrite
+        // above could not see (variable specifiers), idempotent against preload.
+        if !sync_chunks.contains(&file) {
+            if let Some(css_name) = css_of.get(file.as_str()) {
+                let href = serde_json::Value::String(if relative {
+                    relative_chunk_path(&file, css_name)
+                } else {
+                    with_base(css_name, base)
+                });
+                // Compare resolved URLs (`link.href` is absolute), so a link the
+                // preload helper or the page already added is recognized.
+                prefix.push_str(&format!(
+                    "(function(){{var u=new URL({href},import.meta.url).href;var ls=document.getElementsByTagName('link');for(var i=0;i<ls.length;i++){{if(ls[i].rel==='stylesheet'&&ls[i].href===u)return}}var l=document.createElement('link');l.rel='stylesheet';l.href=u;document.head.appendChild(l)}})();"
+                ));
+            }
+        }
+
+        if !prefix.is_empty() {
+            fs::write(&path, format!("{prefix}{code}"))?;
+        }
     }
     Ok(())
 }
@@ -3304,6 +3524,11 @@ mod tests {
             resolve_html_ref("./index.tsx", page_dir, root),
             PathBuf::from("/proj/src/pages/options/index.tsx")
         );
+        // `..` is resolved lexically so the path matches rolldown's facade id.
+        assert_eq!(
+            resolve_html_ref("../../main.tsx", page_dir, root),
+            PathBuf::from("/proj/src/main.tsx")
+        );
         assert_eq!(
             resolve_html_ref("main.tsx", page_dir, root),
             PathBuf::from("/proj/src/pages/options/main.tsx")
@@ -3426,13 +3651,27 @@ mod tests {
     #[test]
     fn base_normalization_and_application() {
         assert_eq!(normalize_base("/"), "/");
-        assert_eq!(normalize_base(""), "/");
-        assert_eq!(normalize_base("./"), "/");
+        assert_eq!(normalize_base(""), "./");
+        assert_eq!(normalize_base("./"), "./");
         assert_eq!(normalize_base("app"), "/app/");
         assert_eq!(normalize_base("/app"), "/app/");
         assert_eq!(normalize_base("/app/"), "/app/");
         assert_eq!(with_base("assets/x-h.js", "/"), "/assets/x-h.js");
         assert_eq!(with_base("assets/x-h.js", "/app/"), "/app/assets/x-h.js");
+        assert_eq!(with_base("assets/x-h.js", "./"), "./assets/x-h.js");
+    }
+
+    #[test]
+    fn relative_base_is_computed_per_page_stylesheet_and_chunk() {
+        assert_eq!(page_base("/app/", "nested/index.html"), "/app/");
+        assert_eq!(page_base("./", "index.html"), "./");
+        assert_eq!(page_base("./", "nested/index.html"), "../");
+        assert_eq!(page_base("./", "a/b/index.html"), "../../");
+        assert_eq!(css_asset_url("assets/img-h.png", "./"), "./img-h.png");
+        assert_eq!(css_asset_url("assets/img-h.png", "/app/"), "/app/assets/img-h.png");
+        assert_eq!(relative_chunk_path("assets/main-h.js", "assets/lazy-h.js"), "./lazy-h.js");
+        assert_eq!(relative_chunk_path("main-h.js", "assets/lazy-h.js"), "./assets/lazy-h.js");
+        assert_eq!(relative_chunk_path("assets/a/main-h.js", "assets/lazy-h.js"), "../lazy-h.js");
     }
 
     #[test]

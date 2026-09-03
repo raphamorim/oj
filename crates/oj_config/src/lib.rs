@@ -93,6 +93,18 @@ pub fn build_targets(config: &OjConfig) -> Vec<String> {
     out
 }
 
+/// Whether page entries get Vite's modulepreload polyfill: on unless
+/// `build.modulePreload` is `false` or `{ polyfill: false }`.
+pub fn module_preload_polyfill(config: &OjConfig) -> bool {
+    match config.build.as_ref().and_then(|b| b.module_preload.as_ref()) {
+        Some(serde_json::Value::Bool(false)) => false,
+        Some(serde_json::Value::Object(o)) => {
+            o.get("polyfill").and_then(|v| v.as_bool()) != Some(false)
+        }
+        _ => true,
+    }
+}
+
 pub fn rolldown_options(config: &OjConfig) -> Option<&serde_json::Value> {
     let build = config.build.as_ref()?;
     build
@@ -970,6 +982,14 @@ mod build_option_tests {
             build_targets(&cfg(r#"{"build":{"target":["es2020","safari14"]}}"#)),
             vec!["es2020", "safari14"]
         );
+    }
+
+    #[test]
+    fn module_preload_polyfill_defaults_on() {
+        assert!(module_preload_polyfill(&cfg("{}")));
+        assert!(!module_preload_polyfill(&cfg(r#"{"build":{"modulePreload":false}}"#)));
+        assert!(!module_preload_polyfill(&cfg(r#"{"build":{"modulePreload":{"polyfill":false}}}"#)));
+        assert!(module_preload_polyfill(&cfg(r#"{"build":{"modulePreload":{"polyfill":true}}}"#)));
     }
 
     #[test]

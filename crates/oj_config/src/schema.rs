@@ -215,6 +215,9 @@ pub struct BuildConfig {
     pub empty_out_dir: Option<bool>,
     /// Accepted for compatibility; oj minifies with oxc, so this is ignored.
     pub terser_options: Option<serde_json::Value>,
+    /// Vite's `build.modulePreload`: `false`, or `{ polyfill: bool }` (the
+    /// `resolveDependencies` function cannot be carried; it is ignored).
+    pub module_preload: Option<serde_json::Value>,
     pub lib: Option<LibConfig>,
     pub ssr: Option<String>,
     pub prerender: Option<Vec<String>>,

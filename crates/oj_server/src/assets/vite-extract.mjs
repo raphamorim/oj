@@ -200,6 +200,13 @@ function extractBuild(b) {
   else if (Array.isArray(b.target)) out.target = b.target.filter((t) => typeof t === "string");
   else if (b.target === false) warn("build.target false is not supported; the default baseline is used");
   if (typeof b.emptyOutDir === "boolean") out.emptyOutDir = b.emptyOutDir;
+  if (b.modulePreload === false) out.modulePreload = false;
+  else if (b.modulePreload && typeof b.modulePreload === "object") {
+    if (typeof b.modulePreload.resolveDependencies === "function") {
+      warn("build.modulePreload.resolveDependencies is a function and cannot be applied");
+    }
+    if (typeof b.modulePreload.polyfill === "boolean") out.modulePreload = { polyfill: b.modulePreload.polyfill };
+  }
   if (typeof b.ssr === "string") out.ssr = b.ssr;
   return Object.keys(out).length ? out : null;
 }
