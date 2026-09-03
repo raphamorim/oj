@@ -51,6 +51,8 @@ impl StringOrList {
 #[serde(default, rename_all = "camelCase")]
 pub struct CssConfig {
     pub preprocessor_options: Option<BTreeMap<String, PreprocessorEntry>>,
+    /// Vite's `css.devSourcemap`: inline source maps on dev-served CSS.
+    pub dev_sourcemap: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]

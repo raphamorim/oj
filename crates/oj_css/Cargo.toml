@@ -9,6 +9,7 @@ description = "CSS pipeline: Lightning CSS transforms, CSS Modules scoping"
 lightningcss = "1.0.0-alpha.72"
 grass = "0.13.4"
 serde_json.workspace = true
+parcel_sourcemap = "2.1.1"
 
 [dev-dependencies]
 proptest.workspace = true

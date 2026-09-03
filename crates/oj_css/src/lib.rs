@@ -302,11 +302,19 @@ fn default_targets() -> Targets {
 }
 
 pub fn compile_css(url: &str, source: &str, minify: bool) -> Result<CssOutput, String> {
-    compile_css_impl(url, source, minify, false)
+    compile_css_impl(url, source, minify, false, false)
 }
 
 pub fn compile_css_rebased(url: &str, source: &str, minify: bool) -> Result<CssOutput, String> {
-    compile_css_impl(url, source, minify, true)
+    compile_css_impl(url, source, minify, true, false)
+}
+
+/// `compile_css_rebased` plus an inline source map (`css.devSourcemap`): the
+/// served CSS ends with a `sourceMappingURL` data URL mapping back to `url`,
+/// with the (preprocessed) source embedded, so devtools show the stylesheet's
+/// rules at their source lines.
+pub fn compile_css_rebased_with_map(url: &str, source: &str, minify: bool) -> Result<CssOutput, String> {
+    compile_css_impl(url, source, minify, true, true)
 }
 
 fn compile_css_impl(
@@ -314,6 +322,7 @@ fn compile_css_impl(
     source: &str,
     minify: bool,
     rebase: bool,
+    source_map: bool,
 ) -> Result<CssOutput, String> {
     let is_module = is_css_module(url);
     let options = ParserOptions {
@@ -337,16 +346,32 @@ fn compile_css_impl(
         .map_err(|err| format!("css transform error in {url}: {err}"))?;
 
     let base = if rebase { css_base_dir(url) } else { None };
+    let mut sm = parcel_sourcemap::SourceMap::new("");
+    if source_map {
+        let idx = sm.add_source(url);
+        let _ = sm.set_source_content(idx as usize, source);
+    }
     let result = stylesheet
         .to_css(PrinterOptions {
             minify,
             targets,
             analyze_dependencies: base.as_ref().map(|_| DependencyOptions::default()),
+            source_map: source_map.then_some(&mut sm),
             ..PrinterOptions::default()
         })
         .map_err(|err| format!("css print error in {url}: {err}"))?;
 
     let mut css = result.code;
+    if source_map {
+        // Sources are stored root-relative (`src/app.css`); `sourceRoot: "/"`
+        // makes devtools resolve them to the served url (`/src/app.css`).
+        let json = sm
+            .to_json(Some("/"))
+            .map_err(|err| format!("css sourcemap error in {url}: {err}"))?;
+        css.push_str("\n/*# sourceMappingURL=data:application/json;base64,");
+        css.push_str(&base64(json.as_bytes()));
+        css.push_str(" */\n");
+    }
     if let (Some(base), Some(deps)) = (base, result.dependencies) {
         for dep in deps {
             let (placeholder, orig) = match dep {
@@ -672,6 +697,20 @@ fn relative_path(from_dir: &Path, target: &Path) -> String {
     } else {
         format!("./{joined}")
     }
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
 }
 
 fn css_base_dir(url: &str) -> Option<String> {
@@ -1006,6 +1045,30 @@ mod tests {
         assert_eq!(split_package_specifier("@acme/tokens/src/x.css"), Some(("@acme/tokens", "src/x.css")));
         assert_eq!(split_package_specifier("normalize.css"), Some(("normalize.css", "")));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn dev_sourcemap_is_appended_inline_and_names_the_source() {
+        let out = compile_css_rebased_with_map("/src/app.css", ".a {\n  color: red;\n}\n.b { color: blue; }\n", false).unwrap();
+        let marker = "/*# sourceMappingURL=data:application/json;base64,";
+        let at = out.css.find(marker).expect("sourceMappingURL comment");
+        let b64_json = out.css[at + marker.len()..].trim_end().trim_end_matches("*/").trim();
+        // Decode the base64 back and check the map shape.
+        let decoded = {
+            let t = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut bits = 0u32; let mut n = 0; let mut bytes = Vec::new();
+            for c in b64_json.bytes().filter(|c| *c != b'=') {
+                let v = t.iter().position(|x| *x == c).unwrap() as u32;
+                bits = bits << 6 | v; n += 6;
+                if n >= 8 { n -= 8; bytes.push((bits >> n) as u8); bits &= (1 << n) - 1; }
+            }
+            String::from_utf8(bytes).unwrap()
+        };
+        assert!(decoded.contains("\"sources\":[\"src/app.css\"]") && decoded.contains("\"sourceRoot\":\"/\""), "{decoded}");
+        assert!(decoded.contains("sourcesContent"), "source embedded: {decoded}");
+        assert!(decoded.contains("\"mappings\":\"") && !decoded.contains("\"mappings\":\"\""), "non-empty mappings: {decoded}");
+        // Without the flag nothing is appended.
+        assert!(!compile_css_rebased("/src/app.css", ".a { color: red; }", false).unwrap().css.contains("sourceMappingURL"));
     }
 
     #[test]

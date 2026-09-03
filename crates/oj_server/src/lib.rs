@@ -2403,6 +2403,11 @@ async fn ensure_module(
     let url_owned = url.to_string();
     let sass_data = sass_additional_data_for(state, &url_owned);
     let sass_load_paths = sass_load_paths_for(state, &url_owned);
+    let css_dev_sourcemap = state
+        .css_config
+        .as_ref()
+        .and_then(|c| c.dev_sourcemap)
+        .unwrap_or(false);
     let bundle = state.bundle;
     let hmr_state = Arc::clone(state);
     let plugin_fallback = state.plugins.is_some() && !bundle;
@@ -2452,7 +2457,11 @@ async fn ensure_module(
             // Plain `@import`s are inlined (postcss-import parity) so the injected
             // stylesheet does not @import a bare specifier or a wrong-relative url.
             let css_src = oj_css::inline_imports(&css_src, &file_owned)?;
-            let output = oj_css::compile_css_rebased(&url_owned, &css_src, false)?;
+            let output = if css_dev_sourcemap {
+                oj_css::compile_css_rebased_with_map(&url_owned, &css_src, false)?
+            } else {
+                oj_css::compile_css_rebased(&url_owned, &css_src, false)?
+            };
             return Ok(CachedModule {
                 is_boundary: true,
                 kind: "css".into(),
