@@ -121,6 +121,21 @@ pub fn rewrite_cjs_interop(
         }
     }
 
+    // `import("cjs-dep")`: Vite wraps the promise so the awaited namespace reads
+    // like the static-import interop above (module.exports on `default`, its
+    // properties as named members). Without it `(await import("dep")).foo` reads
+    // off the raw ESM wrapper namespace and is undefined.
+    let mut dyn_edits = DynamicImportInterop {
+        interop,
+        edits: Vec::new(),
+    };
+    {
+        use oxc_ast_visit::Visit;
+        dyn_edits.visit_program(&parsed.program);
+    }
+    let has_dynamic = !dyn_edits.edits.is_empty();
+    edits.extend(dyn_edits.edits);
+
     if edits.is_empty() {
         return None;
     }
@@ -129,7 +144,36 @@ pub fn rewrite_cjs_interop(
     for (start, end, text) in edits {
         result.replace_range(start..end, &text);
     }
+    if has_dynamic {
+        result.insert_str(0, DYN_INTEROP_HELPER);
+    }
     Some(result)
+}
+
+/// Vite's `interopNamespace` for a dynamically imported CommonJS dependency: the
+/// CJS value becomes `default`, and its own properties the named exports, unless
+/// it already is an ES module namespace.
+const DYN_INTEROP_HELPER: &str = "const __oj_dyn_interop = (m) => { const v = m && m.__cjs_exports !== undefined ? m.__cjs_exports : (m && m.default !== undefined ? m.default : m); if (v && v.__esModule) return v; return (v && typeof v === \"object\") || typeof v === \"function\" ? Object.assign(Object.create(null), v, { default: v }) : { default: v }; };\n";
+
+struct DynamicImportInterop<'i> {
+    interop: &'i dyn Fn(&str) -> Option<String>,
+    edits: Vec<(usize, usize, String)>,
+}
+
+impl<'a> oxc_ast_visit::Visit<'a> for DynamicImportInterop<'_> {
+    fn visit_import_expression(&mut self, it: &oxc_ast::ast::ImportExpression<'a>) {
+        if let oxc_ast::ast::Expression::StringLiteral(lit) = &it.source {
+            if let Some(url) = (self.interop)(lit.value.as_str()) {
+                self.edits.push((
+                    it.span.start as usize,
+                    it.span.end as usize,
+                    format!("import({}).then(__oj_dyn_interop)", json_str(&url)),
+                ));
+                return;
+            }
+        }
+        oxc_ast_visit::walk::walk_import_expression(self, it);
+    }
 }
 
 fn export_name(n: &ModuleExportName) -> String {
@@ -172,6 +216,21 @@ fn json_key(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dynamic_import_of_a_cjs_dep_is_wrapped_with_the_namespace_interop() {
+        let src = "const m = await import(\"cjs-dep\");\nconst n = import(\"esm-dep\");\nimport(`tpl`);\n";
+        let out = rewrite_cjs_interop(src, Path::new("a.ts"), &|spec| {
+            (spec == "cjs-dep").then(|| "/@oj-deps/cjs-dep.js".to_string())
+        })
+        .expect("rewritten");
+        assert!(out.starts_with("const __oj_dyn_interop = "), "{out}");
+        assert!(out.contains("import(\"/@oj-deps/cjs-dep.js\").then(__oj_dyn_interop)"), "{out}");
+        assert!(out.contains("import(\"esm-dep\")"), "untouched non-interop import: {out}");
+        assert!(out.contains("import(`tpl`)"), "template specifiers are left alone: {out}");
+        // Nothing to interop: no rewrite, no helper.
+        assert!(rewrite_cjs_interop(src, Path::new("a.ts"), &|_| None).is_none());
+    }
 
     fn interop_all(url: &str) -> impl Fn(&str) -> Option<String> + '_ {
         move |spec: &str| (spec == "cjs-dep").then(|| url.to_string())

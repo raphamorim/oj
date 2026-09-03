@@ -84,6 +84,12 @@ pub struct OptimizeInput {
     pub force: bool,
     /// `optimizeDeps.esbuildOptions`/`rolldownOptions`: forwarded to the sidecar.
     pub bundler_options: Option<serde_json::Value>,
+    /// The Rust resolver's settings, so the pre-bundle resolves every dep to the
+    /// same file the dev server serves (Vite uses one resolver for both).
+    pub conditions: Vec<String>,
+    pub main_fields: Vec<String>,
+    pub extensions: Vec<String>,
+    pub preserve_symlinks: bool,
 }
 
 fn lockfile_hash(root: &Path, version: &str, input: &OptimizeInput) -> String {
@@ -124,6 +130,17 @@ fn lockfile_hash(root: &Path, version: &str, input: &OptimizeInput) -> String {
         hasher.update(b"\0o");
         hasher.update(opts.to_string().as_bytes());
     }
+    for (tag, list) in [
+        (b"\0c".as_slice(), &input.conditions),
+        (b"\0m".as_slice(), &input.main_fields),
+        (b"\0t".as_slice(), &input.extensions),
+    ] {
+        for entry in list {
+            hasher.update(tag);
+            hasher.update(entry.as_bytes());
+        }
+    }
+    hasher.update(&[b'\0', b's', input.preserve_symlinks as u8]);
     hasher.finalize().to_hex().to_string()
 }
 
@@ -201,6 +218,12 @@ async fn run_optimizer(
         "alias": alias,
         "autoDiscover": auto_discover,
         "esbuildOptions": input.bundler_options,
+        "resolve": {
+            "conditions": input.conditions,
+            "mainFields": input.main_fields,
+            "extensions": input.extensions,
+            "preserveSymlinks": input.preserve_symlinks,
+        },
     })
     .to_string();
     let out = tokio::process::Command::new("node")
@@ -387,5 +410,28 @@ mod tests {
         let deps = OptimizedDeps::disabled();
         assert!(deps.ready().await.is_empty());
         assert_eq!(deps.dir(), Path::new(""));
+    }
+
+    #[test]
+    fn resolve_settings_change_the_prebundle_hash() {
+        let dir = std::env::temp_dir().join(format!("oj-opt-hash-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = OptimizeInput {
+            include: vec!["dep".into()],
+            conditions: vec!["browser".into(), "import".into()],
+            ..Default::default()
+        };
+        let mut with_dev = base.clone();
+        with_dev.conditions.push("development".into());
+        let mut fields = base.clone();
+        fields.main_fields = vec!["main".into()];
+        let mut links = base.clone();
+        links.preserve_symlinks = true;
+        let h = |i: &OptimizeInput| lockfile_hash(&dir, "v", i);
+        assert_ne!(h(&base), h(&with_dev));
+        assert_ne!(h(&base), h(&fields));
+        assert_ne!(h(&base), h(&links));
+        assert_eq!(h(&base), h(&base.clone()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

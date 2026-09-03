@@ -1185,6 +1185,24 @@ async function run(hook, args) {
     });
     return String(has);
   }
+  if (hook === "getDepLoadFilters") {
+    // Object-form `load` hooks' `filter.id` include patterns: a node_modules
+    // module is offered to plugin load only when one matches its path.
+    const pats = [];
+    for (const p of plugins) {
+      const l = p && p.load;
+      const f = l && typeof l === "object" ? l.filter : null;
+      let inc = f && f.id;
+      if (inc && typeof inc === "object" && !(inc instanceof RegExp) && !Array.isArray(inc)) {
+        inc = inc.include;
+      }
+      for (const r of Array.isArray(inc) ? inc : inc != null ? [inc] : []) {
+        if (r instanceof RegExp) pats.push(r.source);
+        else if (typeof r === "string") pats.push(r.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+      }
+    }
+    return JSON.stringify(pats);
+  }
   if (hook === "getHasLoad") {
     const has = plugins.some((p) => typeof hookHandler(p.load) === "function");
     return String(has);

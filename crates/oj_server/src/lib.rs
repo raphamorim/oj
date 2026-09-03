@@ -274,6 +274,9 @@ struct ServerState {
     // A dep is transformed only when its source matches one of these (the plugins'
     // own transform `filter.code` patterns); app source always goes through.
     dep_transform_res: Vec<regex::Regex>,
+    // A dep goes through plugin `load` only when its path matches one of these
+    // (the plugins' own object-form load `filter.id` patterns).
+    dep_load_res: Vec<regex::Regex>,
     plugins_watch_change: bool,
     plugins_hot_update: bool,
     html_env: std::collections::BTreeMap<String, String>,
@@ -579,6 +582,15 @@ impl DevServer {
                 .collect(),
             None => Vec::new(),
         };
+        let dep_load_res: Vec<regex::Regex> = match &plugin_host {
+            Some(host) => host
+                .dep_load_filters()
+                .await
+                .iter()
+                .filter_map(|s| regex::Regex::new(s).ok())
+                .collect(),
+            None => Vec::new(),
+        };
         // Same idea for HMR: a host without watchChange/handleHotUpdate hooks (the
         // tagger case) doesn't need those per-save stdio round-trips.
         let (plugins_watch_change, plugins_hot_update) = match &plugin_host {
@@ -730,6 +742,7 @@ impl DevServer {
             plugins_have_transform,
             plugins_have_load,
             dep_transform_res,
+            dep_load_res,
             plugins_watch_change,
             plugins_hot_update,
             html_env,
@@ -751,6 +764,12 @@ impl DevServer {
                         alias: oj_config::resolve_alias(&config, "client"),
                         force: oj_config::optimize_deps_force(&config),
                         bundler_options: oj_config::optimize_deps_bundler_options(&config),
+                        conditions: oj_config::resolve_conditions(&config, "client"),
+                        main_fields: oj_config::resolve_main_fields(&config)
+                            .unwrap_or_else(oj_resolver::default_main_fields),
+                        extensions: oj_config::resolve_extensions(&config)
+                            .unwrap_or_else(oj_resolver::default_extensions),
+                        preserve_symlinks: oj_config::resolve_preserve_symlinks(&config),
                     },
                 )
             }),
@@ -2075,7 +2094,11 @@ async fn ensure_module(
     // gated to app source (deps in node_modules never need it) and reached only on a
     // cold module (the mtime cache above short-circuits warm ones), so it adds no
     // per-request RPC on the warm path, and nothing at all when no plugin has `load`.
-    let plugin_loaded = if state.plugins_have_load && !is_dep_early {
+    let dep_wants_load = is_dep_early && {
+        let path = file.to_string_lossy();
+        state.dep_load_res.iter().any(|re| re.is_match(&path))
+    };
+    let plugin_loaded = if state.plugins_have_load && (!is_dep_early || dep_wants_load) {
         match &state.plugins {
             Some(host) => {
                 let load_id = match url.split_once('?') {
@@ -2829,12 +2852,19 @@ fn is_preprocessor(url: &str) -> bool {
 // the dep/CJS-interop path) rather than app/workspace source. A TS/JSX-extension
 // file is always source and must be transpiled, even outside the root: monorepo
 // packages reached through a resolve.alias are served via /@fs/ but are source.
+/// A dependency module: JS under a `node_modules` directory (by url, or by the
+/// real path an `/@fs/` url names). A linked workspace package realpaths outside
+/// node_modules and is source, as in Vite's optimizer, so plugins and the
+/// source compile path apply to it.
 fn is_dep_module(url: &str, file: &Path) -> bool {
     let src_ext = matches!(
         file.extension().and_then(|e| e.to_str()),
         Some("ts" | "tsx" | "jsx" | "mts" | "cts")
     );
-    !src_ext && (url.contains("/node_modules/") || url.starts_with("/@fs/"))
+    !src_ext
+        && (url.contains("/node_modules/")
+            || (url.starts_with("/@fs/")
+                && file.components().any(|c| c.as_os_str() == "node_modules")))
 }
 
 fn is_style_ext(ext: &str) -> bool {
@@ -3332,8 +3362,16 @@ fn rewrite_specifier(
             None => (spec, None),
         };
         let p = Path::new(base);
-        if p.starts_with(root) && is_file_cached(dir_cache, p) {
-            let url = url_of(root, p);
+        if is_file_cached(dir_cache, p) {
+            let url = if p.starts_with(root) {
+                url_of(root, p)
+            } else {
+                // An absolute path OUTSIDE root (a plugin pointing into a sibling
+                // monorepo package): serve it through /@fs like Vite's FS_PREFIX
+                // and allow its package so the fs guard lets it through.
+                fs_allow.lock().unwrap().insert(package_root(p));
+                dep_serve_url(p, root)
+            };
             return Some(match query {
                 Some(q) => format!("{url}?{q}"),
                 None => url,
@@ -5643,8 +5681,13 @@ mod tests {
         // TS/JSX source) stays on the dep path.
         let dep = Path::new("/app/node_modules/react/index.js");
         assert!(is_dep_module("/node_modules/react/index.js", dep));
+        // A linked workspace package (realpath outside node_modules) is source,
+        // not a dep: plugins and the source compile path apply (Vite treats
+        // linked packages the same way).
         let fs_js = Path::new("/repo/packages/ui/dist/index.mjs");
-        assert!(is_dep_module("/@fs/repo/packages/ui/dist/index.mjs", fs_js));
+        assert!(!is_dep_module("/@fs/repo/packages/ui/dist/index.mjs", fs_js));
+        let fs_dep = Path::new("/repo/node_modules/.pnpm/x@1/node_modules/x/index.js");
+        assert!(is_dep_module("/@fs/repo/node_modules/.pnpm/x@1/node_modules/x/index.js", fs_dep));
         // App-local source (not node_modules, not /@fs/) is never a dep.
         let local = Path::new("/app/src/App.tsx");
         assert!(!is_dep_module("/src/App.tsx", local));

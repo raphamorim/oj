@@ -7,7 +7,11 @@ import { mkdirSync, rmSync, readFileSync, writeFileSync, renameSync, existsSync,
 import path from "node:path";
 import builtinModules from "node:module";
 
-const { root, outDir, entries, include = [], exclude = [], dedupe = [], alias = [], autoDiscover = false, esbuildOptions: rawEsbuildOptions = {} } = JSON.parse(process.argv[2]);
+const { root, outDir, entries, include = [], exclude = [], dedupe = [], alias = [], autoDiscover = false, esbuildOptions: rawEsbuildOptions = {}, resolve: resolveSettings = {} } = JSON.parse(process.argv[2]);
+// esbuild activates import/require/default itself and rejects them in `conditions`.
+const ESBUILD_IMPLICIT_CONDITIONS = new Set(["import", "require", "default"]);
+const resolveConditions = (resolveSettings.conditions ?? ["browser", "module", "import", "development"])
+  .filter((c) => !ESBUILD_IMPLICIT_CONDITIONS.has(c));
 
 const ESBUILD_OPTION_KEYS = new Set([
   "define", "target", "supported", "loader", "jsx", "jsxDev", "jsxSideEffects",
@@ -114,27 +118,58 @@ function stripJsonc(s) {
   return out;
 }
 
+// Read a tsconfig with its `extends` chain (relative, or a package such as
+// `@tsconfig/node20/tsconfig.json`) merged the way tsc does: `paths` and
+// `baseUrl` from the nearest file win, `baseUrl` resolves relative to the file
+// that declares it. This mirrors the Rust resolver's oxc tsconfig handling
+// closely enough that the pre-bundle sees the same aliases as the dev server.
+function readTsconfigChain(file, seen = new Set()) {
+  if (seen.has(file) || !existsSync(file)) return null;
+  seen.add(file);
+  let json;
+  try {
+    json = JSON.parse(stripJsonc(readFileSync(file, "utf8")));
+  } catch {
+    return null;
+  }
+  const own = json.compilerOptions || {};
+  let merged = { paths: undefined, pathsBase: undefined };
+  const parents = Array.isArray(json.extends) ? json.extends : json.extends ? [json.extends] : [];
+  for (const ext of parents) {
+    let parentFile = null;
+    if (ext.startsWith(".") || path.isAbsolute(ext)) {
+      parentFile = path.resolve(path.dirname(file), ext);
+      if (!existsSync(parentFile) && existsSync(parentFile + ".json")) parentFile += ".json";
+    } else {
+      try { parentFile = req.resolve(ext.endsWith(".json") ? ext : ext + "/tsconfig.json", { paths: [path.dirname(file)] }); } catch {}
+    }
+    const parent = parentFile ? readTsconfigChain(parentFile, seen) : null;
+    if (parent && parent.paths) merged = parent;
+  }
+  if (own.paths) {
+    merged = { paths: own.paths, pathsBase: path.resolve(path.dirname(file), own.baseUrl || ".") };
+  } else if (own.baseUrl && merged.paths) {
+    merged = { paths: merged.paths, pathsBase: path.resolve(path.dirname(file), own.baseUrl) };
+  }
+  return merged;
+}
+
 function loadTsconfigAliases(dir) {
   for (const name of ["tsconfig.json", "tsconfig.app.json"]) {
-    const p = path.join(dir, name);
-    if (!existsSync(p)) continue;
-    let json;
-    try {
-      json = JSON.parse(stripJsonc(readFileSync(p, "utf8")));
-    } catch {
-      continue;
-    }
-    const co = json.compilerOptions || {};
-    if (!co.paths) continue;
-    const base = path.resolve(dir, co.baseUrl || ".");
+    const chain = readTsconfigChain(path.join(dir, name));
+    if (!chain || !chain.paths) continue;
+    const base = chain.pathsBase;
     const out = [];
-    for (const [key, targets] of Object.entries(co.paths)) {
+    for (const [key, targets] of Object.entries(chain.paths)) {
       if (!Array.isArray(targets) || !targets.length) continue;
-      const t = targets[0];
-      if (key.endsWith("/*") && t.endsWith("/*")) {
-        out.push({ prefix: key.slice(0, -1), target: path.resolve(base, t.slice(0, -1)) });
-      } else {
-        out.push({ exact: key, target: path.resolve(base, t) });
+      // Every target, in order: the first that resolves wins (tsc fallback order).
+      for (const t of targets) {
+        if (typeof t !== "string") continue;
+        if (key.endsWith("/*") && t.endsWith("/*")) {
+          out.push({ prefix: key.slice(0, -1), target: path.resolve(base, t.slice(0, -1)) });
+        } else if (!key.endsWith("/*") && !t.endsWith("/*")) {
+          out.push({ exact: key, target: path.resolve(base, t) });
+        }
       }
     }
     if (out.length) return out;
@@ -319,8 +354,12 @@ mkdirSync(outDir, { recursive: true });
 const metadata = {};
 if (Object.keys(entryPoints).length) {
   const result = await esbuild.build({
-    mainFields: ["browser", "module", "main"],
-    conditions: ["browser", "module", "import", "development"],
+    // The Rust resolver's settings, so a dual-build dep pre-bundles the same file
+    // the dev server would serve for a source import of it.
+    mainFields: resolveSettings.mainFields ?? ["browser", "module", "main"],
+    conditions: resolveConditions,
+    ...(resolveSettings.extensions ? { resolveExtensions: resolveSettings.extensions } : {}),
+    ...(resolveSettings.preserveSymlinks ? { preserveSymlinks: true } : {}),
     target: "esnext",
     ...esbuildOptions,
     entryPoints,

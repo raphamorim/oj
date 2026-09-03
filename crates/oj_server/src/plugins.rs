@@ -887,6 +887,16 @@ impl PluginHost {
         serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default()
     }
 
+    /// The `filter.id` include patterns of every object-form `load` hook, as regex
+    /// source strings. A dependency module is offered to plugin `load` only when
+    /// its path matches one, so deps cost no RPC unless a plugin asked for them.
+    pub async fn dep_load_filters(&self) -> Vec<String> {
+        let Ok(Some(raw)) = self.call("getDepLoadFilters", &[]).await else {
+            return Vec::new();
+        };
+        serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default()
+    }
+
     /// Which HMR hooks any active plugin defines: (watchChange, handleHotUpdate).
     /// Defaults to (true, true) on RPC or parse failure so an HMR RPC is never
     /// skipped by mistake.
