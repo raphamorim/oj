@@ -3431,7 +3431,15 @@ async fn ensure_module(
                     hex_encode(&importer_abs)
                 ));
             }
-            if !is_dep && relative_import_missing(&dir, resolver, spec) {
+            // A bare specifier no plugin can claim (there is no plugin fallback
+            // here) fails the same way: Vite's importAnalysis errors for it
+            // instead of shipping the bare name for the browser to reject. SSR
+            // keeps Vite's `if (ssr) return [url, null]`: Node reports it.
+            if !is_dep
+                && !is_server
+                && (relative_import_missing(&dir, resolver, spec)
+                    || bare_import_unresolved(&dir, resolver, spec))
+            {
                 unresolved.borrow_mut().get_or_insert_with(|| spec.to_string());
             }
             None
@@ -4784,6 +4792,26 @@ fn relative_import_missing(dir: &Path, resolver: &OjResolver, spec: &str) -> boo
     !normalize(&dir.join(base)).is_file() && resolver.resolve(dir, base).is_err_and(|e| !e.ignored)
 }
 
+/// A bare import (`some-pkg`, `@scope/pkg/sub`) the resolver cannot find and that
+/// nothing else answers: not a node builtin (browser-externalized), not a
+/// plugin-style virtual id (`virtual:`, `\0`), not a URL or data: import, and not
+/// a package that maps the id to `false` (served empty). Vite's importAnalysis
+/// fails the importer for these.
+fn bare_import_unresolved(dir: &Path, resolver: &OjResolver, spec: &str) -> bool {
+    if !is_bare_specifier(spec)
+        || spec.is_empty()
+        || spec.starts_with("virtual:")
+        || spec.starts_with('\0')
+        || spec.starts_with("data:")
+        || is_node_builtin(spec)
+        || is_lingui_macro_specifier(spec)
+    {
+        return false;
+    }
+    let base = spec.split('?').next().unwrap_or(spec);
+    resolver.resolve(dir, base).is_err_and(|e| !e.ignored)
+}
+
 const UNRESOLVED_IMPORT_MARK: &str = "Failed to resolve import \"";
 
 fn is_unresolved_import_error(err: &str) -> bool {
@@ -5249,6 +5277,17 @@ async fn serve_plugin_id(state: &Arc<ServerState>, spec: &str, importer: &str) -
             }
             if is_node_builtin(spec) {
                 return browser_external_stub(spec);
+            }
+            // No plugin claimed the bare id the importer deferred here: this is
+            // Vite's "Failed to resolve import" for that importer (500 + overlay
+            // naming the import site), not a bare 404 the browser reports as a
+            // generic module error.
+            if is_bare_specifier(spec) && !importer.is_empty() {
+                let importer_file = Path::new(importer);
+                let source = std::fs::read_to_string(importer_file).unwrap_or_default();
+                let err = unresolved_import_error(&state.root, importer_file, &source, spec);
+                send_error(state, &err);
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {err}")).into_response();
             }
             return (
                 StatusCode::NOT_FOUND,
@@ -7468,6 +7507,33 @@ mod tests {
         let err = unresolved_import_error(root, file, "export {};\n", "./gone");
         assert!(err.contains("src/App.tsx:1:1 Failed to resolve import \"./gone\""), "{err}");
         assert!(!is_unresolved_import_error("compile error:\nparse error in x.tsx"));
+    }
+
+    #[test]
+    fn bare_import_unresolved_only_for_packages_nothing_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("node_modules/real")).unwrap();
+        std::fs::write(root.join("node_modules/real/package.json"), r#"{"name":"real","main":"index.js"}"#).unwrap();
+        std::fs::write(root.join("node_modules/real/index.js"), "module.exports = 1;\n").unwrap();
+        std::fs::write(root.join("package.json"), r#"{"name":"app","browser":{"mapped-off":false}}"#).unwrap();
+        let resolver = OjResolver::new(root);
+        // Vite's importAnalysis fails the importer for a package that is not
+        // installed (typo, missing install), subpaths included.
+        assert!(bare_import_unresolved(root, &resolver, "not-installed-pkg"));
+        assert!(bare_import_unresolved(root, &resolver, "@scope/not-installed/sub"));
+        assert!(bare_import_unresolved(root, &resolver, "not-installed-pkg?url"), "query dropped");
+        // Everything something else answers is not an error here.
+        assert!(!bare_import_unresolved(root, &resolver, "real"), "installed");
+        assert!(!bare_import_unresolved(root, &resolver, "node:fs"), "builtin stub");
+        assert!(!bare_import_unresolved(root, &resolver, "fs"), "builtin stub");
+        assert!(!bare_import_unresolved(root, &resolver, "virtual:thing"), "plugin virtual");
+        assert!(!bare_import_unresolved(root, &resolver, "\0resolved"), "plugin resolved id");
+        assert!(!bare_import_unresolved(root, &resolver, "data:text/javascript,export{}"), "data url");
+        assert!(!bare_import_unresolved(root, &resolver, "https://cdn.example/x.js"), "external url");
+        assert!(!bare_import_unresolved(root, &resolver, "./nope"), "relative is the other check");
+        assert!(!bare_import_unresolved(root, &resolver, "/src/nope.ts"), "root-absolute");
+        assert!(!bare_import_unresolved(root, &resolver, "@lingui/macro"), "shimmed macro entry");
     }
 
     #[test]
