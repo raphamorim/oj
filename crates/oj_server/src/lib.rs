@@ -92,7 +92,10 @@ const REFRESH_PREAMBLE_JS: &str = include_str!("assets/refresh-preamble.js");
 const BUNDLE_RUNTIME_JS: &str = include_str!("assets/bundle-runtime.js");
 const WORKER_RUNTIME_JS: &str = include_str!("assets/worker-runtime.js");
 pub const SSR_RUNNER_JS: &str = include_str!("assets/ssr-runner.mjs");
-const COMPILABLE: &[&str] = &["tsx", "ts", "jsx", "js", "mjs", "svelte"];
+// Probed in Vite's DEFAULT_EXTENSIONS order (js before ts, .mts included) so the
+// extensionless quick path agrees with the resolver; .cts/.svelte trail as
+// compilable-but-not-default-probed.
+const COMPILABLE: &[&str] = &["mjs", "js", "mts", "ts", "jsx", "tsx", "cts", "svelte"];
 
 const START_ASSETS: &[(&str, &str)] = &[
     (

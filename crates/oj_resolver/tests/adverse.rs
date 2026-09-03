@@ -144,12 +144,16 @@ fn a_specifier_cannot_reach_a_directory_or_a_missing_extension_by_accident() {
 fn extension_probing_order_is_stable() {
     let tree = Tree::new();
     let src = tree.dir("src");
-    // Every candidate exists at once: the first configured extension wins.
-    for ext in ["tsx", "ts", "jsx", "js", "mjs", "cjs", "json"] {
+    // Every candidate exists at once: the first configured extension wins, and
+    // the default list is Vite's DEFAULT_EXTENSIONS (.mjs, .js, .mts, .ts, ...).
+    for ext in ["tsx", "ts", "jsx", "js", "mjs", "mts", "json"] {
         tree.file(&format!("src/Ambiguous.{ext}"), "{}");
     }
     let resolved = tree.resolver().resolve(&src, "./Ambiguous").unwrap();
-    assert!(resolved.ends_with("Ambiguous.tsx"), "{resolved:?}");
+    assert!(resolved.ends_with("Ambiguous.mjs"), "{resolved:?}");
+    std::fs::remove_file(src.join("Ambiguous.mjs")).unwrap();
+    let resolved = tree.resolver().resolve(&src, "./Ambiguous").unwrap();
+    assert!(resolved.ends_with("Ambiguous.js"), ".js before .ts: {resolved:?}");
 }
 
 #[test]
