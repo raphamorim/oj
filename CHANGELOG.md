@@ -5,7 +5,7 @@ All notable changes to oj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.15] - 2026-09-03
 
 ### Fixed
 - TanStack Start dev behind a proxy that sets `x-forwarded-host` (a preview or a tunnel) answered every request with `500 Failed to parse URL from http://proxy-host, localhost:port/`: oj forwarded the browser's `Host` to the SSR runner as a second `x-forwarded-host`, and Node joined the two. The original `Host` now travels in a private header and is restored as `Host` (first value only, as Node does for duplicate `Host` headers), and a proxy's `x-forwarded-host` reaches the app untouched, as under Vite. Plugin middlewares (`configureServer`) see the browser's `Host` in `req.headers.host` for the same reason.
