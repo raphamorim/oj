@@ -241,6 +241,7 @@ async fn run() -> anyhow::Result<()> {
                         ssr_manifest,
                         watch,
                     },
+                    None,
                 )
                 .await
             }

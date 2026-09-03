@@ -1832,8 +1832,13 @@ dependencies = [
  "oj_config",
  "oj_css",
  "oj_env",
+ "oj_plugin",
  "oj_resolver",
  "oj_server",
+ "oxc_allocator",
+ "oxc_ast",
+ "oxc_ast_visit",
+ "oxc_span",
  "rolldown",
  "rolldown_common",
  "rolldown_plugin",
@@ -1928,6 +1933,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "oj_plugin"
+version = "0.1.16"
+dependencies = [
+ "anyhow",
+ "oj_compiler",
+ "oxc_allocator",
+ "oxc_ast",
+ "oxc_ast_visit",
+ "oxc_codegen",
+ "oxc_parser",
+ "oxc_sourcemap",
+ "oxc_span",
+ "rolldown_common",
+ "rolldown_plugin",
+ "rolldown_utils",
+ "serde_json",
+]
+
+[[package]]
 name = "oj_resolver"
 version = "0.1.16"
 dependencies = [
@@ -1954,6 +1978,7 @@ dependencies = [
  "oj_css",
  "oj_env",
  "oj_graph",
+ "oj_plugin",
  "oj_resolver",
  "regex",
  "reqwest",

@@ -16,6 +16,7 @@ oj_env.workspace = true
 oj_config.workspace = true
 oj_resolver.workspace = true
 oj_server.workspace = true
+oj_plugin.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true
