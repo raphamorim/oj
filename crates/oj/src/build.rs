@@ -2213,6 +2213,11 @@ pub async fn build(
     };
     let mut emitted: Vec<(String, usize)> = Vec::new();
     let has_postcss = oj_server::has_postcss_config(&root);
+    let public_dir = config
+        .public_dir
+        .as_ref()
+        .map(|p| root.join(p))
+        .unwrap_or_else(|| root.join("public"));
     let link_css_transform_enabled: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::new();
     let asset_names_pattern = ro_output_str(ro_opts, "assetFileNames");
     let css_asset_opts = CssAssetOpts {
@@ -2439,6 +2444,37 @@ pub async fn build(
             }
         }
 
+        // Every other asset the page references by attribute (img src/srcset,
+        // link icon/manifest href, video/audio/source/track, meta og:image...)
+        // is emitted hashed or inlined, and a publicDir reference gets the base
+        // prefix, as Vite's build-html plugin does.
+        {
+            let mut seen_html_assets: std::collections::HashMap<PathBuf, String> =
+                std::collections::HashMap::new();
+            rewritten_html = rewrite_html_asset_attrs(&rewritten_html, |tag, tag_name, _attr, value, srcset| {
+                let mut one = |url: &str| {
+                    html_asset_url(
+                        tag,
+                        tag_name,
+                        url,
+                        &doc.dir,
+                        &root,
+                        &public_dir,
+                        &out_dir,
+                        &page_base,
+                        css_asset_opts,
+                        &mut emitted,
+                        &mut seen_html_assets,
+                    )
+                };
+                if srcset {
+                    rewrite_srcset(value, one)
+                } else {
+                    one(value)
+                }
+            });
+        }
+
         if let Some(css_name) = &combined_css_name {
             let link = format!(
                 "<link rel=\"stylesheet\" href=\"{}\" />",
@@ -2485,11 +2521,6 @@ pub async fn build(
         serde_json::to_string_pretty(&build_manifest(&manifest_entries))?,
     )?;
 
-    let public_dir = config
-        .public_dir
-        .as_ref()
-        .map(|p| root.join(p))
-        .unwrap_or_else(|| root.join("public"));
     if build_cfg.copy_public_dir.unwrap_or(true) {
         copy_public_dir(&public_dir, &out_dir)?;
     }
@@ -2699,6 +2730,275 @@ fn rewrite_link_hrefs(html: &str, from: &str, to: &str) -> String {
     }
     out.push_str(&html[last..]);
     out
+}
+
+/// Vite's `DEFAULT_HTML_ASSET_SOURCES` (assetSource.ts): per element, the
+/// attributes holding one asset URL and the ones holding a srcset.
+fn html_asset_attrs(tag_name: &str) -> Option<(&'static [&'static str], &'static [&'static str])> {
+    Some(match tag_name {
+        "audio" | "embed" | "input" | "track" => (&["src"], &[]),
+        "img" => (&["src"], &["srcset"]),
+        "image" | "use" => (&["href", "xlink:href"], &[]),
+        "link" => (&["href"], &["imagesrcset"]),
+        "object" => (&["data"], &[]),
+        "source" => (&["src"], &["srcset"]),
+        "video" => (&["src", "poster"], &[]),
+        "meta" => (&["content"], &[]),
+        _ => return None,
+    })
+}
+
+/// Vite only treats `<meta content>` as an asset for these `name`/`property`
+/// values (msapplication tiles, twitter:image, Open Graph media).
+fn meta_content_is_asset(tag: &str) -> bool {
+    const NAMES: [&str; 7] = [
+        "msapplication-tileimage",
+        "msapplication-square70x70logo",
+        "msapplication-square150x150logo",
+        "msapplication-wide310x150logo",
+        "msapplication-square310x310logo",
+        "msapplication-config",
+        "twitter:image",
+    ];
+    const PROPERTIES: [&str; 7] = [
+        "og:image",
+        "og:image:url",
+        "og:image:secure_url",
+        "og:audio",
+        "og:audio:secure_url",
+        "og:video",
+        "og:video:secure_url",
+    ];
+    let matches = |attr: &str, allowed: &[&str]| {
+        html_attr(tag, attr)
+            .map(|v| v.trim().to_ascii_lowercase())
+            .is_some_and(|v| allowed.contains(&v.as_str()))
+    };
+    matches("name", &NAMES) || matches("property", &PROPERTIES)
+}
+
+/// A bare (valueless) attribute such as `vite-ignore`.
+fn has_bare_attr(tag: &str, name: &str) -> bool {
+    tag.split_ascii_whitespace()
+        .skip(1)
+        .any(|tok| tok.eq_ignore_ascii_case(name) || tok.get(..name.len() + 1).is_some_and(|p| p.eq_ignore_ascii_case(&format!("{name}="))))
+}
+
+/// The `<link rel>` values Vite never inlines as a data URL (html.ts
+/// `noInlineLinkRels`): a favicon or manifest must stay a real file.
+fn link_rel_forbids_inline(tag: &str) -> bool {
+    html_attr(tag, "rel").is_some_and(|rel| {
+        rel.split_ascii_whitespace()
+            .any(|r| matches!(r.to_ascii_lowercase().as_str(), "icon" | "apple-touch-icon" | "apple-touch-startup-image" | "manifest"))
+    })
+}
+
+/// Vite's `isCSSRequest`.
+fn is_css_request(url: &str) -> bool {
+    let clean = url.split(['?', '#']).next().unwrap_or(url);
+    let ext = clean.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    matches!(ext, "css" | "less" | "sass" | "scss" | "styl" | "stylus" | "pcss" | "postcss" | "sss")
+}
+
+/// Rewrite the value of each srcset candidate (`url descriptor, ...`) with `f`;
+/// unchanged when no candidate changes.
+fn rewrite_srcset(value: &str, mut f: impl FnMut(&str) -> Option<String>) -> Option<String> {
+    let mut changed = false;
+    let candidates: Vec<String> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(|c| {
+            let (url, descriptor) = match c.split_once(char::is_whitespace) {
+                Some((u, d)) => (u, d.trim()),
+                None => (c, ""),
+            };
+            let url = match f(url) {
+                Some(u) => {
+                    changed = true;
+                    u
+                }
+                None => url.to_string(),
+            };
+            if descriptor.is_empty() {
+                url
+            } else {
+                format!("{url} {descriptor}")
+            }
+        })
+        .collect();
+    changed.then(|| candidates.join(", "))
+}
+
+/// Vite's build-html asset pass (html.ts, `getNodeAssetAttributes`): every
+/// element whose attributes reference an asset (img src/srcset, link href/
+/// imagesrcset, video src/poster, source, audio, track, object data, use/image
+/// href, allowed meta content) gets those values rewritten by `rewrite(tag,
+/// tag_name, attr, value)`, keeping the page's own quoting. A `vite-ignore`
+/// attribute skips the element and is removed.
+fn rewrite_html_asset_attrs(
+    html: &str,
+    mut rewrite: impl FnMut(&str, &str, &str, &str, bool) -> Option<String>,
+) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut last = 0;
+    let bytes = html.as_bytes();
+    for (start, _) in html.match_indices('<') {
+        if start < last {
+            continue;
+        }
+        let name_end = html[start + 1..]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == ':' || c == '-'))
+            .map(|i| start + 1 + i)
+            .unwrap_or(html.len());
+        if name_end == start + 1 || name_end >= bytes.len() || !matches!(bytes[name_end], b' ' | b'\t' | b'\n' | b'\r' | b'/' | b'>') {
+            continue;
+        }
+        let tag_name = html[start + 1..name_end].to_ascii_lowercase();
+        let Some((src_attrs, srcset_attrs)) = html_asset_attrs(&tag_name) else {
+            continue;
+        };
+        let Some(end) = html[start..].find('>') else {
+            continue;
+        };
+        let tag = &html[start..start + end];
+        // (offset within tag, length, replacement)
+        let mut edits: Vec<(usize, usize, String)> = Vec::new();
+        if has_bare_attr(tag, "vite-ignore") {
+            if let Some(pos) = tag.to_ascii_lowercase().find("vite-ignore") {
+                let mut cut_start = pos;
+                while cut_start > 0 && tag.as_bytes()[cut_start - 1].is_ascii_whitespace() {
+                    cut_start -= 1;
+                }
+                let cut_end = tag[pos..].find(char::is_whitespace).map(|i| pos + i).unwrap_or(tag.len());
+                edits.push((cut_start, cut_end - cut_start, String::new()));
+            }
+        } else if tag_name != "meta" || meta_content_is_asset(tag) {
+            for (attrs, srcset) in [(src_attrs, false), (srcset_attrs, true)] {
+                for attr in attrs.iter() {
+                    let Some(value) = html_attr(tag, attr) else {
+                        continue;
+                    };
+                    if let Some(new) = rewrite(tag, &tag_name, attr, value, srcset) {
+                        let offset = value.as_ptr() as usize - tag.as_ptr() as usize;
+                        edits.push((offset, value.len(), new));
+                    }
+                }
+            }
+        }
+        if edits.is_empty() {
+            continue;
+        }
+        edits.sort_by_key(|e| e.0);
+        out.push_str(&html[last..start]);
+        let mut cursor = 0;
+        for (offset, len, new) in edits {
+            out.push_str(&tag[cursor..offset]);
+            out.push_str(&new);
+            cursor = offset + len;
+        }
+        out.push_str(&tag[cursor..]);
+        last = start + end;
+    }
+    out.push_str(&html[last..]);
+    out
+}
+
+/// Vite's `isExcludedUrl` for html asset references: fragments, data URLs and
+/// external (`scheme://`, `//`) URLs are left alone.
+fn is_excluded_html_url(url: &str) -> bool {
+    url.is_empty()
+        || url.starts_with('#')
+        || url.starts_with("data:")
+        || url.starts_with("//")
+        || url.split_once("://").is_some_and(|(scheme, _)| !scheme.is_empty() && scheme.chars().all(|c| c.is_ascii_alphabetic()))
+}
+
+/// Emit one html-referenced source asset (hashed under `assetFileNames`, or
+/// inlined as a data URL when small and inlining is allowed) and return its URL
+/// from the page. `seen` dedupes by resolved path across the page's references.
+fn emit_html_asset(
+    abs: &Path,
+    suffix: &str,
+    out_dir: &Path,
+    page_base: &str,
+    opts: CssAssetOpts<'_>,
+    no_inline: bool,
+    emitted: &mut Vec<(String, usize)>,
+    seen: &mut std::collections::HashMap<PathBuf, String>,
+) -> Option<String> {
+    let abs = abs.canonicalize().ok()?;
+    if let Some(url) = seen.get(&abs) {
+        return Some(format!("{url}{suffix}"));
+    }
+    let data = std::fs::read(&abs).ok()?;
+    let ext = abs.extension().and_then(|s| s.to_str()).unwrap_or("");
+    // Vite's shouldInline: never an .html, never a link icon/manifest, never an
+    // svg addressed by fragment; otherwise anything under assetsInlineLimit.
+    if !no_inline && !ext.eq_ignore_ascii_case("html") && (data.len() as u64) <= opts.inline_limit && !(ext.eq_ignore_ascii_case("svg") && suffix.starts_with('#')) {
+        if ext.eq_ignore_ascii_case("svg") {
+            return Some(svg_data_url(&String::from_utf8_lossy(&data)));
+        }
+        return Some(format!("data:{};base64,{}", asset_mime(ext), b64(&data)));
+    }
+    let hash = content_hash(&data);
+    let stem = abs.file_stem().and_then(|s| s.to_str()).unwrap_or("asset");
+    let name = render_asset_name(opts.asset_names, &sanitize_asset_name(stem), &hash, ext);
+    let dest = out_dir.join(&name);
+    if let Some(p) = dest.parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    std::fs::write(&dest, &data).ok()?;
+    emitted.push((name.clone(), data.len()));
+    let url = with_base(&name, page_base);
+    seen.insert(abs, url.clone());
+    Some(format!("{url}{suffix}"))
+}
+
+/// The new value for one html asset reference (html.ts asset attribute branch):
+/// a `publicDir` file keeps its path under the base; a bundle-relative source
+/// file is emitted hashed (or inlined); a stylesheet `<link>` is left to the
+/// stylesheet pass; anything else (external, data:, missing) stays as written.
+fn html_asset_url(
+    tag: &str,
+    tag_name: &str,
+    value: &str,
+    html_dir: &Path,
+    root: &Path,
+    public_dir: &Path,
+    out_dir: &Path,
+    page_base: &str,
+    opts: CssAssetOpts<'_>,
+    emitted: &mut Vec<(String, usize)>,
+    seen: &mut std::collections::HashMap<PathBuf, String>,
+) -> Option<String> {
+    if is_excluded_html_url(value) {
+        return None;
+    }
+    let cut = value.find(['?', '#']).unwrap_or(value.len());
+    let (clean, query) = value.split_at(cut);
+    // Vite keeps only a `#fragment` on an emitted asset; the public path keeps its
+    // query as written.
+    let fragment = query.find('#').map(|i| &query[i..]).unwrap_or("");
+    if let Some(rest) = clean.strip_prefix('/') {
+        if public_dir.join(rest).is_file() {
+            return Some(format!("{}{query}", with_base(clean, page_base)));
+        }
+    }
+    if tag_name == "link"
+        && is_css_request(clean)
+        && html_attr(tag, "media").is_none()
+        && html_attr(tag, "disabled").is_none()
+        && !has_bare_attr(tag, "disabled")
+    {
+        return None;
+    }
+    let abs = resolve_html_ref(clean, html_dir, root);
+    if !abs.is_file() {
+        return None;
+    }
+    let no_inline = tag_name == "link" && link_rel_forbids_inline(tag);
+    emit_html_asset(&abs, fragment, out_dir, page_base, opts, no_inline, emitted, seen)
 }
 
 fn html_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
@@ -4553,6 +4853,75 @@ mod tests {
             .expect("ssr build");
         let server = fs::read_to_string(root.join("dist-ssr/server.mjs")).unwrap();
         assert!(server.contains("process.env.SOME_FLAG"), "ssr bundle must keep process.env:\n{server}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Vite's build-html asset pass: attribute references to source assets are
+    /// emitted hashed (or inlined under assetsInlineLimit, never for a link
+    /// icon/manifest or a fragment svg), publicDir references get the base
+    /// prefix, srcset candidates are handled one by one, and external,
+    /// missing and `vite-ignore` references stay as written.
+    #[tokio::test]
+    async fn html_asset_attributes_are_rewritten_like_vite() {
+        let root = scratch("html-asset-attrs");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("public")).unwrap();
+        fs::write(root.join("package.json"), r#"{"type":"module"}"#).unwrap();
+        fs::write(root.join("vite.config.mjs"), "export default { base: '/app/' };").unwrap();
+        fs::write(root.join("src/big.png"), vec![7u8; 9000]).unwrap();
+        fs::write(root.join("src/big-2x.png"), vec![8u8; 9000]).unwrap();
+        fs::write(root.join("src/tiny.png"), vec![9u8; 40]).unwrap();
+        fs::write(root.join("src/icon.svg"), "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect id=\"r\"/></svg>").unwrap();
+        fs::write(root.join("public/logo.png"), vec![1u8; 100]).unwrap();
+        fs::write(root.join("src/main.js"), "console.log(1);").unwrap();
+        fs::write(
+            root.join("index.html"),
+            "<html><head>\n\
+             <link rel=\"icon\" href=\"./src/icon.svg\">\n\
+             <link rel=\"manifest\" href=\"/manifest.webmanifest\">\n\
+             <meta property=\"og:image\" content=\"/src/big.png\">\n\
+             <meta name=\"description\" content=\"/src/big.png\">\n\
+             </head><body>\n\
+             <img src=\"./src/big.png\" alt=\"a\">\n\
+             <img src='src/tiny.png' srcset=\"./src/big.png 1x, ./src/big-2x.png 2x\">\n\
+             <img src=\"/logo.png\">\n\
+             <img src=\"https://example.com/x.png\">\n\
+             <img vite-ignore src=\"./src/big.png\">\n\
+             <video poster=\"src/big.png\" src=\"/missing.mp4\"></video>\n\
+             <svg><use href=\"./src/icon.svg#r\"></use></svg>\n\
+             <script type=\"module\" src=\"/src/main.js\"></script></body></html>",
+        )
+        .unwrap();
+        fs::write(root.join("public/manifest.webmanifest"), "{}").unwrap();
+
+        build(root.clone(), None, None, Some("production"), false)
+            .await
+            .expect("html asset fixture should build");
+        let html = fs::read_to_string(root.join("dist/index.html")).unwrap();
+        let big = fs::read_dir(root.join("dist/assets"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .find(|n| n.starts_with("big-") && !n.starts_with("big-2x") && n.ends_with(".png"))
+            .expect("big.png emitted hashed");
+        let big_url = format!("/app/assets/{big}");
+        assert!(html.contains(&format!("<img src=\"{big_url}\" alt=\"a\">")), "{html}");
+        assert!(html.contains(&format!("<meta property=\"og:image\" content=\"{big_url}\">")), "{html}");
+        assert!(html.contains("<meta name=\"description\" content=\"/src/big.png\">"), "{html}");
+        assert!(html.contains(&format!("<video poster=\"{big_url}\" src=\"/missing.mp4\">")), "{html}");
+        assert!(html.contains(&format!("srcset=\"{big_url} 1x, /app/assets/big-2x-")), "{html}");
+        // small: inlined, keeping the page's single quotes
+        assert!(html.contains("<img src='data:image/png;base64,"), "{html}");
+        // link icon is never inlined, and its fragment use shares the same file
+        assert!(html.contains("<link rel=\"icon\" href=\"/app/assets/icon-"), "{html}");
+        assert!(html.contains("<use href=\"/app/assets/icon-") && html.contains(".svg#r\">"), "{html}");
+        // publicDir references get the base prefix
+        assert!(html.contains("<link rel=\"manifest\" href=\"/app/manifest.webmanifest\">"), "{html}");
+        assert!(html.contains("<img src=\"/app/logo.png\">"), "{html}");
+        // left alone: external, vite-ignore (attribute dropped), missing file
+        assert!(html.contains("<img src=\"https://example.com/x.png\">"), "{html}");
+        assert!(html.contains("<img src=\"./src/big.png\">"), "{html}");
+        assert!(!html.contains("vite-ignore"), "{html}");
         fs::remove_dir_all(root).unwrap();
     }
 
