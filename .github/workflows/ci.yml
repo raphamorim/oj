@@ -297,3 +297,5 @@ jobs:
         run: node e2e/html-attribute-quotes.test.js
       - name: build.cssMinify and build.cssTarget drive the CSS compile
         run: node e2e/build-css-options.mjs
+      - name: bare Less imports resolve through node_modules
+        run: node e2e/less-bare-imports.mjs
