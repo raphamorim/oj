@@ -153,6 +153,9 @@ const EPOCH = (() => {
     hashBaseInputs(h);
     hashAdd(h, "define", JSON.stringify(DEFINE));
     hashAdd(h, "fnbase", process.env.TSS_SERVER_FN_BASE ?? "");
+    // Cached resolutions embed condition choices (browser vs node builds), so a
+    // conditions change must invalidate them or stale wrong-runtime picks replay.
+    hashAdd(h, "resolve-conditions", process.env.OJ_RESOLVE_CONDITIONS ?? "");
     return h.digest("hex");
   } catch {
     return null;
