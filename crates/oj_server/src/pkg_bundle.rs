@@ -469,7 +469,8 @@ fn external_url(spec: &str, from_dir: &Path, resolver: &OjResolver, root: &Path)
         }
         Err(e) if e.ignored => Some("/@oj-empty".to_string()),
         Err(_) if is_node_builtin(spec) => Some(format!("/@id/{}", hex_encode(spec))),
-        Err(_) => None,
+        // A missing optional peer of this package: Vite's lazy-error stub.
+        Err(_) => crate::optional_peer_dep_url(root, from_dir, spec),
     }
 }
 

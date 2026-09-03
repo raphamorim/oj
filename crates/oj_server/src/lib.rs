@@ -2515,6 +2515,20 @@ async fn serve_path(
         };
     }
 
+    if let Some(hex) = uri.path().strip_prefix(OPTIONAL_PEER_PREFIX) {
+        return match optional_peer_dep_stub(hex) {
+            Some(code) => (
+                [
+                    (header::CONTENT_TYPE, "text/javascript"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
+                code,
+            )
+                .into_response(),
+            None => (StatusCode::NOT_FOUND, "oj: bad optional peer id").into_response(),
+        };
+    }
+
     if uri.path() == "/@oj-empty" {
         return (
             [
@@ -4627,6 +4641,82 @@ fn dep_response(headers: &HeaderMap, versioned: bool, bytes: Vec<u8>) -> Respons
         .into_response()
 }
 
+pub(crate) const OPTIONAL_PEER_PREFIX: &str = "/@oj-optional-peer/";
+
+/// Vite's optionalPeerDepId (resolve.ts tryNodeResolve): a bare import that does
+/// not resolve, made from inside a dependency (never from the app root), whose
+/// nearest package.json lists the package under `peerDependencies` with
+/// `peerDependenciesMeta[pkg].optional`, resolves to a stub module id carrying
+/// the peer and the parent names. The stub errors only when evaluated.
+pub(crate) fn optional_peer_dep_url(root: &Path, dir: &Path, spec: &str) -> Option<String> {
+    if !is_bare_specifier(spec) || spec.is_empty() || is_node_builtin(spec) || spec.contains('\0') {
+        return None;
+    }
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if dir == root || !dir.components().any(|c| c.as_os_str() == "node_modules") {
+        return None;
+    }
+    let pkg_name = {
+        let mut it = spec.split('/');
+        let first = it.next()?;
+        if first.starts_with('@') {
+            format!("{first}/{}", it.next()?)
+        } else {
+            first.to_string()
+        }
+    };
+    // findNearestMainPackageData: the closest package.json with a `name`.
+    let mut cur: Option<&Path> = Some(dir.as_path());
+    while let Some(d) = cur {
+        if let Ok(txt) = std::fs::read_to_string(d.join("package.json")) {
+            if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&txt) {
+                if let Some(parent) = pkg.get("name").and_then(|n| n.as_str()) {
+                    let declared = pkg
+                        .get("peerDependencies")
+                        .and_then(|p| p.get(&pkg_name))
+                        .is_some();
+                    let optional = pkg
+                        .get("peerDependenciesMeta")
+                        .and_then(|m| m.get(&pkg_name))
+                        .and_then(|m| m.get("optional"))
+                        .and_then(|o| o.as_bool())
+                        .unwrap_or(false);
+                    if declared && optional {
+                        return Some(format!(
+                            "{OPTIONAL_PEER_PREFIX}{}",
+                            hex_encode(&format!("{spec}\n{parent}"))
+                        ));
+                    }
+                    return None;
+                }
+            }
+        }
+        if d.file_name().is_some_and(|n| n == "node_modules") {
+            return None;
+        }
+        cur = d.parent();
+    }
+    None
+}
+
+/// The module `/@oj-optional-peer/<hex>` serves (Vite's optional peer stub in
+/// rolldownDepPlugin): evaluating it throws `Could not resolve "peer" imported by
+/// "parent". Is it installed?`, so the failure names both packages instead of the
+/// browser's generic unresolved-specifier error for the whole importer chain.
+fn optional_peer_dep_stub(hex: &str) -> Option<String> {
+    let decoded = hex_decode(hex)?;
+    let (peer, parent) = decoded.split_once('\n')?;
+    let peer_js = serde_json::Value::String(peer.to_string());
+    let parent_js = serde_json::Value::String(parent.to_string());
+    Some(format!(
+        "// oj: optional peer dependency {peer_js} of {parent_js} is not installed\n\
+         export default {{}};\n\
+         export const __cjs_exports = {{}};\n\
+         throw new Error(`Could not resolve \"${{{peer_js}}}\" imported by \"${{{parent_js}}}\". Is it installed?`);\n"
+    ))
+}
+
 fn rewrite_specifier(
     root: &Path,
     dir: &Path,
@@ -4758,6 +4848,13 @@ fn rewrite_specifier(
             Some("/@oj-empty".to_string())
         }
         Err(err) => {
+            // A dependency's missing OPTIONAL peer (peerDependenciesMeta.optional)
+            // resolves to a module that errors when evaluated, naming both sides,
+            // instead of the bare specifier failing the whole importer chain at
+            // link time (Vite's optionalPeerDepId).
+            if let Some(url) = optional_peer_dep_url(root, dir, spec) {
+                return Some(url);
+            }
             // Plugin-provided ids (virtual: modules, \0-prefixed) are expected
             // to miss the on-disk resolver; the caller's plugin fallback serves
             // them, so a "cannot resolve" line here is just misleading noise.
@@ -7519,6 +7616,49 @@ mod tests {
         let err = unresolved_import_error(root, file, "export {};\n", "./gone");
         assert!(err.contains("src/App.tsx:1:1 Failed to resolve import \"./gone\""), "{err}");
         assert!(!is_unresolved_import_error("compile error:\nparse error in x.tsx"));
+    }
+
+    #[test]
+    fn preload_hints_name_the_exact_import_url() {
+        assert_eq!(preload_href("/src/main.tsx", "abcd1234"), "/src/main.tsx");
+        assert_eq!(preload_href("/src/a.css", "abcd1234"), "/src/a.css?import");
+        // Optimized deps and package bundles preload under their versioned URL,
+        // so the preload and the later import hit one immutable cache entry.
+        assert_eq!(preload_href("/@oj-deps/react.mjs", "abcd1234"), "/@oj-deps/react.mjs?v=abcd1234");
+        assert_eq!(preload_href("/@oj-pkg/00ff", "abcd1234"), "/@oj-pkg/00ff?v=abcd1234");
+        assert_eq!(preload_href("/@oj-deps/react.mjs", ""), "/@oj-deps/react.mjs", "no version, no query");
+        assert_eq!(preload_href("/@id/6e6f6465", "abcd1234"), "/@id/6e6f6465", "stubs are unversioned");
+    }
+
+    #[test]
+    fn optional_peer_dep_resolves_to_a_lazy_error_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let parent = root.join("node_modules/devtools-hook");
+        std::fs::create_dir_all(parent.join("lib")).unwrap();
+        std::fs::write(
+            parent.join("package.json"),
+            r#"{"name":"devtools-hook","peerDependencies":{"react":">=18","@scope/opt":"*","required-peer":"*"},
+                "peerDependenciesMeta":{"react":{"optional":false},"@scope/opt":{"optional":true}}}"#,
+        )
+        .unwrap();
+        // The lookup runs from the importing file's directory inside the package.
+        let from = parent.join("lib");
+        let url = optional_peer_dep_url(&root, &from, "@scope/opt/sub").expect("optional peer");
+        assert!(url.starts_with(OPTIONAL_PEER_PREFIX), "{url}");
+        let stub = optional_peer_dep_stub(url.strip_prefix(OPTIONAL_PEER_PREFIX).unwrap()).unwrap();
+        assert!(stub.contains("Could not resolve \"${\"@scope/opt/sub\"}\" imported by \"${\"devtools-hook\"}\". Is it installed?"), "{stub}");
+        assert!(stub.contains("throw new Error("), "errors when evaluated: {stub}");
+        // A declared but non-optional peer, an undeclared package, a builtin, and
+        // an import from the app root itself all fall through to the normal error.
+        assert!(optional_peer_dep_url(&root, &from, "react").is_none(), "optional: false");
+        assert!(optional_peer_dep_url(&root, &from, "required-peer").is_none(), "no meta");
+        assert!(optional_peer_dep_url(&root, &from, "unknown-pkg").is_none());
+        assert!(optional_peer_dep_url(&root, &from, "node:fs").is_none());
+        assert!(optional_peer_dep_url(&root, &from, "./local").is_none());
+        std::fs::write(root.join("package.json"), r#"{"name":"app","peerDependencies":{"x":"*"},"peerDependenciesMeta":{"x":{"optional":true}}}"#).unwrap();
+        assert!(optional_peer_dep_url(&root, &root, "x").is_none(), "root has no peer deps (Vite: basedir !== root)");
+        assert!(optional_peer_dep_stub("zz").is_none(), "malformed id");
     }
 
     #[test]
