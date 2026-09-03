@@ -137,8 +137,6 @@ jobs:
       - name: ssr dev stack frames map back to the original .ts lines
         if: matrix.mode == 'unbundled'
         run: node e2e/ssr-stacktrace.mjs
-      - name: css specifiers resolve like Vite (alias, root-absolute, hacks)
-      - name: stylesheet Vite parity (alias, root-absolute, hacks, css module exports)
       - name: stylesheet Vite parity (alias, root-absolute, hacks, css modules, ?inline, postcss order)
         if: matrix.mode == 'unbundled'
         run: node e2e/css-vite-parity.mjs
