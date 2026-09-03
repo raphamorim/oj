@@ -189,6 +189,9 @@ jobs:
       - name: start dotted non-GET server routes, streamed bodies, set-cookie (dev + prod server)
         if: matrix.mode == 'unbundled'
         run: node e2e/start-server-routes.mjs
+      - name: generic ssr dev runs requests concurrently, action bodies stay bytes
+        if: matrix.mode == 'unbundled'
+        run: node e2e/ssr-concurrent.mjs
 
   # i need to fix this or automate
   build:
