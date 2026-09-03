@@ -89,6 +89,21 @@ struct OjCssPlugin {
     css: Option<oj_config::CssConfig>,
     /// Inline `<script type="module">` bodies keyed by their html-proxy id.
     html_inline: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    /// What a `?worker&inline` bundle inherits from the app build (Vite's
+    /// `bundleWorkerEntry` builds the worker under the app's resolved config).
+    /// None: a bare browser bundle (server and library builds).
+    worker: Option<Arc<WorkerBundleOpts>>,
+}
+
+/// The app build settings an inline worker bundle shares with its importer:
+/// alias/conditions (`rolldown_resolve`), target and JSX (`transform_options`),
+/// the client `define` map and minification.
+#[derive(Debug)]
+struct WorkerBundleOpts {
+    config: oj_config::OjConfig,
+    is_production: bool,
+    define: Vec<(String, String)>,
+    minify: bool,
 }
 
 fn assets_inline_limit_of(config: &oj_config::OjConfig) -> u64 {
@@ -666,8 +681,20 @@ fn worker_id_parts(id: &str) -> Option<(&str, &'static str, bool, bool)> {
 
 /// Bundle a worker entry to a single ESM string (dynamic imports inlined) for
 /// `?worker&inline`, so the worker ships inside the importing chunk as in Vite.
-async fn bundle_worker_inline(root: &Path, file: &str) -> anyhow::Result<String> {
+/// The worker is bundled the way Vite's `bundleWorkerEntry` does it: under the
+/// app's resolve (alias, conditions), transform (target, JSX), define and minify
+/// settings, with oj's own asset/CSS/worker plugin so `?url`, stylesheets and
+/// nested workers inside the worker behave as in the main bundle. `nested` is
+/// the plugin for that inner bundle, built by the caller from its own fields.
+async fn bundle_worker_inline(
+    root: &Path,
+    file: &str,
+    opts: Option<&Arc<WorkerBundleOpts>>,
+    nested: OjCssPlugin,
+) -> anyhow::Result<String> {
+    let plugins: Vec<SharedPluginable> = vec![Arc::new(nested)];
     let mut bundler = BundlerBuilder::default()
+        .with_plugins(plugins)
         .with_options(BundlerOptions {
             input: Some(vec![InputItem {
                 name: Some("worker".to_string()),
@@ -678,7 +705,10 @@ async fn bundle_worker_inline(root: &Path, file: &str) -> anyhow::Result<String>
             format: Some(OutputFormat::Esm),
             platform: Some(rolldown::Platform::Browser),
             code_splitting: Some(rolldown_common::CodeSplittingMode::Bool(false)),
-            minify: Some(RawMinifyOptions::Bool(true)),
+            resolve: opts.and_then(|o| rolldown_resolve(root, &o.config, "client")),
+            transform: opts.and_then(|o| transform_options(&o.config, o.is_production)),
+            define: opts.map(|o| o.define.iter().cloned().collect()),
+            minify: Some(RawMinifyOptions::Bool(opts.is_none_or(|o| o.minify))),
             ..Default::default()
         })
         .build()
@@ -794,6 +824,7 @@ impl Plugin for OjCssPlugin {
         let self_has_postcss = self.has_postcss;
         let css_cfg = self.css.clone();
         let html_inline = Arc::clone(&self.html_inline);
+        let worker = self.worker.clone();
         async move {
             if id.contains("?html-proxy&index=") {
                 if let Some(body) = html_inline.lock().unwrap().get(&id).cloned() {
@@ -982,7 +1013,20 @@ impl Plugin for OjCssPlugin {
                 if inline {
                     // `?worker&inline`: the worker's bundled code travels inside
                     // this chunk and starts from a Blob URL (data: URL fallback).
-                    let code = bundle_worker_inline(&root, file).await?;
+                    let nested = OjCssPlugin {
+                        collected: Arc::new(Mutex::new(Vec::new())),
+                        root: root.clone(),
+                        has_postcss: self_has_postcss,
+                        client: true,
+                        inline_limit,
+                        css_code_split: false,
+                        host: host.clone(),
+                        css_transform_enabled: Arc::clone(&css_transform_enabled),
+                        css: css_cfg.clone(),
+                        html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                        worker: worker.clone(),
+                    };
+                    let code = bundle_worker_inline(&root, file, worker.as_ref(), nested).await?;
                     let literal = serde_json::Value::String(code).to_string();
                     return Ok(Some(rolldown_plugin::HookLoadOutput {
                         code: arcstr::ArcStr::from(format!(
@@ -2074,6 +2118,17 @@ pub async fn build(
             Arc::clone(&emit),
         )));
     }
+    let client_minify = oj_config::environment_build_bool(&config, "client", "minify").unwrap_or(minify);
+    let client_define: Vec<(String, String)> = {
+        let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &env_prefix_refs);
+        let mut pairs: Vec<(String, String)> = process_env_defines(&node_env);
+        pairs.extend(oj_env::import_meta_env_defines(
+            &env, mode, !is_production, &base, &env_prefix_refs,
+        ));
+        pairs.extend(oj_config::config_defines(&config));
+        pairs.extend(oj_config::environment_defines(&config, "client"));
+        pairs
+    };
     oj_plugins.push(Arc::new(OjCssPlugin {
         collected: Arc::clone(&collected_css),
         root: root.to_path_buf(),
@@ -2085,6 +2140,12 @@ pub async fn build(
         css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
         css: config.css.clone(),
         html_inline: Arc::clone(&html_inline),
+        worker: Some(Arc::new(WorkerBundleOpts {
+            config: config.clone(),
+            is_production,
+            define: client_define.clone(),
+            minify: client_minify,
+        })),
     }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
@@ -2110,20 +2171,9 @@ pub async fn build(
                 let ext = ro_external(ro_opts);
                 (!ext.is_empty()).then(|| rolldown::IsExternal::from(ext))
             },
-            minify: Some(RawMinifyOptions::Bool(
-                oj_config::environment_build_bool(&config, "client", "minify").unwrap_or(minify),
-            )),
+            minify: Some(RawMinifyOptions::Bool(client_minify)),
             sourcemap: env_sourcemap(&config, "client", sourcemap),
-            define: Some({
-                let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &env_prefix_refs);
-                let mut pairs: Vec<(String, String)> = process_env_defines(&node_env);
-                pairs.extend(oj_env::import_meta_env_defines(
-                    &env, mode, !is_production, &base, &env_prefix_refs,
-                ));
-                pairs.extend(oj_config::config_defines(&config));
-                pairs.extend(oj_config::environment_defines(&config, "client"));
-                pairs.into_iter().collect()
-            }),
+            define: Some(client_define.into_iter().collect()),
             ..Default::default()
         })
         .build()
@@ -3119,7 +3169,7 @@ pub(crate) async fn build_ssr(
         &serde_json::json!(config.define),
         &serde_json::json!(config.environments),
         "ssr",
-        "production",
+        mode,
     )
     .await;
 
@@ -3174,6 +3224,7 @@ pub(crate) async fn build_ssr(
         css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
         css: config.css.clone(),
         html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        worker: None,
     }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
@@ -3325,6 +3376,7 @@ async fn build_server_fns(root: &Path, out_dir: &Path, mode: &str) -> anyhow::Re
                 css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
                 css: config.css.clone(),
                 html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                worker: None,
             })])
             .with_options(BundlerOptions {
                 input: Some(vec![InputItem {
@@ -3673,7 +3725,7 @@ async fn build_client_entry(
         &serde_json::json!(config.define),
         &serde_json::json!(config.environments),
         "client",
-        "production",
+        mode,
     )
     .await;
     let emit = Arc::new(EmitState::new(root.to_path_buf()));
@@ -3695,6 +3747,7 @@ async fn build_client_entry(
         css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
         css: config.css.clone(),
         html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        worker: None,
     }));
 
     let mut bundler = BundlerBuilder::default()
@@ -3919,6 +3972,7 @@ async fn build_library(
                 css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
                 css: config.css.clone(),
                 html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                worker: None,
             })])
             .with_options(BundlerOptions {
                 input: Some(
@@ -5090,6 +5144,76 @@ mod tests {
             .expect_err("umd needs build.lib.name");
         assert!(err.to_string().contains("build.lib.name"), "{err}");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Vite's `bundleWorkerEntry`: a `?worker&inline` bundle is built under the
+    /// app config, so an aliased import, `define` and the client `process.env`
+    /// defines resolve the same way inside the worker as in the main bundle.
+    #[tokio::test]
+    async fn inline_worker_is_bundled_with_the_app_config() {
+        let root = scratch("worker-inline-config");
+        fs::create_dir_all(root.join("src/lib")).unwrap();
+        fs::write(root.join("package.json"), r#"{"type":"module"}"#).unwrap();
+        fs::write(
+            root.join("vite.config.mjs"),
+            "import path from 'node:path';\n\
+             export default { resolve: { alias: { '@': path.resolve(import.meta.dirname, 'src') } }, define: { __APP_VERSION__: '\"1.2.3\"' } };\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib/util.js"), "export const greet = (n) => 'hi ' + n;\n").unwrap();
+        fs::write(
+            root.join("src/w.js"),
+            "import { greet } from '@/lib/util';\n\
+             self.postMessage(greet(__APP_VERSION__) + ':' + process.env.NODE_ENV + ':' + String(process.env.NOPE));\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/main.js"),
+            "import W from './w.js?worker&inline';\nnew W().onmessage = (e) => { document.body.textContent = e.data; };\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("index.html"),
+            r#"<html><body><script type="module" src="/src/main.js"></script></body></html>"#,
+        )
+        .unwrap();
+        build(root.clone(), None, None, Some("production"), false)
+            .await
+            .expect("inline worker fixture should build");
+        let mut code = String::new();
+        for entry in fs::read_dir(root.join("dist/assets")).unwrap() {
+            let p = entry.unwrap().path();
+            if p.extension().is_some_and(|e| e == "js") {
+                code.push_str(&fs::read_to_string(p).unwrap());
+            }
+        }
+        assert!(!code.contains("@/lib"), "alias not resolved inside the inline worker:\n{code}");
+        assert!(!code.contains("__APP_VERSION__"), "define not applied inside the inline worker:\n{code}");
+        assert!(code.contains("1.2.3") && code.contains("hi "), "{code}");
+        assert!(!code.contains("process.env"), "process.env defines missing inside the inline worker:\n{code}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The plugin host of an SSR (and client-entry) build is told the real mode,
+    /// so a plugin's `configResolved(config).mode` under `--mode staging` is
+    /// "staging" as in Vite, not a hardcoded "production".
+    #[tokio::test]
+    async fn ssr_build_plugins_see_the_real_mode() {
+        let root = scratch("ssr-plugin-mode");
+        fs::write(root.join("package.json"), r#"{"type":"module"}"#).unwrap();
+        fs::write(
+            root.join("vite.config.mjs"),
+            "import fs from 'node:fs';\n\
+             export default { plugins: [{ name: 'mode-probe', configResolved(c) { fs.writeFileSync(new URL('./mode.txt', import.meta.url), c.mode); } }] };\n",
+        )
+        .unwrap();
+        fs::write(root.join("server.js"), "export const render = () => 'ok';\n").unwrap();
+        build_ssr(&root, &root.join("dist-ssr"), "server.js", "staging", oj_config::Sourcemap::Off)
+            .await
+            .expect("ssr build");
+        let seen = fs::read_to_string(root.join("mode.txt")).expect("plugin configResolved ran");
+        assert_eq!(seen.trim(), "staging");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
