@@ -2504,7 +2504,12 @@ async fn serve_path(
     let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
     if let Some(kind) = query_asset_kind(uri.query()) {
         let url = url_of(&state.root, &file);
-        return match asset_module(&file, &url, kind).await {
+        let js = if kind == "inline" && is_style_ext(ext) {
+            inline_css_module(&state, &file, &url).await
+        } else {
+            asset_module(&file, &url, kind).await
+        };
+        return match js {
             Ok(js) => (
                 [
                     (header::CONTENT_TYPE, "text/javascript"),
@@ -2743,7 +2748,12 @@ async fn ensure_module(
     if !react_svg && state.bundle {
         if let Some(kind) = query_asset_kind(url.split_once('?').map(|(_, q)| q)) {
             if matches!(kind, "url" | "raw" | "inline" | "init") {
-                let code = asset_module(file, url, kind).await?;
+                let style = file.extension().and_then(|e| e.to_str()).is_some_and(is_style_ext);
+                let code = if kind == "inline" && style {
+                    inline_css_module(state, file, url).await?
+                } else {
+                    asset_module(file, url, kind).await?
+                };
                 let mut noop = |_: &str| None;
                 let factory = oj_compiler::bundle::compile_factory(file, url, &code, &mut noop)
                     .map_err(|err| format!("asset module error for {url}: {err}"))?;
@@ -4747,22 +4757,8 @@ async fn asset_module(file: &Path, url: &str, kind: &str) -> Result<String, Stri
             Ok(format!("export default {};\n", serde_json::Value::String(text)))
         }
         "inline" => {
+            // A stylesheet's `?inline` goes through `inline_css_module` instead.
             let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if is_style_ext(ext) {
-                let raw = tokio::fs::read_to_string(file)
-                    .await
-                    .map_err(|e| format!("read {}: {e}", file.display()))?;
-                let css_src = if oj_css::is_sass(clean_url) {
-                    oj_css::compile_sass(&raw, file.parent())?
-                } else {
-                    raw
-                };
-                let output = oj_css::compile_css(clean_url, &css_src, false)?;
-                return Ok(format!(
-                    "export default {};\n",
-                    serde_json::Value::String(output.css)
-                ));
-            }
             let bytes = tokio::fs::read(file).await.map_err(|e| format!("read: {e}"))?;
             let mime = content_type(ext).split(';').next().unwrap_or("application/octet-stream");
             let data_uri = format!("data:{mime};base64,{}", base64_encode(&bytes));
@@ -4779,6 +4775,20 @@ async fn asset_module(file: &Path, url: &str, kind: &str) -> Result<String, Stri
         )),
         _ => Err(format!("unknown asset query: {kind}")),
     }
+}
+
+/// `import css from "./x.css?inline"`: the compiled stylesheet as a string. It
+/// is the output of the same pipeline a plain stylesheet import runs (plugin
+/// transforms, Sass/Less/Stylus with additionalData and loadPaths, PostCSS or
+/// Tailwind, @import inlining, url() rebasing), as Vite's `?inline` is the css
+/// of the same transform; a CSS module inlines its css, not its class map.
+async fn inline_css_module(state: &Arc<ServerState>, file: &Path, url: &str) -> Result<String, String> {
+    let clean = url.split('?').next().unwrap_or(url);
+    let (_, module) = Box::pin(ensure_module(state, file, clean)).await?;
+    Ok(format!(
+        "export default {};\n",
+        serde_json::Value::String(module.code.clone())
+    ))
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
@@ -6675,32 +6685,9 @@ mod tests {
         assert_eq!(listener.local_addr().unwrap().port(), port);
     }
 
-    #[tokio::test]
-    async fn css_inline_returns_compiled_css_not_a_data_uri() {
-        // `import css from './x.css?inline'` yields the compiled CSS string,
-        // not a base64 data: URI (Vite parity).
-        let dir = tempfile::tempdir().unwrap();
-        let css = dir.path().join("styles.css");
-        std::fs::write(&css, ".a { color: red; }").unwrap();
-        let out = asset_module(&css, "/styles.css?inline", "inline")
-            .await
-            .unwrap();
-        assert!(out.starts_with("export default \""), "string export: {out}");
-        assert!(out.contains("color"), "carries the CSS text: {out}");
-        assert!(!out.contains("data:"), "must not be a data URI: {out}");
-    }
-
-    #[tokio::test]
-    async fn scss_inline_is_compiled_through_sass() {
-        let dir = tempfile::tempdir().unwrap();
-        let scss = dir.path().join("styles.scss");
-        std::fs::write(&scss, "$c: red;\n.a { color: $c; }").unwrap();
-        let out = asset_module(&scss, "/styles.scss?inline", "inline")
-            .await
-            .unwrap();
-        assert!(out.contains("red"), "sass variable compiled: {out}");
-        assert!(!out.contains("$c"), "sass compiled away: {out}");
-    }
+    // A stylesheet's `?inline` (compiled css string through the full pipeline,
+    // not a data URI) is covered end to end by e2e/css-vite-parity.mjs, since
+    // it runs the server's compile path.
 
     #[tokio::test]
     async fn non_css_inline_stays_a_data_uri() {

@@ -1,5 +1,8 @@
 {
   "name": "oj-e2e",
   "private": true,
-  "devDependencies": { "playwright": "^1.62" }
+  "devDependencies": {
+    "playwright": "^1.62",
+    "postcss": "^8.5.27"
+  }
 }
