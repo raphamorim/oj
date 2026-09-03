@@ -192,6 +192,9 @@ jobs:
       - name: generic ssr dev runs requests concurrently, action bodies stay bytes
         if: matrix.mode == 'unbundled'
         run: node e2e/ssr-concurrent.mjs
+      - name: start dev holds the page reload behind the editor HMR gate until the flush
+        if: matrix.mode == 'unbundled'
+        run: node e2e/start-hmr-gate.mjs
 
   # i need to fix this or automate
   build:

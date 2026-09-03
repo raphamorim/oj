@@ -298,6 +298,12 @@ struct ServerState {
     jsx: oj_compiler::JsxConfig,
     host_policy: HostPolicy,
     hmr_gate: Option<Arc<HmrGate>>,
+    /// Fires when the HMR gate flushes, so the Start server releases the page
+    /// reload it held (the plain path's held changes go through `decide` instead).
+    gate_flush_tx: broadcast::Sender<()>,
+    /// Process start, epoch milliseconds: the gate status `startedAt` the editor
+    /// compares across dev server restarts.
+    started_at_ms: u64,
     hmr_enabled: bool,
     plugins: Option<std::sync::Arc<PluginHost>>,
     plugin_mw_port: Option<u16>,
@@ -370,6 +376,9 @@ pub struct BuiltApp {
     pub plugin_host: Option<Arc<PluginHost>>,
     /// `server.open`: launch the browser once bound.
     pub open: bool,
+    /// The HMR gate (the editor-driven hold), when enabled: the Start
+    /// server holds its page reload behind it like the plain path holds updates.
+    pub hmr_gate: Option<HmrGateHandle>,
 }
 
 pub async fn bind_dev_listener(
@@ -732,6 +741,7 @@ impl DevServer {
                     full_reload,
                     max_hold: Duration::from_millis(240_000),
                     inner: Mutex::new(GateInner::default()),
+                    held_reload: std::sync::atomic::AtomicBool::new(false),
                 }))
             } else {
                 None
@@ -897,6 +907,11 @@ impl DevServer {
             jsx,
             host_policy: HostPolicy::from_config(&server_cfg, self.host.as_deref()),
             hmr_gate,
+            gate_flush_tx: broadcast::channel::<()>(16).0,
+            started_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
             hmr_enabled,
             plugins: plugin_host.clone(),
             plugin_mw_port,
@@ -1055,6 +1070,7 @@ impl DevServer {
             ));
         }
         let proxy_prefixes: Vec<String> = state.proxy.iter().map(|(p, _)| p.clone()).collect();
+        let hmr_gate = state.hmr_gate.as_ref().map(|_| HmrGateHandle { state: Arc::clone(&state) });
         let app = app.with_state(state);
 
         Ok(BuiltApp {
@@ -1069,6 +1085,7 @@ impl DevServer {
             reload_tx,
             plugin_host,
             open,
+            hmr_gate,
         })
     }
 }
@@ -7054,6 +7071,10 @@ struct HmrGate {
     full_reload: bool,
     max_hold: Duration,
     inner: Mutex<GateInner>,
+    /// A page reload the Start server is holding for the flush (the editor's
+    /// gate plugin's `heldReload`: a bundled dev server's reload is one event,
+    /// not a set of hot updates).
+    held_reload: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -7117,6 +7138,10 @@ impl HmrGate {
             .map(|(p, _)| p.display().to_string())
             .collect();
         let count = entries.len();
+        let held_reload = self.held_reload.swap(false, std::sync::atomic::Ordering::SeqCst);
+        if held_reload || !entries.is_empty() {
+            let _ = state.gate_flush_tx.send(());
+        }
         if !entries.is_empty() {
             *state.chunk_cache.lock().unwrap() = None;
             state.dir_cache.lock().unwrap().clear();
@@ -7143,7 +7168,7 @@ impl HmrGate {
         }
     }
 
-    fn status(&self) -> serde_json::Value {
+    fn status(&self, state: &ServerState) -> serde_json::Value {
         let inner = self.inner.lock().unwrap();
         let mut pending = serde_json::Map::new();
         for (p, events) in &inner.pending {
@@ -7152,12 +7177,45 @@ impl HmrGate {
                 serde_json::json!(events.iter().collect::<Vec<_>>()),
             );
         }
+        let held_reload = self.held_reload.load(std::sync::atomic::Ordering::SeqCst);
         serde_json::json!({
             "enabled": true,
             "pending": pending,
             "count": inner.pending.len(),
             "mode": self.mode(),
+            "heldReload": held_reload,
+            "startedAt": state.started_at_ms,
         })
+    }
+}
+
+/// The HMR gate as the Start server sees it: hold the page reload a rebuild
+/// would send until the editor flushes (`POST /__hmr_flush`) or the hold cap
+/// releases it, like the editor's Vite gate plugin holds a bundled dev server's
+/// `full-reload`. Without it every write under `src/` reloaded the preview at
+/// once, gate or not.
+#[derive(Clone)]
+pub struct HmrGateHandle {
+    state: Arc<ServerState>,
+}
+
+impl HmrGateHandle {
+    /// Record the changed paths and hold the reload. False when nothing relevant
+    /// changed (build output, caches), in which case the caller reloads now.
+    pub fn hold_reload(&self, paths: &[PathBuf]) -> bool {
+        let Some(gate) = &self.state.hmr_gate else {
+            return false;
+        };
+        if !gate.hold(&self.state, paths) {
+            return false;
+        }
+        gate.held_reload.store(true, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+
+    /// Fires once per flush that released something.
+    pub fn subscribe_flush(&self) -> broadcast::Receiver<()> {
+        self.state.gate_flush_tx.subscribe()
     }
 }
 
@@ -7167,13 +7225,14 @@ async fn hmr_flush(State(state): State<Arc<ServerState>>) -> Response {
             serde_json::json!({ "flushed": [], "count": 0, "mode": "disabled" }),
         );
     };
+    let held_reload = gate.held_reload.load(std::sync::atomic::Ordering::SeqCst);
     let (files, count) = gate.flush(&state).await;
-    js_response_json(serde_json::json!({ "flushed": files, "count": count, "mode": gate.mode() }))
+    js_response_json(serde_json::json!({ "flushed": files, "count": count, "mode": gate.mode(), "reload": held_reload || count > 0 }))
 }
 
 async fn hmr_gate_status(State(state): State<Arc<ServerState>>) -> Response {
     match &state.hmr_gate {
-        Some(gate) => js_response_json(gate.status()),
+        Some(gate) => js_response_json(gate.status(&state)),
         None => js_response_json(serde_json::json!({ "enabled": false })),
     }
 }

@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TanStack Start: an app's own server entry (`tanstackStart({ server: { entry } })`, the shape an SSR error wrapper takes) is honored in dev and in the prod server bundle, as Vite imports it: the configured module is the handler and `@tanstack/react-start/server-entry` inside it is oj's handler, so a wrapper composes. Previously oj always ran its own entry and the wrapper never executed.
 
 ### Fixed
+- TanStack Start dev ignored the editor-driven HMR gate: every write under `src/` rebuilt the client bundle and reloaded the page at once, so a preview reloaded over and over while files were being written. The rebuild still happens immediately, but the page reload now waits for `POST /__hmr_flush` (or the 240 second hold cap), as plain-mode updates already did and as the editor's Vite gate plugin holds a bundled dev server's full reload; `/__hmr_gate` reports `heldReload` and `startedAt`, and the flush response says whether a reload was released.
 - `vite.config` "not applied" warnings were emitted for Vite's own resolved defaults (`esbuild.jsxDev/charset/legalComments`, `worker`, `ssr.resolve`, `server.cors.origin`, `optimizeDeps.esbuildOptions`, `build.terserOptions`, the `@vite/env` and `@vite/client` aliases) on every config, and repeated on every config load (three times at Start startup, again after each rebuild). They now describe only options the config file itself sets, and each line prints once per dev session.
 
 ## [0.1.15] - 2026-09-03
