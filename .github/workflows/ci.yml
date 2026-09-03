@@ -65,6 +65,9 @@ jobs:
           node e2e/memory-cache.mjs
           node e2e/mtime-fastpath.mjs
           node e2e/hmr-hook-skip.mjs
+      - name: startup compile error overlay + recovery by reload
+        if: matrix.mode == 'unbundled'
+        run: node e2e/hmr-overlay-recovery.mjs
       - name: request paths (encoded filenames, traversal containment)
         if: matrix.mode == 'unbundled'
         run: node e2e/awkward-paths.mjs
