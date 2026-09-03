@@ -60,21 +60,31 @@ function startRunner(dir) {
       }, 20);
       const to = setTimeout(() => { clearInterval(t); rej(new Error("runner never became ready; stderr:\n" + stderr)); }, 10000);
     });
-  const req = async (msg) => {
+  // Control commands still travel over stdin as JSON lines...
+  const cmd = async (msg) => {
     child.stdin.write(JSON.stringify(msg) + "\n");
     return JSON.parse(await nextFrame());
   };
-  return { child, ready, req, getStderr: () => stderr };
+  // ...while requests go to the loopback HTTP server the runner announces on
+  // its first stdout line (`{ port }`), so bodies stay binary and responses stream.
+  let port = null;
+  const req = async ({ method = "GET", url, headers = {}, body }) => {
+    if (port == null) port = JSON.parse(await nextFrame()).port;
+    const res = await fetch(`http://127.0.0.1:${port}${url}`, { method, headers, body });
+    const h = {};
+    res.headers.forEach((v, k) => { h[k] = v; });
+    return { status: res.status, headers: h, body: await res.text() };
+  };
+  return { child, ready, req, cmd, getStderr: () => stderr };
 }
 
-test("runner speaks the json-lines stdio protocol", async () => {
+test("runner serves requests over loopback http and commands over stdin", async () => {
   const dir = mkdtempSync(join(tmpdir(), "oj-runner-"));
   const r = startRunner(dir);
   try {
     await r.ready();
 
-    const g = await r.req({ id: 1, method: "GET", url: "/hello", headers: { host: "example.test" } });
-    assert.equal(g.id, 1);
+    const g = await r.req({ method: "GET", url: "/hello", headers: { "x-forwarded-host": "example.test" } });
     assert.equal(g.status, 200);
     assert.equal(g.headers["x-custom"], "runner-ok");
     const gbody = JSON.parse(g.body);
@@ -82,19 +92,19 @@ test("runner speaks the json-lines stdio protocol", async () => {
     assert.equal(gbody.host, "example.test");
     assert.equal(gbody.method, "GET");
 
-    const p = await r.req({ id: 2, method: "POST", url: "/submit", headers: { host: "h" }, body: "payload" });
+    const p = await r.req({ method: "POST", url: "/submit", headers: { "x-forwarded-host": "h" }, body: "payload" });
     assert.equal(JSON.parse(p.body).echo, "payload");
 
-    const reloaded = await r.req({ cmd: "reload" });
+    const reloaded = await r.cmd({ cmd: "reload" });
     assert.equal(reloaded.reloaded, true);
-    const after = await r.req({ id: 3, url: "/hello", headers: { host: "h" } });
+    const after = await r.req({ url: "/hello", headers: { "x-forwarded-host": "h" } });
     assert.equal(after.status, 200);
 
-    const boom = await r.req({ id: 4, url: "/boom", headers: { host: "h" } });
+    const boom = await r.req({ url: "/boom", headers: { "x-forwarded-host": "h" } });
     assert.equal(boom.status, 500);
     assert.match(boom.body, /kaboom/);
 
-    const missing = await r.req({ id: 5, url: "/missing", headers: { host: "h" } });
+    const missing = await r.req({ url: "/missing", headers: { "x-forwarded-host": "h" } });
     assert.equal(missing.status, 404);
 
     assert.match(r.getStderr(), /APP_LOG_MUST_NOT_CORRUPT_PROTOCOL/);

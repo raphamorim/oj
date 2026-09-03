@@ -6,11 +6,18 @@ import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-brid
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
-test("matchOne: RegExp tests, string is a substring match", () => {
+test("matchOne: RegExp tests, string is a picomatch-style glob (Vite pluginFilter)", () => {
   assert.ok(matchOne(/\.mdx$/, "/a/b.mdx"));
   assert.ok(!matchOne(/\.mdx$/, "/a/b.tsx"));
-  assert.ok(matchOne("virtual:", "virtual:foo"));
-  assert.ok(!matchOne("virtual:", "./real"));
+  // A string is a glob: `**`-prefixed and absolute patterns are used as-is...
+  assert.ok(matchOne("**/*.mdx", "/a/b.mdx"));
+  assert.ok(!matchOne("**/*.mdx", "/a/b.tsx"));
+  assert.ok(matchOne("/abs/dir/*.svg", "/abs/dir/x.svg"));
+  // ...and a relative one is joined to the app root, so a bare substring no longer matches.
+  const root = process.env.OJ_APP_ROOT ?? process.cwd();
+  assert.ok(matchOne("src/**/*.tsx", root + "/src/pages/a.tsx"));
+  assert.ok(!matchOne("src/**/*.tsx", "/elsewhere/src/pages/a.tsx"));
+  assert.ok(!matchOne("virtual:", "virtual:foo"));
 });
 
 test("idAllowed: no filter allows everything", () => {
