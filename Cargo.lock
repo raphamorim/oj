@@ -1892,6 +1892,7 @@ dependencies = [
  "grass",
  "lightningcss",
  "proptest",
+ "serde_json",
  "tempfile",
 ]
 

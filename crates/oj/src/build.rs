@@ -366,6 +366,84 @@ async fn compile_stylesheet(
     oj_css::compile_css(&css_id, &source, true).map_err(|e| anyhow::anyhow!(e))
 }
 
+/// Split `spec?query` into the file and a normalized oj asset query, for Vite's
+/// import queries in any combination/order: `?worker`, `?worker&inline`,
+/// `?worker&url`, `?sharedworker...`, and the single `?url`/`?raw`/`?inline`/
+/// `?init`/`?react`. Other queries (`?v=1`, `?tsr-split=x`) are not oj's.
+fn split_asset_query(spec: &str) -> Option<(String, String)> {
+    let (base, query) = spec.split_once('?')?;
+    let params: Vec<&str> = query.split('&').filter(|p| !p.is_empty()).collect();
+    let has = |k: &str| params.iter().any(|p| *p == k);
+    let worker_kind = if has("worker") {
+        Some("worker")
+    } else if has("sharedworker") {
+        Some("sharedworker")
+    } else {
+        None
+    };
+    if let Some(kind) = worker_kind {
+        let mut q = kind.to_string();
+        if has("inline") {
+            q.push_str("&inline");
+        } else if has("url") {
+            q.push_str("&url");
+        }
+        return Some((base.to_string(), q));
+    }
+    for kind in ["url", "init", "raw", "inline", "react"] {
+        if params.len() == 1 && has(kind) {
+            return Some((base.to_string(), kind.to_string()));
+        }
+    }
+    None
+}
+
+/// `(file, ctor, inline, url)` for a resolved worker id (`x.ts?worker&inline`).
+fn worker_id_parts(id: &str) -> Option<(&str, &'static str, bool, bool)> {
+    let (file, query) = id.split_once('?')?;
+    let params: Vec<&str> = query.split('&').collect();
+    let ctor = if params.contains(&"worker") {
+        "Worker"
+    } else if params.contains(&"sharedworker") {
+        "SharedWorker"
+    } else {
+        return None;
+    };
+    Some((file, ctor, params.contains(&"inline"), params.contains(&"url")))
+}
+
+/// Bundle a worker entry to a single ESM string (dynamic imports inlined) for
+/// `?worker&inline`, so the worker ships inside the importing chunk as in Vite.
+async fn bundle_worker_inline(root: &Path, file: &str) -> anyhow::Result<String> {
+    let mut bundler = BundlerBuilder::default()
+        .with_options(BundlerOptions {
+            input: Some(vec![InputItem {
+                name: Some("worker".to_string()),
+                import: file.to_string(),
+                ..Default::default()
+            }]),
+            cwd: Some(root.to_path_buf()),
+            format: Some(OutputFormat::Esm),
+            platform: Some(rolldown::Platform::Browser),
+            code_splitting: Some(rolldown_common::CodeSplittingMode::Bool(false)),
+            minify: Some(RawMinifyOptions::Bool(true)),
+            ..Default::default()
+        })
+        .build()
+        .map_err(|errs| anyhow::anyhow!("inline worker init failed: {errs:?}"))?;
+    let out = bundler
+        .generate()
+        .await
+        .map_err(|errs| anyhow::anyhow!("inline worker build failed for {file}:\n{errs:?}"))?;
+    let mut code = String::new();
+    for asset in &out.assets {
+        if let rolldown_common::Output::Chunk(chunk) = asset {
+            code.push_str(&chunk.code);
+        }
+    }
+    Ok(code)
+}
+
 impl Plugin for OjCssPlugin {
     fn name(&self) -> Cow<'static, str> {
         Cow::Borrowed("oj:build")
@@ -388,36 +466,17 @@ impl Plugin for OjCssPlugin {
             .join("oj-routes.tsx")
             .to_string_lossy()
             .into_owned();
-        let url_base = args.specifier.strip_suffix("?url").map(str::to_string);
-        let init_base = args.specifier.strip_suffix("?init").map(str::to_string);
-        let raw_base = args.specifier.strip_suffix("?raw").map(str::to_string);
-        let inline_base = args.specifier.strip_suffix("?inline").map(str::to_string);
-        let react_base = args.specifier.strip_suffix("?react").map(str::to_string);
-        let worker_base = args.specifier.strip_suffix("?worker").map(str::to_string);
-        let shared_base = args
-            .specifier
-            .strip_suffix("?sharedworker")
-            .map(str::to_string);
+        let asset_query = split_asset_query(args.specifier);
         let importer = args.importer.map(str::to_string);
         let ctx = ctx.clone();
         async move {
             if is_routes {
                 return Ok(Some(HookResolveIdOutput::from_id(routes_id)));
             }
-            for (base, query) in [
-                (url_base, "url"),
-                (init_base, "init"),
-                (raw_base, "raw"),
-                (inline_base, "inline"),
-                (react_base, "react"),
-                (worker_base, "worker"),
-                (shared_base, "sharedworker"),
-            ] {
-                if let Some(base) = base {
-                    if let Ok(Ok(resolved)) = ctx.resolve(&base, importer.as_deref(), None).await {
-                        let id = format!("{}?{query}", resolved.id.as_str());
-                        return Ok(Some(HookResolveIdOutput::from_id(id)));
-                    }
+            if let Some((base, query)) = asset_query {
+                if let Ok(Ok(resolved)) = ctx.resolve(&base, importer.as_deref(), None).await {
+                    let id = format!("{}?{query}", resolved.id.as_str());
+                    return Ok(Some(HookResolveIdOutput::from_id(id)));
                 }
             }
             Ok(None)
@@ -646,14 +705,20 @@ impl Plugin for OjCssPlugin {
                     ..Default::default()
                 }));
             }
-            let worker = id
-                .strip_suffix("?worker")
-                .map(|f| (f, "Worker"))
-                .or_else(|| {
-                    id.strip_suffix("?sharedworker")
-                        .map(|f| (f, "SharedWorker"))
-                });
-            if let Some((file, ctor)) = worker {
+            if let Some((file, ctor, inline, url)) = worker_id_parts(&id) {
+                if inline {
+                    // `?worker&inline`: the worker's bundled code travels inside
+                    // this chunk and starts from a Blob URL (data: URL fallback).
+                    let code = bundle_worker_inline(&root, file).await?;
+                    let literal = serde_json::Value::String(code).to_string();
+                    return Ok(Some(rolldown_plugin::HookLoadOutput {
+                        code: arcstr::ArcStr::from(format!(
+                            "const __oj_worker_code = {literal};\nexport default function (options) {{ const opts = Object.assign({{ type: \"module\" }}, options); const blob = typeof Blob !== \"undefined\" && new Blob([__oj_worker_code], {{ type: \"text/javascript;charset=utf-8\" }}); const url = blob ? URL.createObjectURL(blob) : \"data:text/javascript;charset=utf-8,\" + encodeURIComponent(__oj_worker_code); try {{ return new {ctor}(url, opts); }} finally {{ if (blob) setTimeout(() => URL.revokeObjectURL(url), 0); }} }};"
+                        )),
+                        module_type: Some(rolldown_common::ModuleType::Js),
+                        ..Default::default()
+                    }));
+                }
                 let stem = std::path::Path::new(file)
                     .file_stem()
                     .and_then(|n| n.to_str())
@@ -669,10 +734,17 @@ impl Plugin for OjCssPlugin {
                         ..Default::default()
                     })
                     .map_err(|e| anyhow::anyhow!(e))?;
+                let code = if url {
+                    // `?worker&url` (also what `new Worker(new URL(...))` becomes):
+                    // the chunk's URL as a string.
+                    format!("export default import.meta.ROLLUP_FILE_URL_{reference};")
+                } else {
+                    format!(
+                        "export default function (options) {{ return new {ctor}(import.meta.ROLLUP_FILE_URL_{reference}, Object.assign({{ type: \"module\" }}, options)); }};"
+                    )
+                };
                 return Ok(Some(rolldown_plugin::HookLoadOutput {
-                    code: arcstr::ArcStr::from(format!(
-                        "export default function () {{ return new {ctor}(import.meta.ROLLUP_FILE_URL_{reference}, {{ type: \"module\" }}); }};"
-                    )),
+                    code: arcstr::ArcStr::from(code),
                     module_type: Some(rolldown_common::ModuleType::Js),
                     ..Default::default()
                 }));
@@ -3692,6 +3764,21 @@ mod tests {
             let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
             assert_eq!(b64(&bytes).len() % 4, 0, "len {len}");
         }
+    }
+
+    #[test]
+    fn asset_queries_split_in_any_combination() {
+        assert_eq!(split_asset_query("./w.ts?worker"), Some(("./w.ts".into(), "worker".into())));
+        assert_eq!(split_asset_query("./w.ts?worker&inline"), Some(("./w.ts".into(), "worker&inline".into())));
+        assert_eq!(split_asset_query("./w.ts?inline&worker"), Some(("./w.ts".into(), "worker&inline".into())));
+        assert_eq!(split_asset_query("./w.ts?url&sharedworker"), Some(("./w.ts".into(), "sharedworker&url".into())));
+        assert_eq!(split_asset_query("./a.png?url"), Some(("./a.png".into(), "url".into())));
+        assert_eq!(split_asset_query("./a.png?url&v=1"), None, "foreign params are not oj queries");
+        assert_eq!(split_asset_query("./a.png?v=1"), None);
+        assert_eq!(split_asset_query("./a.png"), None);
+        assert_eq!(worker_id_parts("/x/w.ts?worker&inline"), Some(("/x/w.ts", "Worker", true, false)));
+        assert_eq!(worker_id_parts("/x/w.ts?sharedworker&url"), Some(("/x/w.ts", "SharedWorker", false, true)));
+        assert_eq!(worker_id_parts("/x/w.ts?url"), None);
     }
 
     #[test]

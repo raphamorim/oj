@@ -373,7 +373,8 @@ pub fn compile_module_with_maps(
 
     // new URL("./asset", import.meta.url) -> a hoisted ?url asset import.
     if source_text.contains("import.meta.url") {
-        synthesized |= glob::expand_new_url_asset(&allocator, &mut program);
+        let dir = path.parent().unwrap_or(path);
+        synthesized |= glob::expand_new_url_asset(&allocator, dir, &mut program, source_text);
     }
 
     let (imports, dynamic_imports) =
