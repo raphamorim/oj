@@ -586,7 +586,16 @@ export async function loadPluginContainer(app, opts = {}) {
     ? false
     : typeof config.publicDir === "string" ? config.publicDir : null;
   const configDependencies = [configFile, ...(loaded?.dependencies ?? [])];
-  return { ...container, publicDir, configDependencies };
+  // The config's `define` for this environment (top-level, then the
+  // environment's own), serialized the way Vite's define plugin does
+  // (handleDefineValue: strings verbatim, anything else JSON).
+  const environment = opts.environment ?? "client";
+  const defines = () => Object.fromEntries(
+    Object.entries({ ...config.define, ...config.environments?.[environment]?.define })
+      .map(([key, value]) => [key, typeof value === "string" ? value : JSON.stringify(value)])
+      .filter(([, value]) => typeof value === "string"),
+  );
+  return { ...container, publicDir, configDependencies, defines };
 }
 
 export const __test = { matchOne, idAllowed, codeAllowed, byHook, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows };
