@@ -122,6 +122,9 @@ jobs:
       - name: removed files reach hotUpdate / watchChange as delete
         if: matrix.mode == 'unbundled'
         run: node e2e/plugin-hot-update-delete.mjs
+      - name: start dev applies config define to the client bundle; --mode selects .env.<mode>
+        if: matrix.mode == 'unbundled'
+        run: node e2e/start-define-mode.mjs
 
   # i need to fix this or automate
   build:

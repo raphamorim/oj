@@ -39,6 +39,8 @@ struct StartState {
     // only drives the app iframe's live reload).
     ws_tx: broadcast::Sender<String>,
     css_host: Option<Arc<tokio::sync::Mutex<Runner>>>,
+    /// The dev mode (`oj dev --mode`), handed to every node script respawn.
+    mode: String,
 }
 
 // A --config path is resolved against the app root, the way `build` resolves
@@ -53,10 +55,16 @@ pub async fn start_dev(
     port: Option<u16>,
     host: Option<String>,
     config: Option<PathBuf>,
+    mode: Option<String>,
 ) -> anyhow::Result<()> {
     let root = root
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("app root not found: {}: {e}", root.display()))?;
+    // Vite's `--mode` for `serve`: selects `.env.<mode>`, import.meta.env.MODE and
+    // the mode plugin hooks see, on the SSR loader and the client bundle alike.
+    let mode = mode
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| "development".to_string());
 
     // Same order `build` uses: pin the override before anything reads a config,
     // so the Rust side and the plugin host agree on which file is the config.
@@ -80,29 +88,29 @@ pub async fn start_dev(
             enable_cache: false,
             no_cache: false,
             lazy: false,
-                    mode: None,
-}
+            mode: Some(mode.clone()),
+        }
         .build_app(),
     );
 
     let route_tree = {
-        let (root, cache) = (root.clone(), cache.clone());
-        tokio::task::spawn_blocking(move || generate_route_tree(&root, &cache))
+        let (root, cache, mode) = (root.clone(), cache.clone(), mode.clone());
+        tokio::task::spawn_blocking(move || generate_route_tree(&root, &cache, &mode))
     };
     let resolver = {
-        let (root, cache) = (root.clone(), cache.clone());
-        tokio::task::spawn_blocking(move || generate_server_fn_resolver(&root, &cache))
+        let (root, cache, mode) = (root.clone(), cache.clone(), mode.clone());
+        tokio::task::spawn_blocking(move || generate_server_fn_resolver(&root, &cache, &mode))
     };
     route_tree.await??;
     oj_server::boot_phase("route tree ready");
     let bundle = {
-        let (root, cache) = (root.clone(), cache.clone());
-        tokio::task::spawn_blocking(move || bundle_client_entry_cached(&root, &cache))
+        let (root, cache, mode) = (root.clone(), cache.clone(), mode.clone());
+        tokio::task::spawn_blocking(move || bundle_client_entry_cached(&root, &cache, &mode))
     };
     resolver.await??;
     oj_server::boot_phase("resolver ready");
     let runner = Arc::new(tokio::sync::Mutex::new(
-        spawn_start_runner(&root, &cache).await?,
+        spawn_start_runner(&root, &cache, &mode).await?,
     ));
     oj_server::boot_phase("runner spawned");
     let (reload_tx, _) = broadcast::channel::<()>(16);
@@ -123,7 +131,7 @@ pub async fn start_dev(
     let built = built_res??;
     oj_server::boot_phase("bundle+build joined");
     let css_host = if app_uses_tailwind(&root) {
-        spawn_node_service(&root, &cache.join("css-host.mjs"))
+        spawn_node_service(&root, &cache.join("css-host.mjs"), &mode)
             .await
             .ok()
             .map(|r| Arc::new(tokio::sync::Mutex::new(r)))
@@ -141,13 +149,14 @@ pub async fn start_dev(
         reload_tx: reload_tx.clone(),
         ws_tx: built.reload_tx.clone(),
         css_host,
+        mode: mode.clone(),
     });
 
     spawn_start_watcher(root.clone(), cache.clone(), Arc::clone(&state));
     {
-        let root = root.clone();
+        let (root, mode) = (root.clone(), mode.clone());
         tokio::task::spawn_blocking(move || {
-            start_bundle_store(&root).prune(oj_cache::start_bundle::DEFAULT_PRUNE_BUDGET_BYTES);
+            start_bundle_store(&root, &mode).prune(oj_cache::start_bundle::DEFAULT_PRUNE_BUDGET_BYTES);
         });
     }
 
@@ -332,7 +341,7 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             let routes_now = list_route_files(&root);
             let routes_changed = routes_now != prev_routes;
             if routes_changed {
-                let _ = generate_route_tree(&root, &cache);
+                let _ = generate_route_tree(&root, &cache, &state.mode);
                 prev_routes = routes_now;
             }
             let server_fn_changed = paths.iter().any(|p| {
@@ -342,7 +351,7 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
                         || std::fs::read_to_string(p).is_ok_and(|s| s.contains("createServerFn")))
             });
             if routes_changed || server_fn_changed {
-                let _ = generate_server_fn_resolver(&root, &cache);
+                let _ = generate_server_fn_resolver(&root, &cache, &state.mode);
             }
             // Narrate the compile batch to the editor: "Applying changes…" while
             // it rebuilds, then done so the pill clears.
@@ -355,12 +364,12 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect();
             rt.block_on(async {
-                let (r, c) = (root.clone(), cache.clone());
+                let (r, c, m) = (root.clone(), cache.clone(), state.mode.clone());
                 let client = tokio::task::spawn_blocking(move || {
-                    if bundle_client_entry(&r, &c).is_err() {
+                    if bundle_client_entry(&r, &c, &m).is_err() {
                         return None;
                     }
-                    match start_bundle_store(&r).persist(&c) {
+                    match start_bundle_store(&r, &m).persist(&c) {
                         Some((_, pinned)) => Some(pinned),
                         None => oj_cache::start_bundle::PinnedBundle::from_build_dir(&c),
                     }
@@ -433,8 +442,8 @@ pub async fn start_build(root: PathBuf, mode: &str, out: Option<PathBuf>) -> any
     let cache = oj_cache::cache_root(&root).join("start");
     oj_server::prepare_cache_root(&root);
     oj_server::write_start_assets(&cache)?;
-    generate_route_tree(&root, &cache)?;
-    generate_server_fn_resolver(&root, &cache)?;
+    generate_route_tree(&root, &cache, "development")?;
+    generate_server_fn_resolver(&root, &cache, "development")?;
     // The build options Vite resolves for a Start app too: `--out`/`build.outDir`,
     // `base`, `build.sourcemap`, `build.minify` (consumed by build.mjs).
     let mut config = oj_config::load_with(&root, "build", mode).unwrap_or_default();
@@ -533,7 +542,7 @@ fn codegen_store(
     )
 }
 
-fn generate_route_tree(root: &Path, cache: &Path) -> anyhow::Result<()> {
+fn generate_route_tree(root: &Path, cache: &Path, mode: &str) -> anyhow::Result<()> {
     let store = codegen_store(root, cache, "route-tree", "generate.mjs", None);
     let dest = root.join("src").join("routeTree.gen.ts");
     let outputs = [("routeTree.gen.ts", dest.as_path())];
@@ -550,13 +559,13 @@ fn generate_route_tree(root: &Path, cache: &Path) -> anyhow::Result<()> {
         }
         Err(miss) => println!("  oj start: route tree cache miss ({miss})"),
     }
-    run_node(root, &cache.join("generate.mjs"), "route tree generation")?;
+    run_node(root, &cache.join("generate.mjs"), "route tree generation", mode)?;
     let inputs: Vec<PathBuf> = list_route_files(root).into_iter().collect();
     store.persist(&inputs, &outputs);
     Ok(())
 }
 
-fn generate_server_fn_resolver(root: &Path, cache: &Path) -> anyhow::Result<()> {
+fn generate_server_fn_resolver(root: &Path, cache: &Path, mode: &str) -> anyhow::Result<()> {
     let store = codegen_store(
         root,
         cache,
@@ -581,7 +590,7 @@ fn generate_server_fn_resolver(root: &Path, cache: &Path) -> anyhow::Result<()> 
         }
         Err(miss) => println!("  oj start: server-fn resolver cache miss ({miss})"),
     }
-    run_node(root, &cache.join("gen-resolver.mjs"), "server-fn resolver")?;
+    run_node(root, &cache.join("gen-resolver.mjs"), "server-fn resolver", mode)?;
     store.persist(&inputs, &outputs);
     Ok(())
 }
@@ -605,27 +614,30 @@ fn list_src_ts_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn bundle_client_entry(root: &Path, cache: &Path) -> anyhow::Result<()> {
+fn bundle_client_entry(root: &Path, cache: &Path, mode: &str) -> anyhow::Result<()> {
     run_node(
         root,
         &cache.join("bundle-client.mjs"),
         "client entry bundling",
+        mode,
     )
 }
 
-fn start_bundle_store(root: &Path) -> oj_cache::start_bundle::StartBundleStore {
-    oj_cache::start_bundle::StartBundleStore::new(
+fn start_bundle_store(root: &Path, mode: &str) -> oj_cache::start_bundle::StartBundleStore {
+    oj_cache::start_bundle::StartBundleStore::for_mode(
         root,
         env!("CARGO_PKG_VERSION"),
         oj_cache::integrity::VerifyMode::from_env(),
+        mode,
     )
 }
 
 fn bundle_client_entry_cached(
     root: &Path,
     cache: &Path,
+    mode: &str,
 ) -> anyhow::Result<oj_cache::start_bundle::PinnedBundle> {
-    let store = start_bundle_store(root);
+    let store = start_bundle_store(root, mode);
     match store.restore(cache) {
         Ok((stats, pinned)) => {
             let rehashed = match stats.rehashed {
@@ -643,7 +655,7 @@ fn bundle_client_entry_cached(
         }
         Err(miss) => println!("  oj start: client bundle cache miss ({miss})"),
     }
-    bundle_client_entry(root, cache)?;
+    bundle_client_entry(root, cache, mode)?;
     if let Some((key, pinned)) = store.persist(cache) {
         println!(
             "  oj start: client bundle cached (key {}…, {} chunks)",
@@ -664,13 +676,14 @@ fn client_module_count(cache: &Path) -> usize {
         .unwrap_or(0)
 }
 
-fn run_node(root: &Path, script: &Path, what: &str) -> anyhow::Result<()> {
+fn run_node(root: &Path, script: &Path, what: &str, mode: &str) -> anyhow::Result<()> {
     let status = std::process::Command::new("node")
         .arg(script)
         .env("OJ_APP_ROOT", root)
         .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
         .env("NODE_ENV", "development")
-        .envs(start_script_env(root, "serve", "development")?)
+        .env("OJ_MODE", mode)
+        .envs(start_script_env(root, "serve", mode)?)
         .env("NODE_COMPILE_CACHE", oj_server::node_compile_cache(root))
         .current_dir(root)
         .status()
@@ -681,8 +694,8 @@ fn run_node(root: &Path, script: &Path, what: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn spawn_start_runner(root: &Path, cache: &Path) -> anyhow::Result<Runner> {
-    let mut runner = spawn_node_service(root, &cache.join("runner.mjs")).await?;
+async fn spawn_start_runner(root: &Path, cache: &Path, mode: &str) -> anyhow::Result<Runner> {
+    let mut runner = spawn_node_service(root, &cache.join("runner.mjs"), mode).await?;
     // The runner announces its loopback port as its first stdout line, before it
     // evaluates the app entry (requests wait for that inside the runner).
     let line = tokio::time::timeout(std::time::Duration::from_secs(120), runner.lines.next_line())
@@ -698,7 +711,7 @@ async fn spawn_start_runner(root: &Path, cache: &Path) -> anyhow::Result<Runner>
     Ok(runner)
 }
 
-async fn spawn_node_service(root: &Path, script: &Path) -> anyhow::Result<Runner> {
+async fn spawn_node_service(root: &Path, script: &Path, mode: &str) -> anyhow::Result<Runner> {
     let mut cmd = tokio::process::Command::new("node");
     // The SSR loader inlines source maps into every transformed module; this
     // flag makes Node apply them to stack traces (original .tsx positions).
@@ -706,7 +719,8 @@ async fn spawn_node_service(root: &Path, script: &Path) -> anyhow::Result<Runner
         .env("OJ_APP_ROOT", root)
         .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
         .env("NODE_ENV", "development")
-        .envs(start_script_env(root, "serve", "development")?)
+        .env("OJ_MODE", mode)
+        .envs(start_script_env(root, "serve", mode)?)
         .env(
             "OJ_SSR_BRIDGE_DIR",
             oj_server::plugins::ssr_bridge_dir(root),

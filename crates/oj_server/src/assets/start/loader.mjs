@@ -135,7 +135,9 @@ const configDefines = (() => {
     return {};
   }
 })();
-const DEFINE = { ...viteEnvDefine({ ssr: true, env: { ...process.env, ...envDelta } }), ...USER_DEFINE, ...configDefines };
+// Vite's `--mode` (OJ_MODE from oj; `development` for `oj dev` without one).
+const MODE = process.env.OJ_MODE || "development";
+const DEFINE = { ...viteEnvDefine({ ssr: true, mode: MODE, env: { ...process.env, ...envDelta } }), ...USER_DEFINE, ...configDefines };
 
 const cacheStats = { hits: 0, misses: 0, uncached: 0, rhits: 0, rmisses: 0 };
 const EPOCH = (() => {
