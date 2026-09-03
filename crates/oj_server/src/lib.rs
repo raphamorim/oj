@@ -337,6 +337,8 @@ pub struct BuiltApp {
     /// Sender for the `/__ws` broadcast — the channel the Lovable editor reads
     /// HMR + narration frames from. The start path pushes narration here.
     pub reload_tx: broadcast::Sender<String>,
+    /// The client plugin host, for the shutdown hooks (buildEnd, closeBundle).
+    pub plugin_host: Option<Arc<PluginHost>>,
 }
 
 pub async fn bind_dev_listener(
@@ -377,6 +379,9 @@ impl DevServer {
             println!("  proxy: {}", built.proxy_prefixes.join(", "));
         }
         println!("  ready in {:?}", built.started.elapsed());
+        if built.plugin_host.is_some() {
+            tokio::spawn(close_plugins_on_shutdown(built.plugin_host.clone()));
+        }
         axum::serve(listener, built.router).await?;
         Ok(())
     }
@@ -802,7 +807,7 @@ impl DevServer {
             host_policy: HostPolicy::from_config(&server_cfg, self.host.as_deref()),
             hmr_gate,
             hmr_enabled,
-            plugins: plugin_host,
+            plugins: plugin_host.clone(),
             plugin_mw_port,
             plugins_ssr: tokio::sync::OnceCell::new(),
             ssr_plugin_config,
@@ -958,8 +963,48 @@ impl DevServer {
             root,
             started,
             reload_tx,
+            plugin_host,
         })
     }
+}
+
+/// Vite's dev server close runs the plugin container's `buildEnd` then
+/// `closeBundle` (pluginContainer.close), so plugins that hold resources or
+/// write summaries on shutdown get to. oj has no graceful drain (HMR sockets
+/// would hold it open), so the hooks run on the signal and the process exits
+/// with the shell's conventional code; a hung plugin is cut off after a bound.
+async fn close_plugins_on_shutdown(host: Option<Arc<PluginHost>>) {
+    #[cfg(unix)]
+    let code = {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => tokio::select! {
+                _ = tokio::signal::ctrl_c() => 130,
+                _ = term.recv() => 143,
+            },
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                130
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let code = {
+        let _ = tokio::signal::ctrl_c().await;
+        130
+    };
+    if let Some(host) = host {
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            if let Err(e) = host.build_end(None).await {
+                eprintln!("oj: plugin buildEnd on close failed: {e}");
+            }
+            if let Err(e) = host.close_bundle().await {
+                eprintln!("oj: plugin closeBundle on close failed: {e}");
+            }
+        })
+        .await;
+    }
+    std::process::exit(code);
 }
 
 fn js(body: impl IntoResponse) -> Response {

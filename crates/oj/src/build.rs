@@ -1954,6 +1954,24 @@ async fn user_plugin_host(
     }
 }
 
+// Vite (build.ts) closes the bundle in a `finally`, so a failed build still
+// reaches every plugin's buildEnd (with the error) and closeBundle. rolldown
+// runs them itself only when the scan fails; a failure past that (render,
+// write) would skip them, so the host is told directly. Its closeBundle is
+// idempotent, so the rolldown-driven call and this one do not double up.
+async fn fail_with_plugin_hooks(err: anyhow::Error, host: &Option<Arc<PluginHost>>) -> anyhow::Error {
+    if let Some(h) = host {
+        let message = format!("{err:#}");
+        if let Err(e) = h.build_end(Some(&message)).await {
+            eprintln!("oj build: plugin buildEnd (after failure) failed:\n{e}");
+        }
+        if let Err(e) = h.close_bundle().await {
+            eprintln!("oj build: plugin closeBundle (after failure) failed:\n{e}");
+        }
+    }
+    err
+}
+
 // `define` entries the plugins' config() hooks returned; Vite merges them into
 // config.define, so they join the build's define map (plugin value wins).
 async fn plugin_config_defines(host: &Option<Arc<PluginHost>>) -> Vec<(String, String)> {
@@ -2230,15 +2248,18 @@ pub async fn build(
         .build()
         .map_err(|errs| anyhow::anyhow!("rolldown init failed: {errs:?}"))?;
 
-    let output = bundler.write().await.map_err(|errs| {
-        let detail = errs
-            .into_vec()
-            .iter()
-            .map(|e| e.to_diagnostic().to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        anyhow::anyhow!("build failed:\n{detail}")
-    })?;
+    let output = match bundler.write().await {
+        Ok(output) => output,
+        Err(errs) => {
+            let detail = errs
+                .into_vec()
+                .iter()
+                .map(|e| e.to_diagnostic().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(fail_with_plugin_hooks(anyhow::anyhow!("build failed:\n{detail}"), &plugin_host).await);
+        }
+    };
     bundler
         .close()
         .await
@@ -2270,7 +2291,7 @@ pub async fn build(
     }
 
     if let Some(host) = &plugin_host {
-        if let Err(e) = host.build_end().await {
+        if let Err(e) = host.build_end(None).await {
             bail!("plugin buildEnd failed:\n{e}");
         }
         // CSS a plugin routed through the vite:css-post shim (e.g. UnoCSS's
@@ -3355,17 +3376,19 @@ pub(crate) async fn build_ssr(
         .build()
         .map_err(|errs| anyhow::anyhow!("rolldown init failed: {errs:?}"))?;
 
-    let output = bundler
-        .write()
-        .await
-        .map_err(|errs| anyhow::anyhow!("ssr build failed:\n{errs:?}"))?;
+    let output = match bundler.write().await {
+        Ok(output) => output,
+        Err(errs) => {
+            return Err(fail_with_plugin_hooks(anyhow::anyhow!("ssr build failed:\n{errs:?}"), &plugin_host).await);
+        }
+    };
     bundler
         .close()
         .await
         .map_err(|errs| anyhow::anyhow!("ssr close failed:\n{errs:?}"))?;
 
     if let Some(host) = &plugin_host {
-        if let Err(e) = host.build_end().await {
+        if let Err(e) = host.build_end(None).await {
             bail!("plugin buildEnd failed (ssr):\n{e}");
         }
     }
@@ -3873,17 +3896,19 @@ async fn build_client_entry(
         .build()
         .map_err(|errs| anyhow::anyhow!("rolldown init failed: {errs:?}"))?;
 
-    let output = bundler
-        .write()
-        .await
-        .map_err(|errs| anyhow::anyhow!("client build failed:\n{errs:?}"))?;
+    let output = match bundler.write().await {
+        Ok(output) => output,
+        Err(errs) => {
+            return Err(fail_with_plugin_hooks(anyhow::anyhow!("client build failed:\n{errs:?}"), &plugin_host).await);
+        }
+    };
     bundler
         .close()
         .await
         .map_err(|errs| anyhow::anyhow!("client close failed:\n{errs:?}"))?;
 
     if let Some(host) = &plugin_host {
-        if let Err(e) = host.build_end().await {
+        if let Err(e) = host.build_end(None).await {
             bail!("plugin buildEnd failed (client):\n{e}");
         }
     }
