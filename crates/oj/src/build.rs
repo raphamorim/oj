@@ -359,37 +359,66 @@ fn env_sourcemap(
 /// unset means "empty it when it is inside the project root"; an outDir outside
 /// root is left alone with a warning unless `build.emptyOutDir` / `--emptyOutDir`
 /// says so. A `.git` directory inside outDir always survives.
+fn canonical_or_self(p: &Path) -> PathBuf {
+    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Vite's `resolveEmptyOutDir`: an explicit setting wins; otherwise only an outDir
+/// strictly inside root is emptied. An outDir equal to root is NOT inside (Vite
+/// tests `startsWith(root + "/")`); treating it as inside emptied the whole
+/// project, sources included. An outside outDir is left alone with a warning.
+/// `warn` lets a second caller (the failed-build cleanup) reuse the decision
+/// without repeating the message.
+fn out_dir_emptiable(root: &Path, out_dir: &Path, empty: Option<bool>, warn: bool) -> bool {
+    if let Some(b) = empty {
+        return b;
+    }
+    let (r, o) = (canonical_or_self(root), canonical_or_self(out_dir));
+    let inside = o != r && o.starts_with(&r);
+    if !inside && warn && out_dir.exists() {
+        eprintln!(
+            "oj build: (!) outDir {} is not inside project root and will not be emptied.\n\
+             Use --emptyOutDir to override.",
+            out_dir.display()
+        );
+    }
+    inside
+}
+
+/// Empty a directory the way Vite's `emptyDir(outDir, [".git"])` does: every entry
+/// goes except a `.git` directory. Shared by the build-start emptying and the
+/// failed-build cleanup, so both respect the same containment decision.
+fn empty_dir_keep_git(out_dir: &Path) -> anyhow::Result<()> {
+    if !out_dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(out_dir)? {
+        let entry = entry?;
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let p = entry.path();
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(&p)?;
+        } else {
+            fs::remove_file(&p)?;
+        }
+    }
+    Ok(())
+}
+
 fn prepare_out_dir(root: &Path, out_dir: &Path, empty: Option<bool>) -> anyhow::Result<()> {
-    let empty = match empty {
-        Some(b) => b,
-        None => {
-            let inside = out_dir
-                .canonicalize()
-                .map(|o| o.starts_with(root))
-                .unwrap_or_else(|_| out_dir.starts_with(root));
-            if !inside && out_dir.exists() {
-                eprintln!(
-                    "oj build: (!) outDir {} is not inside project root and will not be emptied.\n\
-                     Use --emptyOutDir to override.",
-                    out_dir.display()
-                );
-            }
-            inside
+    if out_dir_emptiable(root, out_dir, empty, true) {
+        // Emptying an outDir that IS the project root deletes the sources the
+        // build reads, so it can never be what anyone meant, even with an explicit
+        // emptyOutDir. Refuse rather than destroy the project (Vite would proceed).
+        if canonical_or_self(out_dir) == canonical_or_self(root) {
+            bail!(
+                "build.outDir {} is the project root; refusing to empty it. Point outDir at a subdirectory.",
+                out_dir.display()
+            );
         }
-    };
-    if empty && out_dir.is_dir() {
-        for entry in fs::read_dir(out_dir)? {
-            let entry = entry?;
-            if entry.file_name() == ".git" {
-                continue;
-            }
-            let p = entry.path();
-            if entry.file_type()?.is_dir() {
-                fs::remove_dir_all(&p)?;
-            } else {
-                fs::remove_file(&p)?;
-            }
-        }
+        empty_dir_keep_git(out_dir)?;
     }
     fs::create_dir_all(out_dir)?;
     Ok(())
@@ -2107,10 +2136,16 @@ pub async fn build(
     if !unresolved.is_empty() {
         // Vite fails the build on an unresolved import and writes nothing. rolldown
         // has already written the bundle by the time its diagnostics are readable, so
-        // drop the partial output (this directory is emptied at every build start
-        // anyway) so a failed build never leaves a broken bundle behind, and point at
-        // the escape hatch the way Vite's message does.
-        let _ = fs::remove_dir_all(&out_dir);
+        // drop the partial output so a failed build never leaves a broken bundle
+        // behind. Only under the same containment rule that emptied the directory at
+        // build start: an outDir outside root (or the user's emptyOutDir: false) was
+        // never oj's to clear, and a failed build must not start clearing it.
+        if out_dir_emptiable(&root, &out_dir, empty_out_dir, false) {
+            let _ = empty_dir_keep_git(&out_dir);
+            // Nothing written means no directory either (like Vite); remove_dir is
+            // non-recursive, so a kept .git simply leaves it in place.
+            let _ = fs::remove_dir(&out_dir);
+        }
         bail!(
             "build failed: unresolved imports:\n{}\n\nThis is most likely unintended because it can break your application at runtime.\nIf you do want to externalize a module explicitly, add it to `build.rollupOptions.external`.",
             unresolved.join("\n")
@@ -4204,6 +4239,61 @@ fn build_manifest(entries: &[ManifestEntry]) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("oj-{name}-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn out_dir_emptiable_follows_vite_and_never_counts_root_as_inside() {
+        let root = scratch("emptiable-root");
+        let outside = scratch("emptiable-outside");
+        let inside = root.join("dist");
+        fs::create_dir_all(&inside).unwrap();
+        // Vite's default: inside root is emptied ...
+        assert!(out_dir_emptiable(&root, &inside, None, false));
+        // ... an outDir equal to root is NOT inside (startsWith(root + "/")) ...
+        assert!(!out_dir_emptiable(&root, &root, None, false));
+        // ... and an outside one is left alone.
+        assert!(!out_dir_emptiable(&root, &outside, None, false));
+        // An explicit setting wins either way.
+        assert!(out_dir_emptiable(&root, &outside, Some(true), false));
+        assert!(!out_dir_emptiable(&root, &inside, Some(false), false));
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn prepare_out_dir_refuses_to_empty_the_project_root_but_still_empties_dist() {
+        let root = scratch("prepare-root");
+        fs::write(root.join("index.html"), "<html></html>").unwrap();
+        fs::write(root.join("main.js"), "export {};").unwrap();
+
+        // outDir == root with an explicit emptyOutDir would delete the sources the
+        // build reads; refuse instead of destroying the project.
+        let err = prepare_out_dir(&root, &root, Some(true)).unwrap_err().to_string();
+        assert!(err.contains("project root"), "{err}");
+        assert!(root.join("index.html").exists() && root.join("main.js").exists());
+
+        // With Vite's default rule an equal path is simply not emptied.
+        prepare_out_dir(&root, &root, None).unwrap();
+        assert!(root.join("index.html").exists() && root.join("main.js").exists());
+
+        // A real inside outDir is still emptied, keeping only .git.
+        let dist = root.join("dist");
+        fs::create_dir_all(dist.join(".git")).unwrap();
+        fs::write(dist.join("stale.js"), "old").unwrap();
+        prepare_out_dir(&root, &dist, None).unwrap();
+        assert!(!dist.join("stale.js").exists());
+        assert!(dist.join(".git").is_dir());
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     #[tokio::test]
     async fn module_preload_configuration_controls_production_links() {
