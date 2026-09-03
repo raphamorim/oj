@@ -3587,8 +3587,12 @@ async fn ensure_module(
                 oj_css::inline_imports_with(&css_src, &file_owned, &resolve)?
             };
             let output = oj_css::compile_css_dev(&url_owned, &css_src, css_dev_sourcemap, &resolve)?;
+            // A CSS module exports its class map, which changes on edit, so it
+            // cannot self-accept (Vite's css-analysis): the update climbs to the
+            // importing component, whose re-import fetches the new exports.
+            let is_css_module = output.exports.is_some();
             return Ok(CachedModule {
-                is_boundary: true,
+                is_boundary: !is_css_module,
                 hot: None,
                 kind: "css".into(),
                 code: output.css,
@@ -4126,12 +4130,20 @@ async fn serve_css_wrapper(state: &Arc<ServerState>, file: &Path, url: &str) -> 
     } else {
         oj_css::css_modules_esm(&module.css_exports)
     };
+    // Plain stylesheets self-accept; a CSS module does not (its exports change
+    // on edit), so the importing component is the boundary, as in Vite's css
+    // plugin (`modulesCode || 'import.meta.hot.accept()'`).
+    let accept = if module.is_boundary {
+        "import.meta.hot.accept(() => {});\n"
+    } else {
+        ""
+    };
     let body = format!(
         "import {{ createHotContext as __oj_hot, updateStyle as __oj_updateStyle }} from \"/@oj/client.js\";\n\
          import.meta.hot = __oj_hot({url:?});\n\
          __oj_updateStyle({url:?}, {css});\n\
          {exports}\
-         import.meta.hot.accept(() => {{}});\n",
+         {accept}",
         css = serde_json::Value::String(module.code.clone()),
     );
     (
@@ -4624,19 +4636,18 @@ fn strip_hmr_timestamp(url: &str) -> String {
 }
 
 /// Append the HMR timestamp to a served module url when its module has one. Only
-/// modules serve_compiled turns into JS are stamped (compilable sources and JSON,
-/// which Vite's importAnalysis also stamps so an edited data file is re-fetched
-/// rather than read from the browser's module cache): asset (`?url`, `?raw`),
-/// style (`?import`) and oj-internal (`/@oj-deps/`, `/@fs/`, `/@id/`, ...) urls
-/// are left alone, since their routes parse the query and deps never take part
-/// in HMR.
+/// modules served as JS are stamped (compilable sources, JSON, and stylesheet
+/// wrappers, which Vite's importAnalysis also stamps so an edited data file or
+/// CSS module is re-fetched rather than read from the browser's module cache):
+/// asset (`?url`, `?raw`) and oj-internal (`/@oj-deps/`, `/@fs/`, `/@id/`, ...)
+/// urls are left alone, since deps never take part in HMR.
 fn stamp_import_url(url: &str, timestamp: u64) -> String {
     if timestamp == 0 || url.starts_with("/@") || !url.starts_with('/') {
         return url.to_string();
     }
     let (path, query) = url.split_once('?').unwrap_or((url, ""));
     let ext = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("");
-    if !COMPILABLE.contains(&ext) && ext != "json" {
+    if !COMPILABLE.contains(&ext) && ext != "json" && !is_style_ext(ext) {
         return url.to_string();
     }
     if query.split('&').any(|kv| kv.starts_with("t=")) {
@@ -7838,7 +7849,12 @@ mod tests {
         assert_eq!(stamp_import_url("/src/utils.ts", 0), "/src/utils.ts", "unstamped module");
         assert_eq!(stamp_import_url("/src/utils.ts?t=3", 5), "/src/utils.ts?t=3", "never doubled");
         assert_eq!(stamp_import_url("/src/data.json", 5), "/src/data.json?t=5", "json is a module");
-        assert_eq!(stamp_import_url("/src/a.css?import", 5), "/src/a.css?import");
+        assert_eq!(
+            stamp_import_url("/src/a.css?import", 5),
+            "/src/a.css?import&t=5",
+            "a CSS module's importer must fetch its new class exports"
+        );
+        assert_eq!(stamp_import_url("/src/a.css?inline", 5), "/src/a.css?inline&t=5");
         assert_eq!(stamp_import_url("/logo.svg?url", 5), "/logo.svg?url");
         assert_eq!(stamp_import_url("/@oj-deps/react.js", 5), "/@oj-deps/react.js");
         assert_eq!(stamp_import_url("/@fs/x/node_modules/a/index.js", 5), "/@fs/x/node_modules/a/index.js");

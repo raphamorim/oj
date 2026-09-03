@@ -173,6 +173,10 @@ jobs:
       - name: html.cspNonce stamps scripts, styles and preload links (dev + build)
         if: matrix.mode == 'unbundled'
         run: node e2e/html-csp-nonce.mjs
+      - name: hmr protocol parity round 2 (css module exports, prune, html reload scope)
+        if: matrix.mode == 'unbundled'
+        run: |
+          node e2e/hmr-css-module-exports.mjs
 
   # i need to fix this or automate
   build:
