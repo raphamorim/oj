@@ -113,6 +113,9 @@ jobs:
       - name: throwing lifecycle hooks fail the build and dev startup
         if: matrix.mode == 'unbundled'
         run: node e2e/plugin-lifecycle-errors.mjs
+      - name: this.resolve / this.load consult sibling plugins first
+        if: matrix.mode == 'unbundled'
+        run: node e2e/plugin-ctx-chain.mjs
 
   # i need to fix this or automate
   build:
