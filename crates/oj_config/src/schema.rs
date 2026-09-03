@@ -44,6 +44,10 @@ pub struct OjConfig {
     /// Vite's `html` block (`cspNonce`).
     pub html: Option<HtmlConfig>,
     pub legacy: Option<LegacyConfig>,
+    /// Vite's `appType`: `spa` (default) falls back to `index.html` for
+    /// navigations, `mpa` only rewrites `/dir/` and `/page` to html files, and
+    /// `custom` leaves html to the app's own middleware.
+    pub app_type: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]

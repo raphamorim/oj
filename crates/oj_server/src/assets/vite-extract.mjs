@@ -327,8 +327,9 @@ function extractResolve(r) {
   if (typeof r.preserveSymlinks === "boolean") out.preserveSymlinks = r.preserveSymlinks;
   return Object.keys(out).length ? out : null;
 }
-function extractServerFlags(s, legacy) {
+function extractServerFlags(s, legacy, appType) {
   const out = {};
+  if (appType === "spa" || appType === "mpa" || appType === "custom") out.appType = appType;
   if (s && typeof s === "object") {
     if (typeof s.strictPort === "boolean") out.strictPort = s.strictPort;
     // Vite admits `open: true | string`; oj opens the served url in both cases.
@@ -495,7 +496,7 @@ if (isMainRun) try {
       ssr: extractSsr(c.ssr),
       mode: typeof c.mode === "string" ? c.mode : null,
       resolve: extractResolve(c.resolve),
-      serverFlags: extractServerFlags(c.server, c.legacy),
+      serverFlags: extractServerFlags(c.server, c.legacy, c.appType),
       css: extractCss(c.css),
       envPrefix: extractEnvPrefix(c.envPrefix),
       envDir: typeof c.envDir === "string" ? c.envDir : null,

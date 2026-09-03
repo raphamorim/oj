@@ -743,6 +743,9 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
         }
     }
     if let Some(sf) = v.server_flags.as_ref().and_then(|s| s.as_object()) {
+        if config.app_type.is_none() {
+            config.app_type = sf.get("appType").and_then(|a| a.as_str()).map(str::to_string);
+        }
         let sc = config.server.get_or_insert_with(Default::default);
         if sc.strict_port.is_none() {
             sc.strict_port = sf.get("strictPort").and_then(|b| b.as_bool());
