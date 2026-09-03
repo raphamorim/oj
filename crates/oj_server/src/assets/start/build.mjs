@@ -24,7 +24,16 @@ const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
 const OJ = _ojTTY ? "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m" : "oj";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const DIST = join(APP, "dist");
+// Resolved by `oj build` from `--out` / `build.outDir`, `base`, `build.sourcemap`
+// and `build.minify`, the options Vite applies to a Start app's client bundle.
+const DIST = process.env.OJ_OUT_DIR ? resolve(process.env.OJ_OUT_DIR) : join(APP, "dist");
+if (DIST === resolve(APP)) throw new Error(`build.outDir ${DIST} is the project root; refusing to empty it`);
+const BASE = process.env.OJ_BASE || "/";
+const SOURCEMAP = (() => {
+  const v = process.env.OJ_SOURCEMAP;
+  return v === "true" ? true : v === "inline" || v === "hidden" ? v : false;
+})();
+const MINIFY = process.env.OJ_MINIFY !== "false";
 const CLIENT = join(DIST, "client");
 const WORKSPACE = workspaceRoot(APP);
 const sfid = (rel, name) => Buffer.from(`${rel}#${name}`).toString("base64url");
@@ -45,13 +54,14 @@ const SERVER = [
   'const handler = (await import("./server-bundle.mjs")).default;',
   'const HERE = dirname(fileURLToPath(import.meta.url));',
   'const CLIENT = join(HERE, "client");',
+  `const BASE = ${JSON.stringify(BASE)};`,
   'const PORT = process.env.PORT || 3000;',
   'const MIME = { ".html":"text/html; charset=utf-8", ".js":"text/javascript", ".css":"text/css", ".json":"application/json", ".wasm":"application/wasm", ".ico":"image/x-icon", ".png":"image/png", ".svg":"image/svg+xml", ".webp":"image/webp", ".avif":"image/avif", ".gif":"image/gif", ".jpg":"image/jpeg", ".jpeg":"image/jpeg", ".woff2":"font/woff2", ".woff":"font/woff", ".ttf":"font/ttf", ".otf":"font/otf", ".txt":"text/plain; charset=utf-8", ".xml":"application/xml", ".webmanifest":"application/manifest+json" };',
   'function readBody(req){ return new Promise((r)=>{ const c=[]; req.on("data",(d)=>c.push(d)); req.on("end",()=>r(Buffer.concat(c))); }); }',
   'createServer(async (req, res) => {',
   '  const url = new URL(req.url, "http://" + (req.headers.host || "localhost"));',
   '  if (req.method === "GET") {',
-  '    const rel = url.pathname.replace(/^\\/+/, "");',
+  '    const rel = (BASE !== "/" && url.pathname.startsWith(BASE) ? url.pathname.slice(BASE.length) : url.pathname).replace(/^\\/+/, "");',
   '    if (!rel.startsWith("_serverFn/")) {',
   '      const candidates = [];',
   '      if (rel) candidates.push(rel);',
@@ -171,7 +181,7 @@ const compileCss = await (async () => {
   } catch {}
   return null;
 })();
-const emit = contentHashEmitter(CLIENT, compileCss);
+const emit = contentHashEmitter(CLIENT, compileCss, BASE);
 const clientContainer = await loadPluginContainer(APP, { command: "build", mode: MODE, environment: "client" });
 const serverContainer = await loadPluginContainer(APP, { command: "build", mode: MODE, environment: "ssr" });
 
@@ -191,7 +201,7 @@ const client = await build({
     define: {
       ...USER_DEFINE,
       "process.env": PROCESS_ENV_JSON,
-      global: "globalThis", ...viteEnvDefine({ ssr: false, mode: MODE }),
+      global: "globalThis", ...viteEnvDefine({ ssr: false, mode: MODE, base: BASE }),
     },
   },
   resolve: { conditionNames: ["browser", "module", "import", NODE_ENV === "production" ? "production" : "development"], alias: clientAlias },
@@ -208,7 +218,8 @@ const client = await build({
   output: {
     dir: CLIENT,
     format: "esm",
-    minify: true,
+    minify: MINIFY,
+    sourcemap: SOURCEMAP,
     entryFileNames: "assets/[name]-[hash].js",
     chunkFileNames: "assets/[name]-[hash].js",
     assetFileNames: "assets/[name]-[hash][extname]",
@@ -216,7 +227,7 @@ const client = await build({
   },
 });
 const entryChunk = client.output.find((o) => o.type === "chunk" && o.isEntry);
-const clientUrl = "/" + entryChunk.fileName;
+const clientUrl = BASE + entryChunk.fileName;
 
 if (clientContainer) {
   const bundle = Object.fromEntries(client.output.map((output) => [output.fileName, output]));
@@ -255,7 +266,7 @@ const server = await build({
     define: {
       ...USER_DEFINE,
       "process.env.NODE_ENV": JSON.stringify(NODE_ENV), "process.env.TSS_SERVER_FN_BASE": '"/_serverFn/"',
-      ...viteEnvDefine({ ssr: true, mode: MODE }),
+      ...viteEnvDefine({ ssr: true, mode: MODE, base: BASE }),
     },
   },
   resolve: {
@@ -277,7 +288,8 @@ const server = await build({
   output: {
     dir: DIST,
     format: "esm",
-    minify: true,
+    minify: MINIFY,
+    sourcemap: SOURCEMAP,
     entryFileNames: "[name].mjs",
     chunkFileNames: "chunks/[name]-[hash].mjs",
     banner: "import { createRequire as ___cr } from 'node:module'; const require = ___cr(import.meta.url || 'file:///worker.js');",

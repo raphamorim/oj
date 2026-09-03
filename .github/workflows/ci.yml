@@ -107,6 +107,9 @@ jobs:
       - name: optimizeDeps.exclude'd packages run through every plugin load/transform
         if: matrix.mode == 'unbundled'
         run: node e2e/plugin-excluded-dep.mjs
+      - name: start prod build honors outDir, base, sourcemap, minify
+        if: matrix.mode == 'unbundled'
+        run: node e2e/start-build-options.mjs
 
   # i need to fix this or automate
   build:

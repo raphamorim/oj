@@ -244,7 +244,7 @@ export function workspaceRoot(app) {
   return best;
 }
 
-export function contentHashEmitter(clientDir, compileCss) {
+export function contentHashEmitter(clientDir, compileCss, base = "/") {
   const assetsDir = join(clientDir, "assets");
   const seen = new Set();
   const emitting = new Set();
@@ -259,7 +259,7 @@ export function contentHashEmitter(clientDir, compileCss) {
       writeFileSync(join(assetsDir, name), buf);
       seen.add(name);
     }
-    return "/assets/" + name;
+    return base + "assets/" + name;
   };
 
   async function emit(absPath) {
