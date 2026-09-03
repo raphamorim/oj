@@ -485,8 +485,12 @@ fn start_script_env(root: &Path, command: &str, mode: &str) -> anyhow::Result<Ve
     // Node's export conditions by the SSR loader the way Vite's resolver honors
     // them; the `development|production` placeholder is the dev one here.
     if let Some(user) = oj_config::user_resolve_conditions(&config, "ssr") {
+        // Drop `browser`: plugins targeting workerd SSR (e.g. @cloudflare/vite-plugin)
+        // set it, but this loader runs in Node — a browser conditional export there
+        // executes DOM code server-side (`document is not defined`).
         let conditions: Vec<String> = user
             .into_iter()
+            .filter(|c| c != "browser")
             .map(|c| if c == "development|production" { "development".to_string() } else { c })
             .collect();
         if !conditions.is_empty() {
@@ -1322,6 +1326,28 @@ mod tests {
         assert_eq!(get("OJ_DEFINE").as_deref(), Some(r#"{"__SHARED__":"1"}"#));
         assert_eq!(get("OJ_DEFINE_CLIENT").as_deref(), Some(r#"{"__SIDE__":"\"client\""}"#));
         assert_eq!(get("OJ_RESOLVE_CONDITIONS").as_deref(), Some(r#"["custom","development"]"#));
+
+        // `browser` never reaches the Node SSR loader (Vite parity:
+        // DEFAULT_SERVER_CONDITIONS excludes it) — workerd-targeting plugins
+        // set it and a browser conditional export would run DOM code in Node.
+        {
+            let browser_root = tmp("script-env-browser-cond");
+            std::fs::write(
+                browser_root.join("oj.config.json"),
+                r#"{ "environments": { "ssr": { "resolve": { "conditions": ["module", "browser", "development|production"] } } } }"#,
+            )
+            .unwrap();
+            let vars = start_script_env(&browser_root, "serve", "development").unwrap();
+            let cond = vars
+                .iter()
+                .find(|(n, _)| n == "OJ_RESOLVE_CONDITIONS")
+                .map(|(_, v)| v.clone());
+            assert_eq!(
+                cond.as_deref(),
+                Some(r#"["module","development"]"#),
+                "browser must be stripped from Node SSR conditions"
+            );
+        }
         let ssr: serde_json::Value = serde_json::from_str(&get("OJ_DEFINE_SSR").unwrap()).unwrap();
         assert_eq!(ssr["__SIDE__"], "\"server\"");
         assert_eq!(ssr["__ONLY_SSR__"], "true");
