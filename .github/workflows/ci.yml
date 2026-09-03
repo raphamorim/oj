@@ -68,6 +68,9 @@ jobs:
       - name: startup compile error overlay + recovery by reload
         if: matrix.mode == 'unbundled'
         run: node e2e/hmr-overlay-recovery.mjs
+      - name: json import edit reaches the boundary (stamped import)
+        if: matrix.mode == 'unbundled'
+        run: node e2e/hmr-json-update.mjs
       - name: request paths (encoded filenames, traversal containment)
         if: matrix.mode == 'unbundled'
         run: node e2e/awkward-paths.mjs
