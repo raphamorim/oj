@@ -245,7 +245,8 @@ pub struct DevServer {
 
 struct ServerState {
     root: PathBuf,
-    public_dir: PathBuf,
+    /// Vite's `publicDir`; None when the config disables it (`publicDir: false`).
+    public_dir: Option<PathBuf>,
     bundle: bool,
     persistent_cache: bool,
     reload_tx: broadcast::Sender<String>,
@@ -724,11 +725,7 @@ impl DevServer {
         let (crawl_tx, crawl_rx) = tokio::sync::watch::channel(false);
         let (write_tx, mut write_rx) =
             tokio::sync::mpsc::channel::<(String, Arc<CachedModule>)>(65536);
-        let public_dir = config
-            .public_dir
-            .as_ref()
-            .map(|p| root.join(p))
-            .unwrap_or_else(|| root.join("public"));
+        let public_dir = oj_config::public_dir(&config, &root);
         let client_resolver = Arc::new(OjResolver::with_settings(
             &root,
             oj_resolver::ResolveSettings {
@@ -743,7 +740,7 @@ impl DevServer {
         ));
         let css_resolve = oj_css::CssResolveConfig {
             root: root.clone(),
-            public_dir: public_dir.clone(),
+            public_dir: public_dir.clone().unwrap_or_default(),
             alias: oj_config::resolve_alias(&config, "client"),
         };
         let state = Arc::new(ServerState {
@@ -2685,7 +2682,7 @@ async fn serve_path(
             }
         }
     } else {
-        match locate(&state.root, &state.public_dir, rel) {
+        match locate(&state.root, state.public_dir.as_deref(), rel) {
             Some(file) => file,
             None => {
                 if let Some(resp) =
@@ -2711,8 +2708,21 @@ async fn serve_path(
     }
 
     let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+    // A publicDir file is served verbatim, never through the compile pipeline
+    // (Vite's servePublicMiddleware runs before transform): a public service
+    // worker or vendored script keeps its bytes. Only an explicit asset query
+    // (`?url`, `?raw`, `?inline`) still yields a module.
+    let in_public = state
+        .public_dir
+        .as_deref()
+        .is_some_and(|p| file.starts_with(p));
     if let Some(kind) = query_asset_kind(uri.query()) {
-        let url = url_of(&state.root, &file);
+        // A public file's url is its path under the public dir (`/logo.svg`,
+        // Vite's checkPublicFile), not `/public/logo.svg`.
+        let url = match state.public_dir.as_deref().filter(|_| in_public) {
+            Some(p) => format!("/{}", file.strip_prefix(p).unwrap_or(&file).display()),
+            None => url_of(&state.root, &file),
+        };
         let js = if kind == "inline" && is_style_ext(ext) {
             inline_css_module(&state, &file, &url).await
         } else {
@@ -2730,7 +2740,7 @@ async fn serve_path(
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {e}")).into_response(),
         };
     }
-    if is_style_ext(ext) && !file.starts_with(&state.public_dir) {
+    if is_style_ext(ext) && !in_public {
         let url = url_of(&state.root, &file);
         let q = uri.query();
         let direct = q.is_some_and(|q| q.split('&').any(|kv| kv == "direct"));
@@ -2742,6 +2752,9 @@ async fn serve_path(
             return serve_css_direct(&state, &file, &url).await;
         }
         return serve_css_wrapper(&state, &file, &url).await;
+    }
+    if in_public {
+        return serve_static_file(&file, ext).await;
     }
     if COMPILABLE.contains(&ext) {
         let url = url_of(&state.root, &file);
@@ -2783,7 +2796,7 @@ async fn serve_path(
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {e}")).into_response(),
         };
     }
-    if ext == "json" && !file.starts_with(&state.public_dir) {
+    if ext == "json" {
         let url = url_of(&state.root, &file);
         return serve_compiled(&state, &file, &url, uri.query(), &headers).await;
     }
@@ -2828,6 +2841,24 @@ async fn serve_path(
             }
             ([(header::CONTENT_TYPE, "text/css")], source).into_response()
         }
+        Ok(bytes) => {
+            let mut response = Response::new(Body::from(bytes));
+            response
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, content_type(ext).parse().unwrap());
+            response
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("oj: read error: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+/// The file's bytes as-is with its content type (publicDir files).
+async fn serve_static_file(file: &Path, ext: &str) -> Response {
+    match tokio::fs::read(file).await {
         Ok(bytes) => {
             let mut response = Response::new(Body::from(bytes));
             response
@@ -5058,7 +5089,7 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
-fn locate(root: &Path, public_dir: &Path, rel: &str) -> Option<PathBuf> {
+fn locate(root: &Path, public_dir: Option<&Path>, rel: &str) -> Option<PathBuf> {
     if rel.split('/').any(|seg| seg == "..") {
         return None;
     }
@@ -5074,7 +5105,7 @@ fn locate(root: &Path, public_dir: &Path, rel: &str) -> Option<PathBuf> {
             }
         }
     }
-    let public = public_dir.join(rel);
+    let public = public_dir?.join(rel);
     if public.is_file() {
         return Some(public);
     }
@@ -6203,7 +6234,7 @@ fn locate_url(state: &ServerState, url: &str) -> Result<PathBuf, String> {
         fs_gate(state, &PathBuf::from(abs)).ok_or_else(|| format!("forbidden: {url}"))
     } else {
         let rel = base.trim_start_matches('/');
-        locate(&state.root, &state.public_dir, rel).ok_or_else(|| format!("no such module: {url}"))
+        locate(&state.root, state.public_dir.as_deref(),rel).ok_or_else(|| format!("no such module: {url}"))
     }
 }
 
@@ -6408,7 +6439,7 @@ fn spawn_crawl(state: Arc<ServerState>, done_tx: tokio::sync::watch::Sender<bool
                     f
                 } else {
                     let rel = url.trim_start_matches('/').to_string();
-                    match locate(&state.root, &state.public_dir, &rel) {
+                    match locate(&state.root, state.public_dir.as_deref(),&rel) {
                         Some(f) => f,
                         None => continue,
                     }
@@ -8087,15 +8118,18 @@ mod adapter_tests {
         std::fs::write(public.join("img").join("logo.webp"), "y").unwrap();
 
         assert_eq!(
-            locate(&root, &public, "src/App"),
+            locate(&root, Some(&public), "src/App"),
             Some(root.join("src/App.tsx"))
         );
         assert_eq!(
-            locate(&root, &public, "img/logo.webp"),
+            locate(&root, Some(&public), "img/logo.webp"),
             Some(public.join("img/logo.webp"))
         );
-        assert_eq!(locate(&root, &public, "img/missing.webp"), None);
-        assert_eq!(locate(&root, &public, "../secret"), None);
+        assert_eq!(locate(&root, Some(&public), "img/missing.webp"), None);
+        assert_eq!(locate(&root, Some(&public), "../secret"), None);
+        // `publicDir: false`: only the root is searched.
+        assert_eq!(locate(&root, None, "img/logo.webp"), None);
+        assert_eq!(locate(&root, None, "src/App"), Some(root.join("src/App.tsx")));
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -8136,18 +8170,18 @@ mod adapter_tests {
             "./../secret.txt",
             "src/../../../etc/passwd",
         ] {
-            assert_eq!(locate(&root, &public, hostile), None, "{hostile}");
+            assert_eq!(locate(&root, Some(&public), hostile), None, "{hostile}");
             // ...and through the decoding the request handler applies first.
             let encoded = hostile.replace("..", "%2e%2e");
             assert_eq!(
-                locate(&root, &public, &urldecode(&encoded)),
+                locate(&root, Some(&public), &urldecode(&encoded)),
                 None,
                 "{encoded}"
             );
         }
         // A name that merely contains dots is not traversal.
         std::fs::write(root.join("src").join("..dotted.tsx"), "x").unwrap();
-        assert!(locate(&root, &public, "src/..dotted.tsx").is_some());
+        assert!(locate(&root, Some(&public), "src/..dotted.tsx").is_some());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -8171,7 +8205,7 @@ mod adapter_tests {
         ] {
             let decoded = urldecode(requested);
             assert_eq!(
-                locate(&root, &public, &decoded),
+                locate(&root, Some(&public), &decoded),
                 Some(root.join("src").join(name)),
                 "{requested}"
             );
