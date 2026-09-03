@@ -107,12 +107,35 @@ pub(crate) fn import_meta_env_defines(dev: bool, ssr: bool) -> Vec<(String, Stri
     ]
 }
 
+/// JSX compile settings: Vite's `oxc.jsx` (what `@vitejs/plugin-react` sets from
+/// its `jsxRuntime`/`jsxImportSource` options) or the older `esbuild.jsx*` form.
+/// A file's own `@jsx`, `@jsxRuntime`, `@jsxImportSource` and `@jsxFrag` pragma
+/// comments still win, since oxc applies them on top of these.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JsxConfig {
+    /// `"classic"` emits `pragma(...)` calls; anything else is the automatic runtime.
+    pub runtime: Option<String>,
+    /// Package the automatic runtime is imported from (default `react`).
+    pub import_source: Option<String>,
+    /// Classic-runtime element factory (default `React.createElement`).
+    pub pragma: Option<String>,
+    /// Classic-runtime fragment (default `React.Fragment`).
+    pub pragma_frag: Option<String>,
+}
+
+impl JsxConfig {
+    pub fn is_classic(&self) -> bool {
+        self.runtime.as_deref() == Some("classic")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CompileOptions {
     pub dev: bool,
     pub refresh: bool,
     pub sourcemap: bool,
     pub ssr: bool,
+    pub jsx: JsxConfig,
 }
 
 impl CompileOptions {
@@ -122,6 +145,7 @@ impl CompileOptions {
             refresh: true,
             sourcemap: true,
             ssr: false,
+            jsx: JsxConfig::default(),
         }
     }
 
@@ -131,6 +155,7 @@ impl CompileOptions {
             refresh: false,
             sourcemap: true,
             ssr: false,
+            jsx: JsxConfig::default(),
         }
     }
 }
@@ -285,7 +310,16 @@ pub fn compile_module_with_maps(
 
     let mut transform_options = TransformOptions::default();
     transform_options.jsx.jsx_plugin = true;
-    transform_options.jsx.runtime = JsxRuntime::Automatic;
+    if opts.jsx.is_classic() {
+        transform_options.jsx.runtime = JsxRuntime::Classic;
+        // oxc rejects pragma/pragmaFrag under the automatic runtime, so they are
+        // only set for classic.
+        transform_options.jsx.pragma = opts.jsx.pragma.clone();
+        transform_options.jsx.pragma_frag = opts.jsx.pragma_frag.clone();
+    } else {
+        transform_options.jsx.runtime = JsxRuntime::Automatic;
+        transform_options.jsx.import_source = opts.jsx.import_source.clone();
+    }
     transform_options.jsx.development = opts.dev;
     transform_options.jsx.jsx_self_plugin = opts.dev;
     transform_options.jsx.jsx_source_plugin = opts.dev;
@@ -872,6 +906,7 @@ export const used: A extends B ? number : number = c + d;
                 refresh: false,
                 sourcemap: false,
                 ssr: false,
+                jsx: JsxConfig::default(),
             },
             None,
         )
@@ -893,6 +928,43 @@ export const used: A extends B ? number : number = c + d;
     }
 
     #[test]
+    fn jsx_import_source_from_config_and_pragma_comment() {
+        let src = "export const A = () => <div>hi</div>;\n";
+        let mut opts = CompileOptions::prod();
+        opts.jsx.import_source = Some("preact".into());
+        let out = compile_module(Path::new("A.tsx"), src, &opts, None).unwrap();
+        assert!(out.imports.iter().any(|i| i == "preact/jsx-runtime"), "{:?}", out.imports);
+        assert!(!out.code.contains("\"react/jsx-runtime\""), "{}", out.code);
+
+        // Dev uses the dev runtime of the same source.
+        let mut dev = CompileOptions::dev();
+        dev.jsx.import_source = Some("@emotion/react".into());
+        let out = compile_module(Path::new("A.tsx"), src, &dev, None).unwrap();
+        assert!(out.imports.iter().any(|i| i == "@emotion/react/jsx-dev-runtime"), "{:?}", out.imports);
+
+        // A file pragma wins over the config (oxc reads leading comments).
+        let pragma = format!("/** @jsxImportSource solid-js */\n{src}");
+        let out = compile_module(Path::new("A.tsx"), &pragma, &opts, None).unwrap();
+        assert!(out.imports.iter().any(|i| i == "solid-js/jsx-runtime"), "{:?}", out.imports);
+    }
+
+    #[test]
+    fn classic_runtime_uses_configured_pragma() {
+        let src = "import { h, Fragment } from 'preact';\nexport const A = () => <><b>x</b></>;\n";
+        let mut opts = CompileOptions::prod();
+        opts.jsx = JsxConfig {
+            runtime: Some("classic".into()),
+            import_source: None,
+            pragma: Some("h".into()),
+            pragma_frag: Some("Fragment".into()),
+        };
+        let out = compile_module(Path::new("A.tsx"), src, &opts, None).unwrap();
+        assert!(out.code.contains("h(Fragment"), "{}", out.code);
+        assert!(out.code.contains("h(\"b\""), "{}", out.code);
+        assert!(!out.imports.iter().any(|i| i.contains("jsx-runtime")), "{:?}", out.imports);
+    }
+
+    #[test]
     fn sourcemap_toggle_and_inline_map_helper() {
         let no_map = compile_module(
             Path::new("a.ts"),
@@ -902,6 +974,7 @@ export const used: A extends B ? number : number = c + d;
                 refresh: false,
                 sourcemap: false,
                 ssr: false,
+                jsx: JsxConfig::default(),
             },
             None,
         )

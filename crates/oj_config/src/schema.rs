@@ -23,6 +23,12 @@ pub struct OjConfig {
     pub bundle: Option<bool>,
     pub environments: Option<BTreeMap<String, serde_json::Value>>,
     pub optimize_deps: Option<OptimizeDepsConfig>,
+    /// Vite's `oxc` block (`oxc.jsx.{runtime,importSource,pragma,pragmaFrag}`);
+    /// kept opaque because Vite also admits `oxc: false`. See `jsx_settings`.
+    pub oxc: Option<serde_json::Value>,
+    /// Vite <=7's `esbuild` block (`jsx`, `jsxImportSource`, `jsxFactory`,
+    /// `jsxFragment`); opaque for the same reason. See `jsx_settings`.
+    pub esbuild: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

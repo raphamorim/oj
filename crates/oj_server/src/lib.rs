@@ -260,6 +260,7 @@ struct ServerState {
     http: reqwest::Client,
     virtual_modules: std::collections::BTreeMap<String, String>,
     jsx_overrides: std::collections::BTreeMap<String, String>,
+    jsx: oj_compiler::JsxConfig,
     hmr_gate: Option<Arc<HmrGate>>,
     hmr_enabled: bool,
     plugins: Option<std::sync::Arc<PluginHost>>,
@@ -386,22 +387,21 @@ impl DevServer {
                 std::env::vars().chain(extra.iter().map(|(k, v)| (k.clone(), v.clone()))),
                 &env_prefix_refs,
             );
+            // Vite defines process.env.NODE_ENV in dev too (nodeEnv = NODE_ENV || mode);
+            // without it, library code that reads it throws a ReferenceError in dev.
+            // DEV/PROD follow it as well: `NODE_ENV=production vite dev` is PROD.
+            let node_env =
+                oj_env::resolve_node_env(std::env::var("NODE_ENV").ok().as_deref(), &env, "development");
             let mut defines = oj_env::import_meta_env_defines(
                 &merged,
                 "development",
-                true,
+                node_env != "production",
                 config.base.as_deref().unwrap_or("/"),
                 &env_prefix_refs,
             );
             defines.extend(oj_config::config_defines(&config));
             defines.extend(oj_config::environment_defines(&config, "client"));
             defines.extend(oj_config::environment_defines(&config, "ssr"));
-            // Vite defines process.env.NODE_ENV in dev too (nodeEnv = NODE_ENV || mode);
-            // without it, library code that reads it throws a ReferenceError in dev.
-            let node_env = std::env::var("NODE_ENV")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "development".into());
             let node_env_json =
                 serde_json::to_string(&node_env).unwrap_or_else(|_| "\"development\"".into());
             for key in [
@@ -586,8 +586,12 @@ impl DevServer {
             None => (false, false),
         };
 
+        let jsx = jsx_config_of(&config);
         let jsx_overrides = match &plugin_host {
-            Some(host) => resolve_jsx_overrides(host, &root).await,
+            Some(host) => {
+                resolve_jsx_overrides(host, &root, jsx.import_source.as_deref().unwrap_or("react"))
+                    .await
+            }
             None => std::collections::BTreeMap::new(),
         };
 
@@ -711,6 +715,7 @@ impl DevServer {
             http: reqwest::Client::new(),
             virtual_modules: config.virtual_modules.clone().unwrap_or_default(),
             jsx_overrides,
+            jsx,
             hmr_gate,
             hmr_enabled,
             plugins: plugin_host,
@@ -2289,6 +2294,7 @@ async fn ensure_module(
     let virtual_ids: std::collections::BTreeSet<String> =
         state.virtual_modules.keys().cloned().collect();
     let jsx_overrides = state.jsx_overrides.clone();
+    let jsx_config = state.jsx.clone();
     let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
     let file_owned = if react_svg || svgr_componentized {
         file.with_extension("svg.tsx")
@@ -2479,16 +2485,18 @@ async fn ensure_module(
                         }
                         None
                     });
-                let opts = if is_svelte {
+                let mut opts = if is_svelte {
                     oj_compiler::CompileOptions {
                         dev: true,
                         refresh: false,
                         sourcemap: true,
                         ssr: false,
+                        jsx: oj_compiler::JsxConfig::default(),
                     }
                 } else {
                     oj_compiler::CompileOptions::dev()
                 };
+                opts.jsx = jsx_config;
                 oj_compiler::compile_module_with_maps(
                     &file_owned,
                     interopped.as_deref().unwrap_or(&source),
@@ -3656,17 +3664,32 @@ async fn serve_oj_routes(State(state): State<Arc<ServerState>>) -> Response {
     }
 }
 
+/// The compiler's JSX settings for a config (`oxc.jsx` / `esbuild.jsx*`).
+pub fn jsx_config_of(config: &oj_config::OjConfig) -> oj_compiler::JsxConfig {
+    let s = oj_config::jsx_settings(config);
+    oj_compiler::JsxConfig {
+        runtime: s.runtime,
+        import_source: s.import_source,
+        pragma: s.pragma,
+        pragma_frag: s.pragma_frag,
+    }
+}
+
 async fn resolve_jsx_overrides(
     host: &PluginHost,
     root: &Path,
+    import_source: &str,
 ) -> std::collections::BTreeMap<String, String> {
     let mut overrides = std::collections::BTreeMap::new();
     let importer = root.join("index.html");
     let importer = importer.to_string_lossy();
-    for spec in ["react/jsx-dev-runtime", "react/jsx-runtime"] {
-        if let Ok(Some(id)) = host.resolve_id(spec, &importer).await {
+    for spec in [
+        format!("{import_source}/jsx-dev-runtime"),
+        format!("{import_source}/jsx-runtime"),
+    ] {
+        if let Ok(Some(id)) = host.resolve_id(&spec, &importer).await {
             if id != spec {
-                overrides.insert(spec.to_string(), id);
+                overrides.insert(spec, id);
             }
         }
     }

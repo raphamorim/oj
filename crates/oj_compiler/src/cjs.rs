@@ -30,6 +30,7 @@ pub fn compile_dep(
             refresh: false,
             sourcemap: false,
             ssr: false,
+            jsx: crate::JsxConfig::default(),
         };
         crate::compile_module(path, source_text, &opts, Some(resolve))
     } else {

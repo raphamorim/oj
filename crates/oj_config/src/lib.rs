@@ -77,6 +77,56 @@ pub fn server_fs_deny(config: &OjConfig) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The JSX transform settings a config asks for, in Vite's precedence: `oxc.jsx`
+/// (what `@vitejs/plugin-react` writes from `jsxRuntime`/`jsxImportSource`) first,
+/// then the older `esbuild.jsx*` names (`jsx: "transform"` is the classic runtime,
+/// `jsxFactory`/`jsxFragment` its pragmas). Unset fields mean oxc's defaults
+/// (automatic runtime from `react`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JsxSettings {
+    pub runtime: Option<String>,
+    pub import_source: Option<String>,
+    pub pragma: Option<String>,
+    pub pragma_frag: Option<String>,
+}
+
+pub fn jsx_settings(config: &OjConfig) -> JsxSettings {
+    fn str_of(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+        obj.get(key).and_then(|v| v.as_str()).map(str::to_string)
+    }
+    let mut s = JsxSettings::default();
+    if let Some(jsx) = config
+        .oxc
+        .as_ref()
+        .and_then(|o| o.get("jsx"))
+        .and_then(|j| j.as_object())
+    {
+        s.runtime = str_of(jsx, "runtime");
+        s.import_source = str_of(jsx, "importSource");
+        s.pragma = str_of(jsx, "pragma");
+        s.pragma_frag = str_of(jsx, "pragmaFrag");
+    }
+    if let Some(es) = config.esbuild.as_ref().and_then(|e| e.as_object()) {
+        if s.runtime.is_none() {
+            s.runtime = match str_of(es, "jsx").as_deref() {
+                Some("transform") => Some("classic".into()),
+                Some("automatic") => Some("automatic".into()),
+                _ => None,
+            };
+        }
+        if s.import_source.is_none() {
+            s.import_source = str_of(es, "jsxImportSource");
+        }
+        if s.pragma.is_none() {
+            s.pragma = str_of(es, "jsxFactory");
+        }
+        if s.pragma_frag.is_none() {
+            s.pragma_frag = str_of(es, "jsxFragment");
+        }
+    }
+    s
+}
+
 pub fn config_defines(config: &OjConfig) -> Vec<(String, String)> {
     config
         .define
@@ -791,5 +841,36 @@ mod tests {
         assert_eq!(cfg.bundle, Some(true));
         assert_eq!(cfg.base.as_deref(), Some("/app/"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod jsx_settings_tests {
+    use super::*;
+
+    #[test]
+    fn oxc_jsx_wins_over_esbuild_and_esbuild_maps_its_names() {
+        let mut c = OjConfig::default();
+        c.esbuild = Some(serde_json::json!({ "jsx": "transform", "jsxImportSource": "preact", "jsxFactory": "h", "jsxFragment": "Fragment" }));
+        let s = jsx_settings(&c);
+        assert_eq!(s.runtime.as_deref(), Some("classic"));
+        assert_eq!(s.import_source.as_deref(), Some("preact"));
+        assert_eq!(s.pragma.as_deref(), Some("h"));
+        assert_eq!(s.pragma_frag.as_deref(), Some("Fragment"));
+
+        c.oxc = Some(serde_json::json!({ "jsx": { "runtime": "automatic", "importSource": "@emotion/react" } }));
+        let s = jsx_settings(&c);
+        assert_eq!(s.runtime.as_deref(), Some("automatic"));
+        assert_eq!(s.import_source.as_deref(), Some("@emotion/react"));
+        assert_eq!(s.pragma.as_deref(), Some("h"), "esbuild fills what oxc left unset");
+    }
+
+    #[test]
+    fn oxc_false_and_missing_blocks_mean_defaults() {
+        let mut c = OjConfig::default();
+        assert_eq!(jsx_settings(&c), JsxSettings::default());
+        c.oxc = Some(serde_json::Value::Bool(false));
+        c.esbuild = Some(serde_json::Value::Bool(false));
+        assert_eq!(jsx_settings(&c), JsxSettings::default());
     }
 }

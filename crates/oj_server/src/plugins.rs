@@ -194,6 +194,10 @@ pub struct ViteValues {
     /// `minify`, `cssCodeSplit`, `target`, `ssr`); see `extractBuild` in
     /// vite-extract.mjs for the shapes it admits.
     pub build: Option<serde_json::Value>,
+    /// `oxc.jsx` as normalized by the extractor (`{ jsx: { runtime, importSource,
+    /// pragma, pragmaFrag } }`), and the `esbuild.jsx*` fields for older configs.
+    pub oxc: Option<serde_json::Value>,
+    pub esbuild: Option<serde_json::Value>,
 }
 
 /// Evaluate the app's `vite.config` for `command` ("serve" | "build") and `mode`.
@@ -301,6 +305,8 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
         }),
         optimize_deps: json.get("optimizeDeps").filter(|v| !v.is_null()).cloned(),
         build: json.get("build").filter(|v| !v.is_null()).cloned(),
+        oxc: json.get("oxc").filter(|v| !v.is_null()).cloned(),
+        esbuild: json.get("esbuild").filter(|v| !v.is_null()).cloned(),
     }
 }
 
@@ -434,6 +440,12 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
         if build.ssr.is_none() {
             build.ssr = str_of("ssr");
         }
+    }
+    if config.oxc.is_none() {
+        config.oxc = v.oxc;
+    }
+    if config.esbuild.is_none() {
+        config.esbuild = v.esbuild;
     }
 }
 
@@ -1049,6 +1061,8 @@ mod vite_values_tests {
             dedupe: None,
             optimize_deps: None,
             build: None,
+            oxc: None,
+            esbuild: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/vite-base/"));
@@ -1077,6 +1091,8 @@ mod vite_values_tests {
             dedupe: None,
             optimize_deps: None,
             build: None,
+            oxc: None,
+            esbuild: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/oj-base/"));
@@ -1167,5 +1183,28 @@ mod vite_values_tests {
         assert!(b.out_dir.is_none());
         assert!(b.sourcemap.is_none());
         assert!(b.target.is_none());
+    }
+
+    #[test]
+    fn merge_adopts_jsx_blocks_when_unset() {
+        let mut config = oj_config::OjConfig::default();
+        let v = ViteValues {
+            oxc: Some(serde_json::json!({ "jsx": { "importSource": "@emotion/react" } })),
+            esbuild: Some(serde_json::json!({ "jsxFactory": "h" })),
+            ..Default::default()
+        };
+        merge_vite_values(&mut config, v);
+        let s = oj_config::jsx_settings(&config);
+        assert_eq!(s.import_source.as_deref(), Some("@emotion/react"));
+        assert_eq!(s.pragma.as_deref(), Some("h"));
+
+        let mut config = oj_config::OjConfig::default();
+        config.oxc = Some(serde_json::json!({ "jsx": { "importSource": "preact" } }));
+        let v = ViteValues {
+            oxc: Some(serde_json::json!({ "jsx": { "importSource": "@emotion/react" } })),
+            ..Default::default()
+        };
+        merge_vite_values(&mut config, v);
+        assert_eq!(oj_config::jsx_settings(&config).import_source.as_deref(), Some("preact"), "oj.config wins");
     }
 }

@@ -209,9 +209,29 @@ function extractBuild(b) {
   return Object.keys(out).length ? out : null;
 }
 
+const JSX_ESBUILD_KEYS = ["jsx", "jsxImportSource", "jsxFactory", "jsxFragment"];
+function extractOxc(oxc) {
+  const jsx = oxc && typeof oxc === "object" ? oxc.jsx : null;
+  if (!jsx || typeof jsx !== "object") return null;
+  const out = {};
+  for (const k of ["runtime", "importSource", "pragma", "pragmaFrag"]) {
+    if (typeof jsx[k] === "string") out[k] = jsx[k];
+  }
+  return Object.keys(out).length ? { jsx: out } : null;
+}
+function extractEsbuild(es) {
+  if (!es || typeof es !== "object") return null;
+  const out = {};
+  for (const k of JSX_ESBUILD_KEYS) if (typeof es[k] === "string") out[k] = es[k];
+  return Object.keys(out).length ? out : null;
+}
+
 function warnUnsupported(c) {
   if (c.css?.preprocessorOptions) warn("css.preprocessorOptions is not applied yet");
-  if (c.esbuild && typeof c.esbuild === "object") warn("esbuild options are not applied");
+  if (c.esbuild && typeof c.esbuild === "object") {
+    const rest = Object.keys(c.esbuild).filter((k) => !JSX_ESBUILD_KEYS.includes(k));
+    if (rest.length) warn(`esbuild options ${rest.join(", ")} are not applied (jsx* are)`);
+  }
   if (c.optimizeDeps?.esbuildOptions || c.optimizeDeps?.rollupOptions) {
     warn("optimizeDeps.esbuildOptions/rollupOptions are not applied; include/exclude/entries are");
   }
@@ -253,6 +273,8 @@ if (isMainRun) try {
         : null,
       optimizeDeps: extractOptimizeDeps(c.optimizeDeps),
       build: extractBuild(c.build),
+      oxc: extractOxc(c.oxc),
+      esbuild: extractEsbuild(c.esbuild),
     }),
   );
 } catch (e) {
