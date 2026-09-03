@@ -506,7 +506,10 @@ pub async fn start_build(root: PathBuf, mode: &str, out: Option<PathBuf>) -> any
         oj_server::oj_brand(),
         out_dir.display()
     );
-    println!("  run: node {}", out_dir.join("server.mjs").display());
+    // A Cloudflare build (the app uses @cloudflare/vite-plugin) has no Node server.
+    if out_dir.join("server.mjs").exists() {
+        println!("  run: node {}", out_dir.join("server.mjs").display());
+    }
     Ok(())
 }
 
