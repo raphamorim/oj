@@ -14,6 +14,11 @@ pub struct ModuleNode {
     /// re-fetched during HMR appends `?t=<timestamp>` to its import of a stamped
     /// module, so the browser loads the new version instead of its cached one.
     pub last_hmr_timestamp: u64,
+    /// Whether the client already called `import.meta.hot.invalidate()` for the
+    /// current update of this module (Vite's `lastHMRInvalidationReceived`): a
+    /// second invalidate for the same update is ignored, and one for a module
+    /// no update ever touched has nothing to escalate.
+    pub last_hmr_invalidation_received: bool,
     /// Dependencies this module accepts updates for via
     /// `import.meta.hot.accept(deps, cb)` (Vite's `acceptedHmrDeps`): an update
     /// of one of them stops here with this module as the boundary.
@@ -29,6 +34,18 @@ pub struct ModuleGraph {
 pub struct UpdatePlan {
     pub dirty: Vec<PathBuf>,
     pub boundaries: Vec<PathBuf>,
+}
+
+/// One boundary an update stops at (Vite's `PropagationBoundary`): the module
+/// that accepts, the module it accepts (itself, or a declared dependency), and
+/// whether the boundary sits inside an import cycle with the changed chain, in
+/// which case a failed re-import must reset the page instead of surfacing an
+/// error (Vite's `isWithinCircularImport`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UpdateTarget {
+    pub boundary: PathBuf,
+    pub accepted: PathBuf,
+    pub within_circular_import: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -69,11 +86,11 @@ impl ModuleGraph {
             .is_some_and(|n| n.accepted_hmr_deps.contains(dep))
     }
 
-    /// The update targets for a change: `(boundary, acceptedPath)` pairs. A
-    /// self-accepting boundary accepts itself; an importer that declared the
-    /// changed module (or a module on the way up) in `hot.accept(deps)` is the
-    /// boundary for that dependency. `Err` means a full reload.
-    pub fn update_targets(&self, changed: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    /// The update targets for a change. A self-accepting boundary accepts
+    /// itself; an importer that declared the changed module (or a module on the
+    /// way up) in `hot.accept(deps)` is the boundary for that dependency. `Err`
+    /// means a full reload.
+    pub fn update_targets(&self, changed: &Path) -> Result<Vec<UpdateTarget>, String> {
         if !self.modules.contains_key(changed) {
             return Err(format!("{} is not in the module graph", changed.display()));
         }
@@ -83,7 +100,32 @@ impl ModuleGraph {
         Ok(targets)
     }
 
-    pub fn set_imports(&mut self, importer: &Path, imports: &[PathBuf]) {
+    /// The update targets when a module calls `import.meta.hot.invalidate()`:
+    /// its own acceptance is skipped and the walk starts at its importers, as
+    /// Vite's `updateModules(..., [...mod.importers])` does. A module nothing
+    /// imports is an entry, so the page must reload.
+    pub fn update_targets_from_importers(
+        &self,
+        changed: &Path,
+    ) -> Result<Vec<UpdateTarget>, String> {
+        let Some(node) = self.modules.get(changed) else {
+            return Err(format!("{} is not in the module graph", changed.display()));
+        };
+        if node.importers.is_empty() {
+            return Err(format!("{} invalidated at an entry", changed.display()));
+        }
+        let seeds: Vec<&Path> = node.importers.iter().map(PathBuf::as_path).collect();
+        let mut targets = self.collect_boundaries(&seeds, &[changed])?;
+        targets.sort();
+        targets.dedup();
+        Ok(targets)
+    }
+
+    /// Record a module's imports, returning the dependencies it no longer
+    /// imports that nothing else imports either (Vite's `prunedImports` in
+    /// `updateModuleInfo`): the client is told to prune them so their side
+    /// effects (an injected stylesheet) are undone.
+    pub fn set_imports(&mut self, importer: &Path, imports: &[PathBuf]) -> Vec<PathBuf> {
         let stale: Vec<PathBuf> = self
             .ensure_module(importer)
             .imports
@@ -91,15 +133,62 @@ impl ModuleGraph {
             .filter(|old| !imports.contains(old))
             .cloned()
             .collect();
+        let mut pruned = Vec::new();
         for old in stale {
             if let Some(node) = self.modules.get_mut(&old) {
                 node.importers.remove(importer);
+                if node.importers.is_empty() {
+                    pruned.push(old.clone());
+                }
             }
             self.ensure_module(importer).imports.remove(&old);
         }
         for import in imports {
             self.add_import(importer, import);
         }
+        pruned.sort();
+        pruned
+    }
+
+    /// Stamp pruned modules so a later re-import fetches and re-runs them
+    /// (their side effects were undone), as Vite's `handlePrunedModules`.
+    pub fn stamp_pruned(&mut self, paths: &[PathBuf], timestamp: u64) {
+        for path in paths {
+            if let Some(node) = self.modules.get_mut(path) {
+                node.last_hmr_timestamp = timestamp;
+                node.last_hmr_invalidation_received = false;
+            }
+        }
+    }
+
+    /// Accept a client's `import.meta.hot.invalidate()` for `changed`: only a
+    /// self-accepting module an update already touched, and only once per
+    /// update (Vite's `lastHMRInvalidationReceived`). Its importers up to the
+    /// next boundaries are stamped so their re-fetch sees the invalidated
+    /// module's current version; the module itself keeps its stamp, so the
+    /// instance the browser already loaded is reused rather than re-evaluated.
+    /// Returns the stamped importers, or `None` when the call is ignored.
+    pub fn accept_invalidation(&mut self, changed: &Path, timestamp: u64) -> Option<Vec<PathBuf>> {
+        let node = self.modules.get_mut(changed)?;
+        if !node.is_self_accepting
+            || node.last_hmr_timestamp == 0
+            || node.last_hmr_invalidation_received
+        {
+            return None;
+        }
+        node.last_hmr_invalidation_received = true;
+        let dirty: Vec<PathBuf> = self
+            .dirty_closure(changed)
+            .into_iter()
+            .filter(|p| p != changed)
+            .collect();
+        for path in &dirty {
+            if let Some(node) = self.modules.get_mut(path) {
+                node.last_hmr_timestamp = timestamp;
+                node.last_hmr_invalidation_received = false;
+            }
+        }
+        Some(dirty)
     }
 
     pub fn contains(&self, path: &Path) -> bool {
@@ -120,7 +209,7 @@ impl ModuleGraph {
         }
         match self.collect_boundaries(&[changed], &[]) {
             Ok(targets) => {
-                let mut boundaries: Vec<PathBuf> = targets.into_iter().map(|(b, _)| b).collect();
+                let mut boundaries: Vec<PathBuf> = targets.into_iter().map(|t| t.boundary).collect();
                 boundaries.sort();
                 boundaries.dedup();
                 HmrDecision::Update { boundaries }
@@ -142,6 +231,7 @@ impl ModuleGraph {
         for path in &dirty {
             if let Some(node) = self.modules.get_mut(path) {
                 node.last_hmr_timestamp = timestamp;
+                node.last_hmr_invalidation_received = false;
             }
         }
         dirty
@@ -180,7 +270,7 @@ impl ModuleGraph {
         }
         match self.collect_boundaries(seeds, &[]) {
             Ok(targets) => {
-                let mut boundaries: Vec<PathBuf> = targets.into_iter().map(|(b, _)| b).collect();
+                let mut boundaries: Vec<PathBuf> = targets.into_iter().map(|t| t.boundary).collect();
                 boundaries.sort();
                 boundaries.dedup();
                 HmrDecision::Update { boundaries }
@@ -251,7 +341,7 @@ impl ModuleGraph {
         let seeds: Vec<&Path> = node.importers.iter().map(PathBuf::as_path).collect();
         match self.collect_boundaries(&seeds, &[changed]) {
             Ok(targets) => {
-                let mut boundaries: Vec<PathBuf> = targets.into_iter().map(|(b, _)| b).collect();
+                let mut boundaries: Vec<PathBuf> = targets.into_iter().map(|t| t.boundary).collect();
                 boundaries.sort();
                 boundaries.dedup();
                 HmrDecision::Update { boundaries }
@@ -264,23 +354,52 @@ impl ModuleGraph {
         &'a self,
         seeds: &[&'a Path],
         pre_stack: &[&'a Path],
-    ) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    ) -> Result<Vec<UpdateTarget>, String> {
         let mut colors: HashMap<&'a Path, Color> = HashMap::new();
         for module in pre_stack {
             colors.insert(module, Color::Gray);
         }
-        let mut boundaries: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let mut boundaries: Vec<UpdateTarget> = Vec::new();
         for seed in seeds {
             self.climb(seed, &mut colors, &mut boundaries)?;
         }
         Ok(boundaries)
     }
 
+    /// Whether `boundary` is imported, directly or through other modules, by a
+    /// module on the current change chain (the gray nodes of the walk, plus the
+    /// boundary itself): Vite's `isNodeWithinCircularImports`. Stylesheet
+    /// importers are skipped as there, and a module's direct self-import is not
+    /// a cycle.
+    fn is_within_circular_imports(&self, boundary: &Path, colors: &HashMap<&Path, Color>) -> bool {
+        let mut stack = vec![boundary];
+        let mut seen: HashSet<&Path> = HashSet::new();
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            let Some(node) = self.modules.get(current) else {
+                continue;
+            };
+            for importer in &node.importers {
+                let importer = importer.as_path();
+                if importer == current || is_css_path(importer) {
+                    continue;
+                }
+                if importer == boundary || colors.get(importer) == Some(&Color::Gray) {
+                    return true;
+                }
+                stack.push(importer);
+            }
+        }
+        false
+    }
+
     fn climb<'a>(
         &'a self,
         seed: &'a Path,
         colors: &mut HashMap<&'a Path, Color>,
-        boundaries: &mut Vec<(PathBuf, PathBuf)>,
+        boundaries: &mut Vec<UpdateTarget>,
     ) -> Result<(), String> {
         enum Step<'s> {
             Enter(&'s Path),
@@ -310,7 +429,11 @@ impl ModuleGraph {
                 return Err(format!("{} is not in the module graph", current.display()));
             };
             if node.is_self_accepting {
-                boundaries.push((current.to_path_buf(), current.to_path_buf()));
+                boundaries.push(UpdateTarget {
+                    boundary: current.to_path_buf(),
+                    accepted: current.to_path_buf(),
+                    within_circular_import: self.is_within_circular_imports(current, colors),
+                });
                 colors.insert(current, Color::Black);
                 continue;
             }
@@ -328,7 +451,11 @@ impl ModuleGraph {
                 // An importer that accepts `current` via hot.accept(deps) is the
                 // boundary for this change; the walk does not continue above it.
                 if self.accepts_dep(importer, current) {
-                    boundaries.push((importer.to_path_buf(), current.to_path_buf()));
+                    boundaries.push(UpdateTarget {
+                        boundary: importer.to_path_buf(),
+                        accepted: current.to_path_buf(),
+                        within_circular_import: self.is_within_circular_imports(importer, colors),
+                    });
                     continue;
                 }
                 stack.push(Step::Enter(importer));
@@ -336,6 +463,13 @@ impl ModuleGraph {
         }
         Ok(())
     }
+}
+
+fn is_css_path(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("css" | "scss" | "sass" | "less" | "styl" | "stylus" | "pcss" | "postcss" | "sss")
+    )
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -616,7 +750,7 @@ mod tests {
         g.set_accepted_deps(&p("main.ts"), &[p("util.ts")]);
         assert_eq!(
             g.update_targets(&p("util.ts")).unwrap(),
-            vec![(p("main.ts"), p("util.ts"))]
+            vec![target("main.ts", "util.ts", false)]
         );
         assert_eq!(
             g.propagate_update(&p("util.ts")),
@@ -628,7 +762,105 @@ mod tests {
         assert!(matches!(g.propagate_update(&p("main.ts")), HmrDecision::FullReload { .. }));
         // A self-accepting module reports itself as acceptedPath.
         g.set_self_accepting(&p("main.ts"), true);
-        assert_eq!(g.update_targets(&p("main.ts")).unwrap(), vec![(p("main.ts"), p("main.ts"))]);
+        assert_eq!(
+            g.update_targets(&p("main.ts")).unwrap(),
+            vec![target("main.ts", "main.ts", false)]
+        );
+    }
+
+    fn target(boundary: &str, accepted: &str, within_circular_import: bool) -> UpdateTarget {
+        UpdateTarget {
+            boundary: p(boundary),
+            accepted: p(accepted),
+            within_circular_import,
+        }
+    }
+
+    #[test]
+    fn boundary_inside_an_import_cycle_is_flagged() {
+        // main -> A (boundary) -> b -> A : b's update stops at A, which b also
+        // imports, so a failed re-import of A must reset the page.
+        let mut g = ModuleGraph::new();
+        g.add_import(&p("main.ts"), &p("A.tsx"));
+        g.add_import(&p("A.tsx"), &p("b.ts"));
+        g.add_import(&p("b.ts"), &p("A.tsx"));
+        g.set_self_accepting(&p("A.tsx"), true);
+        assert_eq!(
+            g.update_targets(&p("b.ts")).unwrap(),
+            vec![target("A.tsx", "A.tsx", true)]
+        );
+        // A cycle that does not involve the boundary is not flagged.
+        let mut g = ModuleGraph::new();
+        g.add_import(&p("main.ts"), &p("A.tsx"));
+        g.add_import(&p("A.tsx"), &p("b.ts"));
+        g.add_import(&p("b.ts"), &p("c.ts"));
+        g.add_import(&p("c.ts"), &p("b.ts"));
+        g.set_self_accepting(&p("A.tsx"), true);
+        assert_eq!(
+            g.update_targets(&p("c.ts")).unwrap(),
+            vec![target("A.tsx", "A.tsx", false)]
+        );
+        // A dep-accepting boundary that the changed module imports back.
+        let mut g = ModuleGraph::new();
+        g.add_import(&p("main.ts"), &p("store.ts"));
+        g.add_import(&p("store.ts"), &p("util.ts"));
+        g.add_import(&p("util.ts"), &p("main.ts"));
+        g.set_accepted_deps(&p("main.ts"), &[p("store.ts")]);
+        assert_eq!(
+            g.update_targets(&p("util.ts")).unwrap(),
+            vec![target("main.ts", "store.ts", true)]
+        );
+        // A cycle below the accepted dependency, not involving the boundary.
+        let mut g = ModuleGraph::new();
+        g.add_import(&p("main.ts"), &p("store.ts"));
+        g.add_import(&p("store.ts"), &p("util.ts"));
+        g.add_import(&p("util.ts"), &p("store.ts"));
+        g.set_accepted_deps(&p("main.ts"), &[p("store.ts")]);
+        assert_eq!(
+            g.update_targets(&p("util.ts")).unwrap(),
+            vec![target("main.ts", "store.ts", false)]
+        );
+    }
+
+    #[test]
+    fn set_imports_reports_pruned_dependencies() {
+        let mut g = graph();
+        g.add_import(&p("App.tsx"), &p("a.css"));
+        g.add_import(&p("main.tsx"), &p("shared.ts"));
+        g.add_import(&p("App.tsx"), &p("shared.ts"));
+        // App drops a.css (nothing else imports it) and shared.ts (main still does).
+        assert_eq!(g.set_imports(&p("App.tsx"), &[p("Button.tsx")]), vec![p("a.css")]);
+        assert!(g.node(&p("shared.ts")).unwrap().importers.contains(&p("main.tsx")));
+        // Re-adding the import yields no prune and the pruned stamp makes a re-import fetch anew.
+        g.stamp_pruned(&[p("a.css")], 42);
+        assert_eq!(g.hmr_timestamp(&p("a.css")), 42);
+        assert_eq!(g.set_imports(&p("App.tsx"), &[p("Button.tsx"), p("a.css")]), Vec::<PathBuf>::new());
+        // Untouched imports never prune.
+        assert_eq!(g.set_imports(&p("App.tsx"), &[p("Button.tsx"), p("a.css")]), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn invalidation_is_accepted_once_per_update_and_stamps_importers_only() {
+        // main -> App (boundary) -> Button (boundary)
+        let mut g = graph();
+        // Never updated: Vite ignores the invalidate.
+        assert_eq!(g.accept_invalidation(&p("Button.tsx"), 5), None);
+        g.stamp_update(&p("Button.tsx"), 3);
+        assert_eq!(g.accept_invalidation(&p("Button.tsx"), 5), Some(vec![p("App.tsx")]));
+        assert_eq!(g.hmr_timestamp(&p("App.tsx")), 5, "the importer is stamped");
+        assert_eq!(g.hmr_timestamp(&p("Button.tsx")), 3, "the invalidated module keeps its stamp");
+        assert_eq!(g.accept_invalidation(&p("Button.tsx"), 6), None, "second call for the same update");
+        g.stamp_update(&p("Button.tsx"), 7);
+        assert!(g.accept_invalidation(&p("Button.tsx"), 8).is_some(), "a new update re-arms it");
+        // Not self-accepting: ignored.
+        g.add_import(&p("Button.tsx"), &p("util.ts"));
+        g.stamp_update(&p("util.ts"), 9);
+        assert_eq!(g.accept_invalidation(&p("util.ts"), 10), None);
+        assert_eq!(
+            g.update_targets_from_importers(&p("Button.tsx")).unwrap(),
+            vec![target("App.tsx", "App.tsx", false)]
+        );
+        assert!(g.update_targets_from_importers(&p("main.tsx")).is_err(), "an entry reloads");
     }
 
     #[test]
