@@ -51,10 +51,12 @@ pub struct ResolveSettings {
     pub preserve_symlinks: bool,
 }
 
-/// Extensions probed for an extensionless import, in priority order. Shared with
+/// Extensions probed for an extensionless import, in priority order: Vite's
+/// DEFAULT_EXTENSIONS (constants.ts), so `./foo` with both `foo.js` and `foo.ts`
+/// on disk picks `foo.js` like Vite, and `./foo` reaches `foo.mts`. Shared with
 /// the dependency optimizer so it resolves exactly like the dev server.
 pub fn default_extensions() -> Vec<String> {
-    [".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs", ".json"]
+    [".mjs", ".js", ".mts", ".ts", ".jsx", ".tsx", ".json"]
         .map(String::from)
         .to_vec()
 }
@@ -424,6 +426,31 @@ mod tests {
                 .unwrap()
                 .ends_with("Counter.module.css"),
             "exact-path .css should resolve",
+        );
+    }
+
+    #[test]
+    fn default_extensions_probe_in_vite_order() {
+        // Vite's DEFAULT_EXTENSIONS: .js before .ts, and .mts is probed.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("package.json"), "{}").unwrap();
+        std::fs::write(root.join("both.js"), "export const js = 1;").unwrap();
+        std::fs::write(root.join("both.ts"), "export const ts = 1;").unwrap();
+        std::fs::write(root.join("modern.mts"), "export const m = 1;").unwrap();
+        std::fs::write(root.join("main.ts"), "").unwrap();
+        let resolver = OjResolver::new(root);
+        assert!(
+            resolver.resolve(root, "./both").unwrap().ends_with("both.js"),
+            ".js wins over a sibling .ts as in Vite",
+        );
+        assert!(
+            resolver.resolve(root, "./modern").unwrap().ends_with("modern.mts"),
+            ".mts is in the default probe list",
+        );
+        assert_eq!(
+            default_extensions(),
+            [".mjs", ".js", ".mts", ".ts", ".jsx", ".tsx", ".json"].map(String::from)
         );
     }
 
