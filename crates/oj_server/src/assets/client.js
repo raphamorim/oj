@@ -130,8 +130,15 @@ async function applyUpdate(update) {
     emit("vite:afterUpdate", { type: "update", updates: [update] });
     console.log(`[oj] hot updated ${update.path}`);
   } catch (err) {
+    // Like Vite's warnFailedUpdate: log, but do not raise an overlay of our own.
+    // A compile error behind the failed fetch already arrived as the server's
+    // error frame (with the file and code frame); replacing that overlay with
+    // "failed to fetch" would hide the real cause.
     emit("vite:error", { err: { message: String(err) } });
-    showOverlay(`hot update failed for ${update.path}\n\n${err && err.stack ? err.stack : err}`);
+    if (!(err instanceof Error) || !err.message.includes("fetch")) console.error(err);
+    console.error(
+      `[oj] Failed to reload ${update.path}. This could be due to syntax errors or importing non-existent modules. (see errors above)`,
+    );
   }
 }
 

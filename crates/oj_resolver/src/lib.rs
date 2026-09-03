@@ -185,6 +185,13 @@ impl OjResolver {
         self.dedupe.iter().any(|d| d == &pkg)
     }
 
+    /// Drop the resolver's file system cache. A lookup that failed is cached
+    /// like a hit, so a file or directory created after the miss (an import
+    /// written before its module exists) stays unresolvable until this runs.
+    pub fn clear_cache(&self) {
+        self.inner.clear_cache();
+    }
+
     pub fn resolve(&self, importer_dir: &Path, specifier: &str) -> Result<PathBuf, ResolveFailure> {
         let deduped = self.should_dedupe(specifier);
         let base = if deduped {
