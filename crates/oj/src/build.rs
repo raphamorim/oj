@@ -637,15 +637,21 @@ async fn compile_stylesheet(
         let opts = oj_config::css_preprocessor_json(&cfg, lang);
         source = preprocess_via_sidecar(root, std::path::Path::new(path), &source, opts)?;
     }
+    // Plain `@import`s are inlined (postcss-import parity) so the concatenated
+    // chunk stylesheet does not carry imports that 404 from `assets/`. It runs
+    // before PostCSS, as postcss-import is the first plugin of Vite's chain, so
+    // imported rules go through the user's plugins too. A Tailwind stylesheet
+    // resolves its own imports in the sidecar (as the Tailwind Vite plugin does).
+    let tailwind = oj_server::sidecar::is_tailwind_css(&source);
+    if !tailwind {
+        source = oj_css::inline_imports_with(&source, std::path::Path::new(path), &resolve.as_ref())
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
     // PostCSS/Tailwind run on the preprocessor OUTPUT (Vite orders them the same
     // way), on the source as transformed so far rather than re-read from disk.
-    if oj_server::sidecar::is_tailwind_css(&source) || has_postcss {
+    if tailwind || has_postcss {
         source = expand_css_via_sidecar(root, std::path::Path::new(path), &source)?;
     }
-    // Plain `@import`s are inlined (postcss-import parity) so the concatenated
-    // chunk stylesheet does not carry imports that 404 from `assets/`.
-    source = oj_css::inline_imports_with(&source, std::path::Path::new(path), &resolve.as_ref())
-        .map_err(|e| anyhow::anyhow!(e))?;
     let css_id = match std::path::Path::new(path).strip_prefix(root) {
         Ok(rel) => format!("/{}", rel.display()),
         Err(_) => path.to_string(),
