@@ -264,3 +264,18 @@ export function scanPack(file, store, epoch, verifyHashes, onRecord) {
   }
   return buf.length;
 }
+
+// The Host a forwarded request should present to the app. hyper owns the
+// loopback Host, so oj sends the browser's in x-oj-host; the runner takes that,
+// then the loopback Host. Node discards duplicate Host headers and keeps the
+// first, so a comma-joined value is cut the same way (a value like
+// "proxy.example.com, localhost:8080" would otherwise break `new Request`).
+export function requestHost(...candidates) {
+  for (const c of candidates) {
+    const v = Array.isArray(c) ? c[0] : c;
+    if (typeof v !== "string") continue;
+    const first = v.split(",")[0].trim();
+    if (first) return first;
+  }
+  return "localhost";
+}

@@ -70,6 +70,20 @@ async function assertServerRoutes(port, label) {
   must((put.headers.get("content-type") || "").includes("text/html"),
     `${label}: PUT /files/a.b should reach the app (got ${put.status} ${put.headers.get("content-type")})`);
   console.log(`${label}: dotted POST server route + binary echo + 2 set-cookie + dotted PUT ok`);
+
+  // Behind a proxy that already set x-forwarded-host (a preview or a tunnel),
+  // the app must still get a parseable URL: Host is the server's own and the
+  // proxy's x-forwarded-host passes through untouched, Vite's shape. Joining
+  // the two hosts used to surface as a 500 "Failed to parse URL".
+  const viaProxy = await fetch(`http://localhost:${port}/api/request-url`, {
+    headers: { "x-forwarded-host": "preview.example.com" },
+  });
+  must(viaProxy.status === 200, `${label}: GET /api/request-url behind a proxy returned ${viaProxy.status}`);
+  const seen = await viaProxy.json();
+  must(seen.url.startsWith(`http://localhost:${port}/api/request-url`), `${label}: request.url should use the server's own host, got ${seen.url}`);
+  must(seen.host === `localhost:${port}`, `${label}: Host should be the server's own, got ${seen.host}`);
+  must(seen.forwardedHost === "preview.example.com", `${label}: x-forwarded-host should pass through, got ${seen.forwardedHost}`);
+  console.log(`${label}: proxied request keeps Host and passes x-forwarded-host through`);
 }
 
 async function devPhase() {

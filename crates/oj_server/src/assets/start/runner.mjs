@@ -8,6 +8,7 @@ import { fstatSync } from "node:fs";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import readline from "node:readline";
+import { requestHost } from "./loader-util.mjs";
 
 process.env.TSS_SERVER_FN_BASE ??= "/_serverFn/";
 process.env.TSS_DEV_SERVER ??= "true";
@@ -48,11 +49,13 @@ let entryReady;
 const server = http.createServer(async (req, res) => {
   try {
     await entryReady;
-    const host = req.headers["x-forwarded-host"] || req.headers.host || "localhost";
+    // The browser's Host arrives as x-oj-host (hyper owns the loopback Host);
+    // a proxy's x-forwarded-host is left to the app, as under Vite.
+    const host = requestHost(req.headers["x-oj-host"], req.headers.host);
     const method = req.method || "GET";
     const headers = new Headers();
     for (const [k, v] of Object.entries(req.headers)) {
-      if (v == null || k === "x-forwarded-host") continue;
+      if (v == null || k === "x-oj-host") continue;
       if (Array.isArray(v)) for (const x of v) headers.append(k, x);
       else headers.set(k, v);
     }

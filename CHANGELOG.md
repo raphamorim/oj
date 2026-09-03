@@ -5,6 +5,11 @@ All notable changes to oj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- TanStack Start dev behind a proxy that sets `x-forwarded-host` (a preview or a tunnel) answered every request with `500 Failed to parse URL from http://proxy-host, localhost:port/`: oj forwarded the browser's `Host` to the SSR runner as a second `x-forwarded-host`, and Node joined the two. The original `Host` now travels in a private header and is restored as `Host` (first value only, as Node does for duplicate `Host` headers), and a proxy's `x-forwarded-host` reaches the app untouched, as under Vite. Plugin middlewares (`configureServer`) see the browser's `Host` in `req.headers.host` for the same reason.
+
 ## [0.1.14] - 2026-09-03
 
 A Vite-parity release: the fifth oj-versus-Vite audit round closed its last P0 (production builds for Cloudflare), every remaining P1 that did not need a redesign, and most of the P2 list across the dev server and HMR, the resolver and dependency optimizer, plugins, the production build, CSS and assets, and SSR with TanStack Start. Every change below ships with a unit or end-to-end test and was matched against rolldown-vite 8.3.0-beta.0.
