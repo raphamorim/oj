@@ -62,6 +62,13 @@ try {
   );
   assert.match(overridden, /window\.__OVR = 1/, "--config loads plugins from the override config");
 
+  // A --config that names a file that does not exist is an error (Vite: "Could
+  // not resolve config file"), not a silent fallback to the root config.
+  const { spawnSync } = await import("node:child_process");
+  const missing = spawnSync(oj, ["build", app, "--config", ".lovable/nope.config.mjs"], { cwd: app, encoding: "utf8" });
+  assert.notEqual(missing.status, 0, "build with a missing --config must fail");
+  assert.match(missing.stderr + missing.stdout, /failed to load config from .*nope\.config\.mjs/, `missing --config error:\n${missing.stderr}`);
+
   console.log("CONFIG-FLAG E2E PASSED");
 } catch (err) {
   failed = true;
