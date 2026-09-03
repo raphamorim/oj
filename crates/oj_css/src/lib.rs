@@ -143,6 +143,50 @@ fn root_absolute_rel(spec: &str) -> Option<&str> {
     (!rel.is_empty() && !rel.starts_with('/')).then_some(rel)
 }
 
+/// The JS module body for a CSS module's class map, shaped like Vite's
+/// `dataToEsm(modules, { namedExports: true })`: the whole map is the default
+/// export and every class whose name is a legal JS identifier (as
+/// @rollup/pluginutils' makeLegalIdentifier judges it) is also a named export,
+/// so `import { button } from "./x.module.css"` works.
+pub fn css_modules_esm(exports: &[(String, String)]) -> String {
+    let mut out = String::new();
+    let mut map = serde_json::Map::new();
+    for (name, scoped) in exports {
+        if is_legal_identifier(name) {
+            out.push_str(&format!("export const {name} = {};\n", serde_json::Value::String(scoped.clone())));
+        }
+        map.insert(name.clone(), serde_json::Value::String(scoped.clone()));
+    }
+    out.push_str(&format!("export default {};\n", serde_json::Value::Object(map)));
+    out
+}
+
+/// `key === makeLegalIdentifier(key)`: identifier characters only, not
+/// digit-led, not a reserved word or a global builtin name.
+fn is_legal_identifier(name: &str) -> bool {
+    const FORBIDDEN: &[&str] = &[
+        "break", "case", "class", "catch", "const", "continue", "debugger", "default", "delete", "do",
+        "else", "export", "extends", "finally", "for", "function", "if", "import", "in", "instanceof",
+        "let", "new", "return", "super", "switch", "this", "throw", "try", "typeof", "var", "void",
+        "while", "with", "yield", "enum", "await", "implements", "package", "protected", "static",
+        "interface", "private", "public", "arguments", "Infinity", "NaN", "undefined", "null", "true",
+        "false", "eval", "uneval", "isFinite", "isNaN", "parseFloat", "parseInt", "decodeURI",
+        "decodeURIComponent", "encodeURI", "encodeURIComponent", "escape", "unescape", "Object",
+        "Function", "Boolean", "Symbol", "Error", "EvalError", "InternalError", "RangeError",
+        "ReferenceError", "SyntaxError", "TypeError", "URIError", "Number", "Math", "Date", "String",
+        "RegExp", "Array", "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array",
+        "Int32Array", "Uint32Array", "Float32Array", "Float64Array", "Map", "Set", "WeakMap", "WeakSet",
+        "SIMD", "ArrayBuffer", "DataView", "JSON", "Promise", "Generator", "GeneratorFunction",
+        "Reflect", "Proxy", "Intl",
+    ];
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let ident_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
+    ident_char(first) && !first.is_ascii_digit() && chars.all(ident_char) && !FORBIDDEN.contains(&name)
+}
+
 pub fn is_css_module(url: &str) -> bool {
     let path = url.split('?').next().unwrap_or(url);
     path.rsplit('/')
@@ -1570,6 +1614,31 @@ mod tests {
         // Without the alias the import is unresolvable, as before.
         assert!(compile_sass(src, Some(&base.join("src/comp"))).is_err());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn css_modules_esm_names_legal_identifiers_and_keeps_the_whole_map_default() {
+        let exports = vec![
+            ("button".to_string(), "m_button_h".to_string()),
+            ("my-class".to_string(), "m_my-class_h".to_string()),
+            ("default".to_string(), "m_default_h".to_string()),
+            ("class".to_string(), "m_class_h".to_string()),
+            ("Map".to_string(), "m_Map_h".to_string()),
+            ("_private".to_string(), "m__private_h".to_string()),
+            ("$x".to_string(), "m_x_h".to_string()),
+            ("1st".to_string(), "m_1st_h".to_string()),
+        ];
+        let js = css_modules_esm(&exports);
+        assert!(js.contains("export const button = \"m_button_h\";"), "{js}");
+        assert!(js.contains("export const _private = ") && js.contains("export const $x = "), "{js}");
+        for bad in ["my-class", "default", "class", "Map", "1st"] {
+            assert!(!js.contains(&format!("export const {bad} ")), "{bad} must not be a named export: {js}");
+        }
+        assert!(js.contains("export default {"), "{js}");
+        for key in ["button", "my-class", "default", "class", "Map", "_private", "$x", "1st"] {
+            assert!(js.contains(&format!("\"{key}\":\"m_")), "{key} in the default map: {js}");
+        }
+        assert_eq!(css_modules_esm(&[]), "export default {};\n");
     }
 
     #[test]

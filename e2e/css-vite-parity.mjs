@@ -45,7 +45,15 @@ fs.writeFileSync(
     `.a { background: url("@/img.png"); }\n.b { background: url(/src/img.png); }\n.c { background: url(/pub.png); }\n` +
     `.hack { *zoom: 1; color: red; }\n`,
 );
-fs.writeFileSync(path.join(app, "src", "main.js"), `import "./ui/app.css";\nimport "./ui/theme.scss";\nwindow.__OK = true;\n`);
+fs.writeFileSync(
+  path.join(app, "src", "ui", "btn.module.css"),
+  `.button { color: red; }\n.my-class { color: blue; }\n.default { color: green; }\n`,
+);
+fs.writeFileSync(
+  path.join(app, "src", "main.js"),
+  `import "./ui/app.css";\nimport "./ui/theme.scss";\nimport styles, { button } from "./ui/btn.module.css";\n` +
+    `document.body.className = button + " " + styles["my-class"];\nwindow.__OK = true;\n`,
+);
 fs.writeFileSync(
   path.join(app, "index.html"),
   `<!doctype html><html><head><title>t</title></head><body><script type="module" src="/src/main.js"></script></body></html>`,
@@ -68,7 +76,12 @@ try {
   const scss = await (await fetch(`http://localhost:${PORT}/src/ui/theme.scss?direct`)).text();
   assert.match(scss, /#123456/, `sass @use through the alias:\n${scss}`);
   assert.match(scss, /url\(["']?\/src\/img\.png/, `aliased url() in sass output:\n${scss}`);
-  console.log("[dev] alias + root-absolute + error recovery OK");
+  const mod = await (await fetch(`http://localhost:${PORT}/src/ui/btn.module.css`)).text();
+  assert.match(mod, /export const button = "btn-module_button_[A-Za-z0-9_-]+";/, `css module named export:\n${mod}`);
+  assert.match(mod, /export default \{"button":"btn-module_button_/, `css module default map kept:\n${mod}`);
+  assert.match(mod, /"my-class":"btn-module_my-class_/, "kebab class stays in the default map");
+  assert.doesNotMatch(mod, /export const (my-class|default) /, "illegal identifiers are not named exports");
+  console.log("[dev] alias + root-absolute + error recovery + css module named exports OK");
   srv.kill("SIGKILL");
   await sleep(300);
 
@@ -89,7 +102,12 @@ try {
   assert.ok(refs.length >= 1, `css references the emitted asset:\n${built}`);
   assert.match(built, /url\(["']?\/pub\.png/, "public url kept in build");
   assert.match(built, /\.hack\{color:red\}/, `hack dropped, rule kept in build:\n${built}`);
-  console.log("[build] alias + root-absolute + error recovery OK");
+  // `import { button }` from a CSS module bundles (rolldown would reject a
+  // missing named export) and carries the scoped class.
+  const js = files.filter((f) => f.endsWith(".js")).map((f) => fs.readFileSync(path.join(assets, f), "utf8")).join("\n");
+  assert.match(js, /btn-module_button_[A-Za-z0-9_-]+/, `named css module export bundled:\n${js.slice(0, 400)}`);
+  assert.match(built, /\.btn-module_button_[A-Za-z0-9_-]+\{color:red\}/, "css module rules in the stylesheet");
+  console.log("[build] alias + root-absolute + error recovery + css module named exports OK");
   console.log("CSS-VITE-PARITY E2E PASSED");
 } catch (err) {
   failed = true;

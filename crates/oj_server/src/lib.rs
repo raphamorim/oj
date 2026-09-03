@@ -1186,13 +1186,7 @@ fn ssr_css_module(root: &Path, path: &Path, source: &str) -> Result<String, Stri
     };
     let output = oj_css::compile_css(&css_id, &css_src, true)?;
     Ok(match output.exports {
-        Some(exports) => {
-            let map: serde_json::Map<String, serde_json::Value> = exports
-                .into_iter()
-                .map(|(k, v)| (k, serde_json::Value::String(v)))
-                .collect();
-            format!("export default {};", serde_json::Value::Object(map))
-        }
+        Some(exports) => oj_css::css_modules_esm(&exports),
         None => "export default {};".to_string(),
     })
 }
@@ -3759,21 +3753,18 @@ async fn serve_css_wrapper(state: &Arc<ServerState>, file: &Path, url: &str) -> 
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {err}")).into_response();
         }
     };
+    // A CSS module exports its class map as the default plus a named export
+    // per identifier-safe class (Vite's dataToEsm with namedExports).
     let exports = if module.css_exports.is_empty() {
-        "void 0".to_string()
+        "export default void 0;\n".to_string()
     } else {
-        let map: serde_json::Map<String, serde_json::Value> = module
-            .css_exports
-            .iter()
-            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-            .collect();
-        serde_json::Value::Object(map).to_string()
+        oj_css::css_modules_esm(&module.css_exports)
     };
     let body = format!(
         "import {{ createHotContext as __oj_hot, updateStyle as __oj_updateStyle }} from \"/@oj/client.js\";\n\
          import.meta.hot = __oj_hot({url:?});\n\
          __oj_updateStyle({url:?}, {css});\n\
-         export default {exports};\n\
+         {exports}\
          import.meta.hot.accept(() => {{}});\n",
         css = serde_json::Value::String(module.code.clone()),
     );

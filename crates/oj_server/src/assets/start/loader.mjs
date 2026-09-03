@@ -553,6 +553,19 @@ function cssModuleExports(path, source) {
   return out;
 }
 
+// Vite's dataToEsm(modules, { namedExports: true }): the map is the default
+// export and each identifier-safe class (makeLegalIdentifier leaves it as is)
+// is also a named export. Mirrors oj_css::css_modules_esm on the client side.
+const FORBIDDEN_IDENTS = new Set(("break case class catch const continue debugger default delete do else export extends finally for function if import in instanceof let new return super switch this throw try typeof var void while with yield enum await implements package protected static interface private public "
+  + "arguments Infinity NaN undefined null true false eval uneval isFinite isNaN parseFloat parseInt decodeURI decodeURIComponent encodeURI encodeURIComponent escape unescape Object Function Boolean Symbol Error EvalError InternalError RangeError ReferenceError SyntaxError TypeError URIError Number Math Date String RegExp Array Int8Array Uint8Array Uint8ClampedArray Int16Array Uint16Array Int32Array Uint32Array Float32Array Float64Array Map Set WeakMap WeakSet SIMD ArrayBuffer DataView JSON Promise Generator GeneratorFunction Reflect Proxy Intl").split(" "));
+function cssModuleEsm(map) {
+  let out = "";
+  for (const [name, scoped] of Object.entries(map)) {
+    if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name) && !FORBIDDEN_IDENTS.has(name)) out += `export const ${name} = ${JSON.stringify(scoped)};\n`;
+  }
+  return out + `export default ${JSON.stringify(map)};\n`;
+}
+
 const ALIASES = {
   "#tanstack-router-entry": pathResolve(APP, "src/router"),
   "#tanstack-start-entry": pathResolve(HERE, "start-entry.ts"),
@@ -844,7 +857,7 @@ export function load(url, context, next) {
         ? readFileSync(path, "utf8")
         : `data:${mimeOf(path)};base64,` + readFileSync(path).toString("base64"))};`;
     else if (kind === "css" && isCssModule(path))
-      src = `export default ${JSON.stringify(cssModuleExports(path, readFileSync(path, "utf8")))};`;
+      src = cssModuleEsm(cssModuleExports(path, readFileSync(path, "utf8")));
     return { format: "module", source: src, shortCircuit: true };
   }
   if (clean.endsWith(".json")) {
