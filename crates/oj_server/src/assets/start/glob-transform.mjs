@@ -63,7 +63,7 @@ function walk(dir, out) {
   }
 }
 
-function matchPattern(fileDir, pattern) {
+function matchPattern(fileDir, pattern, exhaustive = false) {
   const absGlob = (pattern.startsWith("/") ? pattern : resolve(fileDir, pattern)).split(sep).join("/");
   const starIdx = absGlob.search(/[*?{]/);
   const base = starIdx === -1 ? dirname(absGlob) : absGlob.slice(0, absGlob.lastIndexOf("/", starIdx));
@@ -76,8 +76,12 @@ function matchPattern(fileDir, pattern) {
   return all.filter((f) => {
     const normalized = f.split(sep).join("/");
     if (!re.test(normalized)) return false;
-    return normalized.slice(base.length + 1).split("/")
-      .every((part) => !part.startsWith(".") || explicitHidden.some((pattern) => pattern.test(part)));
+    // Vite globs with `dot: !!exhaustive` and ignores node_modules unless
+    // `exhaustive: true`; a literal dot segment in the pattern still matches.
+    if (exhaustive) return true;
+    const parts = normalized.slice(base.length + 1).split("/");
+    if (parts.includes("node_modules")) return false;
+    return parts.every((part) => !part.startsWith(".") || explicitHidden.some((pattern) => pattern.test(part)));
   });
 }
 
@@ -112,8 +116,9 @@ export function transformGlob(code, filePath) {
     const opts = args[1] && typeof args[1] === "object" ? args[1] : {};
     const includes = patterns.filter((p) => !p.startsWith("!"));
     const excludes = patterns.filter((p) => p.startsWith("!")).map((p) => p.slice(1));
-    const exclude = new Set(excludes.flatMap((p) => matchPattern(fileDir, p).map((f) => f)));
-    const files = [...new Set(includes.flatMap((p) => matchPattern(fileDir, p)))]
+    const exhaustive = opts.exhaustive === true;
+    const exclude = new Set(excludes.flatMap((p) => matchPattern(fileDir, p, exhaustive)));
+    const files = [...new Set(includes.flatMap((p) => matchPattern(fileDir, p, exhaustive)))]
       .filter((f) => !exclude.has(f))
       .sort();
     const query = typeof opts.query === "string"

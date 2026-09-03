@@ -172,6 +172,32 @@ test("parseImportsField resolves fallback arrays and nested import conditions", 
   assert.equal(rules["#array-condition"], "./src/module.ts");
 });
 
+test("parseImportsField takes conditions in the object's own order, like Node", () => {
+  const rules = Object.fromEntries(parseImportsField({
+    "#node-first": { node: "./src/node.ts", import: "./src/import.ts", default: "./src/default.ts" },
+    "#import-first": { import: "./src/import.ts", node: "./src/node.ts" },
+    "#unsupported-first": { browser: "./src/browser.ts", default: "./src/default.ts" },
+    "#only-unsupported": { browser: "./src/browser.ts", require: "./src/x.cjs" },
+  }));
+  assert.equal(rules["#node-first"], "./src/node.ts");
+  assert.equal(rules["#import-first"], "./src/import.ts");
+  assert.equal(rules["#unsupported-first"], "./src/default.ts");
+  assert.equal(rules["#only-unsupported"], undefined);
+});
+
+test("probe resolves extensionless .mts modules (Vite's resolve.extensions)", () => {
+  const dir = mk("mts-probe");
+  try {
+    mkdirSync(join(dir, "lib"), { recursive: true });
+    writeFileSync(join(dir, "util.mts"), "export const x = 1;");
+    writeFileSync(join(dir, "lib", "index.mts"), "export const y = 2;");
+    assert.equal(probe(join(dir, "util")), join(dir, "util.mts"));
+    assert.equal(probe(join(dir, "lib")), join(dir, "lib", "index.mts"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("mergeTsConfig merges paths across an extends chain, later wins", () => {
   const base = "/app";
   const chain = [

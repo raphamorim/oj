@@ -51,6 +51,16 @@ test("glob wildcards omit hidden paths unless explicitly requested", () => {
     assert.match(normal, /\.\/content\/a\.md/);
     assert.doesNotMatch(normal, /\.hidden\.md|\.draft/);
     assert.match(explicit, /\.\/content\/\.hidden\.md/);
+
+    // `exhaustive: true` is Vite's dot: true plus node_modules included.
+    mkdirSync(join(dir, "content", "node_modules"), { recursive: true });
+    writeFileSync(join(dir, "content", "node_modules", "dep.md"), "dep");
+    const exhaustive = transformGlob('const modules = import.meta.glob("./content/**/*.md", { exhaustive: true });', join(dir, "index.ts"));
+    assert.match(exhaustive, /\.hidden\.md/);
+    assert.match(exhaustive, /\.draft\/nested\.md/);
+    assert.match(exhaustive, /node_modules\/dep\.md/);
+    const plain = transformGlob('const modules = import.meta.glob("./content/**/*.md");', join(dir, "index.ts"));
+    assert.doesNotMatch(plain, /node_modules/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

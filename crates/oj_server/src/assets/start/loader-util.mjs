@@ -6,9 +6,11 @@ import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 
+// Vite's default `resolve.extensions` (.mjs .js .mts .ts .jsx .tsx .json), as
+// files and as directory indexes.
 export const EXTS = [
-  ".ts", ".tsx", ".js", ".jsx", ".mjs", ".json",
-  "/index.ts", "/index.tsx", "/index.js", "/index.jsx", "/index.mjs", "/index.json",
+  ".ts", ".tsx", ".mts", ".js", ".jsx", ".mjs", ".json",
+  "/index.ts", "/index.tsx", "/index.mts", "/index.js", "/index.jsx", "/index.mjs", "/index.json",
 ];
 
 export const isFile = (p) => {
@@ -84,6 +86,8 @@ export function cjsFacade(path) {
   ].join("\n");
 }
 
+const TRAILING_COMMA = /(?:\s|\/\/[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*[}\]]/y;
+
 export function stripJsonc(s) {
   let out = "", i = 0, inStr = false, q = "";
   while (i < s.length) {
@@ -97,8 +101,10 @@ export function stripJsonc(s) {
     if (c === '"' || c === "'") { inStr = true; q = c; out += c; i++; continue; }
     if (c === "/" && n === "/") { while (i < s.length && s[i] !== "\n") i++; continue; }
     if (c === "/" && n === "*") { i += 2; while (i < s.length && !(s[i] === "*" && s[i + 1] === "/")) i++; i += 2; continue; }
-    if (c === "," && /^(?:\s|\/\/[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*[}\]]/.test(s.slice(i + 1))) {
-      i++; continue;
+    if (c === ",") {
+      // A trailing comma: only whitespace and comments until the closing bracket.
+      TRAILING_COMMA.lastIndex = i + 1;
+      if (TRAILING_COMMA.test(s)) { i++; continue; }
     }
     out += c; i++;
   }
@@ -113,6 +119,8 @@ export function readJsonc(file) {
   }
 }
 
+const IMPORT_CONDITIONS = new Set(["node", "import", "default"]);
+
 export function parseImportsField(imports = {}) {
   const targetOf = (target) => {
     if (typeof target === "string") return target;
@@ -124,7 +132,15 @@ export function parseImportsField(imports = {}) {
       return null;
     }
     if (!target || typeof target !== "object") return null;
-    return targetOf(target.import) ?? targetOf(target.default) ?? targetOf(target.node);
+    // Node's conditional-target rule: keys are tried in the object's own order and
+    // the first supported condition whose target resolves wins (the SSR loader runs
+    // in Node as an ESM importer, so `node`, `import` and `default` apply).
+    for (const [condition, nested] of Object.entries(target)) {
+      if (!IMPORT_CONDITIONS.has(condition)) continue;
+      const resolved = targetOf(nested);
+      if (resolved) return resolved;
+    }
+    return null;
   };
   return Object.entries(imports)
     .map(([pattern, target]) => [pattern, targetOf(target)])
