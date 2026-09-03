@@ -2276,6 +2276,9 @@ pub async fn build(
         html_docs.append(&mut emitted_pages);
     }
 
+    // Page script entries across all documents: the only chunks that get the
+    // modulepreload polyfill (a worker or plugin-emitted entry has no document).
+    let mut page_entry_files: Vec<String> = Vec::new();
     for doc in &html_docs {
         let mut rewritten_html = oj_env::replace_html_env(&doc.src_html, &html_env);
         let page_base = page_base(&base, &doc.out_rel);
@@ -2288,6 +2291,7 @@ pub async fn build(
                 doc_entry_files.push(file.clone());
             }
         }
+        page_entry_files.extend(doc_entry_files.iter().cloned());
         for entry in &doc_entry_files {
             all_sync_chunks.insert(entry.clone());
             all_sync_chunks.extend(transitive_imports(entry, &imports_map));
@@ -2400,7 +2404,7 @@ pub async fn build(
         &imports_map,
         &chunk_css,
         &all_sync_chunks,
-        &facade_to_file.values().cloned().collect::<Vec<_>>(),
+        &page_entry_files,
         oj_config::module_preload_polyfill(&config),
     )?;
 

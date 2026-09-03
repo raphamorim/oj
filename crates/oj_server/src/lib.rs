@@ -2338,7 +2338,7 @@ async fn serve_path(
     }
     if is_importable_asset_ext(ext)
         && query_asset_kind(uri.query()).is_none()
-        && !wants_raw_resource(&headers)
+        && wants_module_import(&headers, uri.query())
     {
         let url = url_of(&state.root, &file);
         return match asset_module(&file, &url, "url").await {
@@ -3646,6 +3646,18 @@ fn path_is_denied(file: &Path, root: &Path, deny: &[(glob::Pattern, bool)]) -> b
 // module with dest `script`/`empty`/worker, which wants the JS-module form: a
 // style-injecting module for CSS, a URL-exporting module for an asset. Vite draws
 // the same line; a `.css` reached from JS is served as JS, not text/css.
+/// An asset url requested by a module import: Vite marks those `?import`, and a
+/// browser sets `sec-fetch-dest: script` for an `import` of the url. Anything
+/// else (a fetch(), curl, the Start proxy, an <img>) gets the file's bytes, as
+/// Vite's static middleware serves them.
+fn wants_module_import(headers: &HeaderMap, query: Option<&str>) -> bool {
+    query.is_some_and(|q| q.split('&').any(|kv| kv == "import"))
+        || headers
+            .get("sec-fetch-dest")
+            .and_then(|v| v.to_str().ok())
+            == Some("script")
+}
+
 fn wants_raw_resource(headers: &HeaderMap) -> bool {
     matches!(
         headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok()),
@@ -6679,6 +6691,20 @@ mod tests {
         let list = CorsPolicy::from_config(Some(&oj_config::CorsConfig::Options(opts))).unwrap();
         assert!(list.allows("http://a.test") && !list.allows("http://localhost:5173"));
         assert!(list.credentials && list.methods == "GET,POST" && list.max_age == Some(60));
+    }
+
+    #[test]
+    fn asset_requests_are_modules_only_for_imports() {
+        let mut h = HeaderMap::new();
+        assert!(!wants_module_import(&h, None), "a bare fetch gets the file");
+        assert!(wants_module_import(&h, Some("import")));
+        assert!(wants_module_import(&h, Some("t=1&import")));
+        h.insert("sec-fetch-dest", "empty".parse().unwrap());
+        assert!(!wants_module_import(&h, None));
+        h.insert("sec-fetch-dest", "image".parse().unwrap());
+        assert!(!wants_module_import(&h, None));
+        h.insert("sec-fetch-dest", "script".parse().unwrap());
+        assert!(wants_module_import(&h, None), "a module import of the url");
     }
 
     #[test]

@@ -29,7 +29,8 @@ fs.mkdirSync(path.join(app, "nested"), { recursive: true });
 fs.writeFileSync(path.join(app, "package.json"), JSON.stringify({ name: "relbase", version: "1.0.0" }));
 fs.writeFileSync(path.join(app, "src", "util.js"), `export const util = "shared-util";\n`);
 fs.writeFileSync(path.join(app, "src", "main.css"), `body { background: url(./bg.png) no-repeat; margin: 0 }\n`);
-fs.writeFileSync(path.join(app, "src", "bg.png"), Buffer.from("89504e470d0a1a0a", "hex"));
+// Larger than assetsInlineLimit (4096), so it is emitted as a file rather than inlined.
+fs.writeFileSync(path.join(app, "src", "bg.png"), Buffer.concat([Buffer.from("89504e470d0a1a0a", "hex"), Buffer.alloc(5000, 1)]));
 fs.writeFileSync(path.join(app, "src", "lazy.css"), `body { color: rgb(255, 0, 0) }\n`);
 fs.writeFileSync(
   path.join(app, "src", "lazy.js"),
