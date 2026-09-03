@@ -210,6 +210,9 @@ impl ProxyEntry {
     pub fn ws(&self) -> bool {
         matches!(self, ProxyEntry::Options(o) if o.ws.unwrap_or(false))
     }
+    pub fn rewrite_ws_origin(&self) -> bool {
+        matches!(self, ProxyEntry::Options(o) if o.rewrite_ws_origin.unwrap_or(false))
+    }
     pub fn secure(&self) -> bool {
         match self {
             ProxyEntry::Options(o) => o.secure.unwrap_or(true),
@@ -233,6 +236,9 @@ pub struct ProxyOptions {
     /// Verify the target's TLS certificate (http-proxy's `secure`, default true);
     /// `false` accepts a self-signed dev backend.
     pub secure: Option<bool>,
+    /// Vite's `rewriteWsOrigin`: on a WebSocket upgrade, replace the browser's
+    /// `Origin` with the target's origin (for servers that check it).
+    pub rewrite_ws_origin: Option<bool>,
     pub rewrite: Option<ProxyRewrite>,
 }
 

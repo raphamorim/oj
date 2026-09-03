@@ -62,7 +62,7 @@ const upstream = http.createServer((req, res) => {
   }
   res.writeHead(404); res.end();
 });
-upstream.on("upgrade", (req, socket) => {
+function wsUpgrade(req, socket) {
   const key = req.headers["sec-websocket-key"];
   const accept = crypto.createHash("sha1").update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
   const protos = String(req.headers["sec-websocket-protocol"] || "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -70,6 +70,7 @@ upstream.on("upgrade", (req, socket) => {
   if (protos.includes("chat")) head.push("Sec-WebSocket-Protocol: chat");
   socket.write(head.join("\r\n") + "\r\n\r\n");
   socket.write(wsFrame(1, Buffer.from("hello from upstream " + req.url)));
+  if (req.url.startsWith("/keep")) socket.write(wsFrame(1, Buffer.from(`host=${req.headers.host} origin=${req.headers.origin}`)));
   socket.on("data", (buf) => {
     for (const f of wsParse(buf)) {
       if (f.op === 1) socket.write(wsFrame(1, Buffer.from("echo:" + f.payload.toString())));
@@ -78,7 +79,8 @@ upstream.on("upgrade", (req, socket) => {
     }
   });
   socket.on("error", () => {});
-});
+}
+upstream.on("upgrade", wsUpgrade);
 await new Promise((r) => upstream.listen(UPSTREAM, r));
 
 // The same upstream behind TLS with a self-signed localhost certificate (test
@@ -135,19 +137,7 @@ const tlsUpstream = https.createServer({ cert: TLS_CERT, key: TLS_KEY }, (req, r
   res.writeHead(200, { "content-type": "text/plain", "x-upstream": "tls" });
   res.end("tls:" + req.url);
 });
-tlsUpstream.on("upgrade", (req, socket) => {
-  const key = req.headers["sec-websocket-key"];
-  const accept = crypto.createHash("sha1").update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
-  socket.write(["HTTP/1.1 101 Switching Protocols", "Upgrade: websocket", "Connection: Upgrade", `Sec-WebSocket-Accept: ${accept}`].join("\r\n") + "\r\n\r\n");
-  socket.write(wsFrame(1, Buffer.from("hello over tls " + req.url)));
-  socket.on("data", (buf) => {
-    for (const f of wsParse(buf)) {
-      if (f.op === 1) socket.write(wsFrame(1, Buffer.from("tls-echo:" + f.payload.toString())));
-      else if (f.op === 8) { socket.write(wsFrame(8, f.payload)); socket.end(); }
-    }
-  });
-  socket.on("error", () => {});
-});
+tlsUpstream.on("upgrade", wsUpgrade);
 await new Promise((r) => tlsUpstream.listen(TLS_UPSTREAM, r));
 
 const app = fs.mkdtempSync(path.join(os.tmpdir(), "oj-proxyws-"));
@@ -157,6 +147,7 @@ fs.writeFileSync(path.join(app, "oj.config.json"), JSON.stringify({ server: { pr
   "/api": { target: `http://localhost:${UPSTREAM}`, ws: true, changeOrigin: true },
   "/tls": { target: `https://localhost:${TLS_UPSTREAM}`, ws: true, changeOrigin: true, secure: false },
   "/strict": { target: `https://localhost:${TLS_UPSTREAM}`, ws: true, changeOrigin: true },
+  "/keep": { target: `http://localhost:${UPSTREAM}`, ws: true, rewriteWsOrigin: true },
 } } }));
 fs.writeFileSync(path.join(app, "src", "main.js"), `window.__OK = 1;\n`);
 fs.writeFileSync(path.join(app, "index.html"), `<!doctype html><html><head><title>t</title></head><body><script type="module" src="/src/main.js"></script></body></html>`);
@@ -219,17 +210,35 @@ try {
     ws.onmessage = (e) => { msgs.push(String(e.data)); if (msgs.length === 2) { clearTimeout(timer); resolve(msgs); ws.close(); } };
     ws.onerror = () => { clearTimeout(timer); reject(new Error("wss tunnel error")); };
   });
-  assert.deepEqual(tlsWs, ["hello over tls /tls/api/ws", "tls-echo:over-tls"]);
+  assert.deepEqual(tlsWs, ["hello from upstream /tls/api/ws", "echo:over-tls"]);
   const strict = await fetch(`http://localhost:${PORT}/strict/api/x`);
   assert.equal(strict.status, 502, "an unverifiable certificate is refused by default");
   const strictWs = await new Promise((resolve) => {
     const r = http.request({ host: "127.0.0.1", port: PORT, path: "/strict/api/ws", headers: { Connection: "Upgrade", Upgrade: "websocket", "Sec-WebSocket-Version": "13", "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==" } });
     r.on("upgrade", (res, socket) => { socket.destroy(); resolve(res.statusCode); });
-    r.on("response", (res) => { res.resume(); res.on("end", () => resolve(res.statusCode)); });
-    r.on("error", () => resolve("error"));
+    r.on("response", (res) => { let b = ""; res.on("data", (c) => (b += c)); res.on("end", () => resolve({ status: res.statusCode, body: b })); });
+    r.on("error", (e) => resolve({ error: String(e) }));
     r.end();
   });
-  assert.equal(strictWs, 502, "an unverifiable wss upstream is refused by default");
+  assert.equal(strictWs.status, 502, `an unverifiable wss upstream is refused by default: ${JSON.stringify(strictWs)}`);
+  assert.match(strictWs.body, /invalid peer certificate|UnknownIssuer/, `refused by TLS verification, not by something else: ${strictWs.body}`);
+
+  // Without changeOrigin the browser's Host reaches the upstream (http-proxy), and
+  // rewriteWsOrigin swaps the Origin for the target's origin (Vite).
+  const kept = await new Promise((resolve) => {
+    const r = http.request({ host: "127.0.0.1", port: PORT, path: "/keep/ws", headers: { Connection: "Upgrade", Upgrade: "websocket", "Sec-WebSocket-Version": "13", "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==", Origin: `http://localhost:${PORT}`, Host: `localhost:${PORT}` } });
+    r.on("upgrade", (res, socket, head) => {
+      let buf = Buffer.from(head);
+      const finish = () => { const frames = wsParse(buf).filter((f) => f.op === 1).map((f) => f.payload.toString()); if (frames.length >= 2) { socket.destroy(); resolve(frames[1]); } };
+      finish();
+      socket.on("data", (d) => { buf = Buffer.concat([buf, d]); finish(); });
+      setTimeout(() => { socket.destroy(); resolve("timeout: " + buf.toString("utf8")); }, 5000);
+    });
+    r.on("response", (res) => resolve("status " + res.statusCode));
+    r.on("error", (e) => resolve(String(e)));
+    r.end();
+  });
+  assert.equal(kept, `host=localhost:${PORT} origin=http://localhost:${UPSTREAM}`);
 
   console.log("PROXY-WS-STREAM E2E PASSED");
 } catch (err) {
