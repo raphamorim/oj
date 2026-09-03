@@ -2389,7 +2389,7 @@ pub async fn build(
     };
     let mut all_sync_chunks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     if let Some(name) = oj_config::ssr_manifest_name(&config) {
-        let manifest = ssr_manifest(&output, &root, &base, &chunk_css, &combined_css_name);
+        let manifest = ssr_manifest(&output, &root, &base, &chunk_css, &combined_css_name, &imports_map);
         let dest = out_dir.join(&name);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
@@ -4546,6 +4546,7 @@ fn ssr_manifest(
     base: &str,
     chunk_css: &[(String, String)],
     combined_css: &Option<String>,
+    imports_map: &std::collections::HashMap<String, Vec<String>>,
 ) -> serde_json::Map<String, serde_json::Value> {
     let css_of: std::collections::HashMap<&str, &str> = chunk_css
         .iter()
@@ -4557,6 +4558,29 @@ fn ssr_manifest(
             continue;
         };
         let file = chunk.filename.to_string();
+        // Vite's css deps map: each dynamically imported chunk is keyed by its
+        // file name with the stylesheets it and its static imports bring in, so
+        // an SSR renderer can preload the CSS of a lazy route.
+        for target in &chunk.dynamic_imports {
+            let target = target.to_string();
+            let mut deps: Vec<serde_json::Value> = Vec::new();
+            let mut push_css = |f: &str| {
+                if f != file {
+                    if let Some(css) = css_of.get(f) {
+                        let url: serde_json::Value = with_base(css, base).into();
+                        if !deps.contains(&url) {
+                            deps.push(url);
+                        }
+                    }
+                }
+            };
+            push_css(&target);
+            for dep in transitive_imports(&target, imports_map) {
+                push_css(&dep);
+            }
+            let key = target.rsplit('/').next().unwrap_or(&target).to_string();
+            manifest.insert(key, serde_json::Value::Array(deps));
+        }
         let mut urls: Vec<serde_json::Value> = Vec::new();
         if !chunk.is_entry {
             urls.push(with_base(&file, base).into());

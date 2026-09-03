@@ -86,6 +86,11 @@ try {
   assert.ok(ssrManifest["src/lazy.js"].some((u) => /^\/assets\/lazy-.*\.js$/.test(u)), "lazy chunk url listed");
   assert.ok(ssrManifest["src/lazy.js"].some((u) => /^\/assets\/lazy-.*\.css$/.test(u)), "lazy css url listed");
   assert.deepEqual(ssrManifest["src/main.js"], [], "entry module has no preload urls");
+  // Vite's css deps map: the dynamically imported chunk, keyed by file name,
+  // lists the stylesheets it brings in.
+  const lazyChunk = Object.keys(ssrManifest).find((k) => /^lazy-.*\.js$/.test(k));
+  assert.ok(lazyChunk, `dynamic import chunk keyed by file name: ${Object.keys(ssrManifest)}`);
+  assert.ok(ssrManifest[lazyChunk].some((u) => /^\/assets\/lazy-.*\.css$/.test(u)), "css deps of the lazy chunk listed");
   build({ build: { ssrManifest: "custom-ssr.json" } });
   assert.ok(fs.existsSync(path.join(app, "dist", "custom-ssr.json")), "ssrManifest file name honored");
 
