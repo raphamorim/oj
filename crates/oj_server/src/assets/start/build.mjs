@@ -3,7 +3,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, cpSync, rmSync } from "node:fs";
 import { dirname, join, resolve, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { importPkg, viteEnvDefine, jsxTransformOptions, ssrExternalRule } from "./resolve-pkg.mjs";
+import { importPkg, viteEnvDefine, environmentDefines, jsxTransformOptions, ssrExternalRule } from "./resolve-pkg.mjs";
 import {
   assetsPlugin, makeVitePlugins, nodeBuiltinShims, workspaceRoot, contentHashEmitter,
 } from "./rolldown-assets.mjs";
@@ -236,6 +236,8 @@ const client = await build({
     jsx: jsxTransformOptions(NODE_ENV !== "production"),
     define: {
       ...USER_DEFINE,
+      ...environmentDefines("client"),
+      ...(clientContainer?.defines?.() ?? {}),
       "process.env": PROCESS_ENV_JSON,
       global: "globalThis", ...viteEnvDefine({ ssr: false, mode: MODE, base: BASE }),
     },
@@ -296,6 +298,8 @@ writeFileSync(
 
 const serverDefine = {
   ...USER_DEFINE,
+  ...environmentDefines("ssr"),
+  ...(serverContainer?.defines?.() ?? {}),
   "process.env.NODE_ENV": JSON.stringify(NODE_ENV), "process.env.TSS_SERVER_FN_BASE": '"/_serverFn/"',
   ...viteEnvDefine({ ssr: true, mode: MODE, base: BASE }),
 };

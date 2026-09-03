@@ -5,7 +5,7 @@ import { readFileSync, unlinkSync, statSync, openSync, readSync, realpathSync } 
 import { writeFile, appendFile, rename, mkdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { resolve as pathResolve, dirname } from "node:path";
-import { importPkg, viteEnvDefine, emptyVirtualStub, jsxTransformOptions } from "./resolve-pkg.mjs";
+import { importPkg, viteEnvDefine, environmentDefines, emptyVirtualStub, jsxTransformOptions } from "./resolve-pkg.mjs";
 import { loadPluginContainerSync } from "./container-bridge.mjs";
 import { transformGlob } from "./glob-transform.mjs";
 import {
@@ -137,7 +137,12 @@ const configDefines = (() => {
 })();
 // Vite's `--mode` (OJ_MODE from oj; `development` for `oj dev` without one).
 const MODE = process.env.OJ_MODE || "development";
-const DEFINE = { ...viteEnvDefine({ ssr: true, mode: MODE, env: { ...process.env, ...envDelta } }), ...USER_DEFINE, ...configDefines };
+// plugin-react's jsxDev = !isProduction: under NODE_ENV=production React's
+// jsx-dev-runtime exports no jsxDEV, so the classic jsx runtime must be used.
+const JSX_DEV = process.env.NODE_ENV !== "production";
+// `environments.ssr.define` (OJ_DEFINE_SSR, also from an oj.config without a
+// plugin host) layers over the shared define, as in Vite's define plugin.
+const DEFINE = { ...viteEnvDefine({ ssr: true, mode: MODE, env: { ...process.env, ...envDelta } }), ...USER_DEFINE, ...environmentDefines("ssr"), ...configDefines };
 
 const cacheStats = { hits: 0, misses: 0, uncached: 0, rhits: 0, rmisses: 0 };
 const EPOCH = (() => {
@@ -908,7 +913,7 @@ export function load(url, context, next) {
     const src = transformServerFns(transformGlob(raw, path), path);
     const out = transformSync(path, src, {
       lang: srcLang,
-      jsx: jsxTransformOptions(),
+      jsx: jsxTransformOptions(JSX_DEV),
       define: DEFINE,
     });
     const code = withInlineMap(out);
@@ -934,7 +939,7 @@ export function load(url, context, next) {
     const compiled = container.transform(raw, path);
     if (compiled != null) {
       const out = transformSync(path, compiled, {
-        lang: "jsx", jsx: jsxTransformOptions(),
+        lang: "jsx", jsx: jsxTransformOptions(JSX_DEV),
         define: DEFINE,
       });
       const code = withInlineMap(out);

@@ -83,12 +83,28 @@ export function jsxTransformOptions(development) {
   return out;
 }
 
-export function viteEnvDefine({ ssr = false, mode = "development", env: envSource = process.env, base = "/" } = {}) {
+// Vite's `envPrefix` (OJ_ENV_PREFIX from oj, a JSON list; `VITE_` by default).
+export function envPrefixes(env = process.env) {
+  try {
+    const list = JSON.parse(env.OJ_ENV_PREFIX || "null");
+    if (Array.isArray(list) && list.every((p) => typeof p === "string" && p)) return list;
+  } catch {}
+  return ["VITE_"];
+}
+
+export function viteEnvDefine({ ssr = false, mode = "development", env: envSource = process.env, base = "/", prefixes = envPrefixes() } = {}) {
   // Vite: DEV/PROD follow NODE_ENV (isProduction), MODE is the mode itself.
   const nodeEnv = envSource.NODE_ENV || (mode === "production" ? "production" : "development");
   const env = { MODE: mode, DEV: nodeEnv !== "production", PROD: nodeEnv === "production", SSR: !!ssr, BASE_URL: base };
-  for (const [k, v] of Object.entries(envSource)) if (k.startsWith("VITE_")) env[k] = v;
+  for (const [k, v] of Object.entries(envSource)) if (prefixes.some((p) => k.startsWith(p))) env[k] = v;
   return { "import.meta.env": JSON.stringify(env) };
+}
+
+// Vite's `environments.<name>.define` (OJ_DEFINE_CLIENT / OJ_DEFINE_SSR from
+// oj): applied on top of the shared `define` for that environment's bundle.
+export function environmentDefines(name, env = process.env) {
+  const raw = name === "ssr" ? env.OJ_DEFINE_SSR : name === "client" ? env.OJ_DEFINE_CLIENT : null;
+  try { return JSON.parse(raw || "{}") || {}; } catch { return {}; }
 }
 
 // Vite's `ssr.external` for the Start production server bundle (OJ_SSR_EXTERNALS

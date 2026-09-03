@@ -3,7 +3,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import { importPkg, viteEnvDefine, jsxTransformOptions } from "./resolve-pkg.mjs";
+import { importPkg, viteEnvDefine, environmentDefines, jsxTransformOptions } from "./resolve-pkg.mjs";
 import { assetsPlugin, makeVitePlugins, nodeBuiltinShims, workspaceRoot } from "./rolldown-assets.mjs";
 import { loadPluginContainer } from "./vite-plugin-bridge.mjs";
 import { transformGlob } from "./glob-transform.mjs";
@@ -15,6 +15,9 @@ const WORKSPACE = workspaceRoot(APP);
 const SERVER_FN_BASE = process.env.TSS_SERVER_FN_BASE ?? "/_serverFn/";
 // Vite's `--mode` (OJ_MODE from oj; `development` for `oj dev` without one).
 const MODE = process.env.OJ_MODE || "development";
+// Set by `oj dev` per Vite's NODE_ENV rule (shell wins, else .env, else
+// development): `NODE_ENV=production oj dev` compiles a PROD client like Vite.
+const NODE_ENV = process.env.NODE_ENV || "development";
 // The config's `define` map (OJ_DEFINE from oj). Vite's define plugin applies
 // it to the client environment exactly as to SSR, so a define a component
 // references must not render on the server and then throw on hydration.
@@ -120,12 +123,13 @@ const result = await build({
   input: join(HERE, "client-entry.tsx"),
   platform: "browser",
   transform: {
-    jsx: jsxTransformOptions(),
+    jsx: jsxTransformOptions(NODE_ENV !== "production"),
     define: {
-      "process.env": JSON.stringify({ NODE_ENV: "development", TSS_SERVER_FN_BASE: SERVER_FN_BASE }),
+      "process.env": JSON.stringify({ NODE_ENV, TSS_SERVER_FN_BASE: SERVER_FN_BASE }),
       global: "globalThis",
       ...viteEnvDefine({ ssr: false, mode: MODE }),
       ...USER_DEFINE,
+      ...environmentDefines("client"),
       ...(container?.defines?.() ?? {}),
     },
   },
@@ -149,7 +153,7 @@ const result = await build({
   output: {
     format: "esm",
     banner:
-      `globalThis.process=globalThis.process||{env:{NODE_ENV:"development",TSS_SERVER_FN_BASE:${JSON.stringify(SERVER_FN_BASE)}}};` +
+      `globalThis.process=globalThis.process||{env:{NODE_ENV:${JSON.stringify(NODE_ENV)},TSS_SERVER_FN_BASE:${JSON.stringify(SERVER_FN_BASE)}}};` +
       "globalThis.global=globalThis.global||globalThis;",
   },
   write: false,

@@ -32,6 +32,9 @@ import { genericGlobTitles } from "../generated/glob-generic";
 import { envProbe } from "../lib/env-probe.js";
 
 declare const __FIXTURE_DEFINE__: string;
+// Per-environment define (environments.{client,ssr}.define): a different value
+// on each side, so the render tells which bundle applied which.
+declare const __FIXTURE_SIDE__: string;
 
 // svgr: a bare .svg import yields a React component (exportType "default")...
 import Logo from "../logo.svg";
@@ -80,6 +83,7 @@ function Index() {
       <p data-testid="glob-ts-generic">{genericGlobTitles}</p>
       <p data-testid="js-env">{envProbe}</p>
       <p data-testid="define">{__FIXTURE_DEFINE__}</p>
+      <p data-testid="env-define" suppressHydrationWarning>{__FIXTURE_SIDE__}</p>
       <p data-testid="raw">{notes.trim()}</p>
       <img data-testid="url" src={heroUrl} alt="hero" />
       <span data-testid="svg"><Logo /></span>
