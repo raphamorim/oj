@@ -308,6 +308,9 @@ struct ServerState {
     // A dep goes through plugin `load` only when its path matches one of these
     // (the plugins' own object-form load `filter.id` patterns).
     dep_load_res: Vec<regex::Regex>,
+    // A relative or absolute import is offered to plugin `resolveId` before oj's
+    // resolver when it matches one of these (object-form resolveId `filter.id`).
+    resolve_id_res: Vec<regex::Regex>,
     plugins_watch_change: bool,
     plugins_hot_update: bool,
     html_env: std::collections::BTreeMap<String, String>,
@@ -652,6 +655,15 @@ impl DevServer {
                 .collect(),
             None => Vec::new(),
         };
+        let resolve_id_res: Vec<regex::Regex> = match &plugin_host {
+            Some(host) => host
+                .resolve_id_filters()
+                .await
+                .iter()
+                .filter_map(|s| regex::Regex::new(s).ok())
+                .collect(),
+            None => Vec::new(),
+        };
         // Same idea for HMR: a host without watchChange/handleHotUpdate hooks (the
         // tagger case) doesn't need those per-save stdio round-trips.
         let (plugins_watch_change, plugins_hot_update) = match &plugin_host {
@@ -817,6 +829,7 @@ impl DevServer {
             plugins_have_load,
             dep_transform_res,
             dep_load_res,
+            resolve_id_res,
             plugins_watch_change,
             plugins_hot_update,
             html_env,
@@ -3285,6 +3298,7 @@ async fn ensure_module(
     let hmr_state = Arc::clone(state);
     let plugin_fallback = state.plugins.is_some() && !bundle;
     let svgr_active = state.plugins_have_transform && !bundle;
+    let resolve_id_res = if plugin_fallback { state.resolve_id_res.clone() } else { Vec::new() };
     let importer_abs = file.to_string_lossy().into_owned();
     let ext = file.extension().and_then(|e| e.to_str());
     let is_css = ext.is_some_and(is_style_ext);
@@ -3362,6 +3376,17 @@ async fn ensure_module(
             }
             if virtual_ids.contains(spec) {
                 return Some(format!("/@virtual/{spec}"));
+            }
+            // Vite runs the plugins' resolveId before its own resolver for every
+            // import. A relative / absolute import a plugin's resolveId filter
+            // claims goes to the plugins first (`./icon.svg?react` remaps); the
+            // /@id/ route falls back to the disk resolver when they decline.
+            if !is_bare_specifier(spec) && resolve_id_res.iter().any(|re| re.is_match(spec)) {
+                return Some(format!(
+                    "/@id/{}?importer={}",
+                    hex_encode(spec),
+                    hex_encode(&importer_abs)
+                ));
             }
             if let Some(id) = jsx_overrides.get(spec) {
                 return Some(format!("/@presolve/{}", hex_encode(id)));
@@ -5108,6 +5133,27 @@ async fn serve_plugin_id(state: &Arc<ServerState>, spec: &str, importer: &str) -
     let id = match host.resolve_id(spec, importer).await {
         Ok(Some(id)) => id,
         Ok(None) => {
+            // A relative / absolute import routed here for a plugin's resolveId
+            // filter that then declined it: Vite's own resolver takes over, so
+            // resolve it against the importer like the native path would have.
+            if !is_bare_specifier(spec) {
+                let (base, query) = spec.split_once('?').unwrap_or((spec, ""));
+                let dir = Path::new(importer)
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| state.root.clone());
+                if let Ok(abs) = state.resolver.resolve(&dir, base) {
+                    if abs.is_file() {
+                        state.fs_allow.lock().unwrap().insert(package_root(&abs));
+                        let mut url = dep_serve_url(&abs, &state.root);
+                        if !query.is_empty() {
+                            url.push('?');
+                            url.push_str(query);
+                        }
+                        return Redirect::temporary(&url).into_response();
+                    }
+                }
+            }
             if is_node_builtin(spec) {
                 return (
                     [

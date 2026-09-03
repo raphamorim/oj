@@ -1220,6 +1220,18 @@ impl PluginHost {
         serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default()
     }
 
+    /// The `filter.id` include patterns of every object-form `resolveId` hook, as
+    /// regex source strings. A relative or absolute import matching one is offered
+    /// to the plugins' resolveId before oj's own resolver (Vite runs plugin
+    /// resolveId first for every id; oj gates the non-bare ones on a declared
+    /// filter so unfiltered plugins cost no RPC per import).
+    pub async fn resolve_id_filters(&self) -> Vec<String> {
+        let Ok(Some(raw)) = self.call("getResolveIdFilters", &[]).await else {
+            return Vec::new();
+        };
+        serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default()
+    }
+
     /// Which HMR hooks any active plugin defines: (watchChange, handleHotUpdate).
     /// Defaults to (true, true) on RPC or parse failure so an HMR RPC is never
     /// skipped by mistake.
