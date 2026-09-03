@@ -339,6 +339,9 @@ struct ServerState {
     /// filled in (Vite's clientInjections), rendered once at startup.
     client_js: String,
     bundle_runtime_js: String,
+    /// Vite's `appType` (`spa` | `mpa` | `custom`): whether an unmatched
+    /// navigation falls back to `index.html`, and whether html is served at all.
+    app_type: String,
     /// Per-process secret a browser page must present as `?token=` to open the
     /// HMR socket (Vite's `webSocketToken`): another origin's page cannot read
     /// update frames or push invalidations. Non-browser clients (no `Origin`)
@@ -754,6 +757,10 @@ impl DevServer {
         let client_js = render_client_js(CLIENT_JS, hmr_options.as_ref(), &hmr_ws_path, &ws_token);
         let bundle_runtime_js =
             render_client_js(BUNDLE_RUNTIME_JS, hmr_options.as_ref(), &hmr_ws_path, &ws_token);
+        let app_type = config.app_type.clone().unwrap_or_else(|| "spa".to_string());
+        if app_type != "spa" {
+            println!("  appType: {app_type}");
+        }
 
         let started = Instant::now();
         let (reload_tx, _) = broadcast::channel::<String>(64);
@@ -887,6 +894,7 @@ impl DevServer {
             resolve_failed: Mutex::new(std::collections::HashSet::new()),
             client_js,
             bundle_runtime_js,
+            app_type,
             ws_token,
             ws_token_check,
             optimized: Arc::new(if bundle {
@@ -2616,6 +2624,30 @@ async fn serve_index_html(state: &ServerState) -> Response {
     }
 }
 
+/// The html file Vite's htmlFallback middleware rewrites an unmatched path to:
+/// a trailing slash asks for that directory's `index.html`, anything else for
+/// the `.html` sibling. An explicit `.html` request is left alone (it either
+/// exists, and was found already, or is a 404).
+fn html_fallback_candidate(rel: &str) -> Option<String> {
+    if rel.is_empty() || rel.ends_with(".html") {
+        return None;
+    }
+    if rel.ends_with('/') {
+        Some(format!("{rel}index.html"))
+    } else {
+        Some(format!("{rel}.html"))
+    }
+}
+
+/// Vite's htmlFallback only acts on requests that accept html: no `Accept`, an
+/// empty one, or one naming `text/html` or `*/*`.
+fn accepts_html_fallback(headers: &HeaderMap) -> bool {
+    match headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) {
+        None => true,
+        Some(a) => a.is_empty() || a.contains("text/html") || a.contains("*/*"),
+    }
+}
+
 fn is_spa_navigation(rel: &str, headers: &HeaderMap) -> bool {
     if rel.starts_with('@')
         || rel.starts_with("__")
@@ -2901,7 +2933,22 @@ async fn serve_path(
                 if let Some(resp) = serve_plugin_load_fallback(&state, &uri).await {
                     return resp;
                 }
-                if is_spa_navigation(rel, &headers) {
+                // Vite's htmlFallback: `/dir/` serves `dir/index.html` and `/page`
+                // serves `page.html` when they exist; only appType `spa` then
+                // falls back to the root index.html, and `custom` serves no html
+                // of its own.
+                if state.app_type != "custom" && accepts_html_fallback(&headers) {
+                    if let Some(page) = html_fallback_candidate(rel)
+                        .and_then(|c| locate(&state.root, &state.public_dir, &c))
+                    {
+                        return match tokio::fs::read(&page).await {
+                            Ok(bytes) => serve_html(&state, bytes).await,
+                            Err(_) => (StatusCode::NOT_FOUND, format!("oj: no such file: /{rel}"))
+                                .into_response(),
+                        };
+                    }
+                }
+                if state.app_type == "spa" && is_spa_navigation(rel, &headers) {
                     return serve_index_html(&state).await;
                 }
                 return (StatusCode::NOT_FOUND, format!("oj: no such file: /{rel}"))
@@ -8021,6 +8068,23 @@ mod tests {
         assert!(!wants_module_import(&h, None));
         h.insert("sec-fetch-dest", "script".parse().unwrap());
         assert!(wants_module_import(&h, None), "a module import of the url");
+    }
+
+    #[test]
+    fn html_fallback_rewrites_like_vite() {
+        assert_eq!(html_fallback_candidate("nested/").as_deref(), Some("nested/index.html"));
+        assert_eq!(html_fallback_candidate("about").as_deref(), Some("about.html"));
+        assert_eq!(html_fallback_candidate("docs/intro").as_deref(), Some("docs/intro.html"));
+        assert_eq!(html_fallback_candidate("about.html"), None, "an explicit html request is not rewritten");
+        assert_eq!(html_fallback_candidate(""), None);
+        let mut h = HeaderMap::new();
+        assert!(accepts_html_fallback(&h), "no Accept is */*");
+        h.insert(header::ACCEPT, "text/html,application/xhtml+xml".parse().unwrap());
+        assert!(accepts_html_fallback(&h));
+        h.insert(header::ACCEPT, "*/*".parse().unwrap());
+        assert!(accepts_html_fallback(&h));
+        h.insert(header::ACCEPT, "application/json".parse().unwrap());
+        assert!(!accepts_html_fallback(&h), "an API-style request never gets html");
     }
 
     #[test]

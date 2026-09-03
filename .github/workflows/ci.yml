@@ -180,6 +180,7 @@ jobs:
           node e2e/hmr-prune-html-scope.mjs
           node e2e/hmr-invalidate-protocol.mjs
           node e2e/hmr-client-options.mjs
+          node e2e/html-fallback-dev.mjs
 
   # i need to fix this or automate
   build:
