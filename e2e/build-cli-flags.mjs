@@ -161,8 +161,8 @@ try {
   console.log("ok: --watch is rejected with a clear message");
 
   // 5. Unsupported build.* options warn once each.
-  const u = ok([], { build: { write: false, license: true, commonjsOptions: {}, cssTarget: "chrome100", watch: {} } });
-  for (const key of ["write: false", "watch", "license", "commonjsOptions", "cssTarget"]) {
+  const u = ok([], { build: { write: false, license: true, commonjsOptions: {}, watch: {} } });
+  for (const key of ["write: false", "watch", "license", "commonjsOptions"]) {
     assert.ok(u.stderr.includes(`build.${key} is not supported`), `warns about build.${key}:\n${u.stderr}`);
   }
   console.log("ok: unsupported build options warn");

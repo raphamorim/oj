@@ -58,6 +58,15 @@ export default defineConfig({
   publicDir: "public",
   // A config define: must be applied by the SSR loader (dev) and the prod bundles.
   define: { __FIXTURE_DEFINE__: JSON.stringify("fixture-define-marker") },
+  // A custom env prefix: FIXTURE_* vars from .env.<mode> reach import.meta.env,
+  // unprefixed ones never do.
+  envPrefix: ["VITE_", "FIXTURE_"],
+  // Per-environment defines: each bundle (dev and prod, client and server) gets
+  // its own value.
+  environments: {
+    client: { define: { __FIXTURE_SIDE__: JSON.stringify("client-side") } },
+    ssr: { define: { __FIXTURE_SIDE__: JSON.stringify("server-side") } },
+  },
   plugins: [
     buildInfoPlugin(),
     freshModulePlugin(),

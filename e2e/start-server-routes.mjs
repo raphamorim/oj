@@ -90,6 +90,20 @@ async function prodPhase() {
   const server = fs.readFileSync(path.join(app, "dist", "server.mjs"), "utf8");
   must(server.includes("getSetCookie") && server.includes("Readable.fromWeb"),
     "prod: dist/server.mjs should stream responses and keep every set-cookie");
+  // environments.{ssr,client}.define reach the matching prod bundle (Vite's
+  // define plugin reads environment.config.define per build).
+  const chunks = path.join(app, "dist", "chunks");
+  const serverBundle = [path.join(app, "dist", "server-bundle.mjs"), ...(fs.existsSync(chunks) ? fs.readdirSync(chunks).map((f) => path.join(chunks, f)) : [])]
+    .filter((f) => f.endsWith(".mjs")).map((f) => fs.readFileSync(f, "utf8")).join("\n");
+  // (the minifier may emit either quote style for the string literal)
+  const lit = (s) => new RegExp(`["'\`]${s}["'\`]`);
+  must(lit("server-side").test(serverBundle) && !lit("client-side").test(serverBundle),
+    "prod: server bundle did not apply environments.ssr.define");
+  const assets = path.join(app, "dist", "client", "assets");
+  const clientJs = fs.readdirSync(assets).filter((f) => f.endsWith(".js"))
+    .map((f) => fs.readFileSync(path.join(assets, f), "utf8")).join("\n");
+  must(lit("client-side").test(clientJs) && !lit("server-side").test(clientJs),
+    "prod: client bundle did not apply environments.client.define");
   const srv = spawn("node", [path.join(app, "dist", "server.mjs")], {
     cwd: app, stdio: "ignore", env: { ...process.env, PORT: String(PROD_PORT) },
   });

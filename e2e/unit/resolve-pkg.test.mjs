@@ -8,7 +8,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { viteEnvDefine, makeResolver, importPkg, ssrExternalRule } from "../../crates/oj_server/src/assets/start/resolve-pkg.mjs";
+import { viteEnvDefine, envPrefixes, environmentDefines, makeResolver, importPkg, ssrExternalRule } from "../../crates/oj_server/src/assets/start/resolve-pkg.mjs";
 
 test("viteEnvDefine builds import.meta.env with the standard flags", () => {
   process.env.VITE_ONLY_FOR_TEST = "hello";
@@ -32,6 +32,33 @@ test("viteEnvDefine reflects ssr and production", () => {
   assert.equal(env.MODE, "production");
   assert.equal(env.PROD, true);
   assert.equal(env.DEV, false);
+});
+
+// Vite: `envPrefix` decides which vars reach import.meta.env; DEV/PROD follow
+// NODE_ENV even in a development mode (`NODE_ENV=production vite dev` is PROD).
+test("viteEnvDefine honors envPrefix (OJ_ENV_PREFIX) and NODE_ENV over mode", () => {
+  const source = { NODE_ENV: "production", VITE_A: "a", APP_B: "b", SECRET_C: "c", OJ_ENV_PREFIX: JSON.stringify(["VITE_", "APP_"]) };
+  assert.deepEqual(envPrefixes(source), ["VITE_", "APP_"]);
+  assert.deepEqual(envPrefixes({}), ["VITE_"]);
+  assert.deepEqual(envPrefixes({ OJ_ENV_PREFIX: "not json" }), ["VITE_"]);
+  const env = JSON.parse(viteEnvDefine({ mode: "development", env: source, prefixes: envPrefixes(source) })["import.meta.env"]);
+  assert.equal(env.MODE, "development");
+  assert.equal(env.DEV, false);
+  assert.equal(env.PROD, true);
+  assert.equal(env.VITE_A, "a");
+  assert.equal(env.APP_B, "b");
+  assert.equal("SECRET_C" in env, false);
+  const only = JSON.parse(viteEnvDefine({ env: source, prefixes: ["APP_"] })["import.meta.env"]);
+  assert.equal("VITE_A" in only, false);
+  assert.equal(only.APP_B, "b");
+});
+
+test("environmentDefines reads the per-environment define maps oj hands over", () => {
+  const source = { OJ_DEFINE_CLIENT: JSON.stringify({ __SIDE__: '"client"' }), OJ_DEFINE_SSR: JSON.stringify({ __SIDE__: '"server"' }) };
+  assert.deepEqual(environmentDefines("client", source), { __SIDE__: '"client"' });
+  assert.deepEqual(environmentDefines("ssr", source), { __SIDE__: '"server"' });
+  assert.deepEqual(environmentDefines("client", {}), {});
+  assert.deepEqual(environmentDefines("ssr", { OJ_DEFINE_SSR: "{broken" }), {});
 });
 
 function pkg(dir, name, main = "index.js") {

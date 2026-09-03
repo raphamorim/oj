@@ -575,7 +575,10 @@ impl DevServer {
                 "command": "serve",
                 "define": config.define,
                 "server": { "port": port, "host": server_cfg.host },
-                "environments": config.environments,
+                // `{}` rather than null when the config has none: the host deep-merges
+                // this over the user's Vite-resolved config, and a null would erase
+                // its environments (and their per-environment `define`).
+                "environments": config.environments.clone().unwrap_or_default(),
             },
             "env": { "command": "serve", "mode": dev_mode },
             "environment": { "name": "client", "mode": "dev" },

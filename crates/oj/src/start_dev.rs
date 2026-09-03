@@ -399,9 +399,12 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
     });
 }
 
-/// Environment handed to the Start node scripts: the mode's `.env` `VITE_*` vars
-/// (shell wins, as in Vite's loadEnv) and the JSX settings from the config
-/// (`OJ_JSX`, consumed by `jsxTransformOptions` in resolve-pkg.mjs).
+/// Environment handed to the Start node scripts: the mode's `.env` vars with an
+/// `envPrefix` (shell wins, as in Vite's loadEnv), the prefixes themselves
+/// (`OJ_ENV_PREFIX`), the per-environment defines (`OJ_DEFINE_CLIENT` /
+/// `OJ_DEFINE_SSR`, Vite's `environments.<name>.define`) and the JSX settings
+/// from the config (`OJ_JSX`, consumed by `jsxTransformOptions` in
+/// resolve-pkg.mjs).
 fn start_script_env(root: &Path, command: &str, mode: &str) -> anyhow::Result<Vec<(String, String)>> {
     let mut config = oj_config::load(root).unwrap_or_default();
     // `.env` files come from `envDir` and only `envPrefix` variables are exposed
@@ -417,6 +420,29 @@ fn start_script_env(root: &Path, command: &str, mode: &str) -> anyhow::Result<Ve
         .collect();
     oj_server::plugins::adopt_vite_config_values(&mut config, root, command, mode)
         .map_err(|e| anyhow::anyhow!(e))?;
+    let prefixes = oj_config::env_prefixes(&config);
+    let mut vars: Vec<(String, String)> = oj_env::load(root, mode)
+        .into_iter()
+        .filter(|(k, _)| {
+            prefixes.iter().any(|p| k.starts_with(p.as_str())) && std::env::var_os(k).is_none()
+        })
+        .collect();
+    if prefixes != ["VITE_"] {
+        vars.push((
+            "OJ_ENV_PREFIX".into(),
+            serde_json::to_string(&prefixes).unwrap_or_default(),
+        ));
+    }
+    for (env_name, var) in [("client", "OJ_DEFINE_CLIENT"), ("ssr", "OJ_DEFINE_SSR")] {
+        let defines: serde_json::Map<String, serde_json::Value> =
+            oj_config::environment_defines(&config, env_name)
+                .into_iter()
+                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                .collect();
+        if !defines.is_empty() {
+            vars.push((var.into(), serde_json::Value::Object(defines).to_string()));
+        }
+    }
     let jsx = oj_config::jsx_settings(&config);
     if jsx != oj_config::JsxSettings::default() {
         vars.push(("OJ_JSX".into(), serde_json::to_string(&jsx).unwrap_or_default()));
@@ -703,12 +729,23 @@ fn client_module_count(cache: &Path) -> usize {
         .unwrap_or(0)
 }
 
+/// Vite's rule for the dev server too: the shell's NODE_ENV wins (so
+/// `NODE_ENV=production oj dev` is PROD, as in Vite and oj's generic server),
+/// else `.env[.mode]` NODE_ENV=development, else development.
+fn dev_node_env(root: &Path, mode: &str) -> String {
+    oj_env::resolve_node_env(
+        std::env::var("NODE_ENV").ok().as_deref(),
+        &oj_env::load(root, mode),
+        "development",
+    )
+}
+
 fn run_node(root: &Path, script: &Path, what: &str, mode: &str) -> anyhow::Result<()> {
     let status = std::process::Command::new("node")
         .arg(script)
         .env("OJ_APP_ROOT", root)
         .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
-        .env("NODE_ENV", "development")
+        .env("NODE_ENV", dev_node_env(root, mode))
         .env("OJ_MODE", mode)
         .envs(start_script_env(root, "serve", mode)?)
         .env("NODE_COMPILE_CACHE", oj_server::node_compile_cache(root))
@@ -745,7 +782,7 @@ async fn spawn_node_service(root: &Path, script: &Path, mode: &str) -> anyhow::R
     cmd.arg("--enable-source-maps").arg(script)
         .env("OJ_APP_ROOT", root)
         .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
-        .env("NODE_ENV", "development")
+        .env("NODE_ENV", dev_node_env(root, mode))
         .env("OJ_MODE", mode)
         .envs(start_script_env(root, "serve", mode)?)
         .env(
@@ -1186,6 +1223,74 @@ mod tests {
             .uri(path)
             .body(axum::body::Body::empty())
             .unwrap()
+    }
+
+    // Vite's loadEnv rule for the Start scripts: `.env.<mode>` vars with any
+    // configured envPrefix (not just VITE_) pass, unprefixed ones never do; the
+    // prefixes and the per-environment defines travel alongside.
+    #[test]
+    fn start_script_env_honors_env_prefix_and_environment_defines() {
+        let root = tmp("script-env");
+        std::fs::write(
+            root.join("oj.config.json"),
+            r#"{
+              "envPrefix": ["VITE_", "APP_"],
+              "define": { "__SHARED__": "1" },
+              "environments": {
+                "client": { "define": { "__SIDE__": "\"client\"" } },
+                "ssr": { "define": { "__SIDE__": "\"server\"", "__ONLY_SSR__": "true" } }
+              }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".env.staging"),
+            "VITE_X=1\nAPP_Y=2\nSECRET_Z=3\n",
+        )
+        .unwrap();
+        let vars = start_script_env(&root, "serve", "staging").unwrap();
+        let get = |k: &str| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!(get("VITE_X").as_deref(), Some("1"));
+        assert_eq!(get("APP_Y").as_deref(), Some("2"));
+        assert_eq!(get("SECRET_Z"), None);
+        assert_eq!(get("OJ_ENV_PREFIX").as_deref(), Some(r#"["VITE_","APP_"]"#));
+        assert_eq!(get("OJ_DEFINE").as_deref(), Some(r#"{"__SHARED__":"1"}"#));
+        assert_eq!(get("OJ_DEFINE_CLIENT").as_deref(), Some(r#"{"__SIDE__":"\"client\""}"#));
+        let ssr: serde_json::Value = serde_json::from_str(&get("OJ_DEFINE_SSR").unwrap()).unwrap();
+        assert_eq!(ssr["__SIDE__"], "\"server\"");
+        assert_eq!(ssr["__ONLY_SSR__"], "true");
+
+        // Defaults: VITE_ only, and no prefix/define vars at all.
+        let plain = tmp("script-env-plain");
+        std::fs::write(plain.join(".env"), "VITE_X=1\nAPP_Y=2\n").unwrap();
+        let vars = start_script_env(&plain, "serve", "development").unwrap();
+        let names: Vec<&str> = vars.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"VITE_X"));
+        assert!(!names.contains(&"APP_Y"));
+        assert!(!names.contains(&"OJ_ENV_PREFIX"));
+        assert!(!names.contains(&"OJ_DEFINE_CLIENT"));
+        assert!(!names.contains(&"OJ_DEFINE_SSR"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&plain);
+    }
+
+    // Vite's NODE_ENV rule for the dev server: the shell wins (so
+    // `NODE_ENV=production oj dev` is PROD), else `.env[.mode]` may only pick
+    // development, else development. The shell value is read live, so the
+    // test only covers the two file-driven branches.
+    #[test]
+    fn dev_node_env_follows_env_files_when_shell_is_silent() {
+        if std::env::var_os("NODE_ENV").is_some_and(|v| !v.is_empty()) {
+            return;
+        }
+        let root = tmp("node-env");
+        assert_eq!(dev_node_env(&root, "development"), "development");
+        std::fs::write(root.join(".env.staging"), "NODE_ENV=development\n").unwrap();
+        assert_eq!(dev_node_env(&root, "staging"), "development");
+        std::fs::write(root.join(".env.prodlike"), "NODE_ENV=production\n").unwrap();
+        // Only development is honored from a .env file (Vite warns and ignores).
+        assert_eq!(dev_node_env(&root, "prodlike"), "development");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

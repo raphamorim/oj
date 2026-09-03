@@ -521,8 +521,10 @@ fn epoch(root: &Path, mode: &str) -> String {
             hasher.update(&bytes);
         }
     }
+    // NODE_ENV too: the shell's value decides DEV/PROD and the React build the
+    // client bundle compiles against, as it does under Vite.
     let mut env: Vec<(String, String)> = std::env::vars()
-        .filter(|(k, _)| k.starts_with("VITE_") || k == "TSS_SERVER_FN_BASE")
+        .filter(|(k, _)| k.starts_with("VITE_") || k == "TSS_SERVER_FN_BASE" || k == "NODE_ENV")
         .collect();
     env.sort();
     for (k, v) in env {
