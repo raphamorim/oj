@@ -143,6 +143,15 @@ jobs:
       - name: start prod build for @cloudflare/vite-plugin is a Worker bundle that renders in workerd
         if: matrix.mode == 'unbundled'
         run: node e2e/start-cloudflare.mjs
+      - name: transformIndexHtml ctx (path, filename, server, bundle, chunk) and hook errors fail
+        if: matrix.mode == 'unbundled'
+        run: node e2e/plugin-html-ctx.mjs
+      - name: buildEnd(error) and closeBundle on failed builds and dev close
+        if: matrix.mode == 'unbundled'
+        run: node e2e/plugin-close-hooks.mjs
+      - name: relative imports claimed by a resolveId filter go to the plugins first
+        if: matrix.mode == 'unbundled'
+        run: node e2e/plugin-resolve-relative.mjs
 
   # i need to fix this or automate
   build:

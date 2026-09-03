@@ -1010,10 +1010,14 @@ impl PluginHost {
         .await
     }
 
+    /// `ctx_json` is Vite's IndexHtmlTransformContext for the page (`path`,
+    /// `filename`, and `originalUrl` in dev or `bundle` / `chunk` in a build);
+    /// the host adds the dev server. A throwing hook is an `Err`, as in Vite,
+    /// where it fails the request or the build.
     #[inline]
-    pub async fn transform_index_html(&self, html: &str) -> Result<String, String> {
+    pub async fn transform_index_html(&self, html: &str, ctx_json: &str) -> Result<String, String> {
         Ok(self
-            .call("transformIndexHtml", &[html])
+            .call("transformIndexHtml", &[html, ctx_json])
             .await?
             .unwrap_or_else(|| html.to_string()))
     }
