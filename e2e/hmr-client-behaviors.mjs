@@ -57,9 +57,13 @@ try {
   try {
     await page.goto(`http://localhost:${PORT}/`, { waitUntil: "networkidle", timeout: 30000 });
     await page.locator("h1", { hasText: "v1!" }).waitFor({ timeout: 20000 });
-    await page.evaluate(() => {
+    await page.evaluate(async () => {
       window.__frames = [];
-      const ws = new WebSocket("ws://" + location.host + "/__ws");
+      // A browser upgrade must carry the per-process token the served client
+      // dials with (Vite's webSocketToken); read it off the client source.
+      const client = await (await fetch("/@oj/client.js")).text();
+      const token = /const wsToken = "([0-9a-f]+)";/.exec(client)[1];
+      const ws = new WebSocket("ws://" + location.host + "/__ws?token=" + token);
       ws.onmessage = (e) => window.__frames.push(JSON.parse(e.data));
       window.__NOT_RELOADED = true;
     });

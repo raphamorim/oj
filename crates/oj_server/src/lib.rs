@@ -335,6 +335,16 @@ struct ServerState {
     /// (Vite's `_hasResolveFailedErrorModules`): a file appearing on disk
     /// re-processes them so the overlay clears once the missing file exists.
     resolve_failed: Mutex<std::collections::HashSet<String>>,
+    /// `assets/client.js` with the `server.hmr` options and the socket token
+    /// filled in (Vite's clientInjections), rendered once at startup.
+    client_js: String,
+    bundle_runtime_js: String,
+    /// Per-process secret a browser page must present as `?token=` to open the
+    /// HMR socket (Vite's `webSocketToken`): another origin's page cannot read
+    /// update frames or push invalidations. Non-browser clients (no `Origin`)
+    /// connect freely, as in Vite.
+    ws_token: String,
+    ws_token_check: bool,
 }
 
 pub struct BuiltApp {
@@ -721,6 +731,29 @@ impl DevServer {
         if !hmr_enabled {
             println!("  hmr: disabled (server.hmr: false)");
         }
+        let hmr_options = match &server_cfg.hmr {
+            Some(oj_config::HmrConfig::Options(o)) => Some(o.clone()),
+            _ => None,
+        };
+        if hmr_options.as_ref().is_some_and(|o| o.port.is_some() && o.client_port.is_none()) {
+            println!(
+                "  hmr.port is not applied (the socket shares the dev server port); set hmr.clientPort for the port the browser dials"
+            );
+        }
+        let hmr_ws_path = hmr_socket_path(hmr_options.as_ref());
+        let ws_token = new_ws_token();
+        // An external editor attaches to the socket from a browser page in gated
+        // mode, so the token is not demanded there (as with Vite's
+        // legacy.skipWebSocketTokenCheck).
+        let ws_token_check = hmr_gate.is_none()
+            && config
+                .legacy
+                .as_ref()
+                .and_then(|l| l.skip_web_socket_token_check)
+                != Some(true);
+        let client_js = render_client_js(CLIENT_JS, hmr_options.as_ref(), &hmr_ws_path, &ws_token);
+        let bundle_runtime_js =
+            render_client_js(BUNDLE_RUNTIME_JS, hmr_options.as_ref(), &hmr_ws_path, &ws_token);
 
         let started = Instant::now();
         let (reload_tx, _) = broadcast::channel::<String>(64);
@@ -852,6 +885,10 @@ impl DevServer {
             base: config.base.clone().filter(|b| b != "/"),
             buffered_error: Mutex::new(None),
             resolve_failed: Mutex::new(std::collections::HashSet::new()),
+            client_js,
+            bundle_runtime_js,
+            ws_token,
+            ws_token_check,
             optimized: Arc::new(if bundle {
                 optimize::OptimizedDeps::disabled()
             } else {
@@ -913,7 +950,7 @@ impl DevServer {
         }
 
         let mut app = Router::new()
-            .route("/@oj/client.js", get(|| async { js(CLIENT_JS) }))
+            .route("/@oj/client.js", get(serve_client_js))
             .route(
                 "/@oj/refresh-runtime.js",
                 get(|| async { js(REFRESH_RUNTIME_JS) }),
@@ -922,10 +959,7 @@ impl DevServer {
                 "/@oj/refresh-preamble.js",
                 get(|| async { js(REFRESH_PREAMBLE_JS) }),
             )
-            .route(
-                "/@oj/bundle-runtime.js",
-                get(|| async { js(BUNDLE_RUNTIME_JS) }),
-            )
+            .route("/@oj/bundle-runtime.js", get(serve_bundle_runtime_js))
             .route("/@oj/chunk.js", get(serve_chunk))
             .route("/@oj/patch.js", get(serve_patch))
             .route("/@oj/lazy.js", get(serve_lazy))
@@ -942,6 +976,11 @@ impl DevServer {
             .route("/__hmr_flush", post(hmr_flush))
             .route("/__hmr_gate", get(hmr_gate_status))
             .fallback(serve_fallback);
+        // `server.hmr.path`: the client dials this path instead of /__ws (Vite
+        // serves its socket at base + hmr.path).
+        if hmr_ws_path != "/__ws" && hmr_ws_path != "/" && !hmr_ws_path.starts_with("/@oj/") {
+            app = app.route(&hmr_ws_path, get(ws_upgrade));
+        }
         app = app.layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             vite_hmr_upgrade,
@@ -1039,6 +1078,81 @@ async fn close_plugins_on_shutdown(host: Option<Arc<PluginHost>>) {
 
 fn js(body: impl IntoResponse) -> Response {
     ([(header::CONTENT_TYPE, "text/javascript")], body).into_response()
+}
+
+async fn serve_client_js(State(state): State<Arc<ServerState>>) -> Response {
+    js(state.client_js.clone())
+}
+
+async fn serve_bundle_runtime_js(State(state): State<Arc<ServerState>>) -> Response {
+    js(state.bundle_runtime_js.clone())
+}
+
+/// The path the HMR socket is served at: `server.hmr.path` (made absolute) or
+/// oj's `/__ws`.
+fn hmr_socket_path(hmr: Option<&oj_config::HmrOptions>) -> String {
+    match hmr.and_then(|h| h.path.as_deref()).map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) if p.starts_with('/') => p.to_string(),
+        Some(p) => format!("/{p}"),
+        None => "/__ws".to_string(),
+    }
+}
+
+/// Fill the client's `__HMR_*__` / `__WS_TOKEN__` placeholders the way Vite's
+/// clientInjections does: JSON literals, `null` where the config is silent so
+/// the client falls back to the page's own location.
+fn render_client_js(
+    template: &str,
+    hmr: Option<&oj_config::HmrOptions>,
+    ws_path: &str,
+    token: &str,
+) -> String {
+    let lit = |v: serde_json::Value| v.to_string();
+    let protocol = hmr.and_then(|h| h.protocol.clone());
+    let hostname = hmr.and_then(|h| h.host.clone());
+    // Vite: `ws.clientPort -> ws.port -> the page's port`; oj's socket shares
+    // the dev server port, so only clientPort (the browser-facing port behind a
+    // proxy) moves the dial.
+    let port = hmr.and_then(|h| h.client_port);
+    let overlay = hmr.and_then(|h| h.overlay).unwrap_or(true);
+    template
+        .replace("__HMR_PROTOCOL__", &lit(protocol.into()))
+        .replace("__HMR_HOSTNAME__", &lit(hostname.into()))
+        .replace("__HMR_PORT__", &lit(port.into()))
+        .replace("__HMR_PATH__", &lit(ws_path.into()))
+        .replace("__HMR_ENABLE_OVERLAY__", &lit(overlay.into()))
+        .replace("__WS_TOKEN__", &lit(token.into()))
+}
+
+/// A fresh random token for this process (Vite: `crypto.randomBytes(9)`, as
+/// base64url). rustls' provider RNG is already linked; a hash of process-unique
+/// state is the fallback if it ever fails.
+fn new_ws_token() -> String {
+    let mut bytes = [0u8; 16];
+    let filled = rustls::crypto::aws_lc_rs::default_provider()
+        .secure_random
+        .fill(&mut bytes)
+        .is_ok();
+    if !filled {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seed = format!("{}:{nanos}:{:p}", std::process::id(), &bytes);
+        bytes.copy_from_slice(&blake3::hash(seed.as_bytes()).as_bytes()[..16]);
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Vite's ws `shouldHandle`: a request carrying `Origin` comes from a browser
+/// and must present the token (`hasValidToken`); requests without one are
+/// allowed, since a client that can send them can already make plain HTTP
+/// requests to the server. `vite-ping` never carries data and is exempt.
+fn ws_token_rejected(check: bool, token: &str, headers: &HeaderMap, query: Option<&str>) -> bool {
+    if !check || !headers.contains_key(header::ORIGIN) {
+        return false;
+    }
+    !query.is_some_and(|q| q.split('&').any(|kv| kv.strip_prefix("token=") == Some(token)))
 }
 
 // An SSR module carries its source map inline: the runner maps stack frames
@@ -1563,10 +1677,14 @@ pub fn update_progress_frame(
 async fn ws_upgrade(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
+    uri: Uri,
     upgrade: WebSocketUpgrade,
 ) -> Response {
     if let Some(resp) = state.host_policy.reject_ws_origin(&headers) {
         return resp;
+    }
+    if ws_token_rejected(state.ws_token_check, &state.ws_token, &headers, uri.query()) {
+        return (StatusCode::UNAUTHORIZED, "oj: websocket token missing or invalid").into_response();
     }
     hmr_socket(upgrade, state, false)
 }
@@ -1598,6 +1716,11 @@ async fn vite_hmr_upgrade(
     };
     if let Some(resp) = state.host_policy.reject_ws_origin(req.headers()) {
         return resp;
+    }
+    if proto != "vite-ping"
+        && ws_token_rejected(state.ws_token_check, &state.ws_token, req.headers(), req.uri().query())
+    {
+        return (StatusCode::UNAUTHORIZED, "oj: websocket token missing or invalid").into_response();
     }
     let (mut parts, body) = req.into_parts();
     match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
@@ -7898,6 +8021,50 @@ mod tests {
         assert!(!wants_module_import(&h, None));
         h.insert("sec-fetch-dest", "script".parse().unwrap());
         assert!(wants_module_import(&h, None), "a module import of the url");
+    }
+
+    #[test]
+    fn client_js_is_rendered_from_server_hmr_options() {
+        let tpl = "a=__HMR_PROTOCOL__;b=__HMR_HOSTNAME__;c=__HMR_PORT__;d=__HMR_PATH__;e=__HMR_ENABLE_OVERLAY__;f=__WS_TOKEN__;";
+        assert_eq!(hmr_socket_path(None), "/__ws");
+        assert_eq!(
+            render_client_js(tpl, None, "/__ws", "tok"),
+            r#"a=null;b=null;c=null;d="/__ws";e=true;f="tok";"#
+        );
+        let opts = oj_config::HmrOptions {
+            path: Some("hmr".into()),
+            port: Some(24678),
+            client_port: Some(443),
+            host: Some("app.test".into()),
+            protocol: Some("wss".into()),
+            overlay: Some(false),
+            timeout: None,
+        };
+        let path = hmr_socket_path(Some(&opts));
+        assert_eq!(path, "/hmr", "a relative hmr.path is made absolute");
+        assert_eq!(
+            render_client_js(tpl, Some(&opts), &path, "tok"),
+            r#"a="wss";b="app.test";c=443;d="/hmr";e=false;f="tok";"#,
+            "clientPort, not port, is what the browser dials"
+        );
+        let real = render_client_js(CLIENT_JS, None, "/__ws", "tok");
+        assert!(!real.contains("__HMR_") && !real.contains("__WS_TOKEN__"), "no placeholder left");
+    }
+
+    #[test]
+    fn ws_token_is_demanded_only_from_browser_upgrades() {
+        let mut h = HeaderMap::new();
+        assert!(!ws_token_rejected(true, "t0k", &h, None), "no Origin: not a browser");
+        h.insert(header::ORIGIN, "http://localhost:5199".parse().unwrap());
+        assert!(ws_token_rejected(true, "t0k", &h, None));
+        assert!(ws_token_rejected(true, "t0k", &h, Some("token=nope")));
+        assert!(!ws_token_rejected(true, "t0k", &h, Some("token=t0k")));
+        assert!(!ws_token_rejected(true, "t0k", &h, Some("a=1&token=t0k")));
+        assert!(!ws_token_rejected(false, "t0k", &h, None), "legacy.skipWebSocketTokenCheck");
+        let token = new_ws_token();
+        assert_eq!(token.len(), 32);
+        assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(token, new_ws_token());
     }
 
     #[test]

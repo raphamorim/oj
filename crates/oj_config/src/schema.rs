@@ -43,6 +43,7 @@ pub struct OjConfig {
     pub ssr: Option<serde_json::Value>,
     /// Vite's `html` block (`cspNonce`).
     pub html: Option<HtmlConfig>,
+    pub legacy: Option<LegacyConfig>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -216,12 +217,28 @@ impl HmrConfig {
     }
 }
 
+/// Vite's `server.hmr` object form. `path`, `host`, `protocol`, `clientPort`
+/// and `overlay` reach the served client (Vite's clientInjections); `port` is
+/// accepted but the socket shares the dev server's port, so only `clientPort`
+/// changes what the browser dials.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct HmrOptions {
     pub path: Option<String>,
     pub port: Option<u16>,
     pub overlay: Option<bool>,
+    pub host: Option<String>,
+    pub client_port: Option<u16>,
+    pub protocol: Option<String>,
+    pub timeout: Option<u64>,
+}
+
+/// Vite's `legacy` block: `skipWebSocketTokenCheck` lets a browser page attach
+/// to the HMR socket without the per-process `?token=`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LegacyConfig {
+    pub skip_web_socket_token_check: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]

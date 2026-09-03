@@ -750,6 +750,18 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
         if sc.open.is_none() {
             sc.open = sf.get("open").and_then(|b| b.as_bool());
         }
+        if sc.hmr.is_none() {
+            sc.hmr = sf
+                .get("hmr")
+                .and_then(|h| serde_json::from_value::<oj_config::HmrOptions>(h.clone()).ok())
+                .map(oj_config::HmrConfig::Options);
+        }
+        if sf.get("skipWebSocketTokenCheck").and_then(|b| b.as_bool()) == Some(true) {
+            let legacy = config.legacy.get_or_insert_with(Default::default);
+            if legacy.skip_web_socket_token_check.is_none() {
+                legacy.skip_web_socket_token_check = Some(true);
+            }
+        }
     }
     if let Some(css) = v.css.as_ref() {
         if config.css.is_none() {
