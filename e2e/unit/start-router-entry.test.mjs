@@ -35,6 +35,10 @@ writeFileSync(
 );
 if (installed) symlinkSync(join(fixture, "node_modules"), join(app, "node_modules"), "dir");
 process.env.OJ_APP_ROOT = app;
+// The loader keeps its resolve cache under OJ_CACHE_ROOT; without it, importing the
+// module from the source tree would write that cache next to the sources.
+process.env.OJ_CACHE_ROOT = join(app, "cache");
+process.env.OJ_SSR_LOADER_CACHE = "off";
 process.on("exit", () => rmSync(app, { recursive: true, force: true }));
 
 const maybe = installed ? test : test.skip;

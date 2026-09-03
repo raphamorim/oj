@@ -19,3 +19,5 @@ mutants.out.old/
 
 # also a symlink named node_modules (the trailing-slash form only matches directories)
 node_modules
+# runtime caches a loader imported from the source tree could leave behind
+crates/oj_server/src/assets/*.jsonl
