@@ -9,7 +9,19 @@ const [BASE, ENTRY] = process.argv.slice(2);
 
 const vmConsole = new console.Console(process.stderr, process.stderr);
 
-const context = vm.createContext({
+// The web platform surface server code reaches for (Vite evaluates SSR modules
+// in the main realm, where all of these exist). Shared by reference from the
+// host realm so `instanceof` against a host-created Response/Request holds.
+const HOST_GLOBALS = [
+  "fetch", "Request", "Response", "Headers", "FormData", "Blob", "File",
+  "ReadableStream", "WritableStream", "TransformStream", "TextEncoderStream", "TextDecoderStream",
+  "crypto", "Crypto", "CryptoKey", "SubtleCrypto",
+  "AbortController", "AbortSignal", "Event", "EventTarget", "CustomEvent", "DOMException",
+  "structuredClone", "setImmediate", "clearImmediate", "MessageChannel", "MessagePort", "MessageEvent",
+  "BroadcastChannel", "WebSocket", "atob", "btoa", "navigator", "Intl",
+  "CompressionStream", "DecompressionStream", "BigInt", "Symbol", "WeakRef", "FinalizationRegistry",
+];
+const contextGlobals = {
   console: vmConsole,
   process,
   URL,
@@ -23,7 +35,11 @@ const context = vm.createContext({
   clearInterval,
   queueMicrotask,
   performance,
-});
+};
+for (const name of HOST_GLOBALS) {
+  if (typeof globalThis[name] !== "undefined") contextGlobals[name] = globalThis[name];
+}
+const context = vm.createContext(contextGlobals);
 
 const registry = new Map();
 const externals = new Map();

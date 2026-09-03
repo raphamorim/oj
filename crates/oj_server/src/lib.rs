@@ -982,17 +982,19 @@ async fn ssr_module(
     } else {
         path
     };
+    // Dev SSR modules compile as dev + ssr (Vite's importAnalysis injects
+    // `SSR: true` and the dev env), so `import.meta.env.SSR` is true and
+    // `DEV`/`MODE` match the client; Fast Refresh stays off on the server.
+    let mut opts = dev_compile_opts(&state);
+    opts.refresh = false;
+    opts.ssr = true;
     if q.get("runner").map(|v| v == "1").unwrap_or(false) {
-        return match oj_compiler::ssr::ssr_transform_module(
-            &compile_path,
-            &source,
-            &prod_compile_opts(&state),
-        ) {
+        return match oj_compiler::ssr::ssr_transform_module(&compile_path, &source, &opts) {
             Ok(code) => js(code),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
         };
     }
-    match oj_compiler::compile(&compile_path, &source, &prod_compile_opts(&state)) {
+    match oj_compiler::compile(&compile_path, &source, &opts) {
         Ok(out) => js(out.code),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
@@ -3659,12 +3661,6 @@ async fn serve_oj_routes(State(state): State<Arc<ServerState>>) -> Response {
 
 fn dev_compile_opts(state: &ServerState) -> oj_compiler::CompileOptions {
     let mut opts = oj_compiler::CompileOptions::dev();
-    opts.jsx = state.jsx.clone();
-    opts
-}
-
-fn prod_compile_opts(state: &ServerState) -> oj_compiler::CompileOptions {
-    let mut opts = oj_compiler::CompileOptions::prod();
     opts.jsx = state.jsx.clone();
     opts
 }
