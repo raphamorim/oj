@@ -327,19 +327,26 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
         }
         let mut prev_routes = list_route_files(&root);
         let mut batch = 0u64;
+        // Attribute-only events (the atime update a read causes on Linux) are
+        // not changes: the client rebundle reads every source file, which
+        // otherwise looked like an edit of every source file and rebuilt again.
+        let mut changes = oj_server::ContentChanges::new();
         loop {
             let mut paths: std::collections::HashSet<PathBuf> = match rx.recv() {
-                Ok(Ok(ev)) => ev.paths.into_iter().collect(),
+                Ok(Ok(ev)) => changes.changed_paths(&ev).into_iter().collect(),
                 Ok(Err(_)) => continue,
                 Err(_) => break,
             };
             loop {
                 match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                    Ok(Ok(ev)) => paths.extend(ev.paths),
+                    Ok(Ok(ev)) => paths.extend(changes.changed_paths(&ev)),
                     Ok(Err(_)) => {}
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
+            }
+            if paths.is_empty() {
+                continue;
             }
             // Rebuild only on a real source-file change. Ignore the generated
             // route tree and its atomic-write temp siblings, plus bare directory
