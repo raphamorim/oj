@@ -970,10 +970,16 @@ async fn ssr_module(
         Some(host) => {
             let resolved =
                 resolved_imports_json(&state.resolver, &state.fs_allow, &source, Path::new(id));
-            host.transform(&source, id, &resolved)
-                .await
-                .map(|(code, _, _, _)| code)
-                .unwrap_or(source)
+            match host.transform(&source, id, &resolved).await {
+                Ok((code, _, _, _)) => code,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("oj: plugin transform error for {id}:\n{e}"),
+                    )
+                        .into_response();
+                }
+            }
         }
         None => source,
     };
@@ -2082,7 +2088,11 @@ async fn ensure_module(
                     Some((_, q)) => format!("{}?{}", file.display(), q),
                     None => file.to_string_lossy().into_owned(),
                 };
-                host.load(&load_id).await.ok().flatten()
+                // A throwing `load` fails the module like Vite (500 + overlay),
+                // rather than silently reading the disk file it meant to replace.
+                host.load(&load_id)
+                    .await
+                    .map_err(|e| format!("plugin load error for {url}:\n{e}"))?
             }
             None => None,
         }
@@ -2229,9 +2239,10 @@ async fn ensure_module(
                     plugin_maps = maps;
                     code
                 }
+                // Vite fails the request with the plugin's error (code frame in the
+                // overlay); serving the untransformed source would ship wrong code.
                 Err(e) => {
-                    eprintln!("oj: plugin transform failed for {}: {e}", file.display());
-                    source
+                    return Err(format!("plugin transform error for {}:\n{e}", file.display()));
                 }
             }
         }
