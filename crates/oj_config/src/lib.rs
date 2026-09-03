@@ -128,6 +128,159 @@ pub fn jsx_settings(config: &OjConfig) -> JsxSettings {
     s
 }
 
+/// Vite's `ssr.noExternal` / `ssr.external` / `ssr.target` as a matching rule
+/// (external.ts): `external` names stay external; `noExternal` (`true`, or a
+/// package name / glob / RegExp match on the import specifier or package name)
+/// is bundled and transformed; everything else that resolves into
+/// `node_modules` stays external.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SsrExternals {
+    pub no_external_all: bool,
+    /// Package names / globs (`@scope/*`) to bundle.
+    pub no_external: Vec<String>,
+    /// RegExp sources to bundle (from `noExternal: [/^@acme\//]`).
+    pub no_external_regex: Vec<String>,
+    /// `external: true` externalizes every dependency, even `noExternal` ones.
+    pub external_all: bool,
+    pub external: Vec<String>,
+    pub target: Option<String>,
+}
+
+pub fn ssr_externals(config: &OjConfig) -> SsrExternals {
+    let mut out = SsrExternals::default();
+    let Some(ssr) = config.ssr.as_ref().and_then(|s| s.as_object()) else {
+        return out;
+    };
+    fn entries(v: Option<&serde_json::Value>) -> (bool, Vec<String>, Vec<String>) {
+        let mut names = Vec::new();
+        let mut regexes = Vec::new();
+        let items: Vec<&serde_json::Value> = match v {
+            Some(serde_json::Value::Bool(true)) => return (true, names, regexes),
+            Some(serde_json::Value::Array(a)) => a.iter().collect(),
+            Some(other @ (serde_json::Value::String(_) | serde_json::Value::Object(_))) => vec![other],
+            _ => Vec::new(),
+        };
+        for item in items {
+            match item {
+                serde_json::Value::String(s) => names.push(s.clone()),
+                serde_json::Value::Object(o) => {
+                    if let Some(src) = o.get("regex").and_then(|r| r.as_str()) {
+                        regexes.push(src.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        (false, names, regexes)
+    }
+    let (all, names, regexes) = entries(ssr.get("noExternal"));
+    out.no_external_all = all;
+    out.no_external = names;
+    out.no_external_regex = regexes;
+    let (all, names, _) = entries(ssr.get("external"));
+    out.external_all = all;
+    out.external = names;
+    out.target = ssr.get("target").and_then(|t| t.as_str()).map(str::to_string);
+    out
+}
+
+/// The package name an import specifier or a `node_modules` path names
+/// (`@scope/pkg` or `pkg`).
+pub fn package_name_of(spec_or_path: &str) -> Option<String> {
+    let rest = match spec_or_path.rfind("/node_modules/") {
+        Some(i) => &spec_or_path[i + "/node_modules/".len()..],
+        None => spec_or_path,
+    };
+    let rest = rest.split('?').next().unwrap_or(rest);
+    let mut parts = rest.split('/');
+    let first = parts.next().filter(|s| !s.is_empty())?;
+    if first.starts_with('@') {
+        let second = parts.next().filter(|s| !s.is_empty())?;
+        Some(format!("{first}/{second}"))
+    } else {
+        Some(first.to_string())
+    }
+}
+
+fn glob_matches(pattern: &str, value: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == value;
+    }
+    // A `*` matches any run of characters (Vite's picomatch use on package
+    // names is effectively this).
+    let mut rest = value;
+    let mut pieces = pattern.split('*').peekable();
+    let first = pieces.next().unwrap_or("");
+    if !rest.starts_with(first) {
+        return false;
+    }
+    rest = &rest[first.len()..];
+    let mut last_piece = "";
+    while let Some(piece) = pieces.next() {
+        if pieces.peek().is_none() {
+            last_piece = piece;
+            break;
+        }
+        match rest.find(piece) {
+            Some(i) => rest = &rest[i + piece.len()..],
+            None => return false,
+        }
+    }
+    rest.ends_with(last_piece)
+}
+
+impl SsrExternals {
+    /// Whether `noExternal` claims this specifier / package (so it is bundled
+    /// and transformed rather than left to Node).
+    pub fn is_no_external(&self, spec: &str) -> bool {
+        if self.no_external_all {
+            return true;
+        }
+        let pkg = package_name_of(spec);
+        let candidates = [Some(spec.to_string()), pkg.clone()];
+        for pat in &self.no_external {
+            for c in candidates.iter().flatten() {
+                if glob_matches(pat, c) || c.starts_with(&format!("{pat}/")) {
+                    return true;
+                }
+            }
+        }
+        for src in &self.no_external_regex {
+            if let Ok(re) = regex::Regex::new(src) {
+                if candidates.iter().flatten().any(|c| re.is_match(c)) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Vite's `createIsConfiguredAsExternal` decision for an SSR build: given
+    /// the raw specifier, or a resolved path (`in_node_modules`), should the
+    /// module stay external?
+    pub fn is_external(&self, spec: &str, in_node_modules: bool) -> Option<bool> {
+        if self.external_all {
+            return Some(true);
+        }
+        let pkg = package_name_of(spec);
+        if self
+            .external
+            .iter()
+            .any(|e| Some(e) == pkg.as_ref() || e == spec)
+        {
+            return Some(true);
+        }
+        if self.is_no_external(spec) {
+            return Some(false);
+        }
+        if in_node_modules {
+            return Some(true);
+        }
+        None
+    }
+}
+
 pub fn config_defines(config: &OjConfig) -> Vec<(String, String)> {
     config
         .define
@@ -873,5 +1026,56 @@ mod jsx_settings_tests {
         c.oxc = Some(serde_json::Value::Bool(false));
         c.esbuild = Some(serde_json::Value::Bool(false));
         assert_eq!(jsx_settings(&c), JsxSettings::default());
+    }
+}
+
+#[cfg(test)]
+mod ssr_externals_tests {
+    use super::*;
+
+    fn cfg(v: serde_json::Value) -> OjConfig {
+        let mut c = OjConfig::default();
+        c.ssr = Some(v);
+        c
+    }
+
+    #[test]
+    fn no_external_names_globs_regexes_and_true() {
+        let r = ssr_externals(&cfg(serde_json::json!({
+            "noExternal": ["lodash-es", "@acme/*", { "regex": "^@tanstack/" }],
+            "external": ["sharp"],
+            "target": "node"
+        })));
+        assert!(r.is_no_external("lodash-es"));
+        assert!(r.is_no_external("lodash-es/debounce"));
+        assert!(r.is_no_external("@acme/ui"));
+        assert!(r.is_no_external("/app/node_modules/@acme/ui/dist/index.js"));
+        assert!(r.is_no_external("@tanstack/react-query"));
+        assert!(!r.is_no_external("react"));
+        assert_eq!(r.is_external("sharp", true), Some(true), "external wins");
+        assert_eq!(r.is_external("/app/node_modules/sharp/lib/index.js", true), Some(true));
+        assert_eq!(r.is_external("lodash-es", false), Some(false));
+        assert_eq!(r.is_external("/app/node_modules/react/index.js", true), Some(true));
+        assert_eq!(r.is_external("./local", false), None, "undecided until resolved");
+        assert_eq!(r.target.as_deref(), Some("node"));
+
+        let all = ssr_externals(&cfg(serde_json::json!({ "noExternal": true })));
+        assert!(all.no_external_all);
+        assert_eq!(all.is_external("/app/node_modules/react/index.js", true), Some(false));
+        let ext_all = ssr_externals(&cfg(serde_json::json!({ "noExternal": true, "external": true })));
+        assert_eq!(ext_all.is_external("react", false), Some(true));
+        let none = ssr_externals(&OjConfig::default());
+        assert_eq!(none.is_external("/app/node_modules/react/index.js", true), Some(true));
+        assert_eq!(none.is_external("react", false), None);
+    }
+
+    #[test]
+    fn package_names_from_specifiers_and_paths() {
+        assert_eq!(package_name_of("react").as_deref(), Some("react"));
+        assert_eq!(package_name_of("react/jsx-runtime").as_deref(), Some("react"));
+        assert_eq!(package_name_of("@scope/pkg/sub?x").as_deref(), Some("@scope/pkg"));
+        assert_eq!(package_name_of("/a/node_modules/x/node_modules/@s/p/i.js").as_deref(), Some("@s/p"));
+        assert_eq!(package_name_of(""), None);
+        assert_eq!(package_name_of("@scope"), None);
     }
 }

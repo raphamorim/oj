@@ -1878,6 +1878,7 @@ dependencies = [
  "oxc_span",
  "oxc_transformer",
  "proptest",
+ "regex",
  "rquickjs",
  "serde",
  "serde_json",

@@ -716,6 +716,33 @@ function withInlineMap(out) {
   }
 }
 
+// Vite's `ssr.noExternal`: dependencies the loader must transform itself (define,
+// import.meta.env, glob) instead of leaving to Node. Names, `@scope/*` globs,
+// RegExp sources, or everything (`true`); `external` names always stay Node's.
+const SSR_EXTERNALS = (() => {
+  try { return JSON.parse(process.env.OJ_SSR_EXTERNALS || "null"); } catch { return null; }
+})();
+function pkgNameOfPath(path) {
+  const i = path.lastIndexOf("/node_modules/");
+  if (i < 0) return null;
+  const parts = path.slice(i + "/node_modules/".length).split("/");
+  return parts[0]?.startsWith("@") ? (parts[1] ? `${parts[0]}/${parts[1]}` : null) : parts[0] || null;
+}
+function globMatch(pattern, value) {
+  if (!pattern.includes("*")) return pattern === value;
+  const re = new RegExp("^" + pattern.split("*").map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$");
+  return re.test(value);
+}
+function isNoExternalDep(path) {
+  if (!SSR_EXTERNALS) return false;
+  const pkg = pkgNameOfPath(path);
+  if (!pkg) return false;
+  if ((SSR_EXTERNALS.external || []).includes(pkg) || SSR_EXTERNALS.externalAll) return false;
+  if (SSR_EXTERNALS.noExternalAll) return true;
+  if ((SSR_EXTERNALS.noExternal || []).some((p) => globMatch(p, pkg))) return true;
+  return (SSR_EXTERNALS.noExternalRegex || []).some((src) => { try { return new RegExp(src).test(pkg); } catch { return false; } });
+}
+
 // oxc `lang` for a module url, or null for anything the transform does not own.
 function SRC_LANG_OF(clean) {
   if (clean.endsWith(".tsx")) return "tsx";
@@ -812,7 +839,9 @@ export function load(url, context, next) {
   // a CommonJS file (a `file:` package or a .cjs-style module keeps Node's
   // loader, whose lexer provides its named exports).
   const srcLang = SRC_LANG_OF(clean);
-  const ownsJs = srcLang === "js" && clean.startsWith("file:") && !clean.includes("/node_modules/")
+  const inDeps = clean.includes("/node_modules/");
+  const ownsJs = srcLang === "js" && clean.startsWith("file:")
+    && (!inDeps || isNoExternalDep(fileURLToPath(clean)))
     && !isCjsFile(fileURLToPath(clean));
   if (srcLang && (srcLang !== "js" || ownsJs)) {
     const path = fileURLToPath(clean);

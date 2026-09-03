@@ -2049,12 +2049,25 @@ pub(crate) async fn build_ssr(
     )
     .await;
 
+    // Vite's SSR externalization: `ssr.external` names stay external,
+    // `ssr.noExternal` matches are bundled (and so transformed), everything
+    // else resolving into node_modules is external.
+    let externals = Arc::new(oj_config::ssr_externals(&config));
+    let ext_rule = Arc::clone(&externals);
     let external = IsExternal::Fn(Some(Arc::new(
-        |spec: &str, _importer, is_resolved: bool| {
-            let ext = is_resolved && spec.contains("node_modules");
+        move |spec: &str, _importer, is_resolved: bool| {
+            let in_node_modules = is_resolved && spec.contains("node_modules");
+            let ext = ext_rule
+                .is_external(spec, in_node_modules)
+                .unwrap_or(false);
             Box::pin(async move { Ok(ext) })
         },
     )));
+    let ssr_platform = if externals.target.as_deref() == Some("webworker") {
+        Platform::Browser
+    } else {
+        Platform::Node
+    };
 
     let emit = Arc::new(EmitState::new(root.to_path_buf()));
     let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
@@ -2086,7 +2099,7 @@ pub(crate) async fn build_ssr(
             dir: Some(out_dir.display().to_string()),
             resolve: rolldown_resolve(root, &config, "ssr"),
             transform: transform_options(&config, is_production),
-            platform: Some(Platform::Node),
+            platform: Some(ssr_platform),
             external: Some(external),
             format: Some(OutputFormat::Esm),
             entry_filenames: Some(format!("{stem}.mjs").into()),
@@ -2198,8 +2211,12 @@ async fn build_server_fns(root: &Path, out_dir: &Path, mode: &str) -> anyhow::Re
     let entry_path = root.join("_oj_server_fns_entry.tsx");
     fs::write(&entry_path, OJ_SERVER_FNS_JS)?;
     let collected: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
-    let external = IsExternal::Fn(Some(Arc::new(|spec: &str, _i, resolved: bool| {
-        let ext = resolved && spec.contains("node_modules");
+    let ext_rule = Arc::new(oj_config::ssr_externals(&config));
+    let external = IsExternal::Fn(Some(Arc::new(move |spec: &str, _i, resolved: bool| {
+        let in_node_modules = resolved && spec.contains("node_modules");
+        let ext = ext_rule
+            .is_external(spec, in_node_modules)
+            .unwrap_or(false);
         Box::pin(async move { Ok(ext) })
     })));
     let result = async {

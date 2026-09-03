@@ -397,6 +397,15 @@ fn start_script_env(root: &Path, command: &str, mode: &str) -> Vec<(String, Stri
     if !defines.is_empty() {
         vars.push(("OJ_DEFINE".into(), serde_json::Value::Object(defines).to_string()));
     }
+    // `ssr.noExternal`/`external`, consumed by the SSR loader to transform (rather
+    // than hand to Node) the dependencies Vite would bundle.
+    let externals = oj_config::ssr_externals(&config);
+    if externals != oj_config::SsrExternals::default() {
+        vars.push((
+            "OJ_SSR_EXTERNALS".into(),
+            serde_json::to_string(&externals).unwrap_or_default(),
+        ));
+    }
     vars
 }
 
