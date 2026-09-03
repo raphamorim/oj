@@ -84,7 +84,7 @@ try {
     assert.match(r.b, /\/assets\/big-.*\.svg$/, "big svg is an emitted file url");
     assert.match(r.crlf, /^data:image\/svg\+xml,/, "a CRLF svg inlines too");
     assert.ok(!/[\r\n]/.test(r.crlf), "no line terminator survives in the data uri");
-    assert.match(r.crlf, /%3Crect/, "the CRLF svg kept its content");
+    assert.match(r.crlf, /%3crect/, "the CRLF svg kept its content");
     assert.match(r.bmp, /^data:image\/bmp;base64,/, "bmp inlines with its own mime type");
     assert.equal(errors.length, 0, `page errors: ${errors.join("|")}`);
   } finally {

@@ -643,21 +643,57 @@ fn export_default_url(url: &str) -> String {
     )
 }
 
+/// Vite's `svgToDataURL` (asset.ts): an SVG with `<text`, `<foreignObject` or
+/// nested quotes is base64 (any rewrite would be unsafe); otherwise the markup
+/// is trimmed, inter-tag whitespace dropped, double quotes turned single, and
+/// `% # < >` plus whitespace runs percent-encoded (`%20` keeps srcset valid).
+/// A backslash is encoded too, so the url is safe inside a `"…"` CSS string.
 fn svg_data_url(text: &str) -> String {
+    if text.contains("<text") || text.contains("<foreignObject") || has_nested_quotes(text) {
+        return format!("data:image/svg+xml;base64,{}", b64(text.as_bytes()));
+    }
     let mut out = String::with_capacity(text.len() + 16);
-    for ch in text.chars() {
+    let mut pending_ws = false;
+    for ch in text.trim().chars() {
+        if ch.is_whitespace() {
+            pending_ws = true;
+            continue;
+        }
+        if pending_ws {
+            // `>   <` collapses to `><`; any other whitespace run is one `%20`.
+            if !(ch == '<' && out.ends_with("%3e")) {
+                out.push_str("%20");
+            }
+            pending_ws = false;
+        }
         match ch {
             '%' => out.push_str("%25"),
             '#' => out.push_str("%23"),
-            '<' => out.push_str("%3C"),
-            '>' => out.push_str("%3E"),
+            '<' => out.push_str("%3c"),
+            '>' => out.push_str("%3e"),
             '\\' => out.push_str("%5C"),
             '"' => out.push('\''),
-            '\n' | '\r' | '\u{2028}' | '\u{2029}' => {}
             other => out.push(other),
         }
     }
     format!("data:image/svg+xml,{out}")
+}
+
+/// Vite's `nestedQuotesRE`: a double-quoted run containing a single quote, or
+/// the reverse, which the quote swap would corrupt.
+fn has_nested_quotes(text: &str) -> bool {
+    for (open, inner) in [('"', '\''), ('\'', '"')] {
+        let mut rest = text;
+        while let Some(start) = rest.find(open) {
+            let after = &rest[start + 1..];
+            let Some(end) = after.find(open) else { break };
+            if after[..end].contains(inner) {
+                return true;
+            }
+            rest = &after[end + 1..];
+        }
+    }
+    false
 }
 
 fn emit_or_inline(
@@ -669,14 +705,15 @@ fn emit_or_inline(
 ) -> anyhow::Result<String> {
     let path = std::path::Path::new(file);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    if (bytes.len() as u64) <= inline_limit && ext != "svg" {
+    // Vite's shouldInline: strictly below the limit.
+    if (bytes.len() as u64) < inline_limit && ext != "svg" {
         return Ok(export_default_url(&format!(
             "data:{};base64,{}",
             asset_mime(ext),
             b64(&bytes)
         )));
     }
-    if (bytes.len() as u64) <= inline_limit && ext == "svg" {
+    if (bytes.len() as u64) < inline_limit && ext == "svg" {
         let text = String::from_utf8_lossy(&bytes);
         return Ok(export_default_url(&svg_data_url(&text)));
     }
@@ -3470,7 +3507,7 @@ fn emit_html_asset(
     let ext = abs.extension().and_then(|s| s.to_str()).unwrap_or("");
     // Vite's shouldInline: never an .html, never a link icon/manifest, never an
     // svg addressed by fragment; otherwise anything under assetsInlineLimit.
-    if !no_inline && !ext.eq_ignore_ascii_case("html") && (data.len() as u64) <= opts.inline_limit && !(ext.eq_ignore_ascii_case("svg") && suffix.starts_with('#')) {
+    if !no_inline && !ext.eq_ignore_ascii_case("html") && (data.len() as u64) < opts.inline_limit && !(ext.eq_ignore_ascii_case("svg") && suffix.starts_with('#')) {
         if ext.eq_ignore_ascii_case("svg") {
             return Some(svg_data_url(&String::from_utf8_lossy(&data)));
         }
@@ -4479,7 +4516,8 @@ async fn build_library(
                 collected: Arc::clone(&collected_css),
                 root: root.to_path_buf(),
                 has_postcss: oj_server::has_postcss_config(root),
-                inline_limit: 4096,
+                // Vite inlines every asset of a library build.
+                inline_limit: u64::MAX,
                 client: true,
                 resolve: css_resolve_of(root, &config, "client"),
                 css_code_split: false,
@@ -4757,7 +4795,7 @@ fn emit_css_url(
     let ext = abs.extension().and_then(|s| s.to_str()).unwrap_or("");
     // Small assets referenced from CSS are inlined as in Vite (assetsInlineLimit),
     // except an svg with a fragment, which must stay a file to keep its `#id`.
-    if (data.len() as u64) <= opts.inline_limit && !suffix.starts_with('#') {
+    if (data.len() as u64) < opts.inline_limit && !suffix.starts_with('#') {
         if ext.eq_ignore_ascii_case("svg") {
             return Some(svg_data_url(&String::from_utf8_lossy(&data)));
         }
@@ -6293,18 +6331,20 @@ mod tests {
         assert!(!url.contains('\r'), "carriage return survived: {url}");
         assert!(!url.contains('\n'), "line feed survived: {url}");
         assert!(url.starts_with("data:image/svg+xml,"), "{url}");
-        assert!(url.contains("%3Crect/%3E"), "content lost: {url}");
+        assert!(url.contains("%3crect/%3e"), "content lost: {url}");
         assert!(parses(&export_default_url(&url)), "{url}");
     }
 
     #[test]
     fn svg_data_urls_encode_everything_that_would_break_the_url_or_the_literal() {
         let cases = [
-            ("<svg/>", "%3Csvg/%3E"),
-            ("<svg a=\"b\"/>", "%3Csvg a='b'/%3E"),
-            ("<svg>100%</svg>", "%3Csvg%3E100%25%3C/svg%3E"),
-            ("<svg fill=\"#fff\"/>", "%3Csvg fill='%23fff'/%3E"),
-            ("<svg>a\\b</svg>", "%3Csvg%3Ea%5Cb%3C/svg%3E"),
+            ("<svg/>", "%3csvg/%3e"),
+            ("<svg a=\"b\"/>", "%3csvg%20a='b'/%3e"),
+            ("<svg>100%</svg>", "%3csvg%3e100%25%3c/svg%3e"),
+            ("<svg fill=\"#fff\"/>", "%3csvg%20fill='%23fff'/%3e"),
+            ("<svg>a\\b</svg>", "%3csvg%3ea%5Cb%3c/svg%3e"),
+            // Vite: whitespace between tags is dropped, other runs become one %20.
+            ("  <svg>\n  <rect   x=\"1\"/>\n</svg>  ", "%3csvg%3e%3crect%20x='1'/%3e%3c/svg%3e"),
         ];
         for (svg, expected_tail) in cases {
             let url = svg_data_url(svg);
@@ -6314,9 +6354,21 @@ mod tests {
         // Line and paragraph separators are string-literal terminators too.
         for terminator in ["\u{2028}", "\u{2029}", "\r", "\n", "\r\n"] {
             let url = svg_data_url(&format!("<svg>{terminator}</svg>"));
-            assert_eq!(url, "data:image/svg+xml,%3Csvg%3E%3C/svg%3E");
+            assert_eq!(url, "data:image/svg+xml,%3csvg%3e%3c/svg%3e");
             assert!(parses(&export_default_url(&url)));
         }
+        // Text, foreignObject and nested quotes cannot be rewritten safely: base64 (Vite).
+        for svg in [
+            "<svg><text>hi</text></svg>",
+            "<svg><foreignObject/></svg>",
+            "<svg title=\"it's\"/>",
+            "<svg title='say \"hi\"'/>",
+        ] {
+            let url = svg_data_url(svg);
+            assert!(url.starts_with("data:image/svg+xml;base64,"), "{svg} -> {url}");
+            assert_eq!(url, format!("data:image/svg+xml;base64,{}", b64(svg.as_bytes())));
+        }
+        assert!(!has_nested_quotes("<svg a=\"b\" c='d'/>"), "separate quote styles are fine");
     }
 
     #[test]
