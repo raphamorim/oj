@@ -484,20 +484,40 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
         if build.out_dir.is_none() {
             build.out_dir = str_of("outDir");
         }
+        let bool_or_str = |k: &str| match vb.get(k) {
+            Some(serde_json::Value::Bool(b)) => Some(oj_config::BoolOrString::Bool(*b)),
+            Some(serde_json::Value::String(s)) => Some(oj_config::BoolOrString::Str(s.clone())),
+            _ => None,
+        };
         if build.sourcemap.is_none() {
-            build.sourcemap = bool_of("sourcemap");
+            build.sourcemap = bool_or_str("sourcemap");
         }
         if build.minify.is_none() {
-            build.minify = bool_of("minify");
+            build.minify = bool_or_str("minify");
         }
         if build.css_code_split.is_none() {
             build.css_code_split = bool_of("cssCodeSplit");
         }
         if build.target.is_none() {
-            build.target = str_of("target");
+            build.target = match vb.get("target") {
+                Some(serde_json::Value::String(s)) => Some(oj_config::StringOrList::One(s.clone())),
+                Some(serde_json::Value::Array(a)) => Some(oj_config::StringOrList::Many(
+                    a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+                )),
+                _ => None,
+            };
+        }
+        if build.empty_out_dir.is_none() {
+            build.empty_out_dir = bool_of("emptyOutDir");
+        }
+        if build.module_preload.is_none() {
+            build.module_preload = vb.get("modulePreload").filter(|v| !v.is_null()).cloned();
         }
         if build.ssr.is_none() {
-            build.ssr = str_of("ssr");
+            build.ssr = bool_or_str("ssr");
+        }
+        if build.ssr_manifest.is_none() {
+            build.ssr_manifest = bool_or_str("ssrManifest");
         }
     }
     if config.oxc.is_none() {
@@ -1331,18 +1351,49 @@ mod vite_values_tests {
         merge_vite_values(&mut config, v);
         let b = config.build.unwrap();
         assert_eq!(b.out_dir.as_deref(), Some("oj-out"), "oj.config wins");
-        assert_eq!(b.sourcemap, Some(true));
-        assert_eq!(b.minify, Some(false));
+        assert_eq!(b.sourcemap, Some(oj_config::BoolOrString::Bool(true)));
+        assert_eq!(b.minify, Some(oj_config::BoolOrString::Bool(false)));
         assert_eq!(b.css_code_split, Some(false));
-        assert_eq!(b.target.as_deref(), Some("es2020"));
-        assert_eq!(b.ssr.as_deref(), Some("src/server.ts"));
+        assert_eq!(b.target.as_ref().map(|t| t.to_vec()), Some(vec!["es2020".to_string()]));
+        assert_eq!(b.ssr, Some(oj_config::BoolOrString::Str("src/server.ts".into())));
+    }
+
+    #[test]
+    fn merge_adopts_ssr_block_and_ssr_manifest() {
+        let mut config = oj_config::OjConfig::default();
+        let v = ViteValues {
+            build: Some(serde_json::json!({ "ssr": true, "ssrManifest": true })),
+            ssr: Some(serde_json::json!({ "noExternal": ["ui-kit"], "target": "webworker" })),
+            ..Default::default()
+        };
+        merge_vite_values(&mut config, v);
+        assert_eq!(oj_config::ssr_manifest_name(&config).as_deref(), Some(".vite/ssr-manifest.json"));
+        let e = oj_config::ssr_externals(&config);
+        assert!(e.webworker() && !e.is_external_pkg("ui-kit"));
+    }
+
+    #[test]
+    fn merge_adopts_vite_string_variants_and_empty_out_dir() {
+        let mut config = oj_config::OjConfig::default();
+        let v = ViteValues {
+            build: Some(serde_json::json!({
+                "sourcemap": "hidden", "minify": "terser", "target": ["es2020", "safari14"],
+                "emptyOutDir": false
+            })),
+            ..Default::default()
+        };
+        merge_vite_values(&mut config, v);
+        assert_eq!(oj_config::build_sourcemap(&config), oj_config::Sourcemap::Hidden);
+        assert!(oj_config::build_minify(&config));
+        assert_eq!(oj_config::build_targets(&config), vec!["es2020", "safari14"]);
+        assert_eq!(config.build.unwrap().empty_out_dir, Some(false));
     }
 
     #[test]
     fn merge_ignores_build_values_of_the_wrong_shape() {
         let mut config = oj_config::OjConfig::default();
         let v = ViteValues {
-            build: Some(serde_json::json!({ "outDir": 3, "sourcemap": "inline", "target": ["es2020"] })),
+            build: Some(serde_json::json!({ "outDir": 3, "sourcemap": 7, "target": {"x": 1} })),
             ..Default::default()
         };
         merge_vite_values(&mut config, v);

@@ -1141,6 +1141,26 @@ fn preview_rel(path: &str, base: &str) -> Option<String> {
     })
 }
 
+/// Vite's html fallback for an extensionless preview request: a page's own
+/// `index.html` (`/nested/` and `/nested`), then `<path>.html`, then the SPA
+/// root `index.html`. Multi-page builds put pages in subdirectories, so serving
+/// the root page for `/nested/` would load the wrong page (and, with a relative
+/// base, break its `./assets/` URLs).
+fn preview_html_fallback(dir: &Path, rel: &str) -> PathBuf {
+    let rel = rel.trim_end_matches('/');
+    if !rel.is_empty() {
+        let dir_index = dir.join(rel).join("index.html");
+        if dir_index.is_file() {
+            return dir_index;
+        }
+        let sibling = dir.join(format!("{rel}.html"));
+        if sibling.is_file() {
+            return sibling;
+        }
+    }
+    dir.join("index.html")
+}
+
 async fn preview_serve(
     State(state): State<
         Arc<(
@@ -1164,7 +1184,7 @@ async fn preview_serve(
     let (target, ctype) = if file.is_file() {
         (file, content_type(ext))
     } else if ext.is_empty() {
-        (dir.join("index.html"), "text/html; charset=utf-8")
+        (preview_html_fallback(dir, &rel), "text/html; charset=utf-8")
     } else {
         return (StatusCode::NOT_FOUND, format!("oj: not found: {rel}")).into_response();
     };
@@ -5845,6 +5865,22 @@ mod tests {
             normalize(Path::new("/a/b/../c/./d.ts")),
             PathBuf::from("/a/c/d.ts")
         );
+    }
+
+    #[test]
+    fn preview_html_fallback_prefers_page_index_then_sibling_then_root() {
+        let dir = std::env::temp_dir().join(format!("oj-preview-fb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("index.html"), "root").unwrap();
+        std::fs::write(dir.join("nested/index.html"), "nested").unwrap();
+        std::fs::write(dir.join("about.html"), "about").unwrap();
+        assert_eq!(preview_html_fallback(&dir, "nested/"), dir.join("nested/index.html"));
+        assert_eq!(preview_html_fallback(&dir, "nested"), dir.join("nested/index.html"));
+        assert_eq!(preview_html_fallback(&dir, "about"), dir.join("about.html"));
+        assert_eq!(preview_html_fallback(&dir, "missing/route"), dir.join("index.html"));
+        assert_eq!(preview_html_fallback(&dir, ""), dir.join("index.html"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -33,6 +33,110 @@ fn define_value(v: &serde_json::Value) -> String {
     }
 }
 
+/// `build.sourcemap` resolved: Vite's `true` -> separate `.map` files, `"inline"`,
+/// `"hidden"` (maps written, no `sourceMappingURL` comment), default off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sourcemap {
+    Off,
+    File,
+    Inline,
+    Hidden,
+}
+
+pub fn build_sourcemap(config: &OjConfig) -> Sourcemap {
+    match config.build.as_ref().and_then(|b| b.sourcemap.as_ref()) {
+        None | Some(BoolOrString::Bool(false)) => Sourcemap::Off,
+        Some(BoolOrString::Bool(true)) => Sourcemap::File,
+        Some(BoolOrString::Str(s)) => match s.as_str() {
+            "inline" => Sourcemap::Inline,
+            "hidden" => Sourcemap::Hidden,
+            "false" => Sourcemap::Off,
+            _ => Sourcemap::File,
+        },
+    }
+}
+
+/// `build.minify`: Vite's default is on; a minifier name (`"oxc"`, `"esbuild"`,
+/// `"terser"`) selects the tool in Vite and just means "on" here.
+pub fn build_minify(config: &OjConfig) -> bool {
+    match config.build.as_ref().and_then(|b| b.minify.as_ref()) {
+        None => true,
+        Some(BoolOrString::Bool(b)) => *b,
+        Some(BoolOrString::Str(s)) => s != "false",
+    }
+}
+
+/// Vite 8's `'baseline-widely-available'` default target (constants.ts).
+pub const BASELINE_WIDELY_AVAILABLE: &[&str] =
+    &["chrome111", "edge111", "firefox114", "safari16.4", "ios16.4"];
+/// Vite's legacy `'modules'` target.
+pub const MODULES_TARGET: &[&str] = &["es2020", "edge88", "firefox78", "chrome87", "safari14"];
+
+/// `build.target` as the engine list oxc lowers to. Vite's named presets expand
+/// to their browser lists; unset means Vite's default baseline (Vite lowers to
+/// it by default too, oj used to emit `esnext`).
+pub fn build_targets(config: &OjConfig) -> Vec<String> {
+    let raw: Vec<String> = match config.build.as_ref().and_then(|b| b.target.as_ref()) {
+        None => vec!["baseline-widely-available".into()],
+        Some(t) => t.to_vec(),
+    };
+    let mut out = Vec::new();
+    for t in raw {
+        match t.as_str() {
+            "baseline-widely-available" => {
+                out.extend(BASELINE_WIDELY_AVAILABLE.iter().map(|s| s.to_string()))
+            }
+            "modules" => out.extend(MODULES_TARGET.iter().map(|s| s.to_string())),
+            _ => out.push(t),
+        }
+    }
+    out
+}
+
+/// Whether page entries get Vite's modulepreload polyfill: on unless
+/// `build.modulePreload` is `false` or `{ polyfill: false }`.
+pub fn module_preload_polyfill(config: &OjConfig) -> bool {
+    match config.build.as_ref().and_then(|b| b.module_preload.as_ref()) {
+        Some(serde_json::Value::Bool(false)) => false,
+        Some(serde_json::Value::Object(o)) => {
+            o.get("polyfill").and_then(|v| v.as_bool()) != Some(false)
+        }
+        _ => true,
+    }
+}
+
+
+/// The SSR entry `oj build` uses when none is given on the command line:
+/// `build.ssr` as a path, or with `build.ssr: true` the `rollupOptions.input`
+/// entry (Vite's contract).
+pub fn build_ssr_entry(config: &OjConfig) -> Result<Option<String>, String> {
+    match config.build.as_ref().and_then(|b| b.ssr.as_ref()) {
+        None | Some(BoolOrString::Bool(false)) => Ok(None),
+        Some(BoolOrString::Str(s)) => Ok(Some(s.clone())),
+        Some(BoolOrString::Bool(true)) => {
+            let input = rolldown_options(config).and_then(|ro| ro.get("input"));
+            let entry = match input {
+                Some(serde_json::Value::String(s)) => Some(s.clone()),
+                Some(serde_json::Value::Array(a)) => a.first().and_then(|v| v.as_str()).map(str::to_string),
+                Some(serde_json::Value::Object(o)) => o.values().next().and_then(|v| v.as_str()).map(str::to_string),
+                _ => None,
+            };
+            entry
+                .map(Some)
+                .ok_or_else(|| "build.ssr: true needs the SSR entry in build.rollupOptions.input".to_string())
+        }
+    }
+}
+
+/// `build.ssrManifest`: the manifest file name to write, if any.
+pub fn ssr_manifest_name(config: &OjConfig) -> Option<String> {
+    match config.build.as_ref().and_then(|b| b.ssr_manifest.as_ref()) {
+        None | Some(BoolOrString::Bool(false)) => None,
+        Some(BoolOrString::Bool(true)) => Some(".vite/ssr-manifest.json".to_string()),
+        Some(BoolOrString::Str(s)) => Some(s.clone()),
+    }
+}
+
 pub fn rolldown_options(config: &OjConfig) -> Option<&serde_json::Value> {
     let build = config.build.as_ref()?;
     build
@@ -231,10 +335,47 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
 }
 
 impl SsrExternals {
+    /// The package name of a bare specifier (`@scope/pkg/sub` -> `@scope/pkg`).
+    pub fn package_of(spec: &str) -> &str {
+        let mut parts = spec.splitn(3, '/');
+        let first = parts.next().unwrap_or(spec);
+        if first.starts_with('@') {
+            match parts.next() {
+                Some(second) => &spec[..first.len() + 1 + second.len()],
+                None => first,
+            }
+        } else {
+            first
+        }
+    }
+
+    /// The package name of a resolved `node_modules` path.
+    pub fn package_of_path(path: &str) -> Option<&str> {
+        let idx = path.rfind("node_modules/")?;
+        Some(Self::package_of(&path[idx + "node_modules/".len()..]))
+    }
+
+    /// `ssr.target: "webworker"`: as in Vite, every dependency is bundled.
+    pub fn webworker(&self) -> bool {
+        self.target.as_deref() == Some("webworker")
+    }
+
+    /// Whether a dependency (by package name) stays external to an SSR bundle.
+    /// `external` wins over `noExternal`; a webworker target bundles everything.
+    pub fn is_external_pkg(&self, pkg: &str) -> bool {
+        if self.external_all || self.external.iter().any(|e| e == pkg) {
+            return true;
+        }
+        if self.webworker() {
+            return false;
+        }
+        !self.is_no_external(pkg)
+    }
+
     /// Whether `noExternal` claims this specifier / package (so it is bundled
     /// and transformed rather than left to Node).
     pub fn is_no_external(&self, spec: &str) -> bool {
-        if self.no_external_all {
+        if self.no_external_all || self.webworker() {
             return true;
         }
         let pkg = package_name_of(spec);
@@ -550,6 +691,15 @@ fn evaluate(path: &Path, source: &str, command: &str, mode: &str) -> Result<Stri
             "{prelude}{script}\n\
              var __ojC = globalThis.__ojConfig;\n\
              if (typeof __ojC === 'function') __ojC = __ojC({env_arg});\n\
+             (function mark(o) {{\n\
+               if (!o || typeof o !== 'object') return;\n\
+               for (var k in o) {{\n\
+                 var v = o[k];\n\
+                 if (typeof v === 'function') o[k] = '__oj_fn__';\n\
+                 else if (v instanceof RegExp) o[k] = {{ __oj_regex__: v.source }};\n\
+                 else mark(v);\n\
+               }}\n\
+             }})(__ojC && __ojC.build && (__ojC.build.rolldownOptions || __ojC.build.rollupOptions));\n\
              JSON.stringify(__ojC ?? null)"
         );
         let result: rquickjs::Value = ctx.eval(full).map_err(|e| {
@@ -1129,5 +1279,114 @@ mod ssr_externals_tests {
         assert_eq!(package_name_of("/a/node_modules/x/node_modules/@s/p/i.js").as_deref(), Some("@s/p"));
         assert_eq!(package_name_of(""), None);
         assert_eq!(package_name_of("@scope"), None);
+    }
+}
+
+#[cfg(test)]
+mod build_option_tests {
+    use super::*;
+
+    fn cfg(json: &str) -> OjConfig {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn sourcemap_accepts_bool_and_vite_strings() {
+        assert_eq!(build_sourcemap(&cfg("{}")), Sourcemap::Off);
+        assert_eq!(build_sourcemap(&cfg(r#"{"build":{"sourcemap":true}}"#)), Sourcemap::File);
+        assert_eq!(build_sourcemap(&cfg(r#"{"build":{"sourcemap":false}}"#)), Sourcemap::Off);
+        assert_eq!(build_sourcemap(&cfg(r#"{"build":{"sourcemap":"inline"}}"#)), Sourcemap::Inline);
+        assert_eq!(build_sourcemap(&cfg(r#"{"build":{"sourcemap":"hidden"}}"#)), Sourcemap::Hidden);
+    }
+
+    #[test]
+    fn minify_accepts_bool_and_minifier_names() {
+        assert!(build_minify(&cfg("{}")));
+        assert!(!build_minify(&cfg(r#"{"build":{"minify":false}}"#)));
+        assert!(build_minify(&cfg(r#"{"build":{"minify":"terser"}}"#)));
+        assert!(build_minify(&cfg(r#"{"build":{"minify":"esbuild","terserOptions":{"compress":{}}}}"#)));
+    }
+
+    #[test]
+    fn target_expands_vite_presets_and_accepts_arrays() {
+        assert_eq!(build_targets(&cfg("{}")), BASELINE_WIDELY_AVAILABLE);
+        assert_eq!(build_targets(&cfg(r#"{"build":{"target":"es2015"}}"#)), vec!["es2015"]);
+        assert_eq!(build_targets(&cfg(r#"{"build":{"target":"modules"}}"#)), MODULES_TARGET);
+        assert_eq!(
+            build_targets(&cfg(r#"{"build":{"target":["es2020","safari14"]}}"#)),
+            vec!["es2020", "safari14"]
+        );
+    }
+
+    #[test]
+    fn module_preload_polyfill_defaults_on() {
+        assert!(module_preload_polyfill(&cfg("{}")));
+        assert!(!module_preload_polyfill(&cfg(r#"{"build":{"modulePreload":false}}"#)));
+        assert!(!module_preload_polyfill(&cfg(r#"{"build":{"modulePreload":{"polyfill":false}}}"#)));
+        assert!(module_preload_polyfill(&cfg(r#"{"build":{"modulePreload":{"polyfill":true}}}"#)));
+    }
+
+    #[test]
+    fn empty_out_dir_parses() {
+        assert_eq!(cfg(r#"{"build":{"emptyOutDir":false}}"#).build.unwrap().empty_out_dir, Some(false));
+        assert_eq!(cfg("{}").build.and_then(|b| b.empty_out_dir), None);
+    }
+}
+
+#[cfg(test)]
+mod ssr_option_tests {
+    use super::*;
+
+    fn cfg(json: &str) -> OjConfig {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn package_names_from_specifiers_and_paths() {
+        assert_eq!(SsrExternals::package_of("react"), "react");
+        assert_eq!(SsrExternals::package_of("react-dom/server"), "react-dom");
+        assert_eq!(SsrExternals::package_of("@scope/pkg/sub/x"), "@scope/pkg");
+        assert_eq!(SsrExternals::package_of("@scope/pkg"), "@scope/pkg");
+        assert_eq!(
+            SsrExternals::package_of_path("/app/node_modules/.pnpm/x/node_modules/@scope/pkg/dist/i.js"),
+            Some("@scope/pkg")
+        );
+        assert_eq!(SsrExternals::package_of_path("/app/src/x.js"), None);
+    }
+
+    #[test]
+    fn ssr_externals_follow_vite_precedence() {
+        let e = ssr_externals(&cfg("{}"));
+        assert!(e.is_external_pkg("react"), "deps are external by default");
+        let e = ssr_externals(&cfg(r#"{"ssr":{"noExternal":["ui-kit"],"external":["react"]}}"#));
+        assert!(!e.is_external_pkg("ui-kit"));
+        assert!(e.is_external_pkg("react"));
+        assert!(e.is_external_pkg("lodash"));
+        let e = ssr_externals(&cfg(r#"{"ssr":{"noExternal":true,"external":["react"]}}"#));
+        assert!(!e.is_external_pkg("lodash"), "noExternal: true bundles everything");
+        assert!(e.is_external_pkg("react"), "except explicit externals");
+        let e = ssr_externals(&cfg(r#"{"ssr":{"noExternal":"single"}}"#));
+        assert!(!e.is_external_pkg("single"));
+        let e = ssr_externals(&cfg(r#"{"ssr":{"target":"webworker"}}"#));
+        assert!(e.webworker() && !e.is_external_pkg("anything"));
+    }
+
+    #[test]
+    fn build_ssr_true_takes_the_rollup_input() {
+        assert_eq!(build_ssr_entry(&cfg("{}")), Ok(None));
+        assert_eq!(build_ssr_entry(&cfg(r#"{"build":{"ssr":"src/s.ts"}}"#)), Ok(Some("src/s.ts".into())));
+        assert_eq!(
+            build_ssr_entry(&cfg(r#"{"build":{"ssr":true,"rollupOptions":{"input":"src/entry-server.ts"}}}"#)),
+            Ok(Some("src/entry-server.ts".into()))
+        );
+        assert!(build_ssr_entry(&cfg(r#"{"build":{"ssr":true}}"#)).is_err());
+        assert_eq!(build_ssr_entry(&cfg(r#"{"build":{"ssr":false}}"#)), Ok(None));
+    }
+
+    #[test]
+    fn ssr_manifest_name_resolves() {
+        assert_eq!(ssr_manifest_name(&cfg("{}")), None);
+        assert_eq!(ssr_manifest_name(&cfg(r#"{"build":{"ssrManifest":true}}"#)), Some(".vite/ssr-manifest.json".into()));
+        assert_eq!(ssr_manifest_name(&cfg(r#"{"build":{"ssrManifest":"m.json"}}"#)), Some("m.json".into()));
     }
 }

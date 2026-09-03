@@ -21,18 +21,47 @@ use rolldown_plugin::{
     PluginContext, SharedLoadPluginContext, SharedTransformPluginContext,
 };
 
-fn ro_output_str(ro: Option<&serde_json::Value>, key: &str) -> Option<String> {
+/// Both config loaders replace a function-valued rollup option with this marker
+/// (the config is evaluated in a sandbox / a subprocess and travels as JSON, so
+/// the function itself cannot reach the bundler). oj warns instead of silently
+/// building without the option.
+const FN_MARKER: &str = "__oj_fn__";
+
+fn warn_fn_option(key: &str, hint: &str) {
+    eprintln!(
+        "oj build: (!) build.rollupOptions.{key} is a function, which oj cannot run (the \
+         config is serialized before the build); the option is ignored. {hint}"
+    );
+}
+
+fn is_fn_marker(v: &serde_json::Value) -> bool {
+    v.as_str() == Some(FN_MARKER)
+}
+
+fn ro_output(ro: Option<&serde_json::Value>) -> Option<&serde_json::Value> {
     let output = ro?.get("output")?;
-    let obj = if output.is_array() {
-        output.get(0)?
+    if output.is_array() {
+        output.get(0)
     } else {
-        output
-    };
-    obj.get(key)?.as_str().map(String::from)
+        Some(output)
+    }
+}
+
+fn ro_output_str(ro: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    let v = ro_output(ro)?.get(key)?;
+    if is_fn_marker(v) {
+        warn_fn_option(&format!("output.{key}"), "Use a pattern string such as \"assets/[name]-[hash].js\".");
+        return None;
+    }
+    v.as_str().map(String::from)
 }
 
 fn ro_external(ro: Option<&serde_json::Value>) -> Vec<String> {
     match ro.and_then(|v| v.get("external")) {
+        Some(serde_json::Value::String(s)) if s == FN_MARKER => {
+            warn_fn_option("external", "List the external specifiers as strings.");
+            Vec::new()
+        }
         Some(serde_json::Value::String(s)) => vec![s.clone()],
         Some(serde_json::Value::Array(a)) => a
             .iter()
@@ -89,29 +118,65 @@ fn re_escape(s: &str) -> String {
     out
 }
 
-fn manual_chunks(ro: Option<&serde_json::Value>) -> Option<rolldown_common::CodeSplittingMode> {
-    let output = ro?.get("output")?;
-    let output = if output.is_array() {
-        output.get(0)?
-    } else {
-        output
-    };
-    let map = output.get("manualChunks")?.as_object()?;
+/// Chunking from `output.advancedChunks` (rolldown's native form; wins when
+/// present) or the Rollup `output.manualChunks` object. A manualChunks value is a
+/// module id: a bare package name matches that package under `node_modules`, a
+/// `./`-relative or absolute path matches that source file (Rollup semantics).
+/// The function forms cannot cross the JSON boundary and produce a warning.
+fn manual_chunks(
+    ro: Option<&serde_json::Value>,
+    root: &Path,
+) -> Option<rolldown_common::CodeSplittingMode> {
+    let output = ro_output(ro)?;
+    if let Some(adv) = output.get("advancedChunks") {
+        if let Some(mode) = advanced_chunks(adv) {
+            return Some(mode);
+        }
+    }
+    let mc = output.get("manualChunks")?;
+    if is_fn_marker(mc) {
+        warn_fn_option(
+            "output.manualChunks",
+            "Use the object form ({ vendor: [\"react\"] }) or rolldown's output.advancedChunks groups.",
+        );
+        return None;
+    }
+    let map = mc.as_object()?;
     let mut groups = Vec::new();
     let mut priority = map.len() as u32;
     for (name, tokens) in map {
         let Some(arr) = tokens.as_array() else {
             continue;
         };
-        let escaped: Vec<String> = arr
-            .iter()
-            .filter_map(|t| t.as_str())
-            .map(re_escape)
-            .collect();
-        if escaped.is_empty() {
+        let mut packages: Vec<String> = Vec::new();
+        let mut paths: Vec<String> = Vec::new();
+        for t in arr.iter().filter_map(|t| t.as_str()) {
+            if t.starts_with("./") || t.starts_with("../") || Path::new(t).is_absolute() {
+                let abs = if Path::new(t).is_absolute() {
+                    PathBuf::from(t)
+                } else {
+                    root.join(t)
+                };
+                let abs = abs.canonicalize().unwrap_or(abs);
+                paths.push(re_escape(&abs.to_string_lossy()));
+            } else {
+                packages.push(re_escape(t));
+            }
+        }
+        let mut alts: Vec<String> = Vec::new();
+        if !packages.is_empty() {
+            alts.push(format!(
+                r"[\\/]node_modules[\\/]({})([\\/]|$)",
+                packages.join("|")
+            ));
+        }
+        if !paths.is_empty() {
+            alts.push(format!("^({})$", paths.join("|")));
+        }
+        if alts.is_empty() {
             continue;
         }
-        let pattern = format!(r"[\\/]node_modules[\\/]({})([\\/]|$)", escaped.join("|"));
+        let pattern = alts.join("|");
         let Ok(test) = rolldown_utils::js_regex::HybridRegex::new(&pattern) else {
             continue;
         };
@@ -134,6 +199,76 @@ fn manual_chunks(ro: Option<&serde_json::Value>) -> Option<rolldown_common::Code
     ))
 }
 
+/// rolldown `output.advancedChunks` from its JSON form. A group `test` is a
+/// regex source (a RegExp literal arrives as `{ __oj_regex__ }`, a string is
+/// taken as a regex like rolldown's own deserializer does); function tests and
+/// names are warned about and skipped.
+fn advanced_chunks(adv: &serde_json::Value) -> Option<rolldown_common::CodeSplittingMode> {
+    let obj = adv.as_object()?;
+    let f64_of = |k: &str| obj.get(k).and_then(|v| v.as_f64());
+    let u32_of = |k: &str| obj.get(k).and_then(|v| v.as_u64()).map(|n| n as u32);
+    let mut groups = Vec::new();
+    for g in obj.get("groups").and_then(|g| g.as_array()).into_iter().flatten() {
+        let Some(g) = g.as_object() else { continue };
+        let name = match g.get("name") {
+            Some(serde_json::Value::String(s)) if s == FN_MARKER => {
+                warn_fn_option("output.advancedChunks.groups[].name", "Use a static name.");
+                continue;
+            }
+            Some(serde_json::Value::String(s)) => s.clone(),
+            _ => continue,
+        };
+        let test = match g.get("test") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) if s == FN_MARKER => {
+                warn_fn_option("output.advancedChunks.groups[].test", "Use a RegExp or string.");
+                continue;
+            }
+            Some(serde_json::Value::String(s)) => Some(s.clone()),
+            Some(serde_json::Value::Object(o)) => o.get("__oj_regex__").and_then(|v| v.as_str()).map(str::to_string),
+            _ => None,
+        };
+        let test = match test {
+            Some(src) => match rolldown_utils::js_regex::HybridRegex::new(&src) {
+                Ok(re) => Some(rolldown_common::MatchGroupTest::Regex(re)),
+                Err(_) => {
+                    eprintln!("oj build: (!) advancedChunks group {name}: invalid test regex {src:?}; skipped");
+                    continue;
+                }
+            },
+            None => None,
+        };
+        let gf = |k: &str| g.get(k).and_then(|v| v.as_f64());
+        let gu = |k: &str| g.get(k).and_then(|v| v.as_u64()).map(|n| n as u32);
+        groups.push(rolldown_common::MatchGroup {
+            name: rolldown_common::MatchGroupName::Static(name),
+            test,
+            priority: gu("priority"),
+            min_size: gf("minSize"),
+            max_size: gf("maxSize"),
+            min_share_count: gu("minShareCount"),
+            min_module_size: gf("minModuleSize"),
+            max_module_size: gf("maxModuleSize"),
+            include_dependencies_recursively: g.get("includeDependenciesRecursively").and_then(|v| v.as_bool()),
+            ..Default::default()
+        });
+    }
+    if groups.is_empty() {
+        return None;
+    }
+    Some(rolldown_common::CodeSplittingMode::Advanced(
+        rolldown_common::ManualCodeSplittingOptions {
+            groups: Some(groups),
+            min_share_count: u32_of("minShareCount"),
+            min_size: f64_of("minSize"),
+            max_size: f64_of("maxSize"),
+            min_module_size: f64_of("minModuleSize"),
+            max_module_size: f64_of("maxModuleSize"),
+            include_dependencies_recursively: obj.get("includeDependenciesRecursively").and_then(|v| v.as_bool()),
+        },
+    ))
+}
+
 /// rolldown's oxc transform settings: `build.target`, and the JSX runtime /
 /// importSource / pragmas from `oxc.jsx` or `esbuild.jsx*` (what plugin-react's
 /// `jsxImportSource` becomes). `development` follows NODE_ENV as in Vite, so a
@@ -145,11 +280,7 @@ fn transform_options(
     let jsx = oj_config::jsx_settings(config);
     let classic = jsx.runtime.as_deref() == Some("classic");
     Some(rolldown_common::BundlerTransformOptions {
-        target: config
-            .build
-            .as_ref()
-            .and_then(|b| b.target.clone())
-            .map(rolldown_common::Either::Left),
+        target: Some(rolldown_common::Either::Right(oj_config::build_targets(config))),
         // `runtime` stays None unless configured: rolldown only merges the
         // tsconfig `compilerOptions.jsx`/`jsxFactory`/`jsxImportSource` into the
         // transform when no runtime is set, and a project configured that way
@@ -195,6 +326,68 @@ fn env_dir_of(root: &Path, config: &oj_config::OjConfig) -> PathBuf {
 
 fn env_prefixes_of(config: &oj_config::OjConfig) -> Vec<String> {
     oj_config::env_prefixes(config)
+}
+
+fn sourcemap_type(s: oj_config::Sourcemap) -> Option<SourceMapType> {
+    match s {
+        oj_config::Sourcemap::Off => None,
+        oj_config::Sourcemap::File => Some(SourceMapType::File),
+        oj_config::Sourcemap::Inline => Some(SourceMapType::Inline),
+        oj_config::Sourcemap::Hidden => Some(SourceMapType::Hidden),
+    }
+}
+
+/// `environments.<env>.build.sourcemap` (boolean) overrides the top-level setting.
+fn env_sourcemap(
+    config: &oj_config::OjConfig,
+    env: &str,
+    default: oj_config::Sourcemap,
+) -> Option<SourceMapType> {
+    match oj_config::environment_build_bool(config, env, "sourcemap") {
+        Some(true) => Some(SourceMapType::File),
+        Some(false) => None,
+        None => sourcemap_type(default),
+    }
+}
+
+/// Vite's `emptyOutDir` rule (watch.ts `resolveEmptyOutDir`, prepareOutDir.ts):
+/// unset means "empty it when it is inside the project root"; an outDir outside
+/// root is left alone with a warning unless `build.emptyOutDir` / `--emptyOutDir`
+/// says so. A `.git` directory inside outDir always survives.
+fn prepare_out_dir(root: &Path, out_dir: &Path, empty: Option<bool>) -> anyhow::Result<()> {
+    let empty = match empty {
+        Some(b) => b,
+        None => {
+            let inside = out_dir
+                .canonicalize()
+                .map(|o| o.starts_with(root))
+                .unwrap_or_else(|_| out_dir.starts_with(root));
+            if !inside && out_dir.exists() {
+                eprintln!(
+                    "oj build: (!) outDir {} is not inside project root and will not be emptied.\n\
+                     Use --emptyOutDir to override.",
+                    out_dir.display()
+                );
+            }
+            inside
+        }
+    };
+    if empty && out_dir.is_dir() {
+        for entry in fs::read_dir(out_dir)? {
+            let entry = entry?;
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            let p = entry.path();
+            if entry.file_type()?.is_dir() {
+                fs::remove_dir_all(&p)?;
+            } else {
+                fs::remove_file(&p)?;
+            }
+        }
+    }
+    fs::create_dir_all(out_dir)?;
+    Ok(())
 }
 
 fn is_build_asset(id: &str) -> bool {
@@ -1450,6 +1643,7 @@ pub async fn build(
     out: Option<PathBuf>,
     ssr: Option<String>,
     cli_mode: Option<&str>,
+    empty_out_dir_flag: bool,
 ) -> anyhow::Result<()> {
     let root = root
         .canonicalize()
@@ -1483,15 +1677,22 @@ pub async fn build(
     } else {
         root.join(&out)
     };
-    let minify = build_cfg.minify.unwrap_or(true);
-    let sourcemap = build_cfg.sourcemap.unwrap_or(false);
+    let minify = oj_config::build_minify(&config);
+    let sourcemap = oj_config::build_sourcemap(&config);
+    let empty_out_dir = if empty_out_dir_flag {
+        Some(true)
+    } else {
+        build_cfg.empty_out_dir
+    };
     let loaded_env = oj_env::load(&env_dir_of(&root, &config), mode);
     let env_prefixes = env_prefixes_of(&config);
     let env_prefix_refs: Vec<&str> = env_prefixes.iter().map(String::as_str).collect();
     let node_env = oj_env::resolve_node_env(shell_node_env().as_deref(), &loaded_env, "production");
     let is_production = node_env == "production";
 
-    if let Some(entry) = ssr.or_else(|| build_cfg.ssr.clone()) {
+    let config_ssr_entry =
+        oj_config::build_ssr_entry(&config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Some(entry) = ssr.or(config_ssr_entry) {
         return build_ssr_app(
             &root,
             &out_dir,
@@ -1500,6 +1701,7 @@ pub async fn build(
             minify,
             sourcemap,
             build_cfg.prerender.clone(),
+            empty_out_dir,
         )
         .await;
     }
@@ -1510,8 +1712,7 @@ pub async fn build(
 
     let base = normalize_base(config.base.as_deref().unwrap_or("/"));
 
-    let _ = fs::remove_dir_all(&out_dir);
-    fs::create_dir_all(&out_dir)?;
+    prepare_out_dir(&root, &out_dir, empty_out_dir)?;
 
     let started = Instant::now();
 
@@ -1642,7 +1843,7 @@ pub async fn build(
         .with_options(BundlerOptions {
             input: Some(inputs),
             transform: transform_options(&config, is_production),
-            code_splitting: manual_chunks(ro_opts),
+            code_splitting: manual_chunks(ro_opts, &root),
             cwd: Some(root.clone()),
             dir: Some(out_dir.display().to_string()),
             resolve: rolldown_resolve(&root, &config, "client"),
@@ -1664,9 +1865,7 @@ pub async fn build(
             minify: Some(RawMinifyOptions::Bool(
                 oj_config::environment_build_bool(&config, "client", "minify").unwrap_or(minify),
             )),
-            sourcemap: oj_config::environment_build_bool(&config, "client", "sourcemap")
-                .unwrap_or(sourcemap)
-                .then_some(SourceMapType::File),
+            sourcemap: env_sourcemap(&config, "client", sourcemap),
             define: Some({
                 let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &env_prefix_refs);
                 let mut pairs: Vec<(String, String)> = node_env_defines(&node_env);
@@ -1802,7 +2001,7 @@ pub async fn build(
     }
 
     // Non-split CSS is one combined stylesheet linked from every page.
-    let combined_css_link: Option<String> = if !css_split {
+    let combined_css_name: Option<String> = if !css_split {
         let mut css_entries = collected_css.lock().unwrap().clone();
         if css_entries.is_empty() {
             None
@@ -1831,14 +2030,36 @@ pub async fn build(
                     entry.css.push(css_name.clone());
                 }
             }
-            Some(format!(
-                "<link rel=\"stylesheet\" href=\"{}\" />",
-                with_base(&css_name, &base)
-            ))
+            Some(css_name)
         }
     } else {
         None
     };
+    // Split CSS is emitted once for the whole bundle; each page then links the
+    // stylesheets of its own entry chunks (a page-relative href when the base is
+    // relative).
+    let chunk_css: Vec<(String, String)> = if css_split {
+        emit_split_css_files(
+            &output,
+            &collected_css,
+            &out_dir,
+            &root,
+            &base,
+            &mut emitted,
+            &mut manifest_entries,
+        )?
+    } else {
+        Vec::new()
+    };
+    let mut all_sync_chunks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if let Some(name) = oj_config::ssr_manifest_name(&config) {
+        let manifest = ssr_manifest(&output, &root, &base, &chunk_css, &combined_css_name);
+        let dest = out_dir.join(&name);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&dest, serde_json::to_string_pretty(&manifest)?)?;
+    }
 
     // Pages a plugin emitted as `.html` chunks during the build are rendered
     // here alongside the statically-resolved input pages.
@@ -1849,14 +2070,19 @@ pub async fn build(
 
     for doc in &html_docs {
         let mut rewritten_html = oj_env::replace_html_env(&doc.src_html, &html_env);
+        let page_base = page_base(&base, &doc.out_rel);
         // Rewrite each `<script src>` to its hashed output chunk and collect
         // this page's own entry chunks (for modulepreload and split CSS).
         let mut doc_entry_files: Vec<String> = Vec::new();
         for s in &doc.scripts {
             if let Some(file) = facade_to_file.get(&s.abs) {
-                rewritten_html = rewritten_html.replace(&s.src, &with_base(file, &base));
+                rewritten_html = rewritten_html.replace(&s.src, &with_base(file, &page_base));
                 doc_entry_files.push(file.clone());
             }
+        }
+        for entry in &doc_entry_files {
+            all_sync_chunks.insert(entry.clone());
+            all_sync_chunks.extend(transitive_imports(entry, &imports_map));
         }
 
         // Inject <link rel="modulepreload"> for this page's transitively
@@ -1873,7 +2099,7 @@ pub async fn build(
                 .map(|f| {
                     format!(
                         "<link rel=\"modulepreload\" href=\"{}\" />",
-                        with_base(f, &base)
+                        with_base(f, &page_base)
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1900,21 +2126,17 @@ pub async fn build(
             }
         }
 
-        if let Some(link) = &combined_css_link {
-            rewritten_html = insert_before_head(&rewritten_html, link);
+        if let Some(css_name) = &combined_css_name {
+            let link = format!(
+                "<link rel=\"stylesheet\" href=\"{}\" />",
+                with_base(css_name, &page_base)
+            );
+            rewritten_html = insert_before_head(&rewritten_html, &link);
         } else if css_split {
-            emit_split_css(
-                &output,
-                &collected_css,
-                &doc_entry_files,
-                &imports_map,
-                &out_dir,
-                &root,
-                &base,
-                &mut emitted,
-                &mut manifest_entries,
-                &mut rewritten_html,
-            )?;
+            let links = split_css_links(&chunk_css, &doc_entry_files, &imports_map, &page_base);
+            if !links.is_empty() {
+                rewritten_html = insert_before_head(&rewritten_html, &links);
+            }
         }
 
         if let Some(host) = &plugin_host {
@@ -1928,6 +2150,21 @@ pub async fn build(
         }
         fs::write(&dest, rewritten_html)?;
     }
+
+    // Vite's build import analysis: wrap dynamic imports in `__vitePreload` so a
+    // lazy chunk's own dependencies and stylesheets load in parallel (and its
+    // CSS is applied before it runs), inject the modulepreload polyfill into
+    // page entries, and give async-only chunks a stylesheet fallback.
+    apply_preload_helper(
+        &output,
+        &out_dir,
+        &base,
+        &imports_map,
+        &chunk_css,
+        &all_sync_chunks,
+        &facade_to_file.values().cloned().collect::<Vec<_>>(),
+        oj_config::module_preload_polyfill(&config),
+    )?;
 
     fs::create_dir_all(out_dir.join(".vite"))?;
     fs::write(
@@ -2014,10 +2251,24 @@ fn normalize_input_entries(input: &serde_json::Value) -> Vec<(String, String)> {
 fn resolve_html_ref(src: &str, html_dir: &Path, root: &Path) -> PathBuf {
     let s = src.trim();
     let s = s.strip_prefix("./").unwrap_or(s);
-    match s.strip_prefix('/') {
+    let joined = match s.strip_prefix('/') {
         Some(rest) => root.join(rest),
         None => html_dir.join(s),
+    };
+    // Lexically resolve `..` so a page-relative `../src/x.js` matches the
+    // normalized facade id rolldown reports for the chunk (and its `<script>`
+    // tag gets rewritten).
+    let mut out = PathBuf::new();
+    for c in joined.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
     }
+    out
 }
 
 fn insert_before_head(html: &str, snippet: &str) -> String {
@@ -2059,7 +2310,7 @@ pub(crate) async fn build_ssr(
     out_dir: &Path,
     entry: &str,
     mode: &str,
-    sourcemap: bool,
+    sourcemap: oj_config::Sourcemap,
 ) -> anyhow::Result<()> {
     use rolldown::{IsExternal, Platform};
 
@@ -2097,25 +2348,37 @@ pub(crate) async fn build_ssr(
     )
     .await;
 
-    // Vite's SSR externalization: `ssr.external` names stay external,
-    // `ssr.noExternal` matches are bundled (and so transformed), everything
-    // else resolving into node_modules is external.
+    // Vite's SSR externalization: dependencies stay external unless
+    // `ssr.noExternal` (or a webworker target) bundles them; `ssr.external` wins.
     let externals = Arc::new(oj_config::ssr_externals(&config));
-    let ext_rule = Arc::clone(&externals);
-    let external = IsExternal::Fn(Some(Arc::new(
+    let external = IsExternal::Fn(Some(Arc::new({
+        let externals = Arc::clone(&externals);
+        let node_modules = root.join("node_modules");
         move |spec: &str, _importer, is_resolved: bool| {
-            let in_node_modules = is_resolved && spec.contains("node_modules");
-            let ext = ext_rule
-                .is_external(spec, in_node_modules)
-                .unwrap_or(false);
+            let ext = if is_resolved {
+                // Fallback for dependencies reached some other way (a plugin
+                // resolution, a nested node_modules); kept as their resolved path.
+                spec.contains("node_modules")
+                    && oj_config::SsrExternals::package_of_path(spec)
+                        .is_none_or(|pkg| externals.is_external_pkg(pkg))
+            } else {
+                // Externalize a dependency by its bare specifier, as Vite does, so the
+                // server bundle imports `react`, not an absolute path. Only a name that
+                // is an installed package qualifies; an alias or a plugin virtual that
+                // merely looks bare resolves and bundles as usual.
+                let bare = !spec.starts_with('.')
+                    && !spec.starts_with('/')
+                    && !spec.starts_with('\0')
+                    && !spec.contains(':');
+                bare && {
+                    let pkg = oj_config::SsrExternals::package_of(spec);
+                    externals.is_external_pkg(pkg)
+                        && node_modules.join(pkg).join("package.json").is_file()
+                }
+            };
             Box::pin(async move { Ok(ext) })
-        },
-    )));
-    let ssr_platform = if externals.target.as_deref() == Some("webworker") {
-        Platform::Browser
-    } else {
-        Platform::Node
-    };
+        }
+    })));
 
     let emit = Arc::new(EmitState::new(root.to_path_buf()));
     let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
@@ -2147,7 +2410,7 @@ pub(crate) async fn build_ssr(
             dir: Some(out_dir.display().to_string()),
             resolve: rolldown_resolve(root, &config, "ssr"),
             transform: transform_options(&config, is_production),
-            platform: Some(ssr_platform),
+            platform: Some(if externals.webworker() { Platform::Browser } else { Platform::Node }),
             external: Some(external),
             format: Some(OutputFormat::Esm),
             entry_filenames: Some(format!("{stem}.mjs").into()),
@@ -2155,9 +2418,7 @@ pub(crate) async fn build_ssr(
             minify: Some(RawMinifyOptions::Bool(
                 oj_config::environment_build_bool(&config, "ssr", "minify").unwrap_or(false),
             )),
-            sourcemap: oj_config::environment_build_bool(&config, "ssr", "sourcemap")
-                .unwrap_or(sourcemap)
-                .then_some(SourceMapType::File),
+            sourcemap: env_sourcemap(&config, "ssr", sourcemap),
             define: Some({
                 let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &env_prefix_refs);
                 let mut pairs = node_env_defines(&node_env);
@@ -2528,11 +2789,11 @@ pub(crate) async fn build_ssr_app(
     entry: &str,
     mode: &str,
     minify: bool,
-    sourcemap: bool,
+    sourcemap: oj_config::Sourcemap,
     prerender: Option<Vec<String>>,
+    empty_out_dir: Option<bool>,
 ) -> anyhow::Result<()> {
-    let _ = fs::remove_dir_all(out_dir);
-    fs::create_dir_all(out_dir)?;
+    prepare_out_dir(root, out_dir, empty_out_dir)?;
 
     build_ssr(root, out_dir, entry, mode, sourcemap).await?;
 
@@ -2596,7 +2857,7 @@ async fn build_client_entry(
     entry: &str,
     mode: &str,
     minify: bool,
-    sourcemap: bool,
+    sourcemap: oj_config::Sourcemap,
 ) -> anyhow::Result<(String, Option<String>)> {
     let entry_import = if entry.starts_with('.') {
         entry.to_string()
@@ -2664,9 +2925,7 @@ async fn build_client_entry(
             minify: Some(RawMinifyOptions::Bool(
                 oj_config::environment_build_bool(&config, "client", "minify").unwrap_or(minify),
             )),
-            sourcemap: oj_config::environment_build_bool(&config, "client", "sourcemap")
-                .unwrap_or(sourcemap)
-                .then_some(SourceMapType::File),
+            sourcemap: env_sourcemap(&config, "client", sourcemap),
             define: Some({
                 let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &env_prefix_refs);
                 let mut pairs = node_env_defines(&node_env);
@@ -2741,7 +3000,7 @@ async fn build_library(
     lib: oj_config::LibConfig,
     mode: &str,
     minify: bool,
-    sourcemap: bool,
+    sourcemap: oj_config::Sourcemap,
 ) -> anyhow::Result<()> {
     let node_env =
         oj_env::resolve_node_env(shell_node_env().as_deref(), &oj_env::load(root, mode), "production");
@@ -2760,8 +3019,7 @@ async fn build_library(
     });
     let formats = lib.formats.clone().unwrap_or_else(|| vec!["es".into()]);
 
-    let _ = fs::remove_dir_all(out_dir);
-    fs::create_dir_all(out_dir)?;
+    prepare_out_dir(root, out_dir, config.build.as_ref().and_then(|b| b.empty_out_dir))?;
     let started = Instant::now();
     let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let mut emitted: Vec<(String, usize)> = Vec::new();
@@ -2803,7 +3061,7 @@ async fn build_library(
                 entry_filenames: Some(format!("{file_name}.{ext}").into()),
                 chunk_filenames: Some(format!("{file_name}-[hash].{ext}").into()),
                 minify: Some(RawMinifyOptions::Bool(minify)),
-                sourcemap: sourcemap.then_some(SourceMapType::File),
+                sourcemap: sourcemap_type(sourcemap),
                 transform: transform_options(config, is_production),
                 define: Some(node_env_defines(&node_env).into_iter().collect()),
                 ..Default::default()
@@ -2857,9 +3115,12 @@ fn lib_format(fmt: &str) -> Option<(&'static str, bool)> {
     }
 }
 
+/// Vite's `base`: `""` and `"./"` mean a relative base (URLs are emitted relative
+/// to the page / stylesheet / chunk that references them, so the build can be
+/// served from any path or from `file://`); anything else is an absolute prefix.
 fn normalize_base(base: &str) -> String {
     if base.is_empty() || base == "./" {
-        return "/".to_string();
+        return "./".to_string();
     }
     let mut b = base.to_string();
     if !b.starts_with('/') {
@@ -2871,8 +3132,59 @@ fn normalize_base(base: &str) -> String {
     b
 }
 
+fn is_relative_base(base: &str) -> bool {
+    base == "./"
+}
+
+/// A public URL for an output file from a root-level page (or any consumer that
+/// sits at the outDir root).
 fn with_base(filename: &str, base: &str) -> String {
     format!("{base}{}", filename.trim_start_matches('/'))
+}
+
+/// The base to use from a page at `out_rel` (e.g. `nested/index.html`): with a
+/// relative base that is `../` per directory level, otherwise the absolute base.
+fn page_base(base: &str, out_rel: &str) -> String {
+    if !is_relative_base(base) {
+        return base.to_string();
+    }
+    let depth = out_rel.trim_start_matches('/').matches('/').count();
+    if depth == 0 {
+        "./".to_string()
+    } else {
+        "../".repeat(depth)
+    }
+}
+
+/// URL for an emitted `assets/…` file as referenced from a stylesheet that also
+/// lives in `assets/` (all of oj's emitted CSS does): relative bases become a
+/// sibling reference, absolute bases the public path.
+fn css_asset_url(name: &str, base: &str) -> String {
+    if is_relative_base(base) {
+        format!("./{}", name.strip_prefix("assets/").unwrap_or(name))
+    } else {
+        with_base(name, base)
+    }
+}
+
+/// `to` relative to the directory of `from` (both outDir-relative, `/`-separated).
+fn relative_chunk_path(from: &str, to: &str) -> String {
+    let from_dir: Vec<&str> = from.rsplit_once('/').map(|(d, _)| d.split('/').collect()).unwrap_or_default();
+    let to_parts: Vec<&str> = to.split('/').collect();
+    let common = from_dir
+        .iter()
+        .zip(to_parts.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut out = String::new();
+    for _ in common..from_dir.len() {
+        out.push_str("../");
+    }
+    if out.is_empty() {
+        out.push_str("./");
+    }
+    out.push_str(&to_parts[common..].join("/"));
+    out
 }
 
 /// All chunks reachable from `entry` via static imports (excludes `entry`).
@@ -2949,7 +3261,7 @@ fn emit_css_url(
     }
     std::fs::write(&dest, &data).ok()?;
     emitted.push((name.clone(), data.len()));
-    let url = with_base(&name, base);
+    let url = css_asset_url(&name, base);
     seen.insert(abs, url.clone());
     Some(format!("{url}{suffix}"))
 }
@@ -2998,42 +3310,29 @@ fn rebase_css_urls(
     out
 }
 
-/// `build.cssCodeSplit`: emit one stylesheet per chunk that imports CSS. The
-/// entry chunk and every chunk reachable from it via static imports get their
-/// CSS linked render-blocking in the HTML (no FOUC); async-only chunks carry a
-/// tiny injector that appends their stylesheet `<link>` when the chunk runs.
-#[allow(clippy::too_many_arguments)]
-fn emit_split_css(
+/// `build.cssCodeSplit`: emit one stylesheet per chunk that imports CSS and
+/// return `(chunk filename, css filename)` pairs. Which pages link which
+/// stylesheet render-blocking is decided per page by `split_css_links`; chunks
+/// only reached through dynamic imports get their CSS from `__vitePreload` (and
+/// a self-injecting fallback, see `apply_preload_helper`).
+fn emit_split_css_files(
     output: &rolldown::BundleOutput,
     collected_css: &Arc<Mutex<Vec<(String, String)>>>,
-    entry_files: &[String],
-    imports_map: &std::collections::HashMap<String, Vec<String>>,
     out_dir: &Path,
     root: &Path,
     base: &str,
     emitted: &mut Vec<(String, usize)>,
     manifest_entries: &mut [ManifestEntry],
-    rewritten_html: &mut String,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<(String, String)>> {
     let css_map: std::collections::HashMap<String, String> =
         collected_css.lock().unwrap().iter().cloned().collect();
+    let mut chunk_css: Vec<(String, String)> = Vec::new();
     if css_map.is_empty() {
-        return Ok(());
+        return Ok(chunk_css);
     }
     fs::create_dir_all(out_dir.join("assets"))?;
     let mut seen_assets: std::collections::HashMap<PathBuf, String> =
         std::collections::HashMap::new();
-
-    // Chunks reachable from an HTML entry through static imports only: their CSS
-    // is safe to link render-blocking. Anything else loads asynchronously.
-    let mut sync_chunks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for entry in entry_files {
-        sync_chunks.insert(entry.clone());
-        sync_chunks.extend(transitive_imports(entry, imports_map));
-    }
-
-    // chunk filename -> emitted css filename
-    let mut chunk_css: Vec<(String, String)> = Vec::new();
     for asset in &output.assets {
         let rolldown_common::Output::Chunk(chunk) = asset else {
             continue;
@@ -3077,47 +3376,233 @@ fn emit_split_css(
         }
         chunk_css.push((chunk.filename.to_string(), css_name));
     }
+    Ok(chunk_css)
+}
 
-    // Render-blocking links for entry + statically-imported chunk CSS.
+/// Render-blocking `<link rel=stylesheet>` tags for a page: the CSS of its entry
+/// chunks and of every chunk they reach through static imports (no FOUC).
+fn split_css_links(
+    chunk_css: &[(String, String)],
+    entry_files: &[String],
+    imports_map: &std::collections::HashMap<String, Vec<String>>,
+    page_base: &str,
+) -> String {
+    let mut sync_chunks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for entry in entry_files {
+        sync_chunks.insert(entry.clone());
+        sync_chunks.extend(transitive_imports(entry, imports_map));
+    }
     let mut linked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut links = String::new();
-    for (chunk_file, css_name) in &chunk_css {
+    for (chunk_file, css_name) in chunk_css {
         if sync_chunks.contains(chunk_file) && linked.insert(css_name.clone()) {
+            if !links.is_empty() {
+                links.push('\n');
+            }
             links.push_str(&format!(
-                "<link rel=\"stylesheet\" href=\"{}\" />\n",
-                with_base(css_name, base)
+                "<link rel=\"stylesheet\" href=\"{}\" />",
+                with_base(css_name, page_base)
             ));
         }
     }
-    if !links.is_empty() {
-        let links = links.trim_end();
-        *rewritten_html = match rewritten_html.find("</head>") {
-            Some(idx) => format!(
-                "{}{}\n{}",
-                &rewritten_html[..idx],
-                links,
-                &rewritten_html[idx..]
-            ),
-            None => format!("{links}\n{rewritten_html}"),
-        };
-    }
+    links
+}
 
-    // Async-only chunks self-inject their stylesheet when evaluated.
-    for (chunk_file, css_name) in &chunk_css {
-        if sync_chunks.contains(chunk_file) {
-            continue;
-        }
-        let path = out_dir.join(chunk_file);
-        let Ok(code) = fs::read_to_string(&path) else {
+/// Vite's `__vitePreload` helper (importAnalysisBuild.ts), ES2015 so it survives
+/// any `build.target`. `__vite__assetsURL` is generated per base: a relative base
+/// resolves deps against the importing chunk, an absolute base is prefixed.
+const PRELOAD_HELPER_JS: &str = r#"const __vite__scriptRel=(function(){var r=typeof document!=="undefined"&&document.createElement("link").relList;return r&&r.supports&&r.supports("modulepreload")?"modulepreload":"preload"})();const __vite__seen={};function __vitePreload(baseModule,deps,importerUrl){var promise=Promise.resolve();if(deps&&deps.length>0){var links=document.getElementsByTagName("link");var cspNonceMeta=document.querySelector("meta[property=csp-nonce]");var cspNonce=cspNonceMeta&&(cspNonceMeta.nonce||cspNonceMeta.getAttribute("nonce"));var allSettled=function(ps){return Promise.all(ps.map(function(p){return Promise.resolve(p).then(function(value){return{status:"fulfilled",value:value}},function(reason){return{status:"rejected",reason:reason}})}))};promise=allSettled(deps.map(function(dep){dep=new URL(__vite__assetsURL(dep,importerUrl),import.meta.url).href;if(dep in __vite__seen)return;__vite__seen[dep]=true;var isCss=dep.endsWith(".css");for(var i=links.length-1;i>=0;i--){var l=links[i];if(l.href===dep&&(!isCss||l.rel==="stylesheet"))return}var link=document.createElement("link");link.rel=isCss?"stylesheet":__vite__scriptRel;if(!isCss){link.as="script"}link.crossOrigin="";link.href=dep;if(cspNonce)link.setAttribute("nonce",cspNonce);document.head.appendChild(link);if(isCss){return new Promise(function(res,rej){link.addEventListener("load",res);link.addEventListener("error",function(){rej(new Error("Unable to preload CSS for "+dep))})})}}))}function handlePreloadError(err){var e=new Event("vite:preloadError",{cancelable:true});e.payload=err;window.dispatchEvent(e);if(!e.defaultPrevented)throw err}return promise.then(function(res){for(var i=0;i<(res||[]).length;i++){var item=res[i];if(item.status!=="rejected")continue;handlePreloadError(item.reason)}return baseModule().catch(handlePreloadError)})}"#;
+
+/// Vite's `vite/modulepreload-polyfill` (fetches `<link rel=modulepreload>` on
+/// browsers without native support), injected into page entry chunks.
+const MODULEPRELOAD_POLYFILL_JS: &str = r#"(function(){var relList=document.createElement("link").relList;if(relList&&relList.supports&&relList.supports("modulepreload"))return;for(var i=0,ls=document.querySelectorAll('link[rel="modulepreload"]');i<ls.length;i++)processPreload(ls[i]);new MutationObserver(function(mutations){for(var m=0;m<mutations.length;m++){var mutation=mutations[m];if(mutation.type!=="childList")continue;for(var n=0;n<mutation.addedNodes.length;n++){var node=mutation.addedNodes[n];if(node.tagName==="LINK"&&node.rel==="modulepreload")processPreload(node)}}}).observe(document,{childList:true,subtree:true});function getFetchOpts(link){var fetchOpts={};if(link.integrity)fetchOpts.integrity=link.integrity;if(link.referrerPolicy)fetchOpts.referrerPolicy=link.referrerPolicy;if(link.crossOrigin==="use-credentials")fetchOpts.credentials="include";else if(link.crossOrigin==="anonymous")fetchOpts.credentials="omit";else fetchOpts.credentials="same-origin";return fetchOpts}function processPreload(link){if(link.ep)return;link.ep=true;var fetchOpts=getFetchOpts(link);fetch(link.href,fetchOpts)}})();"#;
+
+/// Wrap each `import("./chunk.js")` in a chunk with `__vitePreload`, passing the
+/// dependency list Vite would (the lazy chunk, its statically imported chunks
+/// and their stylesheets, minus what the importer already has), prepend the
+/// modulepreload polyfill to page entries, and give async-only chunks that own
+/// CSS a self-injecting fallback link. Everything is prepended on the chunk's
+/// first line so existing sourcemap line numbers stay valid.
+#[allow(clippy::too_many_arguments)]
+fn apply_preload_helper(
+    output: &rolldown::BundleOutput,
+    out_dir: &Path,
+    base: &str,
+    imports_map: &std::collections::HashMap<String, Vec<String>>,
+    chunk_css: &[(String, String)],
+    sync_chunks: &std::collections::BTreeSet<String>,
+    page_entries: &[String],
+    polyfill: bool,
+) -> anyhow::Result<()> {
+    let css_of: std::collections::HashMap<&str, &str> = chunk_css
+        .iter()
+        .map(|(c, css)| (c.as_str(), css.as_str()))
+        .collect();
+    let relative = is_relative_base(base);
+    for asset in &output.assets {
+        let rolldown_common::Output::Chunk(chunk) = asset else {
             continue;
         };
-        let href = serde_json::Value::String(with_base(css_name, base));
-        let inject = format!(
-            "(function(){{var u={href};if(!document.querySelector('link[rel=\"stylesheet\"][href=\"'+u+'\"]')){{var l=document.createElement('link');l.rel='stylesheet';l.href=u;document.head.appendChild(l);}}}})();\n"
-        );
-        fs::write(&path, format!("{inject}{code}"))?;
+        let file = chunk.filename.to_string();
+        let path = out_dir.join(&file);
+        let Ok(mut code) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut prefix = String::new();
+
+        if polyfill && page_entries.iter().any(|e| e == &file) {
+            prefix.push_str(MODULEPRELOAD_POLYFILL_JS);
+        }
+
+        let mut dep_list: Vec<String> = Vec::new();
+        let mut wrapped = false;
+        if !chunk.dynamic_imports.is_empty() {
+            let own: std::collections::BTreeSet<String> = std::iter::once(file.clone())
+                .chain(transitive_imports(&file, imports_map))
+                .collect();
+            for target in &chunk.dynamic_imports {
+                let target = target.to_string();
+                let rel = relative_chunk_path(&file, &target);
+                let mut deps: Vec<String> = Vec::new();
+                let closure: Vec<String> = std::iter::once(target.clone())
+                    .chain(transitive_imports(&target, imports_map))
+                    .collect();
+                for c in &closure {
+                    if own.contains(c) {
+                        continue;
+                    }
+                    deps.push(c.clone());
+                    if let Some(css) = css_of.get(c.as_str()) {
+                        deps.push(css.to_string());
+                    }
+                }
+                // Only the chunk itself: `import()` fetches it anyway.
+                if deps.len() <= 1 {
+                    deps.clear();
+                }
+                let mut idx: Vec<String> = Vec::new();
+                for d in deps {
+                    let d = if relative {
+                        relative_chunk_path(&file, &d)
+                    } else {
+                        d
+                    };
+                    let i = match dep_list.iter().position(|x| x == &d) {
+                        Some(i) => i,
+                        None => {
+                            dep_list.push(d);
+                            dep_list.len() - 1
+                        }
+                    };
+                    idx.push(i.to_string());
+                }
+                // rolldown's minifier may emit the specifier in any quote style.
+                for quote in ['"', '\'', '`'] {
+                    let needle = format!("import({quote}{rel}{quote})");
+                    if code.contains(&needle) {
+                        let replacement = format!(
+                            "__vitePreload(function(){{return import({quote}{rel}{quote})}},__vite__mapDeps([{}]),import.meta.url)",
+                            idx.join(",")
+                        );
+                        code = code.replace(&needle, &replacement);
+                        wrapped = true;
+                    }
+                }
+            }
+        }
+        if wrapped {
+            let assets_url = if relative {
+                "function(dep,importerUrl){return new URL(dep,importerUrl).href}".to_string()
+            } else {
+                format!(
+                    "function(dep){{return {}+dep}}",
+                    serde_json::Value::String(base.to_string())
+                )
+            };
+            prefix.push_str(&format!(
+                "const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f={})))=>i.map(i=>d[i]);const __vite__assetsURL={assets_url};{PRELOAD_HELPER_JS}",
+                serde_json::Value::Array(
+                    dep_list
+                        .iter()
+                        .map(|d| serde_json::Value::String(d.clone()))
+                        .collect()
+                )
+            ));
+        }
+
+        // Async-only chunks with CSS: a fallback for dynamic imports the rewrite
+        // above could not see (variable specifiers), idempotent against preload.
+        if !sync_chunks.contains(&file) {
+            if let Some(css_name) = css_of.get(file.as_str()) {
+                let href = serde_json::Value::String(if relative {
+                    relative_chunk_path(&file, css_name)
+                } else {
+                    with_base(css_name, base)
+                });
+                // Compare resolved URLs (`link.href` is absolute), so a link the
+                // preload helper or the page already added is recognized.
+                prefix.push_str(&format!(
+                    "(function(){{var u=new URL({href},import.meta.url).href;var ls=document.getElementsByTagName('link');for(var i=0;i<ls.length;i++){{if(ls[i].rel==='stylesheet'&&ls[i].href===u)return}}var l=document.createElement('link');l.rel='stylesheet';l.href=u;document.head.appendChild(l)}})();"
+                ));
+            }
+        }
+
+        if !prefix.is_empty() {
+            fs::write(&path, format!("{prefix}{code}"))?;
+        }
     }
     Ok(())
+}
+
+/// Vite's `ssr-manifest.json` (ssrManifestPlugin): for every source module in the
+/// client bundle, the public URLs a server renderer should preload when that
+/// module renders: the module's chunk (non-entry chunks only; entries are already
+/// in the HTML) and that chunk's stylesheet. Keys are root-relative paths.
+fn ssr_manifest(
+    output: &rolldown::BundleOutput,
+    root: &Path,
+    base: &str,
+    chunk_css: &[(String, String)],
+    combined_css: &Option<String>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let css_of: std::collections::HashMap<&str, &str> = chunk_css
+        .iter()
+        .map(|(c, css)| (c.as_str(), css.as_str()))
+        .collect();
+    let mut manifest = serde_json::Map::new();
+    for asset in &output.assets {
+        let rolldown_common::Output::Chunk(chunk) = asset else {
+            continue;
+        };
+        let file = chunk.filename.to_string();
+        let mut urls: Vec<serde_json::Value> = Vec::new();
+        if !chunk.is_entry {
+            urls.push(with_base(&file, base).into());
+            if let Some(css) = css_of.get(file.as_str()) {
+                urls.push(with_base(css, base).into());
+            }
+        } else if let Some(css) = combined_css {
+            urls.push(with_base(css, base).into());
+        }
+        for module_id in &chunk.modules.keys {
+            let mid = module_id.to_string();
+            let Ok(rel) = Path::new(&mid).strip_prefix(root) else {
+                continue;
+            };
+            let key = rel.to_string_lossy().replace('\\', "/");
+            let entry = manifest
+                .entry(key)
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            if let Some(list) = entry.as_array_mut() {
+                for u in &urls {
+                    if !list.contains(u) {
+                        list.push(u.clone());
+                    }
+                }
+            }
+        }
+    }
+    manifest
 }
 
 struct ManifestEntry {
@@ -3314,6 +3799,11 @@ mod tests {
             resolve_html_ref("./index.tsx", page_dir, root),
             PathBuf::from("/proj/src/pages/options/index.tsx")
         );
+        // `..` is resolved lexically so the path matches rolldown's facade id.
+        assert_eq!(
+            resolve_html_ref("../../main.tsx", page_dir, root),
+            PathBuf::from("/proj/src/main.tsx")
+        );
         assert_eq!(
             resolve_html_ref("main.tsx", page_dir, root),
             PathBuf::from("/proj/src/pages/options/main.tsx")
@@ -3436,13 +3926,27 @@ mod tests {
     #[test]
     fn base_normalization_and_application() {
         assert_eq!(normalize_base("/"), "/");
-        assert_eq!(normalize_base(""), "/");
-        assert_eq!(normalize_base("./"), "/");
+        assert_eq!(normalize_base(""), "./");
+        assert_eq!(normalize_base("./"), "./");
         assert_eq!(normalize_base("app"), "/app/");
         assert_eq!(normalize_base("/app"), "/app/");
         assert_eq!(normalize_base("/app/"), "/app/");
         assert_eq!(with_base("assets/x-h.js", "/"), "/assets/x-h.js");
         assert_eq!(with_base("assets/x-h.js", "/app/"), "/app/assets/x-h.js");
+        assert_eq!(with_base("assets/x-h.js", "./"), "./assets/x-h.js");
+    }
+
+    #[test]
+    fn relative_base_is_computed_per_page_stylesheet_and_chunk() {
+        assert_eq!(page_base("/app/", "nested/index.html"), "/app/");
+        assert_eq!(page_base("./", "index.html"), "./");
+        assert_eq!(page_base("./", "nested/index.html"), "../");
+        assert_eq!(page_base("./", "a/b/index.html"), "../../");
+        assert_eq!(css_asset_url("assets/img-h.png", "./"), "./img-h.png");
+        assert_eq!(css_asset_url("assets/img-h.png", "/app/"), "/app/assets/img-h.png");
+        assert_eq!(relative_chunk_path("assets/main-h.js", "assets/lazy-h.js"), "./lazy-h.js");
+        assert_eq!(relative_chunk_path("main-h.js", "assets/lazy-h.js"), "./assets/lazy-h.js");
+        assert_eq!(relative_chunk_path("assets/a/main-h.js", "assets/lazy-h.js"), "../lazy-h.js");
     }
 
     #[test]

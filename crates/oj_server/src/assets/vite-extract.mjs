@@ -192,22 +192,41 @@ function extractBuild(b) {
   if (!b || typeof b !== "object") return null;
   const out = {};
   if (typeof b.outDir === "string") out.outDir = b.outDir;
-  if (typeof b.sourcemap === "boolean") out.sourcemap = b.sourcemap;
-  else if (typeof b.sourcemap === "string") {
-    warn(`build.sourcemap "${b.sourcemap}" is applied as a regular sourcemap`);
-    out.sourcemap = true;
-  }
-  if (typeof b.minify === "boolean") out.minify = b.minify;
-  else if (typeof b.minify === "string") out.minify = true;
+  if (typeof b.sourcemap === "boolean" || typeof b.sourcemap === "string") out.sourcemap = b.sourcemap;
+  if (typeof b.minify === "boolean" || typeof b.minify === "string") out.minify = b.minify;
+  if (b.terserOptions) warn("build.terserOptions is not applied (oj minifies with oxc)");
   if (typeof b.cssCodeSplit === "boolean") out.cssCodeSplit = b.cssCodeSplit;
-  if (typeof b.target === "string") {
-    if (b.target !== "modules" && b.target !== "baseline-widely-available") out.target = b.target;
-  } else if (Array.isArray(b.target)) {
-    warn("build.target array form is not applied; set a single target");
+  if (typeof b.target === "string") out.target = b.target;
+  else if (Array.isArray(b.target)) out.target = b.target.filter((t) => typeof t === "string");
+  else if (b.target === false) warn("build.target false is not supported; the default baseline is used");
+  if (typeof b.emptyOutDir === "boolean") out.emptyOutDir = b.emptyOutDir;
+  if (b.modulePreload === false) out.modulePreload = false;
+  else if (b.modulePreload && typeof b.modulePreload === "object") {
+    if (typeof b.modulePreload.resolveDependencies === "function") {
+      warn("build.modulePreload.resolveDependencies is a function and cannot be applied");
+    }
+    if (typeof b.modulePreload.polyfill === "boolean") out.modulePreload = { polyfill: b.modulePreload.polyfill };
   }
-  if (typeof b.ssr === "string") out.ssr = b.ssr;
+  if (typeof b.ssr === "string" || typeof b.ssr === "boolean") out.ssr = b.ssr;
+  if (typeof b.ssrManifest === "string" || typeof b.ssrManifest === "boolean") out.ssrManifest = b.ssrManifest;
   return Object.keys(out).length ? out : null;
 }
+
+// rollup/rolldown options travel as JSON. A function (manualChunks, *FileNames,
+// external) or RegExp cannot; mark them so oj warns instead of silently
+// dropping the option.
+function markFunctions(v) {
+  if (typeof v === "function") return "__oj_fn__";
+  if (v instanceof RegExp) return { __oj_regex__: v.source };
+  if (Array.isArray(v)) return v.map(markFunctions);
+  if (v && typeof v === "object") {
+    const out = {};
+    for (const [k, x] of Object.entries(v)) out[k] = markFunctions(x);
+    return out;
+  }
+  return v;
+}
+
 
 const JSX_ESBUILD_KEYS = ["jsx", "jsxImportSource", "jsxFactory", "jsxFragment"];
 function extractOxc(oxc) {
@@ -329,7 +348,7 @@ if (isMainRun) try {
       alias: extractAlias(c.resolve?.alias),
       headers: stringMap(c.server?.headers),
       proxy: extractProxy(c.server?.proxy),
-      rollupOptions: c.build?.rolldownOptions ?? c.build?.rollupOptions ?? null,
+      rollupOptions: markFunctions(c.build?.rolldownOptions ?? c.build?.rollupOptions ?? null),
       assetsInlineLimit:
         typeof c.build?.assetsInlineLimit === "number" ? c.build.assetsInlineLimit : null,
       dedupe: Array.isArray(c.resolve?.dedupe)

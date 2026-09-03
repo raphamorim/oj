@@ -38,6 +38,13 @@ pub struct OjConfig {
     pub ssr: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum BoolOrString {
+    Bool(bool),
+    Str(String),
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum StringOrList {
@@ -203,11 +210,26 @@ pub struct ResolveConfig {
 #[serde(default, rename_all = "camelCase")]
 pub struct BuildConfig {
     pub out_dir: Option<String>,
-    pub target: Option<String>,
-    pub minify: Option<bool>,
-    pub sourcemap: Option<bool>,
+    /// `build.target`: an esbuild/oxc target string or array, or Vite's
+    /// `"baseline-widely-available"` / `"modules"` names (see `build_targets`).
+    pub target: Option<StringOrList>,
+    /// `true`/`false`, or a minifier name (`"oxc"`, `"esbuild"`, `"terser"`),
+    /// which all mean "minify" (oj minifies with oxc).
+    pub minify: Option<BoolOrString>,
+    /// `true`/`false`, or `"inline"` / `"hidden"` (see `build_sourcemap`).
+    pub sourcemap: Option<BoolOrString>,
+    /// Vite's `build.emptyOutDir`: unset means "empty when outDir is inside root".
+    pub empty_out_dir: Option<bool>,
+    /// Accepted for compatibility; oj minifies with oxc, so this is ignored.
+    pub terser_options: Option<serde_json::Value>,
+    /// Vite's `build.modulePreload`: `false`, or `{ polyfill: bool }` (the
+    /// `resolveDependencies` function cannot be carried; it is ignored).
+    pub module_preload: Option<serde_json::Value>,
     pub lib: Option<LibConfig>,
-    pub ssr: Option<String>,
+    /// SSR entry: a path, or `true` to use `rollupOptions.input` (Vite).
+    pub ssr: Option<BoolOrString>,
+    /// Vite's `build.ssrManifest`: `true` for `.vite/ssr-manifest.json`, or a file name.
+    pub ssr_manifest: Option<BoolOrString>,
     pub prerender: Option<Vec<String>>,
     pub rollup_options: Option<serde_json::Value>,
     pub rolldown_options: Option<serde_json::Value>,

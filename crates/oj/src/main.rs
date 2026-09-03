@@ -65,6 +65,9 @@ enum Command {
         /// Use this vite.config instead of the one found in the root.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Empty outDir even when it is outside the project root (Vite's --emptyOutDir).
+        #[arg(long = "emptyOutDir")]
+        empty_out_dir: bool,
     },
     Preview {
         root: Option<PathBuf>,
@@ -146,6 +149,7 @@ async fn run() -> anyhow::Result<()> {
             ssr,
             mode,
             config,
+            empty_out_dir,
         } => {
             let root = root.unwrap_or_else(|| {
                 let playground = PathBuf::from("playground");
@@ -160,7 +164,7 @@ async fn run() -> anyhow::Result<()> {
                 let mode = mode.unwrap_or_else(|| "production".to_string());
                 start_dev::start_build(root, &mode).await
             } else {
-                build::build(root, out, ssr, mode.as_deref()).await
+                build::build(root, out, ssr, mode.as_deref(), empty_out_dir).await
             }
         }
         Command::Preview {
