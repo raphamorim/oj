@@ -2789,10 +2789,14 @@ async fn ensure_module(
     // gated to app source (deps in node_modules never need it) and reached only on a
     // cold module (the mtime cache above short-circuits warm ones), so it adds no
     // per-request RPC on the warm path, and nothing at all when no plugin has `load`.
-    let dep_wants_load = is_dep_early && {
-        let path = file.to_string_lossy();
-        state.dep_load_res.iter().any(|re| re.is_match(&path))
-    };
+    // An `optimizeDeps.exclude`d package is one Vite never pre-bundles, so its
+    // files go through every plugin's `load`/`transform` there like app source;
+    // the other deps stand in for Vite's pre-bundled ones, which no plugin sees.
+    let dep_wants_load = is_dep_early
+        && (pkg_bundle::is_excluded(file) || {
+            let path = file.to_string_lossy();
+            state.dep_load_res.iter().any(|re| re.is_match(&path))
+        });
     let plugin_loaded = if state.plugins_have_load && (!is_dep_early || dep_wants_load) {
         match &state.plugins {
             Some(host) => {
@@ -2935,8 +2939,9 @@ async fn ensure_module(
     let is_dep = is_dep_module(url, file);
     let mut plugin_watch_files: Vec<String> = Vec::new();
     let mut plugin_maps: Vec<String> = Vec::new();
-    let dep_wants_transform =
-        is_dep && state.dep_transform_res.iter().any(|re| re.is_match(&source));
+    let dep_wants_transform = is_dep
+        && (pkg_bundle::is_excluded(file)
+            || state.dep_transform_res.iter().any(|re| re.is_match(&source)));
     let source = match &state.plugins {
         Some(host) if state.plugins_have_transform && (!is_dep || dep_wants_transform) => {
             let resolved =
