@@ -13,6 +13,20 @@ const CONFIG_FILES = [
 ];
 
 const hookHandler = (h) => (typeof h === "function" ? h : typeof h?.handler === "function" ? h.handler : null);
+// Vite fails a module whose plugin hook throws, naming the plugin; the loader
+// surfaces this as the request's error instead of silently skipping the plugin.
+function pluginError(e, plugin, id) {
+  const err = e instanceof Error ? e : new Error((e && e.message) || String(e));
+  if (err.ojDecorated) return err;
+  const loc = err.loc && typeof err.loc === "object" ? err.loc : null;
+  const where = (loc && loc.file) || err.id || id || "";
+  const line = loc ? loc.line : err.line;
+  err.message = `[plugin:${plugin?.name || "unknown"}] ${err.message}` +
+    (where ? `\n${where}${line != null ? `:${line}` : ""}` : "") +
+    (typeof err.frame === "string" && err.frame ? `\n${err.frame}` : "");
+  err.ojDecorated = true;
+  return err;
+}
 const hookFilter = (h) => (typeof h === "object" && h ? h.filter : undefined);
 
 const ojReimplemented = (name = "") =>
@@ -39,10 +53,43 @@ function envAllows(plugin, environment) {
   }
 }
 
+// Vite's pluginFilter: a string id filter is a picomatch glob joined to cwd (unless
+// it starts with `**` or is absolute); a RegExp is tested on the slash-normalized id.
+const slash = (p) => p.replace(/\\/g, "/");
+function globToRegExpSource(glob) {
+  let re = "";
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === "*") {
+      if (glob[i + 1] === "*") {
+        i++;
+        if (glob[i + 1] === "/") { i++; re += "(?:.*/)?"; } else re += ".*";
+      } else re += "[^/]*";
+    } else if (c === "?") re += "[^/]";
+    else if (c === "{") {
+      const j = glob.indexOf("}", i);
+      if (j > i) { re += "(?:" + glob.slice(i + 1, j).split(",").map(globToRegExpSource).join("|") + ")"; i = j; }
+      else re += "\\{";
+    } else if (c === "[") {
+      const j = glob.indexOf("]", i);
+      if (j > i) { let cls = glob.slice(i + 1, j); if (cls[0] === "!") cls = "^" + cls.slice(1); re += "[" + cls + "]"; i = j; }
+      else re += "\\[";
+    } else if (c === "\\" && i + 1 < glob.length) re += "\\" + glob[++i];
+    else re += c.replace(/[.+^$()|]/g, "\\$&");
+  }
+  return re;
+}
+const idGlobCache = new Map();
 function matchOne(pat, id) {
-  if (pat instanceof RegExp) return pat.test(id);
-  if (typeof pat === "string") return id.includes(pat);
-  return false;
+  if (pat instanceof RegExp) { const r = pat.test(slash(id)); pat.lastIndex = 0; return r; }
+  if (typeof pat !== "string") return false;
+  let re = idGlobCache.get(pat);
+  if (!re) {
+    const glob = pat.startsWith("**") || pat.startsWith("/") ? slash(pat) : slash(join(process.env.OJ_APP_ROOT ?? process.cwd(), pat));
+    re = new RegExp("^" + globToRegExpSource(glob) + "$");
+    idGlobCache.set(pat, re);
+  }
+  return re.test(slash(id));
 }
 function idAllowed(filter, id) {
   if (!filter) return true;
@@ -147,7 +194,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
       const h = hookHandler(p.resolveId);
       if (!h || !idAllowed(hookFilter(p.resolveId), id)) continue;
       let r;
-      try { r = await h.call(ctx, id, importer, { isEntry: false }); } catch { continue; }
+      try { r = await h.call(ctx, id, importer, { isEntry: false }); } catch (e) { throw pluginError(e, p, importer || id); }
       if (r != null) return typeof r === "string" ? r : r.id;
     }
     return null;
@@ -159,7 +206,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
       const h = hookHandler(p.load);
       if (!h || !idAllowed(hookFilter(p.load), id)) continue;
       let r;
-      try { r = await h.call(ctx, id); } catch { continue; }
+      try { r = await h.call(ctx, id); } catch (e) { throw pluginError(e, p, id); }
       if (r != null) return typeof r === "string" ? r : r.code;
     }
     return null;
@@ -172,7 +219,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
       const h = hookHandler(p.transform);
       if (!h || !idAllowed(hookFilter(p.transform), id)) continue;
       let r;
-      try { r = await h.call(ctx, current, id); } catch { continue; }
+      try { r = await h.call(ctx, current, id); } catch (e) { throw pluginError(e, p, id); }
       const next = r == null ? null : typeof r === "string" ? r : r.code;
       if (next != null) { current = next; changed = true; }
     }
@@ -187,7 +234,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
       const h = hookHandler(p.transform);
       if (!h || !idAllowed(hookFilter(p.transform), id)) continue;
       let r;
-      try { r = await h.call(ctx, current, id, { ssr }); } catch { continue; }
+      try { r = await h.call(ctx, current, id, { ssr }); } catch (e) { throw pluginError(e, p, id); }
       const next = r == null ? null : typeof r === "string" ? r : r.code;
       if (next != null) { current = next; changed = true; }
     }
