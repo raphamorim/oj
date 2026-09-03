@@ -2860,6 +2860,18 @@ pub async fn proxy_to_loopback(
     headers: &HeaderMap,
     body: Option<Vec<u8>>,
 ) -> Result<Response, String> {
+    proxy_to_loopback_streaming(port, method, path_and_query, headers, body.map(Body::from)).await
+}
+
+/// `proxy_to_loopback` with the request body streamed through as it arrives
+/// (Vite pipes `req` into the app; an upload is never held whole in memory).
+pub async fn proxy_to_loopback_streaming(
+    port: u16,
+    method: &str,
+    path_and_query: &str,
+    headers: &HeaderMap,
+    body: Option<Body>,
+) -> Result<Response, String> {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     let client = CLIENT.get_or_init(reqwest::Client::new);
     let target = format!("http://127.0.0.1:{port}{path_and_query}");
@@ -2873,7 +2885,7 @@ pub async fn proxy_to_loopback(
         out = out.header(name, value);
     }
     if let Some(b) = body {
-        out = out.body(b);
+        out = out.body(reqwest::Body::wrap_stream(b.into_data_stream()));
     }
     let resp = out.send().await.map_err(|e| e.to_string())?;
     let status = resp.status();

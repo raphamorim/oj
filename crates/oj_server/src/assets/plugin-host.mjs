@@ -1158,11 +1158,35 @@ async function setupConfigureServer() {
         res.end(String((err && err.stack) || err));
         return;
       }
+      const upstream = req.headers["x-oj-forward-to"];
+      if (typeof upstream === "string" && /^\d+$/.test(upstream)) return forwardUpstream(req, res, Number(upstream));
       res.setHeader("x-oj-fallthrough", "1");
       res.statusCode = 404;
       res.end();
     };
     next();
+  }
+  // A request oj streams through the chain (a body it cannot replay): when no
+  // middleware claims it, pipe it on to the SSR runner the header names, both
+  // directions streaming, instead of answering with the fall-through mark.
+  function forwardUpstream(req, res, port) {
+    if (req.readableDidRead || req.readableEnded) {
+      res.statusCode = 500;
+      res.end("oj: a configureServer middleware consumed the request body without handling the request");
+      return;
+    }
+    const headers = { ...req.headers };
+    delete headers["x-oj-forward-to"];
+    delete headers.host;
+    const up = http.request({ host: "127.0.0.1", port, method: req.method, path: req.url, headers }, (r) => {
+      res.writeHead(r.statusCode, r.headers);
+      r.pipe(res);
+    });
+    up.on("error", (e) => {
+      if (!res.headersSent) res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+      res.end(`oj: ssr runner unreachable: ${e.message}`);
+    });
+    req.pipe(up);
   }
   // @cloudflare/vite-plugin uses `server.middlewares` both as a callable
   // connect app (its workerd->node bridge) and via `.use()`, so provide both.
