@@ -183,6 +183,20 @@ fn shell_node_env() -> Option<String> {
     std::env::var("NODE_ENV").ok().filter(|v| !v.is_empty())
 }
 
+/// `.env` files are read from `envDir` (default the root) and only `envPrefix`
+/// variables (default `VITE_`) are exposed, as in dev; the build used to
+/// hardcode both.
+fn env_dir_of(root: &Path, config: &oj_config::OjConfig) -> PathBuf {
+    match config.env_dir.as_deref() {
+        Some(d) => root.join(d),
+        None => root.to_path_buf(),
+    }
+}
+
+fn env_prefixes_of(config: &oj_config::OjConfig) -> Vec<String> {
+    oj_config::env_prefixes(config)
+}
+
 fn is_build_asset(id: &str) -> bool {
     matches!(
         std::path::Path::new(id.split('?').next().unwrap_or(id))
@@ -805,13 +819,28 @@ fn rolldown_resolve(
             (find, vec![Some(target)])
         })
         .collect();
-    // Vite resolves a build with the `production` condition (its
-    // `development|production` default); pass the same explicit list the dev
-    // server uses so a dep with a `development` export never differs between
+    // The same `resolve.*` the dev resolver honors, so a module that resolves in
+    // dev (a custom extension, a mainFields order, an exports condition) also
+    // resolves in the build. Only user-set values are forwarded; rolldown keeps
+    // its own defaults for the rest.
+    let extensions = oj_config::resolve_extensions(config);
+    let main_fields = oj_config::resolve_main_fields(config);
+    // Conditions are always explicit: Vite resolves a build with `production`
+    // (its `development|production` default), and the dev server passes the
+    // same list, so a dep with a `development` export never differs between
     // dev and build.
+    let condition_names = Some(oj_config::resolve_conditions_for(config, env, false));
+    let symlinks = config
+        .resolve
+        .as_ref()
+        .and_then(|r| r.preserve_symlinks)
+        .map(|preserve| !preserve);
     Some(rolldown_common::ResolveOptions {
         alias: (!alias.is_empty()).then_some(alias),
-        condition_names: Some(oj_config::resolve_conditions_for(config, env, false)),
+        extensions,
+        main_fields,
+        condition_names,
+        symlinks,
         ..Default::default()
     })
 }
@@ -1041,12 +1070,10 @@ impl Plugin for OjUserPlugin {
         let spec = args.specifier.to_string();
         let importer = args.importer.unwrap_or("").to_string();
         async move {
-            Ok(host
-                .resolve_id(&spec, &importer)
+            host.resolve_id(&spec, &importer)
                 .await
-                .ok()
-                .flatten()
-                .map(HookResolveIdOutput::from_id))
+                .map(|r| r.map(HookResolveIdOutput::from_id))
+                .map_err(|e| anyhow::anyhow!("plugin resolveId failed for {spec}:\n{e}"))
         }
     }
 
@@ -1058,12 +1085,12 @@ impl Plugin for OjUserPlugin {
         let host = Arc::clone(&self.host);
         let id = args.id.to_string();
         async move {
-            Ok(host
-                .load(&id)
+            // A throwing plugin `load`/`transform` fails the build, as in Vite;
+            // bundling the raw source instead would ship wrong output silently.
+            host.load(&id)
                 .await
-                .ok()
-                .flatten()
-                .map(|code| {
+                .map_err(|e| anyhow::anyhow!("plugin load failed for {id}:\n{e}"))
+                .map(|loaded| loaded.map(|code| {
                     let path = id.split(['?', '#']).next().unwrap_or(&id);
                     if path.ends_with(".css") {
                         // A plugin-served virtual CSS module (e.g. UnoCSS's layer
@@ -1122,7 +1149,7 @@ impl Plugin for OjUserPlugin {
                         Ok(None)
                     }
                 }
-                _ => Ok(None),
+                Err(e) => Err(anyhow::anyhow!("plugin transform failed for {id}:\n{e}")),
             }
         }
     }
@@ -1422,15 +1449,30 @@ pub async fn build(
     root: PathBuf,
     out: Option<PathBuf>,
     ssr: Option<String>,
-    mode: &str,
+    cli_mode: Option<&str>,
 ) -> anyhow::Result<()> {
     let root = root
         .canonicalize()
         .with_context(|| format!("app root not found: {}", root.display()))?;
 
-    let mut config =
-        oj_config::load_with(&root, "build", mode).map_err(|e| anyhow::anyhow!("{e}"))?;
-    oj_server::plugins::adopt_vite_config_values(&mut config, &root, "build", mode);
+    // Vite: `mode = inlineConfig.mode || config.mode || "production"`; when the
+    // config file itself names a mode and the CLI did not, the config is loaded
+    // again under that mode (its function form and `.env.<mode>` depend on it).
+    let mut mode_owned = cli_mode.unwrap_or("production").to_string();
+    let mut config = oj_config::load_with(&root, "build", &mode_owned)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if cli_mode.is_none() {
+        oj_server::plugins::adopt_vite_config_values_default_mode(&mut config, &root, "build", &mode_owned);
+        if let Some(m) = config.mode.clone().filter(|m| *m != mode_owned) {
+            mode_owned = m;
+            config = oj_config::load_with(&root, "build", &mode_owned)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            oj_server::plugins::adopt_vite_config_values(&mut config, &root, "build", &mode_owned);
+        }
+    } else {
+        oj_server::plugins::adopt_vite_config_values(&mut config, &root, "build", &mode_owned);
+    }
+    let mode: &str = &mode_owned;
     let build_cfg = config.build.clone().unwrap_or_default();
     let ro_opts = oj_config::rolldown_options(&config);
     let out = out
@@ -1443,7 +1485,9 @@ pub async fn build(
     };
     let minify = build_cfg.minify.unwrap_or(true);
     let sourcemap = build_cfg.sourcemap.unwrap_or(false);
-    let loaded_env = oj_env::load(&root, mode);
+    let loaded_env = oj_env::load(&env_dir_of(&root, &config), mode);
+    let env_prefixes = env_prefixes_of(&config);
+    let env_prefix_refs: Vec<&str> = env_prefixes.iter().map(String::as_str).collect();
     let node_env = oj_env::resolve_node_env(shell_node_env().as_deref(), &loaded_env, "production");
     let is_production = node_env == "production";
 
@@ -1624,10 +1668,10 @@ pub async fn build(
                 .unwrap_or(sourcemap)
                 .then_some(SourceMapType::File),
             define: Some({
-                let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &["VITE_"]);
+                let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &env_prefix_refs);
                 let mut pairs: Vec<(String, String)> = node_env_defines(&node_env);
                 pairs.extend(oj_env::import_meta_env_defines(
-                    &env, mode, !is_production, &base, &["VITE_"],
+                    &env, mode, !is_production, &base, &env_prefix_refs,
                 ));
                 pairs.extend(oj_config::config_defines(&config));
                 pairs.extend(oj_config::environment_defines(&config, "client"));
@@ -1690,8 +1734,8 @@ pub async fn build(
     // %VITE_*% / import.meta.env substitution (Vite's htmlEnvHook), applied to
     // each page before the plugin transformIndexHtml below.
     let html_env = {
-        let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &["VITE_"]);
-        let mut defines = oj_env::import_meta_env_defines(&env, mode, !is_production, &base, &["VITE_"]);
+        let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &env_prefix_refs);
+        let mut defines = oj_env::import_meta_env_defines(&env, mode, !is_production, &base, &env_prefix_refs);
         defines.extend(oj_config::config_defines(&config));
         oj_env::html_env_map(&defines)
     };
@@ -2037,7 +2081,9 @@ pub(crate) async fn build_ssr(
     let mut config =
         oj_config::load_with(root, "build", mode).map_err(|e| anyhow::anyhow!("{e}"))?;
     oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", mode);
-    let loaded_env = oj_env::load(root, mode);
+    let loaded_env = oj_env::load(&env_dir_of(root, &config), mode);
+    let env_prefixes = env_prefixes_of(&config);
+    let env_prefix_refs: Vec<&str> = env_prefixes.iter().map(String::as_str).collect();
     let node_env = oj_env::resolve_node_env(shell_node_env().as_deref(), &loaded_env, "production");
     let is_production = node_env == "production";
     let ssr_base = config.base.clone().unwrap_or_else(|| "/".into());
@@ -2113,14 +2159,14 @@ pub(crate) async fn build_ssr(
                 .unwrap_or(sourcemap)
                 .then_some(SourceMapType::File),
             define: Some({
-                let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &["VITE_"]);
+                let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &env_prefix_refs);
                 let mut pairs = node_env_defines(&node_env);
                 pairs.extend(oj_env::import_meta_env_defines_with(
                     &env,
                     mode,
                     !is_production,
                     &ssr_base,
-                    &["VITE_"],
+                    &env_prefix_refs,
                     true,
                 ));
                 pairs.extend(oj_config::config_defines(&config));
@@ -2567,7 +2613,9 @@ async fn build_client_entry(
     let mut config =
         oj_config::load_with(root, "build", mode).map_err(|e| anyhow::anyhow!("{e}"))?;
     oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", mode);
-    let loaded_env = oj_env::load(root, mode);
+    let loaded_env = oj_env::load(&env_dir_of(root, &config), mode);
+    let env_prefixes = env_prefixes_of(&config);
+    let env_prefix_refs: Vec<&str> = env_prefixes.iter().map(String::as_str).collect();
     let node_env = oj_env::resolve_node_env(shell_node_env().as_deref(), &loaded_env, "production");
     let is_production = node_env == "production";
     let client_base = config.base.clone().unwrap_or_else(|| "/".into());
@@ -2620,14 +2668,14 @@ async fn build_client_entry(
                 .unwrap_or(sourcemap)
                 .then_some(SourceMapType::File),
             define: Some({
-                let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &["VITE_"]);
+                let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &env_prefix_refs);
                 let mut pairs = node_env_defines(&node_env);
                 pairs.extend(oj_env::import_meta_env_defines(
                     &env,
                     mode,
                     !is_production,
                     "/",
-                    &["VITE_"],
+                    &env_prefix_refs,
                 ));
                 pairs.extend(oj_config::config_defines(&config));
                 pairs.extend(oj_config::environment_defines(&config, "client"));

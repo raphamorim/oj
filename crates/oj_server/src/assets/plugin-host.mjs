@@ -272,6 +272,38 @@ environment.config.consumer =
 // resolved environment config until runConfigHooks recomputes it.
 let resolvedConfig = environment.config;
 
+// When the app has Vite installed and its config is a vite.config, ask that Vite
+// to resolve the user's config once (fresh plugin instances, whose config hooks
+// run in that resolve) and use the result as the base the plugins see: real
+// build.outDir/sourcemap/rollupOptions, cacheDir, env, envPrefix, assetsInclude(),
+// css, ssr, worker, createResolver, logger. oj's own plugin instances are spliced
+// in and their config hooks still run on top. Without Vite the synthesized
+// defaults stand. OJ_PLUGIN_SYNTH_CONFIG=1 forces the synthesized path.
+let userResolvedViteConfig = null;
+async function loadUserResolvedViteConfig() {
+  if (initial.pluginsFormat !== "vite" || process.env.OJ_PLUGIN_SYNTH_CONFIG === "1") return null;
+  const appRoot = initial.config?.root ?? process.cwd();
+  let vite;
+  try {
+    vite = await import(createRequire(appRoot + "/package.json").resolve("vite"));
+  } catch {
+    return null;
+  }
+  if (typeof vite.resolveConfig !== "function") return null;
+  try {
+    const rc = await vite.resolveConfig(
+      { root: appRoot, configFile: pluginsPath, mode: env.mode, logLevel: "silent" },
+      env.command,
+      env.mode,
+      env.mode,
+    );
+    return rc && typeof rc === "object" ? rc : null;
+  } catch (e) {
+    process.stderr.write(`${OJ} plugin host: vite.resolveConfig failed, using synthesized config: ${(e && e.message) || e}\n`);
+    return null;
+  }
+}
+
 async function loadViteConfig(configPath) {
   const appRoot = initial.config?.root ?? process.cwd();
   const req = createRequire(appRoot + "/package.json");
@@ -408,6 +440,29 @@ const cssPostShim = {
 
 const moduleInfoCache = new Map();
 
+// Vite reports a failing hook as `[plugin:name] message` followed by the module
+// id with `line:column` and the code frame (pluginContainer's formatError), and
+// fails the request/build. Attach the same so the overlay and the terminal say
+// which plugin broke on which file instead of silently serving the raw source.
+function decoratePluginError(e, plugin, id) {
+  const err = e instanceof Error ? e : new Error(typeof e === "string" ? e : (e && e.message) || String(e));
+  if (e && typeof e === "object" && !(e instanceof Error)) Object.assign(err, e);
+  if (err.ojDecorated) return err;
+  const name = (plugin && plugin.name) || "unknown";
+  const loc = err.loc && typeof err.loc === "object" ? err.loc : null;
+  const line = loc ? loc.line : err.line;
+  const column = loc ? loc.column : err.column;
+  const file = (loc && loc.file) || err.id || id || "";
+  let msg = `[plugin:${name}] ${err.message}`;
+  if (file) msg += `\n${file}${line != null ? `:${line}${column != null ? `:${column}` : ""}` : ""}`;
+  if (typeof err.frame === "string" && err.frame) msg += `\n${err.frame}`;
+  err.message = msg;
+  err.plugin = name;
+  err.ojDecorated = true;
+  err.stack = msg;
+  return err;
+}
+
 const watchedFiles = new Set();
 const transformWatchStore = new AsyncLocalStorage();
 // Per-transform map of oj-resolved imports (spec -> id) the Rust side computes and
@@ -510,7 +565,14 @@ function deepMerge(a, b) {
 }
 
 async function runConfigHooks() {
+  userResolvedViteConfig = await loadUserResolvedViteConfig();
   let config = initial.config ?? {};
+  if (userResolvedViteConfig) {
+    // The user's resolved config is the base; oj's own values (root, base,
+    // define, server, environments) overlay it; the plugin list is replaced below.
+    const { plugins: _fresh, ...base } = userResolvedViteConfig;
+    config = deepMerge(base, config);
+  }
   // Vite hands the config hook the user config, whose `plugins` is the flat
   // plugin array; plugins like @crxjs read `config.plugins` to find sibling
   // plugins. Use the apply-filtered active set (not allPlugins) so command-
@@ -525,10 +587,9 @@ async function runConfigHooks() {
     configPlugins.push(cssPostShim);
   }
   config.plugins = configPlugins;
-  for (const p of plugins) {
-    if (typeof p.config !== "function") continue;
+  for (const { p, fn } of pluginsWithHook("config")) {
     try {
-      const partial = await p.config.call(ctx, config, env);
+      const partial = await fn.call(ctx, config, env);
       if (partial) config = deepMerge(config, partial);
     } catch (e) {
       if (!ojStartMode) throw e;
@@ -537,12 +598,37 @@ async function runConfigHooks() {
     // Keep the plugin array stable regardless of what a config hook returned.
     config.plugins = configPlugins;
   }
+  // Vite runs `configEnvironment(name, options, env)` for every environment after
+  // the config hooks and merges what it returns into that environment's options.
+  const envNames = Object.keys(config.environments ?? {});
+  for (const n of ["client", "ssr"]) if (!envNames.includes(n)) envNames.push(n);
+  const configEnvHooks = pluginsWithHook("configEnvironment");
+  if (configEnvHooks.length) {
+    config.environments = { ...(config.environments ?? {}) };
+    for (const name of envNames) {
+      config.environments[name] = config.environments[name] ?? {};
+      const opts = {
+        ...env,
+        isSsrBuild: name !== "client" && env.command === "build",
+        isPreview: false,
+        isSsrTargetWebworker: false,
+      };
+      for (const { p, fn } of configEnvHooks) {
+        try {
+          const r = await fn.call(ctx, name, config.environments[name], opts);
+          if (r) config.environments[name] = deepMerge(config.environments[name], r);
+        } catch (e) {
+          if (!ojStartMode) throw e;
+          process.stderr.write(`${OJ} plugin host: configEnvironment(${p.name ?? "?"}) skipped: ${(e && e.message) || e}\n`);
+        }
+      }
+    }
+  }
   resolvedConfig = withResolvedDefaults(config);
   resolvedConfig.plugins = configPlugins;
-  for (const p of plugins) {
-    if (typeof p.configResolved !== "function") continue;
+  for (const { p, fn } of pluginsWithHook("configResolved")) {
     try {
-      await p.configResolved.call(ctx, resolvedConfig);
+      await fn.call(ctx, resolvedConfig);
     } catch (e) {
       if (!ojStartMode) throw e;
       process.stderr.write(`${OJ} plugin host: configResolved(${p.name ?? "?"}) skipped: ${(e && e.message) || e}\n`);
@@ -566,6 +652,67 @@ process.stderr.write(
   `${OJ} plugin host: ${plugins.length} plugin(s) active for ${env.command}: ${plugins.map((p) => `${p.name}[${p.enforce ?? "-"}]`).join(",")}\n`,
 );
 
+// Events for the Rust server (not the browser): a plugin invalidating a module
+// through server.moduleGraph, or asking for server.restart().
+function ojServerEvent(action, data) {
+  process.stdout.write(JSON.stringify({ ojServer: { action, ...(data ?? {}) } }) + "\n");
+}
+
+// A ModuleGraph stand-in for plugins that reach into `server.moduleGraph` from
+// configureServer / hotUpdate: `getModuleById(id)` hands back a node for the id
+// (Vite returns undefined for ids it has never seen; plugins guard on that and
+// then call invalidateModule, so an always-present node keeps that path working),
+// and `invalidateModule` tells oj to drop the module's compiled output and
+// propagate an update, as Vite's graph does.
+const graphNodes = new Map();
+function moduleNode(id) {
+  let n = graphNodes.get(id);
+  if (!n) {
+    n = {
+      id,
+      url: id,
+      file: String(id).split("?", 1)[0],
+      type: "js",
+      info: null,
+      importers: new Set(),
+      importedModules: new Set(),
+      acceptedHmrDeps: new Set(),
+      acceptedHmrExports: null,
+      isSelfAccepting: false,
+      lastHMRTimestamp: 0,
+      lastInvalidationTimestamp: 0,
+      transformResult: null,
+      ssrTransformResult: null,
+      ssrModule: null,
+      ssrError: null,
+    };
+    graphNodes.set(id, n);
+  }
+  return n;
+}
+const moduleGraph = {
+  getModuleById: (id) => (id == null ? undefined : moduleNode(String(id))),
+  getModuleByUrl: async (url) => (url == null ? undefined : moduleNode(String(url))),
+  getModulesByFile: (file) => new Set([moduleNode(String(file))]),
+  invalidateModule(mod) {
+    if (!mod) return;
+    mod.lastInvalidationTimestamp = Date.now();
+    mod.transformResult = null;
+    mod.ssrTransformResult = null;
+    ojServerEvent("invalidate", { id: mod.id });
+  },
+  invalidateAll() {
+    for (const m of graphNodes.values()) m.transformResult = null;
+    ojServerEvent("invalidateAll");
+  },
+  onFileChange(file) {
+    ojServerEvent("invalidate", { id: String(file) });
+  },
+  urlToModuleMap: graphNodes,
+  idToModuleMap: graphNodes,
+  fileToModulesMap: new Map(),
+};
+
 const wsListeners = new Map();
 function ojWsSend(event, data) {
   process.stdout.write(JSON.stringify({ ojWs: { event, data: data ?? null } }) + "\n");
@@ -587,6 +734,9 @@ const wsApi = {
 };
 
 let middlewarePort = null;
+// The ViteDevServer stand-in handed to configureServer; hotUpdate/handleHotUpdate
+// contexts carry it as `server` (plugins call server.ws.send / moduleGraph on it).
+let devServer = null;
 let appVite = null;
 async function loadAppVite() {
   if (appVite) return appVite;
@@ -718,8 +868,10 @@ async function setupConfigureServer() {
     ws: wsApi,
     hot: wsApi,
     watcher: fileWatcher,
-    moduleGraph: { getModuleById: () => null, getModuleByUrl: async () => null, getModulesByFile: () => null, invalidateModule: noop, onFileChange: noop },
-    restart: async () => {},
+    moduleGraph,
+    // Vite restarts the dev server (re-reading the config); oj re-execs itself,
+    // which is how it already handles a config-file change.
+    restart: async () => ojServerEvent("restart"),
     close: async () => {},
     transformIndexHtml: async (_url, html) => transformIndexHtml(html),
     transformRequest: async () => null,
@@ -734,12 +886,12 @@ async function setupConfigureServer() {
       process.stderr.write(`${OJ} plugin host: buildEnvironments failed: ${(e && e.message) || e}\n`);
     }
   }
+  devServer = server;
   const post = [];
-  for (const p of plugins) {
-    if (typeof p.configureServer !== "function") continue;
+  for (const { p, fn } of pluginsWithHook("configureServer")) {
     let r;
     try {
-      r = await p.configureServer(server);
+      r = await fn.call(ctx, server);
     } catch (e) {
       if (!ojStartMode) throw e;
       process.stderr.write(`${OJ} plugin host: configureServer(${p.name ?? "?"}) skipped: ${(e && e.message) || e}\n`);
@@ -822,7 +974,12 @@ async function transform(code, id, resolvedJson) {
     for (const p of plugins) {
       const handler = hookHandler(p.transform);
       if (!handler || !hookTransformMatches(p.transform, id, current)) continue;
-      const r = await handler.call(ctx, current, id, transformOptions);
+      let r;
+      try {
+        r = await handler.call(ctx, current, id, transformOptions);
+      } catch (e) {
+        throw decoratePluginError(e, p, id);
+      }
       if (r == null) continue;
       if (typeof r === "string") {
         current = r;
@@ -834,9 +991,7 @@ async function transform(code, id, resolvedJson) {
     const info = { id, code: current, importedIds: [] };
     moduleInfoCache.set(id, info);
     seenIds.add(id);
-    for (const p of plugins) {
-      if (typeof p.moduleParsed === "function") await p.moduleParsed.call(ctx, info);
-    }
+    for (const { fn } of pluginsWithHook("moduleParsed")) await fn.call(ctx, info);
     return JSON.stringify({
       code: current,
       watchFiles: [...bucket],
@@ -855,64 +1010,157 @@ async function replayModuleParsed(id) {
   if (id) seenIds.add(id);
   const info = moduleInfoCache.get(id) ?? { id, code: "", importedIds: [] };
   moduleInfoCache.set(id, info);
-  for (const p of plugins) {
-    if (typeof p.moduleParsed === "function") await p.moduleParsed.call(ctx, info);
-  }
+  for (const { fn } of pluginsWithHook("moduleParsed")) await fn.call(ctx, info);
   return null;
 }
 
-const anyModuleParsed = () => plugins.some((p) => typeof p.moduleParsed === "function");
+const anyModuleParsed = () => pluginsWithHook("moduleParsed").length > 0;
 
 async function watchChange(id, event) {
-  for (const p of plugins) {
-    if (typeof p.watchChange === "function") await p.watchChange.call(ctx, id, { event });
-  }
+  for (const { fn } of pluginsWithHook("watchChange")) await fn.call(ctx, id, { event });
   return null;
 }
 
-// resolveId/load can be a bare function or Vite's object form { filter, handler }
-// (createVirtualModule, import-protection, and others use it). Unwrap the handler
-// and honor filter.id so a hook only runs for the ids it opts into, as Vite does.
+// Any hook can be a bare function or Vite's object form { order, filter, handler }
+// (createVirtualModule, import-protection, and others use it). Vite unwraps every
+// hook through getHookHandler and sorts the plugins of a hook by its `order`
+// (pre / normal / post, stable within a rank); do the same for every hook here.
 function hookHandler(hook) {
   if (typeof hook === "function") return hook;
   if (hook && typeof hook.handler === "function") return hook.handler;
   return null;
 }
-
-function matchOne(pattern, id) {
-  if (pattern instanceof RegExp) return pattern.test(id);
-  // Vite/rolldown match a string id/code filter as a substring, not exact -- e.g.
-  // the router code-splitter excludes `'tsr-shared'`/`'tsr-split'` to skip those
-  // query variants, which only works as a contains check on the query-bearing id.
-  if (typeof pattern === "string") return id.includes(pattern);
-  return false;
+function hookFn(plugin, name) {
+  return plugin ? hookHandler(plugin[name]) : null;
+}
+function hookOrderRank(hook) {
+  const o = hook && typeof hook === "object" ? hook.order : undefined;
+  return o === "pre" ? -1 : o === "post" ? 1 : 0;
+}
+function pluginsWithHook(name) {
+  const out = [];
+  for (const p of plugins) {
+    const fn = hookFn(p, name);
+    if (fn) out.push({ p, fn, rank: hookOrderRank(p[name]) });
+  }
+  out.sort((a, b) => a.rank - b.rank);
+  return out;
 }
 
-function matchList(patterns, id) {
+// Vite's pluginFilter: a string *id* filter is a picomatch glob (dot:true) joined
+// to cwd unless it starts with `**` or is absolute, a RegExp is tested against the
+// slash-normalized id (lastIndex reset), and a string *code* filter is a substring.
+// The glob dialect covered is what plugins use: `*`, `**`, `?`, `{a,b}`, `[...]`.
+const slash = (p) => p.replace(/\\/g, "/");
+function globToRegExpSource(glob) {
+  let re = "";
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === "*") {
+      if (glob[i + 1] === "*") {
+        i++;
+        if (glob[i + 1] === "/") {
+          i++;
+          re += "(?:.*/)?";
+        } else {
+          re += ".*";
+        }
+      } else {
+        re += "[^/]*";
+      }
+    } else if (c === "?") {
+      re += "[^/]";
+    } else if (c === "{") {
+      const j = glob.indexOf("}", i);
+      if (j > i) {
+        re += "(?:" + glob.slice(i + 1, j).split(",").map(globToRegExpSource).join("|") + ")";
+        i = j;
+      } else {
+        re += "\\{";
+      }
+    } else if (c === "[") {
+      const j = glob.indexOf("]", i);
+      if (j > i) {
+        let cls = glob.slice(i + 1, j);
+        if (cls[0] === "!") cls = "^" + cls.slice(1);
+        re += "[" + cls + "]";
+        i = j;
+      } else {
+        re += "\\[";
+      }
+    } else if (c === "\\" && i + 1 < glob.length) {
+      re += "\\" + glob[++i];
+    } else {
+      re += c.replace(/[.+^$()|]/g, "\\$&");
+    }
+  }
+  return re;
+}
+const idGlobCache = new Map();
+function idPatternToRegExp(pattern) {
+  if (pattern instanceof RegExp) return pattern;
+  let re = idGlobCache.get(pattern);
+  if (!re) {
+    const cwd = initial.config?.root ?? process.cwd();
+    const glob = pattern.startsWith("**") || isAbsolute(pattern) ? slash(pattern) : slash(join(cwd, pattern));
+    re = new RegExp("^" + globToRegExpSource(glob) + "$");
+    idGlobCache.set(pattern, re);
+  }
+  return re;
+}
+function matchId(pattern, id) {
+  if (!(pattern instanceof RegExp) && typeof pattern !== "string") return false;
+  const re = idPatternToRegExp(pattern);
+  const r = re.test(slash(id));
+  re.lastIndex = 0;
+  return r;
+}
+function matchCode(pattern, code) {
+  if (pattern instanceof RegExp) {
+    const r = pattern.test(code);
+    pattern.lastIndex = 0;
+    return r;
+  }
+  return typeof pattern === "string" && code.includes(pattern);
+}
+function matchList(patterns, value, matcher) {
   if (patterns == null) return false;
-  return (Array.isArray(patterns) ? patterns : [patterns]).some((p) => matchOne(p, id));
+  return (Array.isArray(patterns) ? patterns : [patterns]).some((p) => matcher(p, value));
 }
-
-function stringFilterMatches(spec, value) {
+function filterMatches(spec, value, matcher) {
   if (spec == null) return true;
   if (spec instanceof RegExp || typeof spec === "string" || Array.isArray(spec)) {
-    return matchList(spec, value);
+    return matchList(spec, value, matcher);
   }
-  if (spec.exclude != null && matchList(spec.exclude, value)) return false;
-  if (spec.include != null) return matchList(spec.include, value);
+  if (spec.exclude != null && matchList(spec.exclude, value, matcher)) return false;
+  if (spec.include != null) return matchList(spec.include, value, matcher);
   return true;
+}
+// Rolldown's moduleType for an id, from its extension (what `filter.moduleType`
+// compares against); anything unknown is "js".
+function moduleTypeOf(id) {
+  const clean = String(id).split("?", 1)[0].split("#", 1)[0];
+  const m = /\.([a-z0-9]+)$/i.exec(clean);
+  const ext = m ? m[1].toLowerCase() : "";
+  if (["js", "jsx", "ts", "tsx", "json", "css", "text", "base64", "dataurl", "binary", "empty", "asset"].includes(ext)) {
+    return ext;
+  }
+  if (ext === "mjs" || ext === "cjs") return "js";
+  if (ext === "mts" || ext === "cts") return "ts";
+  return "js";
 }
 
 function hookIdMatches(hook, id) {
   const f = hook && typeof hook === "object" ? hook.filter : null;
-  return !f || stringFilterMatches(f.id, id);
+  return !f || filterMatches(f.id, id, matchId);
 }
 
 function hookTransformMatches(hook, id, code) {
   const f = hook && typeof hook === "object" ? hook.filter : null;
   if (!f) return true;
-  if (!stringFilterMatches(f.id, id)) return false;
-  if (f.code != null && !stringFilterMatches(f.code, code)) return false;
+  if (!filterMatches(f.id, id, matchId)) return false;
+  if (f.code != null && !filterMatches(f.code, code, matchCode)) return false;
+  if (f.moduleType != null && !filterMatches(f.moduleType, moduleTypeOf(id), (p, v) => p === v)) return false;
   return true;
 }
 
@@ -921,7 +1169,12 @@ async function resolveId(source, importer) {
   for (const p of plugins) {
     const handler = hookHandler(p.resolveId);
     if (!handler || !hookIdMatches(p.resolveId, source)) continue;
-    const r = await handler.call(ctx, source, importer || undefined, options);
+    let r;
+    try {
+      r = await handler.call(ctx, source, importer || undefined, options);
+    } catch (e) {
+      throw decoratePluginError(e, p, importer || source);
+    }
     if (r == null) continue;
     return typeof r === "string" ? r : (r.id ?? null);
   }
@@ -932,7 +1185,12 @@ async function load(id) {
   for (const p of plugins) {
     const handler = hookHandler(p.load);
     if (!handler || !hookIdMatches(p.load, id)) continue;
-    const r = await handler.call(ctx, id);
+    let r;
+    try {
+      r = await handler.call(ctx, id);
+    } catch (e) {
+      throw decoratePluginError(e, p, id);
+    }
     if (r == null) continue;
     return typeof r === "string" ? r : (r.code ?? null);
   }
@@ -958,17 +1216,19 @@ async function handleHotUpdate(file, timestamp, type, modulesJson) {
   } catch {
     modules = [];
   }
+  // Vite's HmrContext / HotUpdateOptions both carry `server`; the ubiquitous
+  // `handleHotUpdate({ file, server }) { server.ws.send(...) }` idiom needs it.
   const hmrContext = {
     file,
     timestamp: Number(timestamp),
     type: type || "update",
     modules,
     read: () => readModifiedFile(file),
+    server: devServer,
   };
   let filtered = null;
-  for (const p of plugins) {
-    if (typeof p.handleHotUpdate !== "function") continue;
-    const r = await p.handleHotUpdate.call(ctx, hmrContext);
+  for (const { fn } of hotUpdatePlugins()) {
+    const r = await fn.call(ctx, hmrContext);
     if (r === "full-reload") return "full-reload";
     if (Array.isArray(r)) {
       hmrContext.modules = r;
@@ -980,6 +1240,19 @@ async function handleHotUpdate(file, timestamp, type, modulesJson) {
   if (filtered === null) return null;
   if (filtered.length === 0) return "skip";
   return JSON.stringify({ action: "filter", modules: filtered });
+}
+
+// Vite 6+: `plugin.hotUpdate ?? plugin.handleHotUpdate` (the Environment API hook
+// takes precedence, with the same context shape plus this.environment).
+function hotUpdatePlugins() {
+  const out = [];
+  for (const p of plugins) {
+    const hook = p.hotUpdate != null ? p.hotUpdate : p.handleHotUpdate;
+    const fn = hookHandler(hook);
+    if (fn) out.push({ p, fn, rank: hookOrderRank(hook) });
+  }
+  out.sort((a, b) => a.rank - b.rank);
+  return out;
 }
 
 function escapeAttr(v) {
@@ -1040,9 +1313,7 @@ async function transformIndexHtml(html) {
 }
 
 async function runLifecycle(hook) {
-  for (const p of plugins) {
-    if (typeof p[hook] === "function") await p[hook].call(ctx);
-  }
+  for (const { fn } of pluginsWithHook(hook)) await fn.call(ctx);
   return null;
 }
 
@@ -1055,9 +1326,7 @@ async function runBuildStart() {
     input: resolvedConfig?.build?.rollupOptions?.input ?? "index.html",
   };
   await transformEmitStore.run(chunkBucket, async () => {
-    for (const p of plugins) {
-      if (typeof p.buildStart === "function") await p.buildStart.call(ctx, options);
-    }
+    for (const { fn } of pluginsWithHook("buildStart")) await fn.call(ctx, options);
   });
   return JSON.stringify({ emittedChunks: chunkBucket });
 }
@@ -1065,9 +1334,7 @@ async function runBuildStart() {
 async function generateBundle(bundleJson, isWrite) {
   const bundle = JSON.parse(bundleJson || "{}");
   const outputOptions = environment.config?.build ?? {};
-  for (const p of plugins) {
-    const fn = typeof p.generateBundle === "function" ? p.generateBundle : p.generateBundle?.handler;
-    if (typeof fn !== "function") continue;
+  for (const { p, fn } of pluginsWithHook("generateBundle")) {
     try {
       await fn.call(ctx, outputOptions, bundle, isWrite);
     } catch (e) {
@@ -1088,9 +1355,7 @@ async function renderChunk(code, chunkJson) {
   const root = resolvedConfig?.root ?? initial.config?.root ?? process.cwd();
   const options = { dir: pathResolve(root, outDir), format: "es" };
   let current = code;
-  for (const p of plugins) {
-    const fn = typeof p.renderChunk === "function" ? p.renderChunk : p.renderChunk?.handler;
-    if (typeof fn !== "function") continue;
+  for (const { fn } of pluginsWithHook("renderChunk")) {
     const r = await fn.call(ctx, current, chunk, options);
     if (r == null) continue;
     current = typeof r === "string" ? r : (r.code ?? current);
@@ -1101,9 +1366,7 @@ async function renderChunk(code, chunkJson) {
 async function writeBundle(bundleJson, isWrite) {
   const bundle = JSON.parse(bundleJson || "{}");
   const outputOptions = environment.config?.build ?? {};
-  for (const p of plugins) {
-    const fn = typeof p.writeBundle === "function" ? p.writeBundle : p.writeBundle?.handler;
-    if (typeof fn !== "function") continue;
+  for (const { fn } of pluginsWithHook("writeBundle")) {
     await fn.call(ctx, outputOptions, bundle, isWrite);
   }
   return null;
@@ -1135,15 +1398,15 @@ async function run(hook, args) {
   if (hook === "hasModuleParsed") return String(anyModuleParsed());
   if (hook === "replayModuleParsed") return replayModuleParsed(args[0]);
   if (hook === "hasGenerateBundle") {
-    return String(plugins.some((p) => typeof (p.generateBundle?.handler ?? p.generateBundle) === "function"));
+    return String(pluginsWithHook("generateBundle").length > 0);
   }
   if (hook === "generateBundle") return generateBundle(args[0], args[1] === "true");
   if (hook === "hasRenderChunk") {
-    return String(plugins.some((p) => typeof (p.renderChunk?.handler ?? p.renderChunk) === "function"));
+    return String(pluginsWithHook("renderChunk").length > 0);
   }
   if (hook === "renderChunk") return renderChunk(args[0], args[1]);
   if (hook === "hasWriteBundle") {
-    return String(plugins.some((p) => typeof (p.writeBundle?.handler ?? p.writeBundle) === "function"));
+    return String(pluginsWithHook("writeBundle").length > 0);
   }
   if (hook === "writeBundle") return writeBundle(args[0], args[1] === "true");
   if (hook === "getPluginCount") return String(plugins.length);
@@ -1178,12 +1441,7 @@ async function run(hook, args) {
     return JSON.stringify(pats);
   }
   if (hook === "getHasTransform") {
-    const has = plugins.some((p) => {
-      const t = p && p.transform;
-      const fn = typeof t === "function" ? t : t && t.handler;
-      return typeof fn === "function";
-    });
-    return String(has);
+    return String(pluginsWithHook("transform").length > 0);
   }
   if (hook === "getDepLoadFilters") {
     // Object-form `load` hooks' `filter.id` include patterns: a node_modules
@@ -1208,8 +1466,8 @@ async function run(hook, args) {
     return String(has);
   }
   if (hook === "getHmrHooks") {
-    const watchChangeHook = plugins.some((p) => typeof p.watchChange === "function");
-    const hotUpdateHook = plugins.some((p) => typeof p.handleHotUpdate === "function");
+    const watchChangeHook = pluginsWithHook("watchChange").length > 0;
+    const hotUpdateHook = hotUpdatePlugins().length > 0;
     return JSON.stringify({ watchChange: watchChangeHook, handleHotUpdate: hotUpdateHook });
   }
   if (hook === "getMiddlewarePort") return middlewarePort == null ? null : String(middlewarePort);

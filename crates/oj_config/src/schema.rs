@@ -9,6 +9,9 @@ use serde::Deserialize;
 #[serde(default, rename_all = "camelCase")]
 pub struct OjConfig {
     pub root: Option<String>,
+    /// A default mode named by the config file itself (Vite's `mode` option);
+    /// the CLI's `--mode` wins over it.
+    pub mode: Option<String>,
     pub base: Option<String>,
     pub public_dir: Option<String>,
     pub server: Option<ServerConfig>,
