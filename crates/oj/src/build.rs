@@ -235,6 +235,7 @@ fn css_resolve_of(root: &Path, config: &oj_config::OjConfig, env: &str) -> oj_cs
         alias: oj_config::resolve_alias(config, env),
         targets: oj_config::build_css_targets(config),
         minify: oj_config::build_css_minify(config, env == "ssr"),
+        modules: oj_server::css_modules_options(config),
     }
 }
 

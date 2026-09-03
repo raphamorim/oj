@@ -84,6 +84,21 @@ pub struct CssConfig {
     pub preprocessor_options: Option<BTreeMap<String, PreprocessorEntry>>,
     /// Vite's `css.devSourcemap`: inline source maps on dev-served CSS.
     pub dev_sourcemap: Option<bool>,
+    /// Vite's `css.modules` (postcss-modules options); see `css_modules`.
+    pub modules: Option<CssModulesConfig>,
+}
+
+/// Vite's `css.modules` as it crosses the config boundary: functions arrive
+/// as the `"__oj_fn__"` marker, RegExps as `{ "__oj_regex__": source }`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CssModulesConfig {
+    pub locals_convention: Option<serde_json::Value>,
+    pub generate_scoped_name: Option<serde_json::Value>,
+    pub scope_behaviour: Option<String>,
+    pub global_module_paths: Option<Vec<serde_json::Value>>,
+    pub export_globals: Option<bool>,
+    pub hash_prefix: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
