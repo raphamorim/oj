@@ -432,6 +432,19 @@ fn start_script_env(root: &Path, command: &str, mode: &str) -> anyhow::Result<Ve
             serde_json::to_string(&externals).unwrap_or_default(),
         ));
     }
+    // The client bundle's export conditions: Vite derives its client environment's
+    // conditions from `resolve.conditions` (DEFAULT_CLIENT_CONDITIONS plus the
+    // user list, dev/prod by command), so the Start client bundle must too
+    // instead of a hardcoded browser/module/import/development.
+    vars.push((
+        "OJ_CLIENT_CONDITIONS".into(),
+        serde_json::to_string(&oj_config::resolve_conditions_for(
+            &config,
+            "client",
+            command != "build",
+        ))
+        .unwrap_or_default(),
+    ));
     Ok(vars)
 }
 
@@ -1159,6 +1172,33 @@ mod tests {
             .uri(path)
             .body(axum::body::Body::empty())
             .unwrap()
+    }
+
+    #[test]
+    fn start_script_env_carries_the_client_resolve_conditions() {
+        let root = tmp("client-conds");
+        std::fs::write(root.join("package.json"), r#"{"name":"app"}"#).unwrap();
+        let conds = |command: &str| -> Vec<String> {
+            let vars = start_script_env(&root, command, "development").unwrap();
+            let raw = &vars.iter().find(|(k, _)| k == "OJ_CLIENT_CONDITIONS").expect("var").1;
+            serde_json::from_str(raw).unwrap()
+        };
+        // Defaults: Vite's client set, development for dev and production for build.
+        let dev = conds("serve");
+        assert!(dev.iter().any(|c| c == "browser") && dev.iter().any(|c| c == "development"), "{dev:?}");
+        let build = conds("build");
+        assert!(build.iter().any(|c| c == "production") && !build.iter().any(|c| c == "development"), "{build:?}");
+        // A user resolve.conditions list reaches the client bundle.
+        std::fs::write(
+            root.join("oj.config.json"),
+            r#"{"environments":{"client":{"resolve":{"conditions":["custom","development|production"]}}}}"#,
+        )
+        .unwrap();
+        let custom = conds("serve");
+        assert!(custom.iter().any(|c| c == "custom"), "{custom:?}");
+        assert!(custom.iter().any(|c| c == "development"), "placeholder mapped: {custom:?}");
+        assert!(!custom.iter().any(|c| c == "browser"), "user list replaces the defaults: {custom:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

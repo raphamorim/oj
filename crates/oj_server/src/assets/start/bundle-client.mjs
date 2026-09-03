@@ -22,6 +22,16 @@ const MODE = process.env.OJ_MODE || "development";
 const USER_DEFINE = (() => {
   try { return JSON.parse(process.env.OJ_DEFINE || "{}") || {}; } catch { return {}; }
 })();
+// The client environment's export conditions (OJ_CLIENT_CONDITIONS from oj):
+// Vite derives them from `resolve.conditions`, so a user list reaches this
+// bundle exactly as it reaches the dev server's resolver.
+const CLIENT_CONDITIONS = (() => {
+  try {
+    const v = JSON.parse(process.env.OJ_CLIENT_CONDITIONS || "null");
+    if (Array.isArray(v) && v.every((c) => typeof c === "string") && v.length) return v;
+  } catch {}
+  return ["browser", "module", "import", "development"];
+})();
 
 function rewriteServerFns(code, id) {
   if (!code.includes("createServerFn")) return null;
@@ -120,7 +130,7 @@ const result = await build({
     },
   },
   resolve: {
-    conditionNames: ["browser", "module", "import", "development"],
+    conditionNames: CLIENT_CONDITIONS,
     alias: {
       "#tanstack-router-entry": routerEntry(),
       "#tanstack-start-entry": join(HERE, "start-entry.ts"),

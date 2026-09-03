@@ -20,6 +20,15 @@ const PROCESS_ENV_JSON = JSON.stringify({ NODE_ENV, TSS_SERVER_FN_BASE: "/_serve
 const USER_DEFINE = (() => {
   try { return JSON.parse(process.env.OJ_DEFINE || "{}") || {}; } catch { return {}; }
 })();
+// Client export conditions from `resolve.conditions` (OJ_CLIENT_CONDITIONS from
+// oj, production-flavored for the build), as Vite's client environment.
+const CLIENT_CONDITIONS = (() => {
+  try {
+    const v = JSON.parse(process.env.OJ_CLIENT_CONDITIONS || "null");
+    if (Array.isArray(v) && v.every((c) => typeof c === "string") && v.length) return v;
+  } catch {}
+  return ["browser", "module", "import", NODE_ENV === "production" ? "production" : "development"];
+})();
 const { build } = await importPkg(APP, "rolldown", ["vite", "@tanstack/react-start"]);
 const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
 const OJ = _ojTTY ? "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m" : "oj";
@@ -212,7 +221,7 @@ const client = await build({
       global: "globalThis", ...viteEnvDefine({ ssr: false, mode: MODE, base: BASE }),
     },
   },
-  resolve: { conditionNames: ["browser", "module", "import", NODE_ENV === "production" ? "production" : "development"], alias: clientAlias },
+  resolve: { conditionNames: CLIENT_CONDITIONS, alias: clientAlias },
   plugins: [
     makeVitePlugins({ container: clientContainer, appRoot: APP, mode: "prod", emit }),
     {
