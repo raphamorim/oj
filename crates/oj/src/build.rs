@@ -3138,7 +3138,12 @@ fn inline_module_scripts(html: &str) -> Vec<(usize, usize, String)> {
             continue;
         };
         let tag = &html[start..start + tag_end];
-        if !tag.contains("type=\"module\"") || tag.contains("src=") || tag.ends_with('/') {
+        // Attribute values compare quote-agnostically (`type='module'`,
+        // `type=module`), as an HTML parser sees them.
+        if !html_attr(tag, "type").is_some_and(|t| t.eq_ignore_ascii_case("module"))
+            || html_attr(tag, "src").is_some()
+            || tag.ends_with('/')
+        {
             continue;
         }
         let body_start = start + tag_end + 1;
@@ -6652,6 +6657,25 @@ mod tests {
         assert!(out.contains("src=\"/src/main.js\""), "external module kept: {out}");
         // The placeholder is picked up as a module entry src.
         assert!(module_script_srcs(&out).contains(&"/@oj-inline/0.js".to_string()));
+    }
+
+    #[test]
+    fn inline_module_scripts_match_any_attribute_quoting() {
+        let html = "<script type='module'>import a from './a.ts'</script>\n\
+                    <script type=module>import b from './b.ts'</script>\n\
+                    <script type = \"MODULE\" data-src='/x.js'>import c from './c.ts'</script>\n\
+                    <script type='module' src='/src/main.ts'></script>\n\
+                    <script type='text/javascript'>var d = 1;</script>";
+        let blocks = inline_module_scripts(html);
+        assert_eq!(blocks.len(), 3, "{blocks:?}");
+        assert!(blocks[0].2.contains("'./a.ts'"));
+        assert!(blocks[1].2.contains("'./b.ts'"));
+        assert!(blocks[2].2.contains("'./c.ts'"));
+        let (out, entries) = externalize_inline_scripts(html, Path::new("/app/index.html"));
+        assert_eq!(entries.len(), 3);
+        assert!(!out.contains("./a.ts") && !out.contains("./c.ts"), "{out}");
+        assert!(out.contains("src='/src/main.ts'"), "external module kept: {out}");
+        assert!(out.contains("var d = 1;"), "classic scripts untouched: {out}");
     }
 
 }

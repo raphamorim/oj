@@ -57,4 +57,36 @@ for (const fixture of fixtures) {
   }
 }
 
+// Inline module scripts are externalized (Vite's html-proxy) whatever the
+// quoting of `type`: the body is bundled and transformed, never shipped raw.
+const inlineFixtures = [
+  { name: "single-quoted inline module", tag: "<script type='module'>" },
+  { name: "unquoted inline module", tag: "<script type=module>" },
+  { name: "spaced double-quoted inline module", tag: '<script type = "module">' },
+];
+for (const fixture of inlineFixtures) {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), "oj-html-inline-"));
+  try {
+    fs.writeFileSync(path.join(project, "package.json"), JSON.stringify({ type: "module" }));
+    fs.writeFileSync(
+      path.join(project, "index.html"),
+      `<html><body>${fixture.tag}import { greet } from "./util.ts"; document.body.textContent = greet("inline");</script></body></html>`,
+    );
+    fs.writeFileSync(path.join(project, "util.ts"), 'export function greet(who: string): string { return `hi ${who}`; }');
+
+    const build = spawnSync(binary, ["build", project], { cwd: root, encoding: "utf8" });
+    assert.equal(build.status, 0, `${fixture.name} must build successfully:\n${build.stdout}\n${build.stderr}`);
+
+    const html = fs.readFileSync(path.join(project, "dist", "index.html"), "utf8");
+    assert.ok(!html.includes("./util.ts"), `${fixture.name}: inline body must not ship raw:\n${html}`);
+    const entry = html.match(/\/assets\/[^"'\s>]+\.js/);
+    assert.ok(entry, `${fixture.name} must reference a bundled entry chunk:\n${html}`);
+    const js = fs.readFileSync(path.join(project, "dist", entry[0].replace(/^\//, "")), "utf8");
+    assert.match(js, /hi /, `${fixture.name}: the bundled chunk carries the inline body and its import`);
+    assert.ok(!js.includes(": string"), `${fixture.name}: TypeScript was compiled`);
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+}
+
 console.log("HTML-ATTRIBUTE-QUOTES E2E PASSED");
