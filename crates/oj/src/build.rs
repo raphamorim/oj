@@ -209,7 +209,6 @@ struct OjCssPlugin {
     /// None: a bare browser bundle (server and library builds).
     worker: Option<Arc<WorkerBundleOpts>>,
     /// Vite's resolved `build.cssMinify` (defaults to `build.minify`).
-    css_minify: bool,
     /// Source ids of `?worker` / `?worker&url` entries emitted as chunks, so the
     /// document-only build helpers can skip chunks that only a worker loads.
     worker_entries: Arc<Mutex<std::collections::HashSet<String>>>,
@@ -234,6 +233,8 @@ fn css_resolve_of(root: &Path, config: &oj_config::OjConfig, env: &str) -> oj_cs
         root: root.to_path_buf(),
         public_dir: oj_config::public_dir(config, root).unwrap_or_default(),
         alias: oj_config::resolve_alias(config, env),
+        targets: oj_config::build_css_targets(config),
+        minify: oj_config::build_css_minify(config, env == "ssr"),
     }
 }
 
@@ -765,7 +766,6 @@ async fn compile_stylesheet(
     resolve: &oj_css::CssResolveConfig,
     path: &str,
     id: &str,
-    minify: bool,
 ) -> anyhow::Result<oj_css::CssOutput> {
     let cfg = oj_config::OjConfig {
         css: css.clone(),
@@ -833,7 +833,7 @@ async fn compile_stylesheet(
         Ok(rel) => format!("/{}", rel.display()),
         Err(_) => path.to_string(),
     };
-    oj_css::compile_css(&css_id, &source, minify).map_err(|e| anyhow::anyhow!(e))
+    oj_css::compile_css_with(&css_id, &source, &resolve.as_ref()).map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Split `spec?query` into the file and a normalized oj asset query, for Vite's
@@ -1027,7 +1027,6 @@ impl Plugin for OjCssPlugin {
         let host = self.host.clone();
         let css_transform_enabled = Arc::clone(&self.css_transform_enabled);
         let self_has_postcss = self.has_postcss;
-        let self_css_minify = self.css_minify;
         let css_cfg = self.css.clone();
         let css_resolve = self.resolve.clone();
         let html_inline = Arc::clone(&self.html_inline);
@@ -1056,7 +1055,6 @@ impl Plugin for OjCssPlugin {
                         &css_resolve,
                         file,
                         &id,
-                        self_css_minify,
                     )
                     .await?;
                     let stem = std::path::Path::new(file)
@@ -1175,7 +1173,6 @@ impl Plugin for OjCssPlugin {
                         &css_resolve,
                         file,
                         &id,
-                        self_css_minify,
                     )
                     .await?;
                     return Ok(Some(rolldown_plugin::HookLoadOutput {
@@ -1237,7 +1234,6 @@ impl Plugin for OjCssPlugin {
                         html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
                         worker: worker.clone(),
                         resolve: css_resolve.clone(),
-                        css_minify: self_css_minify,
                         worker_entries: Arc::clone(&worker_entries),
                     };
                     let code = bundle_worker_inline(&root, file, worker.as_ref(), nested).await?;
@@ -1318,7 +1314,6 @@ impl Plugin for OjCssPlugin {
                 &css_resolve,
                 path,
                 &id,
-                self_css_minify,
             )
             .await?;
             // A CSS module: the class map as default plus named exports per
@@ -2275,9 +2270,6 @@ fn warn_unsupported_build_options(config: &oj_config::OjConfig) {
     if b.commonjs_options.is_some() {
         warn("commonjsOptions", "rolldown handles CommonJS dependencies natively without configuration.");
     }
-    if b.css_target.is_some() {
-        warn("cssTarget", "CSS is lowered with lightningcss for the JS build.target.");
-    }
 }
 
 pub async fn build(
@@ -2525,7 +2517,6 @@ pub async fn build(
             define: client_define.clone(),
             minify: client_minify,
         })),
-        css_minify: oj_config::build_css_minify(&config),
         worker_entries: Arc::clone(&worker_entries),
     }));
     let out_ov = ro_output_overrides(ro_opts);
@@ -2891,7 +2882,6 @@ pub async fn build(
                     &link_css_resolve,
                     &src_str,
                     &src_str,
-                    oj_config::build_css_minify(&config),
                 )
                 .await
                 .with_context(|| format!("stylesheet {href} linked from {}", doc.out_rel))?;
@@ -3760,7 +3750,6 @@ pub(crate) async fn build_ssr(
         css: config.css.clone(),
         html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
         worker: None,
-        css_minify: oj_config::build_css_minify(&config),
         worker_entries: Arc::new(Mutex::new(std::collections::HashSet::new())),
     }));
     let mut bundler = BundlerBuilder::default()
@@ -3813,12 +3802,9 @@ pub(crate) async fn build_ssr(
         .build()
         .map_err(rolldown_failure!("rolldown init failed"))?;
 
-    let output = match bundler.write().await {
+    let output = match bundler.write().await.map_err(rolldown_failure!("ssr build failed")) {
         Ok(output) => output,
-        Err(errs) => {
-            let err = (rolldown_failure!("ssr build failed"))(errs);
-            return Err(fail_with_plugin_hooks(err, &plugin_host).await);
-        }
+        Err(err) => return Err(fail_with_plugin_hooks(err, &plugin_host).await),
     };
     bundler
         .close()
@@ -3925,7 +3911,6 @@ async fn build_server_fns(root: &Path, out_dir: &Path, mode: &str) -> anyhow::Re
                 css: config.css.clone(),
                 html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 worker: None,
-                css_minify: oj_config::build_css_minify(&config),
                 worker_entries: Arc::new(Mutex::new(std::collections::HashSet::new())),
             })])
             .with_options(BundlerOptions {
@@ -4303,7 +4288,6 @@ async fn build_client_entry(
         css: config.css.clone(),
         html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
         worker: None,
-        css_minify: oj_config::build_css_minify(&config),
         worker_entries: Arc::new(Mutex::new(std::collections::HashSet::new())),
     }));
 
@@ -4346,12 +4330,9 @@ async fn build_client_entry(
         .build()
         .map_err(rolldown_failure!("rolldown init failed"))?;
 
-    let output = match bundler.write().await {
+    let output = match bundler.write().await.map_err(rolldown_failure!("client build failed")) {
         Ok(output) => output,
-        Err(errs) => {
-            let err = (rolldown_failure!("client build failed"))(errs);
-            return Err(fail_with_plugin_hooks(err, &plugin_host).await);
-        }
+        Err(err) => return Err(fail_with_plugin_hooks(err, &plugin_host).await),
     };
     bundler
         .close()
@@ -4540,7 +4521,6 @@ async fn build_library(
                 css: config.css.clone(),
                 html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 worker: None,
-                css_minify: oj_config::build_css_minify(&config),
                 worker_entries: Arc::new(Mutex::new(std::collections::HashSet::new())),
             })])
             .with_options(BundlerOptions {
@@ -6177,7 +6157,7 @@ mod tests {
         assert_eq!(b.assets_inline_limit, Some(10));
         assert_eq!(b.empty_out_dir, Some(true));
         assert!(!oj_config::build_minify(&config), "--minify false wins over the config's true");
-        assert!(!oj_config::build_css_minify(&config), "cssMinify follows minify");
+        assert!(!oj_config::build_css_minify(&config, false), "cssMinify follows minify");
         assert_eq!(oj_config::build_sourcemap(&config), oj_config::Sourcemap::Hidden);
         assert_eq!(oj_config::build_assets_dir(&config), "static");
         assert_eq!(oj_config::build_manifest_name(&config).as_deref(), Some(".vite/manifest.json"));

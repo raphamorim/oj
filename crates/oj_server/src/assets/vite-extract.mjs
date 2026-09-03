@@ -211,6 +211,10 @@ function extractBuild(b) {
   if (typeof b.target === "string") out.target = b.target;
   else if (Array.isArray(b.target)) out.target = b.target.filter((t) => typeof t === "string");
   else if (b.target === false) warn("build.target false is not supported; the default baseline is used");
+  if (typeof b.cssTarget === "string") out.cssTarget = b.cssTarget;
+  else if (Array.isArray(b.cssTarget)) out.cssTarget = b.cssTarget.filter((t) => typeof t === "string");
+  else if (b.cssTarget === false) warn("build.cssTarget false is not supported; build.target is used");
+  if (typeof b.cssMinify === "boolean" || typeof b.cssMinify === "string") out.cssMinify = b.cssMinify;
   if (typeof b.emptyOutDir === "boolean") out.emptyOutDir = b.emptyOutDir;
   if (b.modulePreload === false) out.modulePreload = false;
   else if (b.modulePreload && typeof b.modulePreload === "object") {
