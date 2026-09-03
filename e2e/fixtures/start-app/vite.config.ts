@@ -56,6 +56,8 @@ function freshModulePlugin(): Plugin {
 export default defineConfig({
   // A non-default publicDir, to exercise oj adopting vite's publicDir.
   publicDir: "public",
+  // A config define: must be applied by the SSR loader (dev) and the prod bundles.
+  define: { __FIXTURE_DEFINE__: JSON.stringify("fixture-define-marker") },
   plugins: [
     buildInfoPlugin(),
     freshModulePlugin(),

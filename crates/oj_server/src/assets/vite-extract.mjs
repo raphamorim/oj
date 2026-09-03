@@ -226,6 +226,29 @@ function extractEsbuild(es) {
   return Object.keys(out).length ? out : null;
 }
 
+// `ssr.noExternal`/`external` entries: strings and globs pass through, RegExps
+// become `{ regex }`, `true` stays `true`.
+function extractSsr(ssr) {
+  if (!ssr || typeof ssr !== "object") return null;
+  const list = (v) => {
+    if (v === true) return true;
+    const arr = Array.isArray(v) ? v : v == null ? [] : [v];
+    const out = [];
+    for (const e of arr) {
+      if (typeof e === "string") out.push(e);
+      else if (e instanceof RegExp) out.push({ regex: e.source });
+    }
+    return out;
+  };
+  const out = {};
+  const ne = list(ssr.noExternal);
+  const ex = list(ssr.external);
+  if (ne === true || (Array.isArray(ne) && ne.length)) out.noExternal = ne;
+  if (ex === true || (Array.isArray(ex) && ex.length)) out.external = ex;
+  if (typeof ssr.target === "string") out.target = ssr.target;
+  return Object.keys(out).length ? out : null;
+}
+
 function warnUnsupported(c) {
   if (c.css?.preprocessorOptions) warn("css.preprocessorOptions is not applied yet");
   if (c.esbuild?.jsx === "preserve" || c.oxc?.jsx === "preserve") {
@@ -239,7 +262,7 @@ function warnUnsupported(c) {
     warn("optimizeDeps.esbuildOptions/rollupOptions are not applied; include/exclude/entries are");
   }
   if (c.worker) warn("worker config is not applied");
-  if (c.ssr) warn("ssr config is not applied");
+  if (c.ssr?.resolve) warn("ssr.resolve is not applied (noExternal/external/target are)");
   for (const k of ["strictPort", "open", "cors", "allowedHosts"]) {
     if (c.server?.[k] !== undefined) warn(`server.${k} is accepted but not applied`);
   }
@@ -278,6 +301,7 @@ if (isMainRun) try {
       build: extractBuild(c.build),
       oxc: extractOxc(c.oxc),
       esbuild: extractEsbuild(c.esbuild),
+      ssr: extractSsr(c.ssr),
     }),
   );
 } catch (e) {

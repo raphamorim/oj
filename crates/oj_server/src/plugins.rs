@@ -198,6 +198,9 @@ pub struct ViteValues {
     /// pragma, pragmaFrag } }`), and the `esbuild.jsx*` fields for older configs.
     pub oxc: Option<serde_json::Value>,
     pub esbuild: Option<serde_json::Value>,
+    /// `ssr` block as normalized by the extractor (`noExternal`/`external`
+    /// lists of names, globs or `{ regex }`, or `true`; `target`).
+    pub ssr: Option<serde_json::Value>,
 }
 
 /// Evaluate the app's `vite.config` for `command` ("serve" | "build") and `mode`.
@@ -307,6 +310,7 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
         build: json.get("build").filter(|v| !v.is_null()).cloned(),
         oxc: json.get("oxc").filter(|v| !v.is_null()).cloned(),
         esbuild: json.get("esbuild").filter(|v| !v.is_null()).cloned(),
+        ssr: json.get("ssr").filter(|v| !v.is_null()).cloned(),
     }
 }
 
@@ -446,6 +450,9 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
     }
     if config.esbuild.is_none() {
         config.esbuild = v.esbuild;
+    }
+    if config.ssr.is_none() {
+        config.ssr = v.ssr;
     }
 }
 
@@ -1073,6 +1080,7 @@ mod vite_values_tests {
             build: None,
             oxc: None,
             esbuild: None,
+            ssr: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/vite-base/"));
@@ -1103,6 +1111,7 @@ mod vite_values_tests {
             build: None,
             oxc: None,
             esbuild: None,
+            ssr: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/oj-base/"));
@@ -1216,5 +1225,19 @@ mod vite_values_tests {
         };
         merge_vite_values(&mut config, v);
         assert_eq!(oj_config::jsx_settings(&config).import_source.as_deref(), Some("preact"), "oj.config wins");
+    }
+
+    #[test]
+    fn merge_adopts_ssr_block_when_unset() {
+        let mut config = oj_config::OjConfig::default();
+        let v = ViteValues {
+            ssr: Some(serde_json::json!({ "noExternal": ["lodash-es", { "regex": "^@acme/" }], "external": ["sharp"] })),
+            ..Default::default()
+        };
+        merge_vite_values(&mut config, v);
+        let r = oj_config::ssr_externals(&config);
+        assert!(r.is_no_external("lodash-es"));
+        assert!(r.is_no_external("@acme/ui"));
+        assert_eq!(r.is_external("sharp", true), Some(true));
     }
 }

@@ -135,6 +135,33 @@ try {
   if (!pushed) throw new Error("runner did not receive a server-side HMR push");
   console.log("ssr-dev: server-side HMR push ok (runner invalidated on change event)");
 
+  // Dev SSR modules compile as dev + ssr: SSR true, DEV true, MODE development,
+  // and the runner's realm has the web platform globals server code expects.
+  const probe = path.join(repo, "playground", "src", "ssr-env-probe.server.ts");
+  fs.writeFileSync(
+    probe,
+    `export const ssr = import.meta.env.SSR;\nexport const dev = import.meta.env.DEV;\nexport const mode = import.meta.env.MODE;\n` +
+      `export function globals() { return [typeof fetch, typeof Response, typeof Headers, typeof ReadableStream, typeof crypto, typeof structuredClone, typeof AbortController].join(","); }\n`,
+  );
+  try {
+    const compiled = await (await fetch(`${base}/@ssr-module?id=${encodeURIComponent(probe)}`)).text();
+    if (!/const ssr = true/.test(compiled) || !/const dev = true/.test(compiled) || !/const mode = "development"/.test(compiled)) {
+      throw new Error(`generic --ssr module not compiled as dev+ssr:\n${compiled}`);
+    }
+    const call = await fetch(`${base}/__oj_fn`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ module: "/src/ssr-env-probe.server.ts", name: "globals", args: [] }),
+    });
+    const typeofs = JSON.parse(await call.text());
+    if (typeofs !== "function,function,function,function,object,function,function") {
+      throw new Error(`runner realm is missing web globals: ${typeofs}`);
+    }
+    console.log("ssr-dev: dev+ssr compile options + web globals in the runner realm ok");
+  } finally {
+    fs.rmSync(probe, { force: true });
+  }
+
   const html = await waitFor((h) => /ssr[^0-9]*0/.test(stripTags(h)));
   for (const needle of [
     'src="/@oj/refresh-preamble.js"',

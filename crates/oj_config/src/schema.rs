@@ -29,6 +29,10 @@ pub struct OjConfig {
     /// Vite <=7's `esbuild` block (`jsx`, `jsxImportSource`, `jsxFactory`,
     /// `jsxFragment`); opaque for the same reason. See `jsx_settings`.
     pub esbuild: Option<serde_json::Value>,
+    /// Vite's `ssr` block (`noExternal`, `external`, `target`); opaque because
+    /// entries may be strings, globs, RegExps (extracted as `{ regex }`) or
+    /// `true`. See `ssr_externals`.
+    pub ssr: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

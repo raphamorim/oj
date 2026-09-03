@@ -20,6 +20,9 @@ const APP = process.env.OJ_APP_ROOT ?? process.cwd();
 const { transformSync } = await importPkg(APP, "rolldown/experimental", ["vite", "@tanstack/react-start"]);
 const rawContainer = loadPluginContainerSync(APP, { command: "serve", environment: "ssr" });
 const VIRTUAL_SCHEME = "ojvirtual:///";
+const PUBLIC_DIR = process.env.OJ_PUBLIC_DIR
+  ? pathResolve(APP, process.env.OJ_PUBLIC_DIR)
+  : pathResolve(APP, "public");
 const CACHE_DIR = process.env.OJ_CACHE_ROOT ?? pathResolve(HERE, "..");
 
 const BASE_FILES = [
@@ -115,7 +118,11 @@ const envDelta = (() => {
   }
   return fresh;
 })();
-const DEFINE = viteEnvDefine({ ssr: true, env: { ...process.env, ...envDelta } });
+// The config's `define` map (OJ_DEFINE, from oj) under Vite's own env defines.
+const USER_DEFINE = (() => {
+  try { return JSON.parse(process.env.OJ_DEFINE || "{}") || {}; } catch { return {}; }
+})();
+const DEFINE = { ...USER_DEFINE, ...viteEnvDefine({ ssr: true, env: { ...process.env, ...envDelta } }) };
 
 const cacheStats = { hits: 0, misses: 0, uncached: 0, rhits: 0, rmisses: 0 };
 const EPOCH = (() => {
@@ -659,9 +666,10 @@ function resolveSpec(clean, context, next) {
     }
     if (clean.startsWith("/")) {
       // A /-prefixed id resolves against the project root (Vite's asSrc
-      // behavior; the client graph already serves these URLs directly).
-      // True absolute fs paths miss this probe and fall through to Node.
-      const hit = probe(pathResolve(APP, clean.slice(1)));
+      // behavior; the client graph already serves these URLs directly), then
+      // against publicDir (Vite's checkPublicFile). True absolute fs paths miss
+      // both probes and fall through to Node.
+      const hit = probe(pathResolve(APP, clean.slice(1))) || probe(pathResolve(PUBLIC_DIR, clean.slice(1)));
       if (hit) return { abs: hit, via: "local" };
     } else {
       const hit = resolveTsPaths(clean);
@@ -693,6 +701,55 @@ function resolveSpec(clean, context, next) {
     throw err;
   }
   return { result: r, via: "default" };
+}
+
+// Inline the transform's source map so Node (started with --enable-source-maps)
+// reports stack frames at the original .tsx positions, as Vite's
+// ssrFixStacktrace does for its runner.
+function withInlineMap(out) {
+  if (!out || !out.map) return out.code;
+  try {
+    const map = typeof out.map === "string" ? out.map : JSON.stringify(out.map);
+    return out.code + "\n//# sourceMappingURL=data:application/json;base64," + Buffer.from(map).toString("base64") + "\n";
+  } catch {
+    return out.code;
+  }
+}
+
+// Vite's `ssr.noExternal`: dependencies the loader must transform itself (define,
+// import.meta.env, glob) instead of leaving to Node. Names, `@scope/*` globs,
+// RegExp sources, or everything (`true`); `external` names always stay Node's.
+const SSR_EXTERNALS = (() => {
+  try { return JSON.parse(process.env.OJ_SSR_EXTERNALS || "null"); } catch { return null; }
+})();
+function pkgNameOfPath(path) {
+  const i = path.lastIndexOf("/node_modules/");
+  if (i < 0) return null;
+  const parts = path.slice(i + "/node_modules/".length).split("/");
+  return parts[0]?.startsWith("@") ? (parts[1] ? `${parts[0]}/${parts[1]}` : null) : parts[0] || null;
+}
+function globMatch(pattern, value) {
+  if (!pattern.includes("*")) return pattern === value;
+  const re = new RegExp("^" + pattern.split("*").map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$");
+  return re.test(value);
+}
+function isNoExternalDep(path) {
+  if (!SSR_EXTERNALS) return false;
+  const pkg = pkgNameOfPath(path);
+  if (!pkg) return false;
+  if ((SSR_EXTERNALS.external || []).includes(pkg) || SSR_EXTERNALS.externalAll) return false;
+  if (SSR_EXTERNALS.noExternalAll) return true;
+  if ((SSR_EXTERNALS.noExternal || []).some((p) => globMatch(p, pkg))) return true;
+  return (SSR_EXTERNALS.noExternalRegex || []).some((src) => { try { return new RegExp(src).test(pkg); } catch { return false; } });
+}
+
+// oxc `lang` for a module url, or null for anything the transform does not own.
+function SRC_LANG_OF(clean) {
+  if (clean.endsWith(".tsx")) return "tsx";
+  if (clean.endsWith(".ts") || clean.endsWith(".mts") || clean.endsWith(".cts")) return "ts";
+  if (clean.endsWith(".jsx")) return "jsx";
+  if (clean.endsWith(".js") || clean.endsWith(".mjs")) return "js";
+  return null;
 }
 
 const toPath = (u) => {
@@ -774,7 +831,19 @@ export function load(url, context, next) {
   if (clean.endsWith(".json")) {
     return { format: "module", source: `export default ${readFileSync(fileURLToPath(clean), "utf8")};`, shortCircuit: true };
   }
-  if (clean.endsWith(".tsx") || clean.endsWith(".ts") || clean.endsWith(".jsx")) {
+  // TypeScript/JSX always; plain .js/.mjs/.mts/.cts for the app's own modules
+  // too, so import.meta.env, define, import.meta.glob and server functions are
+  // rewritten there as well (Vite transforms every module in the graph; a raw
+  // `import.meta.env.DEV` reaching Node throws on `undefined`).
+  // A plain .js is only ours when it is app source: not a dependency, and not
+  // a CommonJS file (a `file:` package or a .cjs-style module keeps Node's
+  // loader, whose lexer provides its named exports).
+  const srcLang = SRC_LANG_OF(clean);
+  const inDeps = clean.includes("/node_modules/");
+  const ownsJs = srcLang === "js" && clean.startsWith("file:")
+    && (!inDeps || isNoExternalDep(fileURLToPath(clean)))
+    && !isCjsFile(fileURLToPath(clean));
+  if (srcLang && (srcLang !== "js" || ownsJs)) {
     const path = fileURLToPath(clean);
     const userFile = container && !path.includes("/node_modules/");
     let diskRaw = null;
@@ -806,12 +875,13 @@ export function load(url, context, next) {
     }
     const src = transformServerFns(transformGlob(raw, path), path);
     const out = transformSync(path, src, {
-      lang: clean.endsWith("tsx") ? "tsx" : clean.endsWith("jsx") ? "jsx" : "ts",
+      lang: srcLang,
       jsx: jsxTransformOptions(),
       define: DEFINE,
     });
-    cachePut(raw.includes("import.meta.glob") ? null : key, out.code);
-    return { format: "module", source: out.code, shortCircuit: true };
+    const code = withInlineMap(out);
+    cachePut(raw.includes("import.meta.glob") ? null : key, code);
+    return { format: "module", source: code, shortCircuit: true };
   }
   if (url.includes("?ojv=") && isTanstack(url)) {
     return { format: "module", source: readFileSync(fileURLToPath(clean), "utf8"), shortCircuit: true };
@@ -835,8 +905,9 @@ export function load(url, context, next) {
         lang: "jsx", jsx: jsxTransformOptions(),
         define: DEFINE,
       });
-      cachePut(compiled.includes("import.meta.glob") ? null : key, out.code);
-      return { format: "module", source: out.code, shortCircuit: true };
+      const code = withInlineMap(out);
+      cachePut(compiled.includes("import.meta.glob") ? null : key, code);
+      return { format: "module", source: code, shortCircuit: true };
     }
   }
   // A user plugin's load() may override a real on-disk .js/.mjs file (Vite:

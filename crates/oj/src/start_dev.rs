@@ -19,6 +19,10 @@ struct Runner {
     stdin: ChildStdin,
     lines: Lines<BufReader<ChildStdout>>,
     _child: Child,
+    /// The SSR runner's loopback HTTP port (requests go over HTTP so bodies stay
+    /// binary, responses stream and requests run concurrently); None for the
+    /// line-protocol services (css host).
+    http_port: Option<u16>,
 }
 
 struct StartState {
@@ -90,7 +94,7 @@ pub async fn start_dev(
         let runner = Arc::clone(&runner);
         let reload_tx = reload_tx.clone();
         tokio::spawn(async move {
-            let _ = forward(&runner, "GET".into(), "/".into(), vec![], None).await;
+            let _ = forward(&runner, "GET".into(), "/".into(), &header::HeaderMap::new(), None).await;
             oj_server::boot_phase("prewarm complete");
             if revalidate_runner(&runner).await {
                 let _ = reload_tx.send(());
@@ -384,6 +388,24 @@ fn start_script_env(root: &Path, command: &str, mode: &str) -> Vec<(String, Stri
     if jsx != oj_config::JsxSettings::default() {
         vars.push(("OJ_JSX".into(), serde_json::to_string(&jsx).unwrap_or_default()));
     }
+    // The config's `define` map (values are JS expressions), applied by the SSR
+    // loader and the production bundles like Vite's define plugin.
+    let defines: serde_json::Map<String, serde_json::Value> = oj_config::config_defines(&config)
+        .into_iter()
+        .map(|(k, v)| (k, serde_json::Value::String(v)))
+        .collect();
+    if !defines.is_empty() {
+        vars.push(("OJ_DEFINE".into(), serde_json::Value::Object(defines).to_string()));
+    }
+    // `ssr.noExternal`/`external`, consumed by the SSR loader to transform (rather
+    // than hand to Node) the dependencies Vite would bundle.
+    let externals = oj_config::ssr_externals(&config);
+    if externals != oj_config::SsrExternals::default() {
+        vars.push((
+            "OJ_SSR_EXTERNALS".into(),
+            serde_json::to_string(&externals).unwrap_or_default(),
+        ));
+    }
     vars
 }
 
@@ -615,12 +637,27 @@ fn run_node(root: &Path, script: &Path, what: &str) -> anyhow::Result<()> {
 }
 
 async fn spawn_start_runner(root: &Path, cache: &Path) -> anyhow::Result<Runner> {
-    spawn_node_service(root, &cache.join("runner.mjs")).await
+    let mut runner = spawn_node_service(root, &cache.join("runner.mjs")).await?;
+    // The runner announces its loopback port as its first stdout line, before it
+    // evaluates the app entry (requests wait for that inside the runner).
+    let line = tokio::time::timeout(std::time::Duration::from_secs(120), runner.lines.next_line())
+        .await
+        .map_err(|_| anyhow::anyhow!("start runner did not announce its port"))?
+        .map_err(|e| anyhow::anyhow!("start runner stdout: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("start runner exited before announcing its port"))?;
+    let port = serde_json::from_str::<serde_json::Value>(&line)
+        .ok()
+        .and_then(|v| v.get("port").and_then(|p| p.as_u64()))
+        .ok_or_else(|| anyhow::anyhow!("start runner sent an unexpected first line: {line}"))?;
+    runner.http_port = Some(port as u16);
+    Ok(runner)
 }
 
 async fn spawn_node_service(root: &Path, script: &Path) -> anyhow::Result<Runner> {
     let mut cmd = tokio::process::Command::new("node");
-    cmd.arg(script)
+    // The SSR loader inlines source maps into every transformed module; this
+    // flag makes Node apply them to stack traces (original .tsx positions).
+    cmd.arg("--enable-source-maps").arg(script)
         .env("OJ_APP_ROOT", root)
         .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
         .env("NODE_ENV", "development")
@@ -646,6 +683,7 @@ async fn spawn_node_service(root: &Path, script: &Path) -> anyhow::Result<Runner
         stdin,
         lines: BufReader::new(stdout).lines(),
         _child: child,
+        http_port: None,
     })
 }
 
@@ -686,6 +724,11 @@ async fn compile_css(host: &Arc<tokio::sync::Mutex<Runner>>, path: &Path) -> Opt
 #[derive(Debug, PartialEq)]
 enum Route {
     Document,
+    /// A GET whose last segment has an extension (`/robots.txt`,
+    /// `/users/john.doe`): a static file or module if one exists, otherwise the
+    /// SSR handler (a Start server route or a dotted route param), like Vite
+    /// where every request nothing else owns reaches the app.
+    StaticOrDocument,
     Api,
     Pass,
 }
@@ -695,9 +738,16 @@ fn classify(req: &Request, proxy_prefixes: &[String]) -> Route {
     if path.starts_with("/@") || path.starts_with("/__") {
         return Route::Pass;
     }
+    if proxy_prefixes.iter().any(|p| path.starts_with(p.as_str())) {
+        return Route::Pass;
+    }
     let last = path.rsplit('/').next().unwrap_or("");
     if last != "index.html" && last.contains('.') {
-        return Route::Pass;
+        return if *req.method() == Method::GET {
+            Route::StaticOrDocument
+        } else {
+            Route::Pass
+        };
     }
     if proxy_prefixes.iter().any(|p| path.starts_with(p.as_str())) {
         return Route::Pass;
@@ -751,28 +801,46 @@ async fn start_route(State(state): State<Arc<StartState>>, req: Request, next: N
     }
     match classify(&req, &state.proxy_prefixes) {
         Route::Document => {
-            let raw = req
-                .uri()
-                .path_and_query()
-                .map(|p| p.as_str())
-                .unwrap_or("/")
-                .to_string();
-            // Editor plugins (dev-server bridge) register configureServer routes
-            // with no path prefix, so a GET like /_sandbox/preview/viewers can only
-            // be told from an app route by asking the middleware first; it returns
-            // x-oj-fallthrough when it does not own the path, and then we SSR.
-            if let Some(port) = state.plugin_mw_port {
-                if let Some(resp) =
-                    oj_server::forward_get_to_plugin_mw(port, &raw, req.headers()).await
-                {
-                    return resp;
-                }
+            let raw = path_and_query(&req);
+            forward_document(&state, raw, req.headers()).await
+        }
+        Route::StaticOrDocument => {
+            let raw = path_and_query(&req);
+            let headers = req.headers().clone();
+            let resp = next.run(req).await;
+            if resp.status() != StatusCode::NOT_FOUND {
+                return resp;
             }
-            forward(&state.runner, "GET".into(), document_url(&raw), vec![], None).await
+            forward_document(&state, raw, &headers).await
         }
         Route::Api => forward_with_body(&state, req).await,
         Route::Pass => next.run(req).await,
     }
+}
+
+fn path_and_query(req: &Request) -> String {
+    req.uri()
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/")
+        .to_string()
+}
+
+async fn forward_document(
+    state: &Arc<StartState>,
+    raw: String,
+    headers: &header::HeaderMap,
+) -> Response {
+    // Editor plugins (dev-server bridge) register configureServer routes
+    // with no path prefix, so a GET like /_sandbox/preview/viewers can only
+    // be told from an app route by asking the middleware first; it returns
+    // x-oj-fallthrough when it does not own the path, and then we SSR.
+    if let Some(port) = state.plugin_mw_port {
+        if let Some(resp) = oj_server::forward_get_to_plugin_mw(port, &raw, headers).await {
+            return resp;
+        }
+    }
+    forward(&state.runner, "GET".into(), document_url(&raw), headers, None).await
 }
 
 async fn forward_with_body(state: &Arc<StartState>, req: Request) -> Response {
@@ -800,9 +868,14 @@ async fn forward_with_body(state: &Arc<StartState>, req: Request) -> Response {
             return resp;
         }
     }
-    let headers = collect_headers(&header_map);
-    let body = body_bytes.map(|b| String::from_utf8_lossy(&b).into_owned());
-    forward(&state.runner, method, url, headers, body).await
+    forward(
+        &state.runner,
+        method,
+        url,
+        &header_map,
+        body_bytes.map(|b| b.to_vec()),
+    )
+    .await
 }
 
 async fn serve_client_chunk(state: &StartState, name: &str) -> Response {
@@ -953,95 +1026,58 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-fn collect_headers(headers: &header::HeaderMap) -> Vec<(String, String)> {
-    headers
-        .iter()
-        .filter_map(|(k, v)| Some((k.as_str().to_owned(), v.to_str().ok()?.to_owned())))
-        .collect()
-}
 
 async fn forward(
     runner: &Arc<tokio::sync::Mutex<Runner>>,
     method: String,
     url: String,
-    req_headers: Vec<(String, String)>,
-    body: Option<String>,
+    req_headers: &header::HeaderMap,
+    body: Option<Vec<u8>>,
 ) -> Response {
-    let runner = Arc::clone(runner);
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let mut guard = runner.lock_owned().await;
-        let result = async {
-            let hdrs: serde_json::Map<String, serde_json::Value> = req_headers
-                .into_iter()
-                .map(|(k, v)| (k, serde_json::Value::String(v)))
-                .collect();
-            let cmd =
-                serde_json::json!({ "method": method, "url": url, "headers": hdrs, "body": body });
-            guard
-                .stdin
-                .write_all(format!("{cmd}\n").as_bytes())
-                .await
-                .map_err(|e| e.to_string())?;
-            guard.stdin.flush().await.map_err(|e| e.to_string())?;
-            let line = guard
-                .lines
-                .next_line()
-                .await
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "start runner closed".to_string())?;
-            serde_json::from_str::<serde_json::Value>(&line).map_err(|e| e.to_string())
+    let port = match runner.lock().await.http_port {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "oj start: runner has no loopback port",
+            )
+                .into_response()
         }
-        .await;
-        let _ = tx.send(result);
-    });
-    match rx
-        .await
-        .unwrap_or_else(|_| Err("start runner task cancelled".to_string()))
-    {
-        Ok(v) => {
-            let status = v.get("status").and_then(|s| s.as_u64()).unwrap_or(200) as u16;
-            let mut body = v
-                .get("body")
-                .and_then(|b| b.as_str())
-                .unwrap_or("")
-                .to_owned();
-            let is_html = v
-                .get("headers")
-                .and_then(|h| h.get("content-type"))
-                .and_then(|c| c.as_str())
-                .is_some_and(|c| c.contains("text/html"));
-            if is_html {
-                if let Some(i) = body.rfind("</body>") {
-                    body.insert_str(i, RELOAD_CLIENT);
-                } else {
-                    body.push_str(RELOAD_CLIENT);
-                }
-            }
-            let mut resp = Response::new(axum::body::Body::from(body));
-            *resp.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
-            if let Some(h) = v.get("headers").and_then(|h| h.as_object()) {
-                for (k, val) in h {
-                    let lower = k.to_ascii_lowercase();
-                    if lower == "content-length"
-                        || lower == "content-encoding"
-                        || lower == "transfer-encoding"
-                    {
-                        continue;
-                    }
-                    if let (Ok(name), Some(vs)) =
-                        (header::HeaderName::from_bytes(k.as_bytes()), val.as_str())
-                    {
-                        if let Ok(value) = header::HeaderValue::from_str(vs) {
-                            resp.headers_mut().insert(name, value);
-                        }
-                    }
-                }
-            }
-            resp
-        }
+    };
+    match oj_server::proxy_to_loopback(port, &method, &url, req_headers, body).await {
+        Ok(resp) => inject_reload_client(resp),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj start: {e}")).into_response(),
     }
+}
+
+/// Append the live-reload client to a streamed HTML document. The stream is
+/// passed through untouched (TanStack streams its dehydrated data into the
+/// page) and the script tag follows the final chunk; browsers parse a trailing
+/// `<script>` after `</html>` into the body.
+fn inject_reload_client(resp: Response) -> Response {
+    use tokio_stream::StreamExt;
+    let is_html = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|c| c.to_str().ok())
+        .is_some_and(|c| c.contains("text/html"));
+    if !is_html {
+        return resp;
+    }
+    let (parts, body) = resp.into_parts();
+    let tail = tokio_stream::once(Ok::<_, axum::Error>(axum::body::Bytes::from_static(
+        RELOAD_CLIENT.as_bytes(),
+    )));
+    let stream = body.into_data_stream().chain(tail);
+    Response::from_parts(parts, axum::body::Body::from_stream(stream))
+}
+
+#[cfg(test)]
+fn collect_headers(headers: &header::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(k, v)| Some((k.as_str().to_owned(), v.to_str().ok()?.to_owned())))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1185,12 +1221,26 @@ mod tests {
             classify(&req("GET", "/guides/index.html"), &no_proxy),
             Route::Document
         ));
+        // A dotted GET is served statically when a file/module owns it and
+        // otherwise reaches the SSR handler (server routes, dotted params).
         assert!(matches!(
             classify(&req("GET", "/main.js"), &no_proxy),
-            Route::Pass
+            Route::StaticOrDocument
         ));
         assert!(matches!(
             classify(&req("GET", "/styles.css"), &no_proxy),
+            Route::StaticOrDocument
+        ));
+        assert!(matches!(
+            classify(&req("GET", "/robots.txt"), &no_proxy),
+            Route::StaticOrDocument
+        ));
+        assert!(matches!(
+            classify(&req("GET", "/users/john.doe"), &no_proxy),
+            Route::StaticOrDocument
+        ));
+        assert!(matches!(
+            classify(&req("GET", "/api/v1.2/x"), &vec!["/api".to_string()]),
             Route::Pass
         ));
         assert!(matches!(
