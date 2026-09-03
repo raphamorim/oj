@@ -21,18 +21,47 @@ use rolldown_plugin::{
     PluginContext, SharedLoadPluginContext, SharedTransformPluginContext,
 };
 
-fn ro_output_str(ro: Option<&serde_json::Value>, key: &str) -> Option<String> {
+/// Both config loaders replace a function-valued rollup option with this marker
+/// (the config is evaluated in a sandbox / a subprocess and travels as JSON, so
+/// the function itself cannot reach the bundler). oj warns instead of silently
+/// building without the option.
+const FN_MARKER: &str = "__oj_fn__";
+
+fn warn_fn_option(key: &str, hint: &str) {
+    eprintln!(
+        "oj build: (!) build.rollupOptions.{key} is a function, which oj cannot run (the \
+         config is serialized before the build); the option is ignored. {hint}"
+    );
+}
+
+fn is_fn_marker(v: &serde_json::Value) -> bool {
+    v.as_str() == Some(FN_MARKER)
+}
+
+fn ro_output(ro: Option<&serde_json::Value>) -> Option<&serde_json::Value> {
     let output = ro?.get("output")?;
-    let obj = if output.is_array() {
-        output.get(0)?
+    if output.is_array() {
+        output.get(0)
     } else {
-        output
-    };
-    obj.get(key)?.as_str().map(String::from)
+        Some(output)
+    }
+}
+
+fn ro_output_str(ro: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    let v = ro_output(ro)?.get(key)?;
+    if is_fn_marker(v) {
+        warn_fn_option(&format!("output.{key}"), "Use a pattern string such as \"assets/[name]-[hash].js\".");
+        return None;
+    }
+    v.as_str().map(String::from)
 }
 
 fn ro_external(ro: Option<&serde_json::Value>) -> Vec<String> {
     match ro.and_then(|v| v.get("external")) {
+        Some(serde_json::Value::String(s)) if s == FN_MARKER => {
+            warn_fn_option("external", "List the external specifiers as strings.");
+            Vec::new()
+        }
         Some(serde_json::Value::String(s)) => vec![s.clone()],
         Some(serde_json::Value::Array(a)) => a
             .iter()
@@ -89,29 +118,65 @@ fn re_escape(s: &str) -> String {
     out
 }
 
-fn manual_chunks(ro: Option<&serde_json::Value>) -> Option<rolldown_common::CodeSplittingMode> {
-    let output = ro?.get("output")?;
-    let output = if output.is_array() {
-        output.get(0)?
-    } else {
-        output
-    };
-    let map = output.get("manualChunks")?.as_object()?;
+/// Chunking from `output.advancedChunks` (rolldown's native form; wins when
+/// present) or the Rollup `output.manualChunks` object. A manualChunks value is a
+/// module id: a bare package name matches that package under `node_modules`, a
+/// `./`-relative or absolute path matches that source file (Rollup semantics).
+/// The function forms cannot cross the JSON boundary and produce a warning.
+fn manual_chunks(
+    ro: Option<&serde_json::Value>,
+    root: &Path,
+) -> Option<rolldown_common::CodeSplittingMode> {
+    let output = ro_output(ro)?;
+    if let Some(adv) = output.get("advancedChunks") {
+        if let Some(mode) = advanced_chunks(adv) {
+            return Some(mode);
+        }
+    }
+    let mc = output.get("manualChunks")?;
+    if is_fn_marker(mc) {
+        warn_fn_option(
+            "output.manualChunks",
+            "Use the object form ({ vendor: [\"react\"] }) or rolldown's output.advancedChunks groups.",
+        );
+        return None;
+    }
+    let map = mc.as_object()?;
     let mut groups = Vec::new();
     let mut priority = map.len() as u32;
     for (name, tokens) in map {
         let Some(arr) = tokens.as_array() else {
             continue;
         };
-        let escaped: Vec<String> = arr
-            .iter()
-            .filter_map(|t| t.as_str())
-            .map(re_escape)
-            .collect();
-        if escaped.is_empty() {
+        let mut packages: Vec<String> = Vec::new();
+        let mut paths: Vec<String> = Vec::new();
+        for t in arr.iter().filter_map(|t| t.as_str()) {
+            if t.starts_with("./") || t.starts_with("../") || Path::new(t).is_absolute() {
+                let abs = if Path::new(t).is_absolute() {
+                    PathBuf::from(t)
+                } else {
+                    root.join(t)
+                };
+                let abs = abs.canonicalize().unwrap_or(abs);
+                paths.push(re_escape(&abs.to_string_lossy()));
+            } else {
+                packages.push(re_escape(t));
+            }
+        }
+        let mut alts: Vec<String> = Vec::new();
+        if !packages.is_empty() {
+            alts.push(format!(
+                r"[\\/]node_modules[\\/]({})([\\/]|$)",
+                packages.join("|")
+            ));
+        }
+        if !paths.is_empty() {
+            alts.push(format!("^({})$", paths.join("|")));
+        }
+        if alts.is_empty() {
             continue;
         }
-        let pattern = format!(r"[\\/]node_modules[\\/]({})([\\/]|$)", escaped.join("|"));
+        let pattern = alts.join("|");
         let Ok(test) = rolldown_utils::js_regex::HybridRegex::new(&pattern) else {
             continue;
         };
@@ -130,6 +195,76 @@ fn manual_chunks(ro: Option<&serde_json::Value>) -> Option<rolldown_common::Code
         rolldown_common::ManualCodeSplittingOptions {
             groups: Some(groups),
             ..Default::default()
+        },
+    ))
+}
+
+/// rolldown `output.advancedChunks` from its JSON form. A group `test` is a
+/// regex source (a RegExp literal arrives as `{ __oj_regex__ }`, a string is
+/// taken as a regex like rolldown's own deserializer does); function tests and
+/// names are warned about and skipped.
+fn advanced_chunks(adv: &serde_json::Value) -> Option<rolldown_common::CodeSplittingMode> {
+    let obj = adv.as_object()?;
+    let f64_of = |k: &str| obj.get(k).and_then(|v| v.as_f64());
+    let u32_of = |k: &str| obj.get(k).and_then(|v| v.as_u64()).map(|n| n as u32);
+    let mut groups = Vec::new();
+    for g in obj.get("groups").and_then(|g| g.as_array()).into_iter().flatten() {
+        let Some(g) = g.as_object() else { continue };
+        let name = match g.get("name") {
+            Some(serde_json::Value::String(s)) if s == FN_MARKER => {
+                warn_fn_option("output.advancedChunks.groups[].name", "Use a static name.");
+                continue;
+            }
+            Some(serde_json::Value::String(s)) => s.clone(),
+            _ => continue,
+        };
+        let test = match g.get("test") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) if s == FN_MARKER => {
+                warn_fn_option("output.advancedChunks.groups[].test", "Use a RegExp or string.");
+                continue;
+            }
+            Some(serde_json::Value::String(s)) => Some(s.clone()),
+            Some(serde_json::Value::Object(o)) => o.get("__oj_regex__").and_then(|v| v.as_str()).map(str::to_string),
+            _ => None,
+        };
+        let test = match test {
+            Some(src) => match rolldown_utils::js_regex::HybridRegex::new(&src) {
+                Ok(re) => Some(rolldown_common::MatchGroupTest::Regex(re)),
+                Err(_) => {
+                    eprintln!("oj build: (!) advancedChunks group {name}: invalid test regex {src:?}; skipped");
+                    continue;
+                }
+            },
+            None => None,
+        };
+        let gf = |k: &str| g.get(k).and_then(|v| v.as_f64());
+        let gu = |k: &str| g.get(k).and_then(|v| v.as_u64()).map(|n| n as u32);
+        groups.push(rolldown_common::MatchGroup {
+            name: rolldown_common::MatchGroupName::Static(name),
+            test,
+            priority: gu("priority"),
+            min_size: gf("minSize"),
+            max_size: gf("maxSize"),
+            min_share_count: gu("minShareCount"),
+            min_module_size: gf("minModuleSize"),
+            max_module_size: gf("maxModuleSize"),
+            include_dependencies_recursively: g.get("includeDependenciesRecursively").and_then(|v| v.as_bool()),
+            ..Default::default()
+        });
+    }
+    if groups.is_empty() {
+        return None;
+    }
+    Some(rolldown_common::CodeSplittingMode::Advanced(
+        rolldown_common::ManualCodeSplittingOptions {
+            groups: Some(groups),
+            min_share_count: u32_of("minShareCount"),
+            min_size: f64_of("minSize"),
+            max_size: f64_of("maxSize"),
+            min_module_size: f64_of("minModuleSize"),
+            max_module_size: f64_of("maxModuleSize"),
+            include_dependencies_recursively: obj.get("includeDependenciesRecursively").and_then(|v| v.as_bool()),
         },
     ))
 }
@@ -1509,7 +1644,9 @@ pub async fn build(
     let node_env = oj_env::resolve_node_env(shell_node_env().as_deref(), &loaded_env, "production");
     let is_production = node_env == "production";
 
-    if let Some(entry) = ssr.or_else(|| build_cfg.ssr.clone()) {
+    let config_ssr_entry =
+        oj_config::build_ssr_entry(&config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Some(entry) = ssr.or(config_ssr_entry) {
         return build_ssr_app(
             &root,
             &out_dir,
@@ -1660,7 +1797,7 @@ pub async fn build(
         .with_options(BundlerOptions {
             input: Some(inputs),
             transform: transform_options(&config, is_production),
-            code_splitting: manual_chunks(ro_opts),
+            code_splitting: manual_chunks(ro_opts, &root),
             cwd: Some(root.clone()),
             dir: Some(out_dir.display().to_string()),
             resolve: rolldown_resolve(&root, &config, "client"),
@@ -1869,6 +2006,14 @@ pub async fn build(
         Vec::new()
     };
     let mut all_sync_chunks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if let Some(name) = oj_config::ssr_manifest_name(&config) {
+        let manifest = ssr_manifest(&output, &root, &base, &chunk_css, &combined_css_name);
+        let dest = out_dir.join(&name);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&dest, serde_json::to_string_pretty(&manifest)?)?;
+    }
 
     // Pages a plugin emitted as `.html` chunks during the build are rendered
     // here alongside the statically-resolved input pages.
@@ -2155,12 +2300,38 @@ pub(crate) async fn build_ssr(
     )
     .await;
 
-    let external = IsExternal::Fn(Some(Arc::new(
-        |spec: &str, _importer, is_resolved: bool| {
-            let ext = is_resolved && spec.contains("node_modules");
+    // Vite's SSR externalization: dependencies stay external unless
+    // `ssr.noExternal` (or a webworker target) bundles them; `ssr.external` wins.
+    let externals = Arc::new(oj_config::ssr_externals(&config));
+    let webworker = externals.webworker;
+    let external = IsExternal::Fn(Some(Arc::new({
+        let externals = Arc::clone(&externals);
+        let node_modules = root.join("node_modules");
+        move |spec: &str, _importer, is_resolved: bool| {
+            let ext = if is_resolved {
+                // Fallback for dependencies reached some other way (a plugin
+                // resolution, a nested node_modules); kept as their resolved path.
+                spec.contains("node_modules")
+                    && oj_config::SsrExternals::package_of_path(spec)
+                        .is_none_or(|pkg| externals.is_external(pkg))
+            } else {
+                // Externalize a dependency by its bare specifier, as Vite does, so the
+                // server bundle imports `react`, not an absolute path. Only a name that
+                // is an installed package qualifies; an alias or a plugin virtual that
+                // merely looks bare resolves and bundles as usual.
+                let bare = !spec.starts_with('.')
+                    && !spec.starts_with('/')
+                    && !spec.starts_with('\0')
+                    && !spec.contains(':');
+                bare && {
+                    let pkg = oj_config::SsrExternals::package_of(spec);
+                    externals.is_external(pkg)
+                        && node_modules.join(pkg).join("package.json").is_file()
+                }
+            };
             Box::pin(async move { Ok(ext) })
-        },
-    )));
+        }
+    })));
 
     let emit = Arc::new(EmitState::new(root.to_path_buf()));
     let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
@@ -2192,7 +2363,7 @@ pub(crate) async fn build_ssr(
             dir: Some(out_dir.display().to_string()),
             resolve: rolldown_resolve(root, &config, "ssr"),
             transform: transform_options(&config, is_production),
-            platform: Some(Platform::Node),
+            platform: Some(if webworker { Platform::Browser } else { Platform::Node }),
             external: Some(external),
             format: Some(OutputFormat::Esm),
             entry_filenames: Some(format!("{stem}.mjs").into()),
@@ -3328,6 +3499,57 @@ fn apply_preload_helper(
         }
     }
     Ok(())
+}
+
+/// Vite's `ssr-manifest.json` (ssrManifestPlugin): for every source module in the
+/// client bundle, the public URLs a server renderer should preload when that
+/// module renders: the module's chunk (non-entry chunks only; entries are already
+/// in the HTML) and that chunk's stylesheet. Keys are root-relative paths.
+fn ssr_manifest(
+    output: &rolldown::BundleOutput,
+    root: &Path,
+    base: &str,
+    chunk_css: &[(String, String)],
+    combined_css: &Option<String>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let css_of: std::collections::HashMap<&str, &str> = chunk_css
+        .iter()
+        .map(|(c, css)| (c.as_str(), css.as_str()))
+        .collect();
+    let mut manifest = serde_json::Map::new();
+    for asset in &output.assets {
+        let rolldown_common::Output::Chunk(chunk) = asset else {
+            continue;
+        };
+        let file = chunk.filename.to_string();
+        let mut urls: Vec<serde_json::Value> = Vec::new();
+        if !chunk.is_entry {
+            urls.push(with_base(&file, base).into());
+            if let Some(css) = css_of.get(file.as_str()) {
+                urls.push(with_base(css, base).into());
+            }
+        } else if let Some(css) = combined_css {
+            urls.push(with_base(css, base).into());
+        }
+        for module_id in &chunk.modules.keys {
+            let mid = module_id.to_string();
+            let Ok(rel) = Path::new(&mid).strip_prefix(root) else {
+                continue;
+            };
+            let key = rel.to_string_lossy().replace('\\', "/");
+            let entry = manifest
+                .entry(key)
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            if let Some(list) = entry.as_array_mut() {
+                for u in &urls {
+                    if !list.contains(u) {
+                        list.push(u.clone());
+                    }
+                }
+            }
+        }
+    }
+    manifest
 }
 
 struct ManifestEntry {

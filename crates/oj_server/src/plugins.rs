@@ -198,6 +198,8 @@ pub struct ViteValues {
     /// pragma, pragmaFrag } }`), and the `esbuild.jsx*` fields for older configs.
     pub oxc: Option<serde_json::Value>,
     pub esbuild: Option<serde_json::Value>,
+    /// Vite's `ssr` block as normalized by the extractor.
+    pub ssr: Option<serde_json::Value>,
 }
 
 /// Evaluate the app's `vite.config` for `command` ("serve" | "build") and `mode`.
@@ -307,6 +309,7 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
         build: json.get("build").filter(|v| !v.is_null()).cloned(),
         oxc: json.get("oxc").filter(|v| !v.is_null()).cloned(),
         esbuild: json.get("esbuild").filter(|v| !v.is_null()).cloned(),
+        ssr: json.get("ssr").filter(|v| !v.is_null()).cloned(),
     }
 }
 
@@ -455,7 +458,10 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
             build.module_preload = vb.get("modulePreload").filter(|v| !v.is_null()).cloned();
         }
         if build.ssr.is_none() {
-            build.ssr = str_of("ssr");
+            build.ssr = bool_or_str("ssr");
+        }
+        if build.ssr_manifest.is_none() {
+            build.ssr_manifest = bool_or_str("ssrManifest");
         }
     }
     if config.oxc.is_none() {
@@ -463,6 +469,9 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
     }
     if config.esbuild.is_none() {
         config.esbuild = v.esbuild;
+    }
+    if config.ssr.is_none() {
+        config.ssr = v.ssr;
     }
 }
 
@@ -1080,6 +1089,7 @@ mod vite_values_tests {
             build: None,
             oxc: None,
             esbuild: None,
+            ssr: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/vite-base/"));
@@ -1110,6 +1120,7 @@ mod vite_values_tests {
             build: None,
             oxc: None,
             esbuild: None,
+            ssr: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/oj-base/"));
@@ -1185,7 +1196,21 @@ mod vite_values_tests {
         assert_eq!(b.minify, Some(oj_config::BoolOrString::Bool(false)));
         assert_eq!(b.css_code_split, Some(false));
         assert_eq!(b.target.as_ref().map(|t| t.to_vec()), Some(vec!["es2020".to_string()]));
-        assert_eq!(b.ssr.as_deref(), Some("src/server.ts"));
+        assert_eq!(b.ssr, Some(oj_config::BoolOrString::Str("src/server.ts".into())));
+    }
+
+    #[test]
+    fn merge_adopts_ssr_block_and_ssr_manifest() {
+        let mut config = oj_config::OjConfig::default();
+        let v = ViteValues {
+            build: Some(serde_json::json!({ "ssr": true, "ssrManifest": true })),
+            ssr: Some(serde_json::json!({ "noExternal": ["ui-kit"], "target": "webworker" })),
+            ..Default::default()
+        };
+        merge_vite_values(&mut config, v);
+        assert_eq!(oj_config::ssr_manifest_name(&config).as_deref(), Some(".vite/ssr-manifest.json"));
+        let e = oj_config::ssr_externals(&config);
+        assert!(e.webworker && !e.is_external("ui-kit"));
     }
 
     #[test]

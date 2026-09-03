@@ -207,7 +207,41 @@ function extractBuild(b) {
     }
     if (typeof b.modulePreload.polyfill === "boolean") out.modulePreload = { polyfill: b.modulePreload.polyfill };
   }
-  if (typeof b.ssr === "string") out.ssr = b.ssr;
+  if (typeof b.ssr === "string" || typeof b.ssr === "boolean") out.ssr = b.ssr;
+  if (typeof b.ssrManifest === "string" || typeof b.ssrManifest === "boolean") out.ssrManifest = b.ssrManifest;
+  return Object.keys(out).length ? out : null;
+}
+
+// rollup/rolldown options travel as JSON. A function (manualChunks, *FileNames,
+// external) or RegExp cannot; mark them so oj warns instead of silently
+// dropping the option.
+function markFunctions(v) {
+  if (typeof v === "function") return "__oj_fn__";
+  if (v instanceof RegExp) return { __oj_regex__: v.source };
+  if (Array.isArray(v)) return v.map(markFunctions);
+  if (v && typeof v === "object") {
+    const out = {};
+    for (const [k, x] of Object.entries(v)) out[k] = markFunctions(x);
+    return out;
+  }
+  return v;
+}
+
+function extractSsr(ssr) {
+  if (!ssr || typeof ssr !== "object") return null;
+  const out = {};
+  const strList = (v, key) => {
+    if (v === true) return true;
+    const arr = typeof v === "string" ? [v] : Array.isArray(v) ? v : [];
+    const strings = arr.filter((x) => typeof x === "string");
+    if (arr.some((x) => x instanceof RegExp)) warn(`ssr.${key} RegExp entries are not applied; list package names`);
+    return strings.length ? strings : undefined;
+  };
+  const ne = strList(ssr.noExternal, "noExternal");
+  if (ne !== undefined) out.noExternal = ne;
+  const ex = strList(ssr.external, "external");
+  if (ex !== undefined) out.external = ex;
+  if (typeof ssr.target === "string") out.target = ssr.target;
   return Object.keys(out).length ? out : null;
 }
 
@@ -241,7 +275,6 @@ function warnUnsupported(c) {
     warn("optimizeDeps.esbuildOptions/rollupOptions are not applied; include/exclude/entries are");
   }
   if (c.worker) warn("worker config is not applied");
-  if (c.ssr) warn("ssr config is not applied");
   for (const k of ["strictPort", "open", "cors", "allowedHosts"]) {
     if (c.server?.[k] !== undefined) warn(`server.${k} is accepted but not applied`);
   }
@@ -270,7 +303,8 @@ if (isMainRun) try {
       alias: extractAlias(c.resolve?.alias),
       headers: stringMap(c.server?.headers),
       proxy: extractProxy(c.server?.proxy),
-      rollupOptions: c.build?.rolldownOptions ?? c.build?.rollupOptions ?? null,
+      rollupOptions: markFunctions(c.build?.rolldownOptions ?? c.build?.rollupOptions ?? null),
+      ssr: extractSsr(c.ssr),
       assetsInlineLimit:
         typeof c.build?.assetsInlineLimit === "number" ? c.build.assetsInlineLimit : null,
       dedupe: Array.isArray(c.resolve?.dedupe)

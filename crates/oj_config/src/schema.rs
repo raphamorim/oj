@@ -26,6 +26,10 @@ pub struct OjConfig {
     /// Vite's `oxc` block (`oxc.jsx.{runtime,importSource,pragma,pragmaFrag}`);
     /// kept opaque because Vite also admits `oxc: false`. See `jsx_settings`.
     pub oxc: Option<serde_json::Value>,
+    /// Vite's `ssr` block: `noExternal` (true | string | string[]), `external`
+    /// (true | string[]), `target` ("node" | "webworker"). Kept opaque; see
+    /// `ssr_externals`.
+    pub ssr: Option<serde_json::Value>,
     /// Vite <=7's `esbuild` block (`jsx`, `jsxImportSource`, `jsxFactory`,
     /// `jsxFragment`); opaque for the same reason. See `jsx_settings`.
     pub esbuild: Option<serde_json::Value>,
@@ -219,7 +223,10 @@ pub struct BuildConfig {
     /// `resolveDependencies` function cannot be carried; it is ignored).
     pub module_preload: Option<serde_json::Value>,
     pub lib: Option<LibConfig>,
-    pub ssr: Option<String>,
+    /// SSR entry: a path, or `true` to use `rollupOptions.input` (Vite).
+    pub ssr: Option<BoolOrString>,
+    /// Vite's `build.ssrManifest`: `true` for `.vite/ssr-manifest.json`, or a file name.
+    pub ssr_manifest: Option<BoolOrString>,
     pub prerender: Option<Vec<String>>,
     pub rollup_options: Option<serde_json::Value>,
     pub rolldown_options: Option<serde_json::Value>,
