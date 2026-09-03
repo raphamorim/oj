@@ -199,8 +199,9 @@ jobs:
           printf 'export const add = (a, b) => a + b;\n' > /tmp/lib/src/index.ts
           printf 'import { defineConfig } from "oj";\nexport default defineConfig({ build: { lib: { entry: "src/index.ts", name: "L", formats: ["es", "cjs", "umd"] } } });\n' > /tmp/lib/oj.config.ts
           cargo run -p oj -- build /tmp/lib
+          # Vite's lib file names for a package without "type": "module"
+          test -f /tmp/lib/dist/index.mjs
           test -f /tmp/lib/dist/index.js
-          test -f /tmp/lib/dist/index.cjs
           test -f /tmp/lib/dist/index.umd.js
       - name: ssr build + streaming prod server
         run: node e2e/ssr-prod.mjs

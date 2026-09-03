@@ -291,11 +291,25 @@ pub struct BuildConfig {
     pub copy_public_dir: Option<bool>,
 }
 
+/// Vite's `build.lib.entry`: one path, a list (each named by its file stem), or
+/// `{ alias: path }`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum LibEntry {
+    One(String),
+    Many(Vec<String>),
+    Named(std::collections::BTreeMap<String, String>),
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LibConfig {
-    pub entry: String,
+    pub entry: LibEntry,
     pub name: Option<String>,
     pub formats: Option<Vec<String>>,
+    /// Output name without extension (Vite: defaults to the package.json name
+    /// for a single entry, else each entry's own name).
     pub file_name: Option<String>,
+    /// Name of the emitted stylesheet without extension (Vite `build.lib.cssFileName`).
+    pub css_file_name: Option<String>,
 }
