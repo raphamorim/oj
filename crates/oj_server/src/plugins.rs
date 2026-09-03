@@ -1106,6 +1106,33 @@ impl PluginHost {
 
     /// Env mutations made by plugin `config()` hooks in the host process (e.g.
     /// a plugin flipping a VITE_* flag). Empty on RPC failure.
+    /// `define` entries the plugins' `config()` hooks contributed, as
+    /// `(key, js expression)` pairs (a string value is the expression itself,
+    /// anything else its JSON), so they reach oj's compile the way Vite's merged
+    /// `config.define` does.
+    pub async fn config_defines(&self) -> Vec<(String, String)> {
+        let Ok(Some(raw)) = self.call("getPluginConfig", &[]).await else {
+            return Vec::new();
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return Vec::new();
+        };
+        v.get("define")
+            .and_then(|d| d.as_object())
+            .map(|d| {
+                d.iter()
+                    .map(|(k, v)| {
+                        let expr = match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        (k.clone(), expr)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub async fn env_delta(&self) -> std::collections::BTreeMap<String, String> {
         self.call("getEnvDelta", &[])
             .await

@@ -594,8 +594,13 @@ impl DevServer {
                 .into_iter()
                 .filter(|(k, _)| env_prefix_refs.iter().any(|p| k.starts_with(p)))
                 .collect();
-            if !prefixed.is_empty() {
-                let defines = build_env_defines(&prefixed);
+            // Likewise `define` entries the plugins' config() hooks returned
+            // (Vite merges them into config.define; the plugin's value wins).
+            let plugin_defines = host.config_defines().await;
+            if !prefixed.is_empty() || !plugin_defines.is_empty() {
+                let mut defines = build_env_defines(&prefixed);
+                defines.retain(|(k, _)| !plugin_defines.iter().any(|(pk, _)| pk == k));
+                defines.extend(plugin_defines);
                 html_env = oj_env::html_env_map(&defines);
                 env_defines_digest = digest_defines(&defines);
                 oj_compiler::set_import_meta_env(defines);
