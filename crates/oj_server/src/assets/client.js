@@ -53,9 +53,15 @@ export function createHotContext(ownerId) {
     },
     decline() {},
     invalidate(message) {
+      // Vite's shape: the module that started the chain travels along so the
+      // server can spot an invalidate that came back around and reload instead
+      // of ping-ponging updates.
+      const firstInvalidatedBy = currentFirstInvalidatedBy ?? id;
+      const data = { path: id, message, firstInvalidatedBy };
+      emit("vite:invalidate", data);
       console.warn(`[oj] ${id} invalidated${message ? ": " + message : ""}`);
       if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ type: "invalidate", path: id }));
+        socket.send(JSON.stringify({ type: "custom", event: "vite:invalidate", data }));
       } else {
         location.reload();
       }
@@ -87,6 +93,27 @@ export function updateStyle(id, css) {
     styleTags.set(id, tag);
   }
   tag.textContent = css;
+}
+
+export function removeStyle(id) {
+  const tag = styleTags.get(id);
+  if (tag) {
+    tag.remove();
+    styleTags.delete(id);
+  }
+}
+
+// Vite's HMRClient.currentFirstInvalidatedBy: set while an update's accept
+// callbacks run, so an invalidate() they trigger names the original module.
+let currentFirstInvalidatedBy;
+
+async function prunePaths(paths) {
+  for (const path of paths) {
+    const mod = hotModules.get(path);
+    if (!mod) continue;
+    for (const dispose of mod.disposeCallbacks) await dispose(mod.data);
+    for (const prune of mod.pruneCallbacks) await prune(mod.data);
+  }
 }
 
 let updateChain = Promise.resolve();
@@ -121,10 +148,29 @@ async function applyUpdate(update) {
   try {
     for (const dispose of disposes) await dispose(disposed.data);
     const sep = acceptedUrl.includes("?") ? "&" : "?";
-    const next = await import(acceptedUrl + sep + "t=" + update.timestamp);
-    for (const cb of accepts) {
-      if (isSelf || cb.single) await cb.fn(next);
-      else await cb.fn(cb.deps.map((d) => (d === acceptedPath ? next : undefined)));
+    let next;
+    try {
+      next = await import(acceptedUrl + sep + "t=" + update.timestamp);
+    } catch (err) {
+      if (update.isWithinCircularImport) {
+        // Vite: an accepted module inside an import loop cannot recover its
+        // execution order; reload the page to reset it instead of an overlay.
+        console.info(
+          `[oj] ${acceptedPath} failed to apply HMR as it's within a circular import. Reloading page to reset the execution order.`,
+        );
+        location.reload();
+        return;
+      }
+      throw err;
+    }
+    try {
+      currentFirstInvalidatedBy = update.firstInvalidatedBy;
+      for (const cb of accepts) {
+        if (isSelf || cb.single) await cb.fn(next);
+        else await cb.fn(cb.deps.map((d) => (d === acceptedPath ? next : undefined)));
+      }
+    } finally {
+      currentFirstInvalidatedBy = undefined;
     }
     clearOverlay();
     emit("vite:afterUpdate", { type: "update", updates: [update] });
@@ -265,6 +311,8 @@ function swapCss(update) {
 
 let socket = null;
 let hadConnection = false;
+// The dev `base` this client is served under (Vite's __BASE__).
+const base = new URL(import.meta.url).pathname.replace(/@oj\/client\.js$/, "");
 
 (function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -290,9 +338,26 @@ let hadConnection = false;
     } else if (msg.type === "css-update") {
       swapCss(msg);
     } else if (msg.type === "full-reload") {
-      emit("vite:beforeFullReload", { path: msg.reason });
-      console.log("[oj] full reload:", msg.reason || "");
+      emit("vite:beforeFullReload", msg);
+      if (msg.path && msg.path.endsWith(".html")) {
+        // An edited page reloads only the tabs showing it (Vite's client);
+        // index.html is the SPA shell behind every route, so it always does.
+        const pagePath = decodeURI(location.pathname);
+        const payloadPath = base + msg.path.slice(1);
+        if (
+          pagePath !== payloadPath &&
+          msg.path !== "/index.html" &&
+          !(pagePath.endsWith("/") && pagePath + "index.html" === payloadPath)
+        ) {
+          console.log(`[oj] ${msg.path} changed, not this page`);
+          return;
+        }
+      }
+      console.log("[oj] full reload:", msg.reason || msg.path || "");
       location.reload();
+    } else if (msg.type === "prune") {
+      emit("vite:beforePrune", msg);
+      prunePaths(msg.paths || []);
     } else if (msg.type === "error") {
       // Vite's ErrorPayload carries `err`; older oj frames carried `message`.
       const err = msg.err || { message: msg.message };

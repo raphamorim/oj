@@ -4078,7 +4078,19 @@ fn register_in_graph(state: &ServerState, url: &str, module: &CachedModule) {
         .filter(|s| s.starts_with('/') && !s.starts_with("/@oj/") && !is_worker_query(s))
         .map(|s| PathBuf::from(s.split('?').next().unwrap_or(s)))
         .collect();
-    graph.set_imports(Path::new(url), &local_imports);
+    let pruned = graph.set_imports(Path::new(url), &local_imports);
+    if !pruned.is_empty() && !state.bundle {
+        // Dependencies this module dropped that nothing imports any more: the
+        // client runs their `hot.prune` callbacks (a stylesheet removes its
+        // <style>), and they are stamped so a later re-import re-runs them, as
+        // Vite's handlePrunedModules does after importAnalysis.
+        graph.stamp_pruned(&pruned, now_millis() as u64);
+        let paths: Vec<String> = pruned.iter().map(|p| p.display().to_string()).collect();
+        println!("oj: prune {paths:?}");
+        let _ = state
+            .reload_tx
+            .send(serde_json::json!({ "type": "prune", "paths": paths }).to_string());
+    }
     let hot = module.hot.as_ref();
     graph.set_self_accepting(
         Path::new(url),
@@ -4139,11 +4151,12 @@ async fn serve_css_wrapper(state: &Arc<ServerState>, file: &Path, url: &str) -> 
         ""
     };
     let body = format!(
-        "import {{ createHotContext as __oj_hot, updateStyle as __oj_updateStyle }} from \"/@oj/client.js\";\n\
+        "import {{ createHotContext as __oj_hot, updateStyle as __oj_updateStyle, removeStyle as __oj_removeStyle }} from \"/@oj/client.js\";\n\
          import.meta.hot = __oj_hot({url:?});\n\
          __oj_updateStyle({url:?}, {css});\n\
          {exports}\
-         {accept}",
+         {accept}\
+         import.meta.hot.prune(() => __oj_removeStyle({url:?}));\n",
         css = serde_json::Value::String(module.code.clone()),
     );
     (
@@ -4495,7 +4508,7 @@ async fn handle_plugin_server_event(state: &Arc<ServerState>, ev: &serde_json::V
             state.memory.lock().unwrap().clear();
             let _ = state
                 .reload_tx
-                .send(serde_json::json!({ "type": "full-reload", "reason": "plugin invalidateAll" }).to_string());
+                .send(full_reload_frame("plugin invalidateAll", None, None));
         }
         Some("invalidate") => {
             let Some(id) = ev.get("id").and_then(|i| i.as_str()) else {
@@ -4526,10 +4539,16 @@ fn handle_client_message(state: &Arc<ServerState>, text: &str) {
     let Ok(msg) = serde_json::from_str::<serde_json::Value>(text) else {
         return;
     };
-    if msg["type"] == "invalidate" {
-        let Some(path) = msg["path"].as_str() else {
+    // Vite's client sends `import.meta.hot.invalidate()` as the custom event
+    // `vite:invalidate` (`{path, message, firstInvalidatedBy}`); oj's bundle
+    // runtime still sends the legacy `{type:'invalidate', path}` frame.
+    let vite_invalidate = msg["type"] == "custom" && msg["event"] == "vite:invalidate";
+    if msg["type"] == "invalidate" || vite_invalidate {
+        let body = if vite_invalidate { &msg["data"] } else { &msg };
+        let Some(path) = body["path"].as_str() else {
             return;
         };
+        let first_invalidated_by = body["firstInvalidatedBy"].as_str();
         let reply = if state.bundle {
             match state
                 .graph
@@ -4554,40 +4573,62 @@ fn handle_client_message(state: &Arc<ServerState>, text: &str) {
                         "timestamp": now_millis() as u64,
                         "seq": seq,
                     })
+                    .to_string()
                 }
                 Err(reason) => {
                     println!("oj: invalidate {path} -> full-reload ({reason})");
-                    serde_json::json!({ "type": "full-reload", "reason": reason })
+                    full_reload_frame(&reason, None, None)
                 }
             }
         } else {
-            match state
-                .graph
-                .lock()
-                .unwrap()
-                .propagate_update_from_importers(Path::new(path))
+            let timestamp = now_millis() as u64;
+            let (dirty, targets) = {
+                let mut graph = state.graph.lock().unwrap();
+                // Only a self-accepting module an update touched, once per update
+                // (Vite's lastHMRInvalidationReceived); its importers are stamped
+                // so the boundary's re-fetch sees the invalidated module's version.
+                let Some(dirty) = graph.accept_invalidation(Path::new(path), timestamp) else {
+                    println!("oj: invalidate {path} ignored (no pending update)");
+                    return;
+                };
+                (dirty, graph.update_targets_from_importers(Path::new(path)))
+            };
             {
-                HmrDecision::Update { boundaries } => {
-                    println!("oj: invalidate {path} -> update {boundaries:?}");
-                    let timestamp = now_millis() as u64;
-                    let updates: Vec<_> = boundaries
-                        .iter()
-                        .map(|b| {
-                            serde_json::json!({
-                                "path": format!("{}", b.display()),
-                                "timestamp": timestamp,
-                            })
-                        })
-                        .collect();
-                    serde_json::json!({ "type": "update", "updates": updates })
+                let mut keys = state.mtime_keys.lock().unwrap();
+                for d in &dirty {
+                    keys.remove(&d.display().to_string());
                 }
-                HmrDecision::FullReload { reason } => {
+            }
+            match targets {
+                // The invalidate came back around to the module that started the
+                // chain: no importer can hot update it, so reload (Vite's
+                // 'circular import invalidate').
+                Ok(targets)
+                    if first_invalidated_by.is_some_and(|first| {
+                        targets.iter().any(|t| t.accepted.display().to_string() == first)
+                    }) =>
+                {
+                    let reason = "circular import invalidate";
                     println!("oj: invalidate {path} -> full-reload ({reason})");
-                    serde_json::json!({ "type": "full-reload", "reason": reason })
+                    full_reload_frame(reason, None, None)
+                }
+                Ok(targets) => {
+                    let boundaries: Vec<&Path> = targets.iter().map(|t| t.boundary.as_path()).collect();
+                    println!("oj: invalidate {path} -> update {boundaries:?}");
+                    let first = first_invalidated_by.unwrap_or(path);
+                    let updates: Vec<_> = targets
+                        .iter()
+                        .map(|t| update_entry_for(t, timestamp, Some(first)))
+                        .collect();
+                    serde_json::json!({ "type": "update", "updates": updates }).to_string()
+                }
+                Err(reason) => {
+                    println!("oj: invalidate {path} -> full-reload ({reason})");
+                    full_reload_frame(&reason, None, None)
                 }
             }
         };
-        let _ = state.reload_tx.send(reply.to_string());
+        let _ = state.reload_tx.send(reply);
     } else if msg["type"] == "custom" {
         if msg["event"].is_string() {
             let _ = state.reload_tx.send(
@@ -4743,6 +4784,50 @@ fn update_entry(kind: &str, path: &str, timestamp: u64) -> serde_json::Value {
         "acceptedPath": path,
         "timestamp": timestamp,
     })
+}
+
+/// The `js-update` entry for a graph boundary: stylesheet boundaries are named by
+/// their module wrapper (`?import`); `isWithinCircularImport` and
+/// `firstInvalidatedBy` are carried like Vite's `Update` so the client can reset
+/// the page when a re-import inside a cycle fails and escalate a repeated
+/// `hot.invalidate` instead of looping.
+fn update_entry_for(
+    target: &oj_graph::UpdateTarget,
+    timestamp: u64,
+    first_invalidated_by: Option<&str>,
+) -> serde_json::Value {
+    let style = |p: &Path| {
+        let p = p.display().to_string();
+        if is_style_url(&p) {
+            format!("{p}?import")
+        } else {
+            p
+        }
+    };
+    let mut entry = update_entry("js-update", &style(&target.boundary), timestamp);
+    entry["acceptedPath"] = serde_json::Value::String(style(&target.accepted));
+    if target.within_circular_import {
+        entry["isWithinCircularImport"] = serde_json::Value::Bool(true);
+    }
+    if let Some(first) = first_invalidated_by {
+        entry["firstInvalidatedBy"] = serde_json::Value::String(first.to_string());
+    }
+    entry
+}
+
+/// Vite's `FullReloadPayload`: `path` is the edited page (`/about.html`) so the
+/// client reloads only tabs showing it, or `*` for every page; `triggeredBy` is
+/// the absolute file. oj's `reason` is kept for its own log and tooling.
+fn full_reload_frame(reason: &str, page: Option<&str>, triggered_by: Option<&Path>) -> String {
+    let mut frame = serde_json::json!({
+        "type": "full-reload",
+        "reason": reason,
+        "path": page.unwrap_or("*"),
+    });
+    if let Some(file) = triggered_by {
+        frame["triggeredBy"] = serde_json::Value::String(file.display().to_string());
+    }
+    frame.to_string()
 }
 
 fn svelte_hot_glue(url: &str) -> String {
@@ -6732,7 +6817,7 @@ impl HmrGate {
             state.dir_cache.lock().unwrap().clear();
             if self.full_reload {
                 let _ = state.reload_tx.send(
-                    serde_json::json!({ "type": "full-reload", "reason": "hmr-flush" }).to_string(),
+                    full_reload_frame("hmr-flush", None, None),
                 );
             } else {
                 let paths: Vec<PathBuf> = entries.into_iter().map(|(p, _)| p).collect();
@@ -7137,8 +7222,7 @@ async fn decide(
                     Ok(Some(d)) if d == "full-reload" => {
                         println!("oj: change {file} -> full-reload (plugin)");
                         messages.push(
-                            serde_json::json!({ "type": "full-reload", "reason": "plugin" })
-                                .to_string(),
+                            full_reload_frame("plugin", None, Some(path)),
                         );
                         return messages;
                     }
@@ -7167,8 +7251,7 @@ async fn decide(
                                     HmrDecision::FullReload { reason } => {
                                         println!("oj: change {file} -> full-reload ({reason})");
                                         messages.push(
-                                            serde_json::json!({ "type": "full-reload", "reason": reason })
-                                                .to_string(),
+                                            full_reload_frame(&reason, None, Some(path)),
                                         );
                                         return messages;
                                     }
@@ -7189,8 +7272,7 @@ async fn decide(
                     path.display()
                 );
                 messages.push(
-                    serde_json::json!({ "type": "full-reload", "reason": "plugin-watch" })
-                        .to_string(),
+                    full_reload_frame("plugin-watch", None, Some(path)),
                 );
                 return messages;
             }
@@ -7216,11 +7298,12 @@ async fn decide(
             }
         }
         if ext == "html" {
+            // Vite names the edited page (`path: '/about.html'`) so only the tab
+            // showing it reloads; the reason keeps the absolute path oj's own
+            // tooling reads.
+            let page = url_of(&state.root, path);
             println!("oj: change {} -> full-reload", path.display());
-            messages.push(
-                serde_json::json!({ "type": "full-reload", "reason": path.display().to_string() })
-                    .to_string(),
-            );
+            messages.push(full_reload_frame(&path.display().to_string(), Some(&page), Some(path)));
             return messages;
         }
         if !COMPILABLE.contains(&ext) && !(is_style_ext(ext) || ext == "json") {
@@ -7259,26 +7342,16 @@ async fn decide(
                 Err(reason) => {
                     println!("oj: change {url} -> full-reload ({reason})");
                     messages.push(
-                        serde_json::json!({ "type": "full-reload", "reason": reason }).to_string(),
+                        full_reload_frame(&reason, None, Some(path)),
                     );
                     return messages;
                 }
             }
         }
-        let decision = match state.graph.lock().unwrap().update_targets(Path::new(&url)) {
-            Ok(targets) => HmrDecision::Update {
-                boundaries: targets
-                    .iter()
-                    .map(|(b, a)| {
-                        // `boundary\0accepted` pairs travel through the existing shape.
-                        PathBuf::from(format!("{}\0{}", b.display(), a.display()))
-                    })
-                    .collect(),
-            },
-            Err(reason) => HmrDecision::FullReload { reason },
-        };
-        match decision {
-            HmrDecision::Update { boundaries } => {
+        let targets = state.graph.lock().unwrap().update_targets(Path::new(&url));
+        match targets {
+            Ok(targets) => {
+                let boundaries: Vec<&Path> = targets.iter().map(|t| t.boundary.as_path()).collect();
                 println!("oj: change {url} -> update {boundaries:?}");
                 let timestamp = now_millis() as u64;
                 // Stamp the invalidated chain so re-fetched importers point at the
@@ -7296,29 +7369,14 @@ async fn decide(
                         keys.remove(&d.display().to_string());
                     }
                 }
-                if boundaries.is_empty() {
+                if targets.is_empty() {
                     println!("oj: change {url} -> no update (nothing loaded imports it)");
                 }
-                updates.extend(boundaries.iter().map(|b| {
-                    let pair = b.display().to_string();
-                    let (boundary, accepted) = pair.split_once('\0').unwrap_or((&pair, &pair));
-                    let style = |p: &str| {
-                        if is_style_url(p) {
-                            format!("{p}?import")
-                        } else {
-                            p.to_string()
-                        }
-                    };
-                    let mut entry = update_entry("js-update", &style(boundary), timestamp);
-                    entry["acceptedPath"] = serde_json::Value::String(style(accepted));
-                    entry
-                }));
+                updates.extend(targets.iter().map(|t| update_entry_for(t, timestamp, None)));
             }
-            HmrDecision::FullReload { reason } => {
+            Err(reason) => {
                 println!("oj: change {url} -> full-reload ({reason})");
-                messages.push(
-                    serde_json::json!({ "type": "full-reload", "reason": reason }).to_string(),
-                );
+                messages.push(full_reload_frame(&reason, None, Some(path)));
                 return messages;
             }
         }
