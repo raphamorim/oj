@@ -3,7 +3,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, cpSync, rmSync } from "node:fs";
 import { dirname, join, resolve, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { importPkg, viteEnvDefine, jsxTransformOptions } from "./resolve-pkg.mjs";
+import { importPkg, viteEnvDefine, jsxTransformOptions, ssrExternalRule } from "./resolve-pkg.mjs";
 import {
   assetsPlugin, makeVitePlugins, nodeBuiltinShims, workspaceRoot, contentHashEmitter,
 } from "./rolldown-assets.mjs";
@@ -261,6 +261,8 @@ writeFileSync(
 const server = await build({
   input: { "server-bundle": join(HERE, "server-entry.tsx") },
   platform: "node",
+  // Vite's `ssr.external`: those dependencies stay bare imports of the bundle.
+  external: ssrExternalRule(APP),
   transform: {
     jsx: jsxTransformOptions(NODE_ENV !== "production"),
     define: {
