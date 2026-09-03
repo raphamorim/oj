@@ -5440,9 +5440,19 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
         }
 
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if ext == "css" {
+        if is_style_ext(ext) {
             let url = url_of(&state.root, path);
-            if !state.graph.lock().unwrap().contains(Path::new(&url)) {
+            // A stylesheet nothing imports is loaded by a `<link>` (serving it
+            // compiled registers it in the graph, with no importers): swap the
+            // link rather than dispatching a JS update it has no handler for.
+            let link_loaded = {
+                let g = state.graph.lock().unwrap();
+                match g.node(Path::new(&url)) {
+                    None => true,
+                    Some(n) => n.importers.is_empty(),
+                }
+            };
+            if link_loaded {
                 println!("oj: change {url} -> css-update");
                 messages.push(
                     serde_json::json!({
