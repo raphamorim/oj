@@ -92,6 +92,9 @@ jobs:
       - name: require() in a served CJS dep resolves with the require condition
         if: matrix.mode == 'unbundled'
         run: node e2e/cjs-require-condition.mjs
+      - name: optimizeDeps.exclude'd packages run through every plugin load/transform
+        if: matrix.mode == 'unbundled'
+        run: node e2e/plugin-excluded-dep.mjs
 
   # i need to fix this or automate
   build:
