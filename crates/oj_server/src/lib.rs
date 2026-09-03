@@ -1436,6 +1436,13 @@ fn hmr_socket(upgrade: WebSocketUpgrade, state: Arc<ServerState>, vite: bool) ->
             let connected = serde_json::json!({ "type": "connected" }).to_string();
             let _ = socket.send(Message::Text(connected.into())).await;
         }
+        // Vite's ws server emits "connection" per accepted client; plugins that
+        // push initial state from `server.ws.on("connection")` need the event.
+        if let Some(host) = state.plugins.clone() {
+            tokio::spawn(async move {
+                let _ = host.ws_connection().await;
+            });
+        }
         let buffered = state.buffered_error.lock().unwrap().take();
         if let Some(frame) = buffered {
             let _ = socket.send(Message::Text(frame.into())).await;
@@ -4150,7 +4157,7 @@ async fn handle_plugin_server_event(state: &Arc<ServerState>, ev: &serde_json::V
             state.mtime_keys.lock().unwrap().remove(&url);
             state.memory.lock().unwrap().remove(&url);
             if path.is_file() && state.graph.lock().unwrap().contains(Path::new(&url)) {
-                for message in decide(state, &[path.to_path_buf()]).await {
+                for message in decide(state, &[path.to_path_buf()], &Default::default()).await {
                     let _ = state.reload_tx.send(message);
                 }
             }
@@ -6096,7 +6103,7 @@ impl HmrGate {
             } else {
                 let paths: Vec<PathBuf> = entries.into_iter().map(|(p, _)| p).collect();
                 let sref: &ServerState = state;
-                for message in decide(sref, &paths).await {
+                for message in decide(sref, &paths, &Default::default()).await {
                     let _ = state.reload_tx.send(message);
                 }
             }
@@ -6253,6 +6260,11 @@ fn spawn_watcher(state: Arc<ServerState>) {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10);
+        // Paths this watcher has already reported once. FSEvents keeps a file's
+        // "created" flag on later events for a while, so a Create for a path seen
+        // before is an edit (chokidar tracks the same distinction by its own
+        // state, emitting `add` once and `change` after).
+        let mut seen_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         loop {
             let first = match rx.recv() {
                 Ok(Ok(ev)) => ev,
@@ -6262,10 +6274,21 @@ fn spawn_watcher(state: Arc<ServerState>) {
             if matches!(first.kind, notify::EventKind::Access(_)) {
                 continue;
             }
+            // Which of the debounced paths the watcher saw come into existence:
+            // Vite's watcher tells plugins "create" for those (hotUpdate /
+            // watchChange type), "update" for edits and "delete" for removals.
+            let mut created: std::collections::HashSet<PathBuf> =
+                std::collections::HashSet::new();
+            if matches!(first.kind, notify::EventKind::Create(_)) {
+                created.extend(first.paths.iter().cloned());
+            }
             let mut paths: std::collections::HashSet<PathBuf> = first.paths.into_iter().collect();
             loop {
                 match rx.recv_timeout(Duration::from_millis(debounce_ms)) {
                     Ok(Ok(ev)) if !matches!(ev.kind, notify::EventKind::Access(_)) => {
+                        if matches!(ev.kind, notify::EventKind::Create(_)) {
+                            created.extend(ev.paths.iter().cloned());
+                        }
                         paths.extend(ev.paths);
                     }
                     Ok(_) => {}
@@ -6274,6 +6297,8 @@ fn spawn_watcher(state: Arc<ServerState>) {
                 }
             }
             let paths: Vec<PathBuf> = paths.into_iter().collect();
+            created.retain(|p| !seen_paths.contains(p));
+            seen_paths.extend(paths.iter().cloned());
             // A config or .env change can't be hot-applied (config is read once at
             // startup), so restart the process to pick it up — matching Vite.
             if paths.iter().any(|p| is_restart_trigger(p)) {
@@ -6287,7 +6312,7 @@ fn spawn_watcher(state: Arc<ServerState>) {
                     continue;
                 }
             }
-            let messages = state.rt.block_on(decide(&state, &paths));
+            let messages = state.rt.block_on(decide(&state, &paths, &created));
             if messages.is_empty() {
                 continue;
             }
@@ -6316,7 +6341,13 @@ fn parse_hmr_filter(raw: &str) -> Option<Vec<PathBuf>> {
     )
 }
 
-async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
+/// `created`: the paths the watcher reported as newly created among `paths`
+/// (the rest are edits, or removals when the file is gone).
+async fn decide(
+    state: &ServerState,
+    paths: &[PathBuf],
+    created: &std::collections::HashSet<PathBuf>,
+) -> Vec<String> {
     if !state.hmr_enabled {
         return Vec::new();
     }
@@ -6392,11 +6423,36 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
 
         if let Some(host) = &state.plugins {
             let file = path.display().to_string();
-            // Vite's watcher hands plugins the change kind: a removed file still
-            // reaches watchChange / hotUpdate, with type "delete" (unlink).
-            let change_type = if path.exists() { "update" } else { "delete" };
+            // Vite's watcher hands plugins the change kind (hmr.ts HotUpdateOptions
+            // type): a new file is "create" (chokidar add), an edit "update", and
+            // a removed file still reaches watchChange / hotUpdate as "delete".
+            let change_type = if !path.exists() {
+                "delete"
+            } else if created.contains(path)
+                && !state
+                    .graph
+                    .lock()
+                    .unwrap()
+                    .contains(Path::new(&url_of(&state.root, path)))
+            {
+                // Newly created and never served: a file the graph already holds
+                // was only rewritten (editors that replace files on save).
+                "create"
+            } else {
+                "update"
+            };
+            // The ssr environment's plugin instances (Vite dispatches hotUpdate
+            // and watchChange to every environment) when that host is up.
+            let ssr_host = state.plugins_ssr.get().and_then(|h| h.clone());
             if state.plugins_watch_change {
-                let _ = host.watch_change(&file, change_type).await;
+                if let Err(e) = host.watch_change(&file, change_type).await {
+                    eprintln!("oj: watchChange failed for {file}: {e}");
+                }
+                if let Some(ssr) = &ssr_host {
+                    if let Err(e) = ssr.watch_change(&file, change_type).await {
+                        eprintln!("oj: watchChange (ssr) failed for {file}: {e}");
+                    }
+                }
             }
             if state.plugins_hot_update {
                 let ts = now_millis() as u64;
@@ -6418,10 +6474,28 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
                         None => "[]".to_string(),
                     }
                 };
+                if let Some(ssr) = &ssr_host {
+                    // Its result steers no client update (the ssr environment has
+                    // no browser); only a throwing hook is worth reporting.
+                    if let Err(e) = ssr
+                        .handle_hot_update(&file, ts, change_type, &modules_json)
+                        .await
+                    {
+                        eprintln!("oj: hotUpdate (ssr) failed for {file}: {e}");
+                    }
+                }
                 match host
                     .handle_hot_update(&file, ts, change_type, &modules_json)
                     .await
                 {
+                    // Vite (hmr.ts): a throwing hotUpdate is logged and sent to
+                    // the client as an error payload (the overlay), and no update
+                    // is dispatched for that file.
+                    Err(e) => {
+                        eprintln!("oj: hotUpdate failed for {file}: {e}");
+                        messages.push(error_frame(&e));
+                        continue;
+                    }
                     Ok(Some(d)) if d == "skip" => {
                         println!("oj: change {file} -> HMR suppressed by plugin");
                         continue;

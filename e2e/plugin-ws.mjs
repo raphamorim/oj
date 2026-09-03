@@ -22,6 +22,11 @@ fs.writeFileSync(
   `export default [{
     name: "ws-echo",
     configureServer(server) {
+      // Vite: the ws server emits "connection" per accepted client socket;
+      // plugins push initial state from it.
+      server.ws.on("connection", (socket) => {
+        socket.send(JSON.stringify({ type: "custom", event: "server:hello", data: { greeted: true } }));
+      });
       server.ws.on("client:ping", (data, client) => {
         server.ws.send("server:pong", { echo: data });
       });
@@ -44,10 +49,22 @@ try {
   }
 
   const ws = new WebSocket(`ws://localhost:${port}/__ws`);
+  const hello = new Promise((res, rej) => {
+    const timer = setTimeout(() => rej(new Error("timed out waiting for server:hello on connection")), 8000);
+    ws.addEventListener("message", (e) => {
+      let m;
+      try { m = JSON.parse(e.data); } catch { return; }
+      if (m.type === "custom" && m.event === "server:hello") {
+        clearTimeout(timer);
+        res(m.data);
+      }
+    });
+  });
   await new Promise((res, rej) => {
     ws.addEventListener("open", res);
     ws.addEventListener("error", rej);
   });
+  assert.deepEqual(await hello, { greeted: true }, "server.ws.on('connection') fires for a new client");
 
   const pong = await new Promise((res, rej) => {
     const timer = setTimeout(() => rej(new Error("timed out waiting for server:pong")), 8000);
