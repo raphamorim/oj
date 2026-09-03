@@ -1657,8 +1657,14 @@ pub async fn build(
         .map(|warning| warning.to_string())
         .collect();
     if !unresolved.is_empty() {
+        // Vite fails the build on an unresolved import and writes nothing. rolldown
+        // has already written the bundle by the time its diagnostics are readable, so
+        // drop the partial output (this directory is emptied at every build start
+        // anyway) so a failed build never leaves a broken bundle behind, and point at
+        // the escape hatch the way Vite's message does.
+        let _ = fs::remove_dir_all(&out_dir);
         bail!(
-            "build failed: unresolved imports:\n{}",
+            "build failed: unresolved imports:\n{}\n\nThis is most likely unintended because it can break your application at runtime.\nIf you do want to externalize a module explicitly, add it to `build.rollupOptions.external`.",
             unresolved.join("\n")
         );
     }

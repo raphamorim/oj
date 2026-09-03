@@ -18,7 +18,12 @@ try {
 
   const missing = spawnSync(binary, ["build", project], { cwd: root, encoding: "utf8" });
   assert.notEqual(missing.status, 0, `an unresolved dependency must fail the build:\n${missing.stdout}\n${missing.stderr}`);
-  assert.match(`${missing.stdout}\n${missing.stderr}`, /missing-example-dependency/);
+  const missingOut = `${missing.stdout}\n${missing.stderr}`;
+  assert.match(missingOut, /missing-example-dependency/);
+  // Like Vite, the failure names the escape hatch for a deliberate external.
+  assert.match(missingOut, /build\.rollupOptions\.external/, `the failure must point at the externalization option:\n${missingOut}`);
+  // Like Vite (which writes nothing), a failed build leaves no broken bundle on disk.
+  assert.equal(fs.existsSync(path.join(project, "dist")), false, "a failed build must not leave a partial dist/ behind");
 
   fs.writeFileSync(path.join(project, "oj.config.json"), JSON.stringify({
     build: { rollupOptions: { external: ["missing-example-dependency"] } },
