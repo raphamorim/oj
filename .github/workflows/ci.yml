@@ -183,6 +183,9 @@ jobs:
           node e2e/html-fallback-dev.mjs
           node e2e/hmr-glob-add-delete.mjs
           node e2e/watch-config-deps-ignored.mjs
+      - name: transformIndexHtml per-page ctx (dev + build) via the css fixture
+        if: matrix.mode == 'unbundled'
+        run: node e2e/html-transform-ctx.mjs
 
   # i need to fix this or automate
   build:
