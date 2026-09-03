@@ -289,3 +289,5 @@ jobs:
         run: node e2e/build-assets-dir.mjs
       - name: html attribute quoting (stylesheet links, module entries, inline module scripts)
         run: node e2e/html-attribute-quotes.test.js
+      - name: build.cssMinify and build.cssTarget drive the CSS compile
+        run: node e2e/build-css-options.mjs

@@ -294,6 +294,12 @@ pub struct BuildConfig {
     /// `true`/`false`, or a minifier name (`"oxc"`, `"esbuild"`, `"terser"`),
     /// which all mean "minify" (oj minifies with oxc).
     pub minify: Option<BoolOrString>,
+    /// Vite's `build.cssTarget`: browser targets for CSS lowering; defaults to
+    /// `build.target` (see `build_css_targets`).
+    pub css_target: Option<StringOrList>,
+    /// Vite's `build.cssMinify`: `true`/`false` or a minifier name (all mean
+    /// "minify"); defaults to `build.minify` (see `build_css_minify`).
+    pub css_minify: Option<BoolOrString>,
     /// `true`/`false`, or `"inline"` / `"hidden"` (see `build_sourcemap`).
     pub sourcemap: Option<BoolOrString>,
     /// Vite's `build.emptyOutDir`: unset means "empty when outDir is inside root".
@@ -317,9 +323,6 @@ pub struct BuildConfig {
     /// Vite's `build.assetsDir` (default `assets`): where hashed chunks and
     /// assets go under outDir.
     pub assets_dir: Option<String>,
-    /// Vite's `build.cssMinify`: unset follows `build.minify`; a minifier name
-    /// (`"lightningcss"`, `"esbuild"`) means on.
-    pub css_minify: Option<BoolOrString>,
     /// Vite's `build.manifest`: `true` for `.vite/manifest.json`, or a file name.
     pub manifest: Option<BoolOrString>,
     /// Vite's `build.reportCompressedSize` (default true): gzip column in the report.
@@ -334,8 +337,6 @@ pub struct BuildConfig {
     pub license: Option<serde_json::Value>,
     /// Vite's `build.commonjsOptions`; rolldown handles CJS natively (warned about, ignored).
     pub commonjs_options: Option<serde_json::Value>,
-    /// Vite's `build.cssTarget`; accepted, oj lowers CSS with lightningcss defaults (warned about).
-    pub css_target: Option<StringOrList>,
 }
 
 /// Vite's `build.lib.entry`: one path, a list (each named by its file stem), or

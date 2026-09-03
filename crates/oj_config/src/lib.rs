@@ -66,16 +66,6 @@ pub fn build_minify(config: &OjConfig) -> bool {
     }
 }
 
-/// `build.cssMinify`: Vite resolves an unset value to `!!build.minify` for the
-/// client; a minifier name (`"lightningcss"`, `"esbuild"`) means on.
-pub fn build_css_minify(config: &OjConfig) -> bool {
-    match config.build.as_ref().and_then(|b| b.css_minify.as_ref()) {
-        None => build_minify(config),
-        Some(BoolOrString::Bool(b)) => *b,
-        Some(BoolOrString::Str(s)) => s != "false",
-    }
-}
-
 /// The public directory, absolute: Vite's `publicDir` (default `<root>/public`),
 /// or None when the config sets `publicDir: false`.
 pub fn public_dir(config: &OjConfig, root: &Path) -> Option<PathBuf> {
@@ -158,6 +148,36 @@ pub fn build_targets(config: &OjConfig) -> Vec<String> {
         }
     }
     out
+}
+
+/// `build.cssTarget` as an engine list for CSS lowering: Vite defaults it to
+/// `build.target`, so unset means the same baseline JS lowers to. Named
+/// presets expand as for `build_targets`.
+pub fn build_css_targets(config: &OjConfig) -> Vec<String> {
+    let Some(raw) = config.build.as_ref().and_then(|b| b.css_target.as_ref()) else {
+        return build_targets(config);
+    };
+    let mut out = Vec::new();
+    for t in raw.to_vec() {
+        match t.as_str() {
+            "baseline-widely-available" => {
+                out.extend(BASELINE_WIDELY_AVAILABLE.iter().map(|s| s.to_string()))
+            }
+            "modules" => out.extend(MODULES_TARGET.iter().map(|s| s.to_string())),
+            _ => out.push(t),
+        }
+    }
+    out
+}
+
+/// `build.cssMinify` (Vite build.ts): unset follows `build.minify` for the
+/// client and is on for a server (SSR) build; a minifier name means "on".
+pub fn build_css_minify(config: &OjConfig, server: bool) -> bool {
+    match config.build.as_ref().and_then(|b| b.css_minify.as_ref()) {
+        None => server || build_minify(config),
+        Some(BoolOrString::Bool(b)) => *b,
+        Some(BoolOrString::Str(s)) => s != "false",
+    }
 }
 
 /// Whether pages get `<link rel="modulepreload">` for their entry chunks' static
@@ -1535,7 +1555,7 @@ mod build_manifest_css_minify_tests {
     fn manifest_css_minify_and_assets_dir_follow_vite_defaults() {
         let cfg = OjConfig::default();
         assert_eq!(build_manifest_name(&cfg), None, "Vite writes no manifest by default");
-        assert!(build_css_minify(&cfg), "cssMinify defaults to minify (on)");
+        assert!(build_css_minify(&cfg, false), "cssMinify defaults to minify (on)");
         assert_eq!(build_assets_dir(&cfg), "assets");
         assert!(build_report_compressed_size(&cfg));
         assert_eq!(build_chunk_size_warning_limit(&cfg), 500.0);
@@ -1545,7 +1565,7 @@ mod build_manifest_css_minify_tests {
         )
         .unwrap();
         assert_eq!(build_manifest_name(&cfg).as_deref(), Some(".vite/manifest.json"));
-        assert!(!build_css_minify(&cfg), "cssMinify unset follows minify: false");
+        assert!(!build_css_minify(&cfg, false), "cssMinify unset follows minify: false");
         assert_eq!(build_assets_dir(&cfg), "static");
         assert_eq!(build_chunk_size_warning_limit(&cfg), 1000.0);
         assert!(!build_report_compressed_size(&cfg));
@@ -1555,7 +1575,7 @@ mod build_manifest_css_minify_tests {
         )
         .unwrap();
         assert_eq!(build_manifest_name(&cfg).as_deref(), Some("meta/m.json"));
-        assert!(build_css_minify(&cfg), "an explicit cssMinify is independent of minify");
+        assert!(build_css_minify(&cfg, false), "an explicit cssMinify is independent of minify");
         assert_eq!(ssr_manifest_name(&cfg).as_deref(), Some(".vite/ssr-manifest.json"));
     }
 }
@@ -1581,6 +1601,24 @@ mod proxy_secure_tests {
 #[cfg(test)]
 mod public_dir_tests {
     use super::*;
+
+    #[test]
+    fn css_target_and_minify_default_to_the_js_settings() {
+        let none: OjConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(build_css_targets(&none), build_targets(&none));
+        assert!(build_css_minify(&none, false));
+        let js_off: OjConfig = serde_json::from_str(r#"{"build":{"minify":false}}"#).unwrap();
+        assert!(!build_css_minify(&js_off, false), "cssMinify follows build.minify");
+        assert!(build_css_minify(&js_off, true), "server builds minify CSS by default");
+        let explicit: OjConfig =
+            serde_json::from_str(r#"{"build":{"minify":false,"cssMinify":"lightningcss","cssTarget":["chrome120","modules"]}}"#).unwrap();
+        assert!(build_css_minify(&explicit, false));
+        let t = build_css_targets(&explicit);
+        assert_eq!(t[0], "chrome120");
+        assert!(t.contains(&"safari14".to_string()), "modules preset expands: {t:?}");
+        let off: OjConfig = serde_json::from_str(r#"{"build":{"cssMinify":false}}"#).unwrap();
+        assert!(!build_css_minify(&off, false));
+    }
 
     #[test]
     fn public_dir_reads_path_default_and_false() {

@@ -44,6 +44,12 @@ pub struct CssResolve<'a> {
     pub public_dir: Option<&'a Path>,
     /// `(find, replacement)`; a replacement starting with `.` is root-relative.
     pub alias: &'a [(String, String)],
+    /// Browser targets lightningcss lowers to (`build.cssTarget`, falling back
+    /// to `build.target`), as esbuild-style names (`chrome111`, `safari16.4`);
+    /// empty means Vite's `baseline-widely-available` default.
+    pub targets: &'a [String],
+    /// `build.cssMinify`: whether a build compile minifies (dev never does).
+    pub minify: bool,
 }
 
 /// Owned `CssResolve`, for holders that outlive a borrow (server state, build
@@ -53,6 +59,8 @@ pub struct CssResolveConfig {
     pub root: PathBuf,
     pub public_dir: PathBuf,
     pub alias: Vec<(String, String)>,
+    pub targets: Vec<String>,
+    pub minify: bool,
 }
 
 impl CssResolveConfig {
@@ -64,6 +72,8 @@ impl CssResolveConfig {
             root: set(&self.root),
             public_dir: set(&self.public_dir),
             alias: &self.alias,
+            targets: &self.targets,
+            minify: self.minify,
         }
     }
 }
@@ -511,6 +521,8 @@ pub fn compile_sass_opts(source: &str, opts: &SassOptions<'_>) -> Result<String,
             root: opts.resolve.root.map(Path::to_path_buf).unwrap_or_default(),
             public_dir: opts.resolve.public_dir.map(Path::to_path_buf).unwrap_or_default(),
             alias: opts.resolve.alias.to_vec(),
+            targets: opts.resolve.targets.to_vec(),
+            minify: opts.resolve.minify,
         },
     };
     let mut options = grass::Options::default().fs(&fs);
@@ -534,19 +546,65 @@ pub fn compile_sass_opts(source: &str, opts: &SassOptions<'_>) -> Result<String,
     grass::from_string(source, &options).map_err(|e| format!("sass error: {e}"))
 }
 
+/// Vite 8's `baseline-widely-available` target list (its `build.target` and
+/// so `build.cssTarget` default).
+const BASELINE_TARGETS: &[&str] = &["chrome111", "edge111", "firefox114", "safari16.4", "ios16.4"];
+
+/// esbuild-style target names as lightningcss browser targets, as Vite's
+/// `convertTargets` (css.ts) maps them: `chrome`, `edge`, `firefox`, `ie`,
+/// `ios` (-> ios_saf), `opera`, `safari`; the lowest version per browser wins;
+/// `es20xx`/`esnext` and unknown names carry no browser and are skipped. No
+/// browser at all falls back to the baseline.
+pub fn browser_targets(list: &[String]) -> Targets {
+    let mut b = Browsers::default();
+    let mut any = false;
+    for entry in list {
+        let split = entry
+            .find(|c: char| c.is_ascii_digit())
+            .unwrap_or(entry.len());
+        let (name, version) = entry.split_at(split);
+        let mut parts = version.split('.').map(|v| v.parse::<u32>().ok());
+        let (Some(Some(major)), minor) = (parts.next(), parts.next().flatten().unwrap_or(0)) else {
+            continue;
+        };
+        let v = (major << 16) | (minor << 8);
+        let slot = match name.to_ascii_lowercase().as_str() {
+            "chrome" => &mut b.chrome,
+            "edge" => &mut b.edge,
+            "firefox" => &mut b.firefox,
+            "ie" => &mut b.ie,
+            "ios" | "ios_saf" => &mut b.ios_saf,
+            "opera" => &mut b.opera,
+            "safari" => &mut b.safari,
+            "android" => &mut b.android,
+            "samsung" => &mut b.samsung,
+            _ => continue,
+        };
+        *slot = Some(slot.map_or(v, |cur| cur.min(v)));
+        any = true;
+    }
+    if !any {
+        if list.iter().any(|t| t == "modules") {
+            // Vite's legacy `modules` preset.
+            return browser_targets(&["chrome87", "edge88", "firefox78", "safari14"].map(String::from));
+        }
+        return default_targets();
+    }
+    Targets::from(b)
+}
+
 fn default_targets() -> Targets {
-    Targets::from(Browsers {
-        chrome: Some(100 << 16),
-        edge: Some(100 << 16),
-        firefox: Some(100 << 16),
-        safari: Some(14 << 16),
-        ios_saf: Some(14 << 16),
-        ..Browsers::default()
-    })
+    browser_targets(&BASELINE_TARGETS.iter().map(|s| s.to_string()).collect::<Vec<_>>())
 }
 
 pub fn compile_css(url: &str, source: &str, minify: bool) -> Result<CssOutput, String> {
     compile_css_impl(url, source, minify, false, false, &CssResolve::default())
+}
+
+/// The build compile with the app's settings: minified when `resolve.minify`
+/// (`build.cssMinify`), lowered to `resolve.targets` (`build.cssTarget`).
+pub fn compile_css_with(url: &str, source: &str, resolve: &CssResolve<'_>) -> Result<CssOutput, String> {
+    compile_css_impl(url, source, resolve.minify, false, false, resolve)
 }
 
 pub fn compile_css_rebased(url: &str, source: &str, minify: bool) -> Result<CssOutput, String> {
@@ -603,7 +661,7 @@ fn compile_css_impl(
         .map_err(|err| format!("css parse error in {url}: {err}"))?;
     report_css_warnings(url, &warnings);
 
-    let targets = default_targets();
+    let targets = browser_targets(resolve.targets);
     stylesheet
         .minify(MinifyOptions {
             targets: targets.clone(),
@@ -1098,6 +1156,48 @@ mod tests {
     }
 
     #[test]
+    fn browser_targets_follow_vite_convert_targets() {
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let b = browser_targets(&s(&["chrome120", "safari16.4", "es2020", "ios15", "node18"]))
+            .browsers
+            .unwrap();
+        assert_eq!(b.chrome, Some(120 << 16));
+        assert_eq!(b.safari, Some((16 << 16) | (4 << 8)));
+        assert_eq!(b.ios_saf, Some(15 << 16));
+        assert_eq!(b.firefox, None);
+        // The lowest version per browser wins.
+        let b = browser_targets(&s(&["chrome120", "chrome100"])).browsers.unwrap();
+        assert_eq!(b.chrome, Some(100 << 16));
+        // No browser at all (esnext, empty) is Vite's baseline default.
+        for list in [s(&["esnext"]), Vec::new()] {
+            let b = browser_targets(&list).browsers.unwrap();
+            assert_eq!(b.chrome, Some(111 << 16));
+            assert_eq!(b.safari, Some((16 << 16) | (4 << 8)));
+        }
+    }
+
+    #[test]
+    fn css_target_and_minify_settings_drive_the_build_compile() {
+        let src = ".a {\n  .b { color: red }\n}\n";
+        let modern = CssResolveConfig {
+            targets: vec!["chrome120".into(), "safari17.2".into(), "firefox117".into()],
+            minify: true,
+            ..Default::default()
+        };
+        let out = compile_css_with("/a.css", src, &modern.as_ref()).unwrap().css;
+        assert!(out.contains(".a{") && out.contains(".b{"), "nesting kept for targets that support it: {out}");
+        assert!(!out.contains(".a .b"), "{out}");
+
+        let baseline = CssResolveConfig { minify: true, ..Default::default() };
+        let out = compile_css_with("/a.css", src, &baseline.as_ref()).unwrap().css;
+        assert_eq!(out, ".a .b{color:red}", "baseline (safari16.4) lowers nesting");
+
+        let unminified = CssResolveConfig { minify: false, ..Default::default() };
+        let out = compile_css_with("/a.css", src, &unminified.as_ref()).unwrap().css;
+        assert!(out.contains('\n') && out.contains("color: red"), "cssMinify false keeps whitespace: {out}");
+    }
+
+    #[test]
     fn rebases_relative_url_and_import_to_server_root() {
         // A stylesheet served at /src/app.css: its relative @import and url()
         // must become server-absolute so an injected <style> resolves them
@@ -1470,14 +1570,22 @@ mod tests {
         assert!(out.contains("aspect-ratio"), "aspect-ratio is supported: {out}");
         assert!(!out.contains("max(1px"), "clamp must not be lowered: {out}");
 
-        // Nesting and logical properties are not supported by the oldest target,
-        // so they are lowered.
+        // Nesting is not supported by the oldest baseline target (safari 16.4),
+        // so it is lowered; logical properties are (safari 15+), so they stay,
+        // as Vite's default target keeps them.
         let nested = compile_css("/p.css", ".a { .b { color: red } }", true).unwrap().css;
         assert_eq!(nested, ".a .b{color:red}");
         let logical = compile_css("/p.css", ".a { inset-inline-start: 1px }", true)
             .unwrap()
             .css;
-        assert!(logical.contains("left:1px"), "logical props lowered: {logical}");
+        assert_eq!(logical, ".a{inset-inline-start:1px}");
+        // An older explicit target (Vite's legacy `modules` preset, safari14)
+        // lowers them.
+        let legacy = CssResolveConfig { targets: vec!["safari14".into()], minify: true, ..Default::default() };
+        let lowered = compile_css_with("/p.css", ".a { inset-inline-start: 1px }", &legacy.as_ref())
+            .unwrap()
+            .css;
+        assert!(lowered.contains("left:1px"), "logical props lowered for safari14: {lowered}");
     }
 
     #[test]
@@ -1518,7 +1626,7 @@ mod tests {
             ("@components".to_string(), "/abs/components".to_string()),
             ("react".to_string(), "preact/compat".to_string()),
         ];
-        let r = CssResolve { root: Some(Path::new("/proj")), public_dir: None, alias: &alias };
+        let r = CssResolve { root: Some(Path::new("/proj")), public_dir: None, alias: &alias, ..CssResolve::default() };
         assert_eq!(r.alias_spec("@/img.png").as_deref(), Some("/proj/src/img.png"));
         assert_eq!(r.alias_spec("@").as_deref(), Some("/proj/src"));
         // `@components/x` must not be eaten by the shorter `@` alias.
@@ -1533,7 +1641,7 @@ mod tests {
     #[test]
     fn dev_compile_rewrites_aliased_urls_and_keeps_root_absolute_ones() {
         let alias = vec![("@".to_string(), "./src".to_string())];
-        let r = CssResolve { root: Some(Path::new("/proj")), public_dir: None, alias: &alias };
+        let r = CssResolve { root: Some(Path::new("/proj")), public_dir: None, alias: &alias, ..CssResolve::default() };
         let src = ".a { background: url(@/img/bg.png?v=1); }\n\
                    .b { background: url(/src/x.png); }\n\
                    .c { background: url(./y.png); }\n\
@@ -1546,7 +1654,7 @@ mod tests {
         assert!(out.contains("/logo.svg#id"), "public url kept: {out}");
         // An alias to a file outside the root is served through /@fs.
         let outside = vec![("~ui".to_string(), "/elsewhere/ui".to_string())];
-        let r2 = CssResolve { root: Some(Path::new("/proj")), public_dir: None, alias: &outside };
+        let r2 = CssResolve { root: Some(Path::new("/proj")), public_dir: None, alias: &outside, ..CssResolve::default() };
         let out = compile_css_dev("/src/a.css", ".a { background: url(~ui/i.png) }", false, &r2).unwrap().css;
         assert!(out.contains("/@fs/elsewhere/ui/i.png"), "{out}");
     }
@@ -1564,7 +1672,7 @@ mod tests {
         std::fs::write(base.join("vendor.css"), ".wrong { margin: 1px; }\n").unwrap();
         let alias = vec![("@".to_string(), "./src".to_string())];
         let public = base.join("public");
-        let r = CssResolve { root: Some(&base), public_dir: Some(&public), alias: &alias };
+        let r = CssResolve { root: Some(&base), public_dir: Some(&public), alias: &alias, ..CssResolve::default() };
         let dir = base.join("src/ui");
         assert_eq!(resolve_css_import_with("@/vars.css", &dir, &r), Some(base.join("src/vars.css")));
         assert_eq!(resolve_css_import_with("@/vars", &dir, &r), Some(base.join("src/vars.css")), "extension probed");
@@ -1603,7 +1711,7 @@ mod tests {
             load_dir: Some(&base.join("src/comp")),
             additional_data: None,
             load_paths: &[],
-            resolve: CssResolve { root: Some(&base), public_dir: None, alias: &alias },
+            resolve: CssResolve { root: Some(&base), public_dir: None, alias: &alias, ..CssResolve::default() },
         };
         // alias, alias with explicit extension, alias inside an imported file,
         // root-absolute, dotted module through an alias.
