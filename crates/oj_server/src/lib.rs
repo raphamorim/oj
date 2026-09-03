@@ -226,6 +226,9 @@ pub struct DevServer {
     pub no_cache: bool,
     /// Skip the eager graph crawl; compile modules on demand (Vite's default).
     pub lazy: bool,
+    /// Vite's `--mode` for `serve` (default `development`): selects `.env.<mode>`,
+    /// `import.meta.env.MODE`, and the mode plugin `config` hooks see.
+    pub mode: Option<String>,
 }
 
 struct ServerState {
@@ -261,6 +264,7 @@ struct ServerState {
     virtual_modules: std::collections::BTreeMap<String, String>,
     jsx_overrides: std::collections::BTreeMap<String, String>,
     jsx: oj_compiler::JsxConfig,
+    host_policy: HostPolicy,
     hmr_gate: Option<Arc<HmrGate>>,
     hmr_enabled: bool,
     plugins: Option<std::sync::Arc<PluginHost>>,
@@ -356,8 +360,14 @@ impl DevServer {
 
         boot_phase("build_app begin");
         prepare_cache_root(&root);
-        let mut config = oj_config::load(&root).map_err(|e| anyhow::anyhow!("{e}"))?;
-        plugins::adopt_vite_config_values(&mut config, &root, "serve", "development");
+        let dev_mode = self
+            .mode
+            .clone()
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| "development".to_string());
+        let mut config =
+            oj_config::load_with(&root, "serve", &dev_mode).map_err(|e| anyhow::anyhow!("{e}"))?;
+        plugins::adopt_vite_config_values(&mut config, &root, "serve", &dev_mode);
         boot_phase("vite config values adopted");
 
         // Feed optimizeDeps.include/exclude/needsInterop into partial bundling so
@@ -378,7 +388,7 @@ impl DevServer {
             .as_deref()
             .map(|d| root.join(d))
             .unwrap_or_else(|| root.clone());
-        let env = oj_env::load(&env_dir, "development");
+        let env = oj_env::load(&env_dir, &dev_mode);
         // Rebuilt after plugin-host boot with the config()-hook env delta, so
         // it stays a closure over the same inputs rather than a one-shot block.
         let build_env_defines = |extra: &std::collections::BTreeMap<String, String>| {
@@ -394,7 +404,7 @@ impl DevServer {
                 oj_env::resolve_node_env(std::env::var("NODE_ENV").ok().as_deref(), &env, "development");
             let mut defines = oj_env::import_meta_env_defines(
                 &merged,
-                "development",
+                &dev_mode,
                 node_env != "production",
                 config.base.as_deref().unwrap_or("/"),
                 &env_prefix_refs,
@@ -477,13 +487,13 @@ impl DevServer {
             "config": {
                 "root": root.display().to_string(),
                 "base": config.base.clone().unwrap_or_else(|| "/".into()),
-                "mode": "development",
+                "mode": dev_mode,
                 "command": "serve",
                 "define": config.define,
                 "server": { "port": port, "host": server_cfg.host },
                 "environments": config.environments,
             },
-            "env": { "command": "serve", "mode": "development" },
+            "env": { "command": "serve", "mode": dev_mode },
             "environment": { "name": "client", "mode": "dev" },
             "pluginsFormat": plugins_format,
             "ojStartMode": is_start,
@@ -719,6 +729,7 @@ impl DevServer {
             virtual_modules: config.virtual_modules.clone().unwrap_or_default(),
             jsx_overrides,
             jsx,
+            host_policy: HostPolicy::from_config(&server_cfg, self.host.as_deref()),
             hmr_gate,
             hmr_enabled,
             plugins: plugin_host,
@@ -813,6 +824,18 @@ impl DevServer {
             Arc::clone(&state),
             vite_hmr_upgrade,
         ));
+        if let Some(cors) = CorsPolicy::from_config(server_cfg.cors.as_ref()) {
+            app = app.layer(axum::middleware::from_fn_with_state(
+                Arc::new(cors),
+                cors_middleware,
+            ));
+        }
+        if !state.host_policy.allow_all {
+            app = app.layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                host_check_middleware,
+            ));
+        }
         let extra_headers: Vec<(header::HeaderName, header::HeaderValue)> = config
             .server
             .as_ref()
@@ -1214,8 +1237,12 @@ pub fn update_progress_frame(
 
 async fn ws_upgrade(
     State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    if let Some(resp) = state.host_policy.reject_ws_origin(&headers) {
+        return resp;
+    }
     hmr_socket(upgrade, state, false)
 }
 
@@ -1244,6 +1271,9 @@ async fn vite_hmr_upgrade(
     let Some(proto) = vite_ws_subprotocol(req.headers()) else {
         return next.run(req).await;
     };
+    if let Some(resp) = state.host_policy.reject_ws_origin(req.headers()) {
+        return resp;
+    }
     let (mut parts, body) = req.into_parts();
     match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
         Ok(upgrade) if proto == "vite-ping" => upgrade
@@ -1298,6 +1328,278 @@ fn hmr_socket(upgrade: WebSocketUpgrade, state: Arc<ServerState>, vite: bool) ->
             }
         }
     })
+}
+
+/// Vite's `server.allowedHosts` (middlewares/hostCheck.ts, server/ws.ts): a
+/// request whose `Host` names something other than localhost, an IP literal, the
+/// configured host, or an allowed host is refused with 403 so a malicious page
+/// cannot reach the dev server through DNS rebinding. WebSocket upgrades apply
+/// the same rule to `Origin`.
+#[derive(Debug, Clone, Default)]
+struct HostPolicy {
+    allow_all: bool,
+    allowed: Vec<String>,
+}
+
+impl HostPolicy {
+    fn from_config(server: &oj_config::ServerConfig, cli_host: Option<&str>) -> Self {
+        let mut allowed = Vec::new();
+        match &server.allowed_hosts {
+            Some(oj_config::AllowedHosts::All(true)) => return Self { allow_all: true, allowed },
+            Some(oj_config::AllowedHosts::List(list)) => {
+                allowed.extend(list.iter().map(|h| h.to_ascii_lowercase()))
+            }
+            _ => {}
+        }
+        // A specific hostname the server was asked to bind to is allowed too.
+        if let Some(h) = cli_host.or(server.host.as_deref()) {
+            if !matches!(h, "true" | "0.0.0.0" | "::" | "[::]" | "localhost")
+                && h.parse::<std::net::IpAddr>().is_err()
+            {
+                allowed.push(h.to_ascii_lowercase());
+            }
+        }
+        Self { allow_all: false, allowed }
+    }
+
+    fn hostname_allowed(&self, hostname: &str) -> bool {
+        if self.allow_all {
+            return true;
+        }
+        let host = hostname.trim().trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+        if host.is_empty()
+            || host == "localhost"
+            || host.ends_with(".localhost")
+            || host.parse::<std::net::IpAddr>().is_ok()
+        {
+            return true;
+        }
+        self.allowed.iter().any(|a| {
+            if let Some(domain) = a.strip_prefix('.') {
+                host == domain || host.ends_with(a.as_str())
+            } else {
+                host == *a
+            }
+        })
+    }
+
+    /// The hostname of a `Host` header value (`example.com:5173`, `[::1]:5173`).
+    fn host_header_name(value: &str) -> &str {
+        let v = value.trim();
+        if let Some(rest) = v.strip_prefix('[') {
+            return rest.split(']').next().unwrap_or(rest);
+        }
+        v.rsplit_once(':').map(|(h, _)| h).unwrap_or(v)
+    }
+
+    fn reject_message(host: &str) -> String {
+        format!(
+            "Blocked request. This host ({host}) is not allowed.\nTo allow this host, add \"{host}\" to `server.allowedHosts` in your config."
+        )
+    }
+
+    fn reject_ws_origin(&self, headers: &HeaderMap) -> Option<Response> {
+        let origin = headers.get(header::ORIGIN)?.to_str().ok()?;
+        let host = origin
+            .split("://")
+            .nth(1)
+            .map(|rest| rest.split('/').next().unwrap_or(rest))
+            .map(Self::host_header_name)
+            .unwrap_or("");
+        if self.hostname_allowed(host) {
+            return None;
+        }
+        Some((StatusCode::FORBIDDEN, Self::reject_message(host)).into_response())
+    }
+}
+
+async fn host_check_middleware(
+    State(state): State<Arc<ServerState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Some(raw) = req.headers().get(header::HOST).and_then(|v| v.to_str().ok()) {
+        let host = HostPolicy::host_header_name(raw);
+        if !state.host_policy.hostname_allowed(host) {
+            return (StatusCode::FORBIDDEN, HostPolicy::reject_message(host)).into_response();
+        }
+    }
+    next.run(req).await
+}
+
+/// Vite's `server.cors` (the `cors` package behind it). Unset: only localhost
+/// origins (Vite's `defaultAllowedOrigins`); `true`: reflect any origin;
+/// `false`: no CORS headers; an object: exact origins, methods, headers,
+/// credentials, max-age.
+#[derive(Debug, Clone)]
+struct CorsPolicy {
+    origin: CorsOrigin,
+    methods: String,
+    allowed_headers: Option<String>,
+    credentials: bool,
+    max_age: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+enum CorsOrigin {
+    Any,
+    LocalhostDefault,
+    List(Vec<String>),
+}
+
+impl CorsPolicy {
+    fn from_config(cfg: Option<&oj_config::CorsConfig>) -> Option<Self> {
+        let default_methods = "GET,HEAD,PUT,PATCH,POST,DELETE".to_string();
+        let list_or_str = |v: &serde_json::Value| -> Option<String> {
+            match v {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Array(a) => Some(
+                    a.iter()
+                        .filter_map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+                _ => None,
+            }
+        };
+        match cfg {
+            Some(oj_config::CorsConfig::Toggle(false)) => None,
+            Some(oj_config::CorsConfig::Toggle(true)) => Some(Self {
+                origin: CorsOrigin::Any,
+                methods: default_methods,
+                allowed_headers: None,
+                credentials: false,
+                max_age: None,
+            }),
+            Some(oj_config::CorsConfig::Options(o)) => {
+                let origin = match &o.origin {
+                    Some(serde_json::Value::Bool(true)) | Some(serde_json::Value::String(_))
+                        if o.origin.as_ref().and_then(|v| v.as_str()) == Some("*") =>
+                    {
+                        CorsOrigin::Any
+                    }
+                    Some(serde_json::Value::Bool(true)) => CorsOrigin::Any,
+                    Some(serde_json::Value::Bool(false)) => return None,
+                    Some(serde_json::Value::String(s)) => CorsOrigin::List(vec![s.clone()]),
+                    Some(serde_json::Value::Array(a)) => CorsOrigin::List(
+                        a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+                    ),
+                    _ => CorsOrigin::LocalhostDefault,
+                };
+                Some(Self {
+                    origin,
+                    methods: o.methods.as_ref().and_then(list_or_str).unwrap_or(default_methods),
+                    allowed_headers: o.allowed_headers.as_ref().and_then(list_or_str),
+                    credentials: o.credentials.unwrap_or(false),
+                    max_age: o.max_age,
+                })
+            }
+            None => Some(Self {
+                origin: CorsOrigin::LocalhostDefault,
+                methods: default_methods,
+                allowed_headers: None,
+                credentials: false,
+                max_age: None,
+            }),
+        }
+    }
+
+    fn allows(&self, origin: &str) -> bool {
+        match &self.origin {
+            CorsOrigin::Any => true,
+            CorsOrigin::List(list) => list.iter().any(|o| o == origin),
+            CorsOrigin::LocalhostDefault => is_localhost_origin(origin),
+        }
+    }
+}
+
+/// Vite's `defaultAllowedOrigins`:
+/// `/^https?:\/\/(?:(?:[^:]+\.)?localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/`.
+fn is_localhost_origin(origin: &str) -> bool {
+    let rest = match origin.strip_prefix("https://").or_else(|| origin.strip_prefix("http://")) {
+        Some(r) => r,
+        None => return false,
+    };
+    let (host, port) = if let Some(r) = rest.strip_prefix("[::1]") {
+        ("[::1]", r)
+    } else {
+        rest.rsplit_once(':').unwrap_or((rest, ""))
+    };
+    let port_ok = port.is_empty()
+        || port
+            .strip_prefix(':')
+            .unwrap_or(port)
+            .chars()
+            .all(|c| c.is_ascii_digit())
+            && !port.strip_prefix(':').unwrap_or(port).is_empty();
+    if !port_ok {
+        return false;
+    }
+    host == "localhost"
+        || host == "127.0.0.1"
+        || host == "[::1]"
+        || (host.ends_with(".localhost") && !host[..host.len() - ".localhost".len()].contains(':'))
+}
+
+async fn cors_middleware(
+    State(policy): State<Arc<CorsPolicy>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let origin = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let allowed = origin.as_deref().is_some_and(|o| policy.allows(o));
+    let preflight = req.method() == axum::http::Method::OPTIONS
+        && req.headers().contains_key(header::ACCESS_CONTROL_REQUEST_METHOD);
+    let mut resp = if preflight && allowed {
+        let mut r = StatusCode::NO_CONTENT.into_response();
+        let h = r.headers_mut();
+        if let Ok(v) = policy.methods.parse() {
+            h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, v);
+        }
+        let requested = req
+            .headers()
+            .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+            .cloned();
+        match (&policy.allowed_headers, requested) {
+            (Some(list), _) => {
+                if let Ok(v) = list.parse() {
+                    h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, v);
+                }
+            }
+            (None, Some(v)) => {
+                h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, v);
+                h.append(header::VARY, header::HeaderValue::from_static("Access-Control-Request-Headers"));
+            }
+            (None, None) => {}
+        }
+        if let Some(age) = policy.max_age {
+            if let Ok(v) = age.to_string().parse() {
+                h.insert(header::ACCESS_CONTROL_MAX_AGE, v);
+            }
+        }
+        h.insert(header::CONTENT_LENGTH, header::HeaderValue::from_static("0"));
+        r
+    } else {
+        next.run(req).await
+    };
+    if allowed {
+        let h = resp.headers_mut();
+        if let Some(v) = origin.as_deref().and_then(|o| o.parse().ok()) {
+            h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+        }
+        h.append(header::VARY, header::HeaderValue::from_static("Origin"));
+        if policy.credentials {
+            h.insert(
+                header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+                header::HeaderValue::from_static("true"),
+            );
+        }
+    }
+    resp
 }
 
 async fn apply_dev_headers(
@@ -5688,6 +5990,71 @@ mod tests {
         );
         assert!(v.contains(r#"createHotContext("/src/r.tsx?tsr-shared=1")"#), "{v}");
         assert!(v.contains(r#"from "/src/r.tsx?tsr-shared=1&t=1700000000000""#), "{v}");
+    }
+
+    #[test]
+    fn localhost_origin_default_matches_vite_regex() {
+        for ok in [
+            "http://localhost",
+            "http://localhost:5173",
+            "https://app.localhost:3000",
+            "http://127.0.0.1:8080",
+            "http://[::1]:5173",
+        ] {
+            assert!(is_localhost_origin(ok), "{ok}");
+        }
+        for bad in [
+            "http://evil.com",
+            "http://localhost.evil.com",
+            "http://127.0.0.1.nip.io",
+            "ftp://localhost",
+            "http://localhost:abc",
+        ] {
+            assert!(!is_localhost_origin(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn host_policy_allows_localhost_ips_and_configured_hosts_only() {
+        let mut server = oj_config::ServerConfig::default();
+        server.allowed_hosts = Some(oj_config::AllowedHosts::List(vec![
+            "app.test".into(),
+            ".corp.example".into(),
+        ]));
+        let p = HostPolicy::from_config(&server, Some("dev.local"));
+        for ok in ["localhost", "sub.localhost", "127.0.0.1", "[::1]", "10.0.0.5", "app.test", "APP.TEST", "corp.example", "x.corp.example", "dev.local"] {
+            assert!(p.hostname_allowed(ok), "{ok}");
+        }
+        for bad in ["evil.com", "notcorp.example", "app.test.evil", ""] {
+            assert_eq!(p.hostname_allowed(bad), bad.is_empty(), "{bad}");
+        }
+        assert_eq!(HostPolicy::host_header_name("example.com:5173"), "example.com");
+        assert_eq!(HostPolicy::host_header_name("[::1]:5173"), "::1");
+        assert_eq!(HostPolicy::host_header_name("example.com"), "example.com");
+        let all = HostPolicy::from_config(
+            &oj_config::ServerConfig {
+                allowed_hosts: Some(oj_config::AllowedHosts::All(true)),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(all.allow_all && all.hostname_allowed("evil.com"));
+    }
+
+    #[test]
+    fn cors_policy_forms() {
+        let default = CorsPolicy::from_config(None).unwrap();
+        assert!(default.allows("http://localhost:5173") && !default.allows("http://evil.com"));
+        assert!(CorsPolicy::from_config(Some(&oj_config::CorsConfig::Toggle(false))).is_none());
+        let any = CorsPolicy::from_config(Some(&oj_config::CorsConfig::Toggle(true))).unwrap();
+        assert!(any.allows("http://evil.com"));
+        let opts: oj_config::CorsOptions = serde_json::from_value(serde_json::json!({
+            "origin": ["http://a.test", "http://b.test"], "credentials": true, "methods": ["GET", "POST"], "maxAge": 60
+        }))
+        .unwrap();
+        let list = CorsPolicy::from_config(Some(&oj_config::CorsConfig::Options(opts))).unwrap();
+        assert!(list.allows("http://a.test") && !list.allows("http://localhost:5173"));
+        assert!(list.credentials && list.methods == "GET,POST" && list.max_age == Some(60));
     }
 
     #[test]

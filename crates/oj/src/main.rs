@@ -35,6 +35,9 @@ enum Command {
         host: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Vite's `--mode` for the dev server (default `development`).
+        #[arg(long)]
+        mode: Option<String>,
         /// Enable the experimental on-disk module cache (also OJ_ENABLE_CACHE=1).
         /// Off by default; warm restarts then re-serve compiled modules from disk.
         #[arg(long)]
@@ -91,6 +94,7 @@ async fn run() -> anyhow::Result<()> {
             ssr,
             host,
             config,
+            mode,
             enable_cache,
             no_cache,
             lazy,
@@ -117,6 +121,7 @@ async fn run() -> anyhow::Result<()> {
                     enable_cache,
                     no_cache,
                     lazy,
+                    mode,
                 }
                 .run()
                 .await

@@ -226,6 +226,26 @@ function extractEsbuild(es) {
   return Object.keys(out).length ? out : null;
 }
 
+function extractCors(cors) {
+  if (typeof cors === "boolean") return cors;
+  if (!cors || typeof cors !== "object") return null;
+  const out = {};
+  const strOrList = (v) =>
+    typeof v === "string" ? v : Array.isArray(v) ? v.filter((x) => typeof x === "string") : undefined;
+  if (cors.origin === true || cors.origin === false) out.origin = cors.origin;
+  else if (strOrList(cors.origin) !== undefined) out.origin = strOrList(cors.origin);
+  if (strOrList(cors.methods) !== undefined) out.methods = strOrList(cors.methods);
+  if (strOrList(cors.allowedHeaders) !== undefined) out.allowedHeaders = strOrList(cors.allowedHeaders);
+  if (typeof cors.credentials === "boolean") out.credentials = cors.credentials;
+  if (typeof cors.maxAge === "number") out.maxAge = cors.maxAge;
+  return out;
+}
+function extractAllowedHosts(v) {
+  if (v === true) return true;
+  if (Array.isArray(v)) return v.filter((x) => typeof x === "string");
+  return null;
+}
+
 function warnUnsupported(c) {
   if (c.css?.preprocessorOptions) warn("css.preprocessorOptions is not applied yet");
   if (c.esbuild?.jsx === "preserve" || c.oxc?.jsx === "preserve") {
@@ -240,7 +260,10 @@ function warnUnsupported(c) {
   }
   if (c.worker) warn("worker config is not applied");
   if (c.ssr) warn("ssr config is not applied");
-  for (const k of ["strictPort", "open", "cors", "allowedHosts"]) {
+  if (c.server?.cors && typeof c.server.cors === "object" && c.server.cors.origin instanceof RegExp) {
+    warn("server.cors.origin RegExp is not applied; the localhost default is used");
+  }
+  for (const k of ["strictPort", "open"]) {
     if (c.server?.[k] !== undefined) warn(`server.${k} is accepted but not applied`);
   }
 }
@@ -278,6 +301,8 @@ if (isMainRun) try {
       build: extractBuild(c.build),
       oxc: extractOxc(c.oxc),
       esbuild: extractEsbuild(c.esbuild),
+      cors: extractCors(c.server?.cors),
+      allowedHosts: extractAllowedHosts(c.server?.allowedHosts),
     }),
   );
 } catch (e) {
