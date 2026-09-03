@@ -5,6 +5,14 @@ All notable changes to oj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- TanStack Start: an app's own server entry (`tanstackStart({ server: { entry } })`, the shape an SSR error wrapper takes) is honored in dev and in the prod server bundle, as Vite imports it: the configured module is the handler and `@tanstack/react-start/server-entry` inside it is oj's handler, so a wrapper composes. Previously oj always ran its own entry and the wrapper never executed.
+
+### Fixed
+- `vite.config` "not applied" warnings were emitted for Vite's own resolved defaults (`esbuild.jsxDev/charset/legalComments`, `worker`, `ssr.resolve`, `server.cors.origin`, `optimizeDeps.esbuildOptions`, `build.terserOptions`, the `@vite/env` and `@vite/client` aliases) on every config, and repeated on every config load (three times at Start startup, again after each rebuild). They now describe only options the config file itself sets, and each line prints once per dev session.
+
 ## [0.1.15] - 2026-09-03
 
 ### Fixed

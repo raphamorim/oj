@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { extractAlias, extractOptimizeDeps, extractProxy } from "../../crates/oj_server/src/assets/vite-extract.mjs";
+import { extractAlias, extractOptimizeDeps, extractProxy, warnUnsupported } from "../../crates/oj_server/src/assets/vite-extract.mjs";
 
 test("optimizeDeps carries needsInterop and force alongside the lists", () => {
   const out = extractOptimizeDeps({
@@ -101,4 +101,39 @@ test("function-valued proxy options are dropped with a warning, the entry still 
   assert.match(err, /server\.proxy\["\/api"\]\.rewrite is a function/);
   assert.match(err, /server\.proxy\["\/api"\]\.configure is a function and cannot cross the config bridge/);
   assert.match(err, /server\.proxy\["\/api"\]\.bypass is a function and cannot cross the config bridge/);
+});
+
+
+test("Vite's own client aliases (@vite/env, @vite/client) are skipped without a warning", () => {
+  let out;
+  const stderr = captureStderr(() => {
+    out = extractAlias([
+      { find: /^\/?@vite\/env/, replacement: "/vite/dist/client/env.mjs" },
+      { find: /^\/?@vite\/client/, replacement: "/vite/dist/client/client.mjs" },
+      { find: "@", replacement: "/app/src" },
+    ]);
+  });
+  assert.deepEqual(out, { "@": "/app/src" });
+  assert.equal(stderr, "", "Vite's built-in aliases are not the user's configuration");
+});
+
+test("warnUnsupported reports only options the user's config sets", () => {
+  // The shape resolveConfig produces for a config that sets none of these: all
+  // defaults Vite injects. Called with the RAW config instead, nothing is reported.
+  const resolvedDefaults = {
+    esbuild: { jsxDev: true, charset: "utf8", legalComments: "none" },
+    optimizeDeps: { esbuildOptions: { preserveSymlinks: false } },
+    worker: { format: "iife", plugins: () => [] },
+    ssr: { resolve: { conditions: [], externalConditions: [] } },
+    server: { cors: { origin: /^https?:\/\/(?:(?:[^:]+\.)?localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/ } },
+    build: { terserOptions: {} },
+  };
+  assert.notEqual(captureStderr(() => warnUnsupported(resolvedDefaults)), "", "the resolved shape would warn");
+  const rawUserConfig = { plugins: [], tanstackStart: { server: { entry: "server" } } };
+  assert.equal(captureStderr(() => warnUnsupported(rawUserConfig)), "");
+  assert.equal(captureStderr(() => warnUnsupported(null)), "");
+  const userSets = captureStderr(() => warnUnsupported({ worker: { format: "es" }, esbuild: { charset: "ascii" }, build: { terserOptions: { compress: true } } }));
+  assert.match(userSets, /worker config is not applied/);
+  assert.match(userSets, /esbuild options charset are not applied/);
+  assert.match(userSets, /build.terserOptions is not applied/);
 });
