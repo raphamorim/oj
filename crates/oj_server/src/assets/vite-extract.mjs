@@ -226,8 +226,28 @@ function extractEsbuild(es) {
   return Object.keys(out).length ? out : null;
 }
 
+// The `css` block as JSON: preprocessorOptions (additionalData, loadPaths, Less
+// and Stylus options), devSourcemap, modules. Function-valued options (an
+// `additionalData` callback) cannot cross to Rust and are dropped with a warning.
+function extractCss(css) {
+  if (!css || typeof css !== "object") return null;
+  const po = css.preprocessorOptions;
+  if (po && typeof po === "object") {
+    for (const [lang, opts] of Object.entries(po)) {
+      if (opts && typeof opts.additionalData === "function") {
+        warn(`css.preprocessorOptions.${lang}.additionalData is a function; only the string form is applied`);
+      }
+    }
+  }
+  try {
+    const out = JSON.parse(JSON.stringify(css));
+    return out && Object.keys(out).length ? out : null;
+  } catch {
+    return null;
+  }
+}
+
 function warnUnsupported(c) {
-  if (c.css?.preprocessorOptions) warn("css.preprocessorOptions is not applied yet");
   if (c.esbuild?.jsx === "preserve" || c.oxc?.jsx === "preserve") {
     warn("jsx: \"preserve\" is not supported; JSX is compiled with the automatic runtime");
   }
@@ -278,6 +298,7 @@ if (isMainRun) try {
       build: extractBuild(c.build),
       oxc: extractOxc(c.oxc),
       esbuild: extractEsbuild(c.esbuild),
+      css: extractCss(c.css),
     }),
   );
 } catch (e) {

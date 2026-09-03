@@ -55,6 +55,9 @@ struct OjCssPlugin {
     // preprocesses/compiles them, matching Vite where CSS is a real module.
     host: Option<Arc<PluginHost>>,
     css_transform_enabled: Arc<tokio::sync::OnceCell<bool>>,
+    /// `css.preprocessorOptions` (Sass additionalData/loadPaths, Less/Stylus
+    /// options), applied the same way the dev server applies them.
+    css: Option<oj_config::CssConfig>,
 }
 
 fn assets_inline_limit_of(config: &oj_config::OjConfig) -> u64 {
@@ -298,9 +301,14 @@ async fn compile_stylesheet(
     host: &Option<Arc<oj_server::plugins::PluginHost>>,
     css_transform_enabled: &tokio::sync::OnceCell<bool>,
     has_postcss: bool,
+    css: &Option<oj_config::CssConfig>,
     path: &str,
     id: &str,
 ) -> anyhow::Result<oj_css::CssOutput> {
+    let cfg = oj_config::OjConfig {
+        css: css.clone(),
+        ..Default::default()
+    };
     let is_less = oj_server::sidecar::is_less(path);
     let is_stylus = oj_server::sidecar::is_stylus(path);
     let mut source =
@@ -319,13 +327,34 @@ async fn compile_stylesheet(
         }
     }
     if oj_css::is_sass(path) {
+        let lang = if path.ends_with(".sass") { "sass" } else { "scss" };
+        let data = oj_config::css_additional_data(&cfg, lang);
+        let load_paths: Vec<PathBuf> = oj_config::css_load_paths(&cfg, lang)
+            .into_iter()
+            .map(|p| root.join(p))
+            .collect();
         let dir = std::path::Path::new(path).parent();
-        source = oj_css::compile_sass(&source, dir).map_err(|e| anyhow::anyhow!(e))?;
+        source = oj_css::compile_sass_opts(
+            &source,
+            &oj_css::SassOptions {
+                load_dir: dir,
+                additional_data: data.as_deref(),
+                load_paths: &load_paths,
+            },
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
     } else if is_less || is_stylus {
-        source = preprocess_via_sidecar(root, std::path::Path::new(path))?;
+        let lang = if is_less { "less" } else { "stylus" };
+        if let Some(data) = oj_config::css_additional_data(&cfg, lang).filter(|d| !d.is_empty()) {
+            source = format!("{data}\n{source}");
+        }
+        let opts = oj_config::css_preprocessor_json(&cfg, lang);
+        source = preprocess_via_sidecar(root, std::path::Path::new(path), &source, opts)?;
     }
-    if oj_server::sidecar::is_tailwind_css(&source) || (has_postcss && path.ends_with(".css")) {
-        source = expand_css_via_sidecar(root, std::path::Path::new(path))?;
+    // PostCSS/Tailwind run on the preprocessor OUTPUT (Vite orders them the same
+    // way), on the source as transformed so far rather than re-read from disk.
+    if oj_server::sidecar::is_tailwind_css(&source) || has_postcss {
+        source = expand_css_via_sidecar(root, std::path::Path::new(path), &source)?;
     }
     let css_id = match std::path::Path::new(path).strip_prefix(root) {
         Ok(rel) => format!("/{}", rel.display()),
@@ -438,6 +467,7 @@ impl Plugin for OjCssPlugin {
         let host = self.host.clone();
         let css_transform_enabled = Arc::clone(&self.css_transform_enabled);
         let self_has_postcss = self.has_postcss;
+        let css_cfg = self.css.clone();
         async move {
             if let Some(file) = id.strip_suffix("?url") {
                 if is_stylesheet_path(file) {
@@ -449,6 +479,7 @@ impl Plugin for OjCssPlugin {
                         &host,
                         &css_transform_enabled,
                         self_has_postcss,
+                        &css_cfg,
                         file,
                         &id,
                     )
@@ -565,6 +596,7 @@ impl Plugin for OjCssPlugin {
                         &host,
                         &css_transform_enabled,
                         self_has_postcss,
+                        &css_cfg,
                         file,
                         &id,
                     )
@@ -675,6 +707,7 @@ impl Plugin for OjCssPlugin {
                 &host,
                 &css_transform_enabled,
                 self_has_postcss,
+                &css_cfg,
                 path,
                 &id,
             )
@@ -709,31 +742,71 @@ impl Plugin for OjCssPlugin {
     }
 }
 
-fn expand_css_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String> {
-    let script = oj_cache::cache_root(&root).join("css-sidecar.mjs");
+/// Tailwind / PostCSS over `css` (the file's content as processed so far, not
+/// re-read from disk), via the sidecar's line protocol.
+fn expand_css_via_sidecar(root: &Path, css_file: &Path, css: &str) -> anyhow::Result<String> {
+    run_sidecar_once(
+        root,
+        "css-sidecar.mjs",
+        oj_server::sidecar::SIDECAR_JS,
+        css_file,
+        css,
+        serde_json::Value::Null,
+        "tailwind/postcss",
+    )
+}
+
+fn run_sidecar_once(
+    root: &Path,
+    script_name: &str,
+    script_src: &str,
+    css_file: &Path,
+    css: &str,
+    options: serde_json::Value,
+    what: &str,
+) -> anyhow::Result<String> {
+    use std::io::Write;
+    let script = oj_cache::cache_root(root).join(script_name);
     if let Some(parent) = script.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&script, oj_server::sidecar::SIDECAR_JS)?;
-    let out = std::process::Command::new("node")
-        .args([
-            script.to_str().unwrap(),
-            "--once",
-            css_file.to_str().unwrap(),
-            root.to_str().unwrap(),
-        ])
+    fs::write(&script, script_src)?;
+    let req = serde_json::json!({
+        "id": 1,
+        "base": root.to_string_lossy(),
+        "css": css,
+        "from": css_file.to_string_lossy(),
+        "options": options,
+    })
+    .to_string();
+    let mut child = std::process::Command::new("node")
+        .arg(&script)
         .env("NODE_COMPILE_CACHE", oj_server::node_compile_cache(root))
         .current_dir(root)
-        .output()
-        .context("node not found for tailwind/postcss build")?;
-    if !out.status.success() {
-        bail!(
-            "css build failed for {}: {}",
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("node not found for {what} build"))?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{req}\n").as_bytes())?;
+    let out = child.wait_with_output()?;
+    let line = String::from_utf8_lossy(&out.stdout);
+    let line = line.trim().lines().next().unwrap_or("{}");
+    let v: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+    match v.get("css").and_then(|c| c.as_str()) {
+        Some(css) => Ok(css.to_string()),
+        None => bail!(
+            "{what} failed for {}: {}",
             css_file.display(),
-            String::from_utf8_lossy(&out.stderr)
-        );
+            v.get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("sidecar produced no output")
+        ),
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn svelte_via_sidecar(root: &Path, file: &Path) -> anyhow::Result<String> {
@@ -782,49 +855,22 @@ fn svelte_via_sidecar(root: &Path, file: &Path) -> anyhow::Result<String> {
     }
 }
 
-fn preprocess_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String> {
-    use std::io::Write;
-    let script = oj_cache::cache_root(&root).join("css-preprocess.mjs");
-    if let Some(parent) = script.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&script, oj_server::sidecar::PREPROCESS_JS)?;
-    let css = fs::read_to_string(css_file)?;
-    let req = serde_json::json!({
-        "id": 1,
-        "base": root.to_string_lossy(),
-        "css": css,
-        "from": css_file.to_string_lossy(),
-    })
-    .to_string();
-    let mut child = std::process::Command::new("node")
-        .arg(&script)
-        .env("NODE_COMPILE_CACHE", oj_server::node_compile_cache(root))
-        .current_dir(root)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .context("node not found for css preprocess build")?;
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(format!("{req}\n").as_bytes())?;
-    let out = child.wait_with_output()?;
-    let line = String::from_utf8_lossy(&out.stdout);
-    let line = line.trim().lines().next().unwrap_or("{}");
-    let v: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
-    match v.get("css").and_then(|c| c.as_str()) {
-        Some(css) => Ok(css.to_string()),
-        None => bail!(
-            "css preprocess failed for {}: {}",
-            css_file.display(),
-            v.get("error")
-                .and_then(|e| e.as_str())
-                .unwrap_or("is `less`/`stylus` installed?")
-        ),
-    }
+fn preprocess_via_sidecar(
+    root: &Path,
+    css_file: &Path,
+    css: &str,
+    options: serde_json::Value,
+) -> anyhow::Result<String> {
+    run_sidecar_once(
+        root,
+        "css-preprocess.mjs",
+        oj_server::sidecar::PREPROCESS_JS,
+        css_file,
+        css,
+        options,
+        "css preprocess",
+    )
+    .map_err(|e| anyhow::anyhow!("{e} (is `less`/`stylus` installed?)"))
 }
 
 fn rolldown_resolve(
@@ -1629,6 +1675,7 @@ pub async fn build(
         css_code_split: css_split,
         host: plugin_host.clone(),
         css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
+        css: config.css.clone(),
     }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
@@ -1883,7 +1930,7 @@ pub async fn build(
                 }
                 let source = fs::read_to_string(&src)?;
                 if oj_server::sidecar::is_tailwind_css(&source) {
-                    let css = expand_css_via_sidecar(&root, &src)?;
+                    let css = expand_css_via_sidecar(&root, &src, &source)?;
                     let minified = oj_css::compile_css(href.as_str(), &css, true)
                         .map_err(|e| anyhow::anyhow!(e))?;
                     fs::write(&dest, minified.css)?;
@@ -2112,6 +2159,7 @@ pub(crate) async fn build_ssr(
         css_code_split: false,
         host: plugin_host.clone(),
         css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
+        css: config.css.clone(),
     }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
@@ -2252,6 +2300,7 @@ async fn build_server_fns(root: &Path, out_dir: &Path, mode: &str) -> anyhow::Re
                 css_code_split: false,
                 host: None,
                 css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
+                css: config.css.clone(),
             })])
             .with_options(BundlerOptions {
                 input: Some(vec![InputItem {
@@ -2617,6 +2666,7 @@ async fn build_client_entry(
         css_code_split: false,
         host: plugin_host.clone(),
         css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
+        css: config.css.clone(),
     }));
 
     let mut bundler = BundlerBuilder::default()
@@ -2761,6 +2811,7 @@ async fn build_library(
                 css_code_split: false,
                 host: None,
                 css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
+                css: config.css.clone(),
             })])
             .with_options(BundlerOptions {
                 input: Some(vec![InputItem {

@@ -198,6 +198,8 @@ pub struct ViteValues {
     /// pragma, pragmaFrag } }`), and the `esbuild.jsx*` fields for older configs.
     pub oxc: Option<serde_json::Value>,
     pub esbuild: Option<serde_json::Value>,
+    /// The `css` block (preprocessorOptions, devSourcemap, modules) as JSON.
+    pub css: Option<serde_json::Value>,
 }
 
 /// Evaluate the app's `vite.config` for `command` ("serve" | "build") and `mode`.
@@ -307,6 +309,7 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
         build: json.get("build").filter(|v| !v.is_null()).cloned(),
         oxc: json.get("oxc").filter(|v| !v.is_null()).cloned(),
         esbuild: json.get("esbuild").filter(|v| !v.is_null()).cloned(),
+        css: json.get("css").filter(|v| !v.is_null()).cloned(),
     }
 }
 
@@ -446,6 +449,11 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
     }
     if config.esbuild.is_none() {
         config.esbuild = v.esbuild;
+    }
+    if config.css.is_none() {
+        if let Some(css) = v.css {
+            config.css = serde_json::from_value::<oj_config::CssConfig>(css).ok();
+        }
     }
 }
 
@@ -1063,6 +1071,7 @@ mod vite_values_tests {
             build: None,
             oxc: None,
             esbuild: None,
+            css: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/vite-base/"));
@@ -1093,6 +1102,7 @@ mod vite_values_tests {
             build: None,
             oxc: None,
             esbuild: None,
+            css: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/oj-base/"));
@@ -1206,5 +1216,17 @@ mod vite_values_tests {
         };
         merge_vite_values(&mut config, v);
         assert_eq!(oj_config::jsx_settings(&config).import_source.as_deref(), Some("preact"), "oj.config wins");
+    }
+
+    #[test]
+    fn merge_adopts_css_preprocessor_options() {
+        let mut config = oj_config::OjConfig::default();
+        let v = ViteValues {
+            css: Some(serde_json::json!({ "preprocessorOptions": { "scss": { "additionalData": "$b: red;", "loadPaths": ["styles"] } } })),
+            ..Default::default()
+        };
+        merge_vite_values(&mut config, v);
+        assert_eq!(oj_config::css_additional_data(&config, "scss").as_deref(), Some("$b: red;"));
+        assert_eq!(oj_config::css_load_paths(&config, "scss"), vec!["styles".to_string()]);
     }
 }

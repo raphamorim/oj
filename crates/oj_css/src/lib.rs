@@ -115,18 +115,64 @@ fn index_target(p: &Path) -> Option<PathBuf> {
 #[derive(Debug)]
 struct DottedFs;
 
+// grass resolves a directory import `@use "pkg"` by probing `pkg/index.scss` and
+// `pkg/_index.scss` (or `.sass`). When `pkg` is an npm package reached through
+// a node_modules load path, its package.json names the stylesheet instead:
+// Vite's sass importer resolves with mainFields `["sass", "style"]` (then
+// `main`). Map the probe to that file. Syntax follows the probed extension
+// (grass parses by it), so an `index.sass` probe only accepts a `.sass` entry
+// and an `index.scss` probe accepts `.scss` or plain `.css`.
+fn package_entry(probe: &Path) -> Option<PathBuf> {
+    let name = probe.file_name()?.to_str()?;
+    let want_sass = match name {
+        "index.scss" | "_index.scss" => false,
+        "index.sass" | "_index.sass" => true,
+        _ => return None,
+    };
+    let dir = probe.parent()?;
+    let pkg = std::fs::read_to_string(dir.join("package.json")).ok()?;
+    let pkg: serde_json::Value = serde_json::from_str(&pkg).ok()?;
+    let accepts = |p: &Path| {
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+        p.is_file() && if want_sass { ext == "sass" } else { ext == "scss" || ext == "css" }
+    };
+    for field in ["sass", "style", "main"] {
+        let Some(rel) = pkg.get(field).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let p = dir.join(rel);
+        if accepts(&p) {
+            return Some(p);
+        }
+        let exts: &[&str] = if want_sass { &["sass"] } else { &["scss", "css"] };
+        for ext in exts {
+            let c = with_ext(&p, ext);
+            if c.is_file() {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+// The real file behind a grass probe that is not itself a file: a dotted-basename
+// stylesheet's phantom index, or an npm package's `sass`/`style`/`main` entry.
+fn probe_target(p: &Path) -> Option<PathBuf> {
+    index_target(p).or_else(|| package_entry(p))
+}
+
 impl grass::Fs for DottedFs {
     fn is_dir(&self, p: &Path) -> bool {
         p.is_dir() || dotted_stylesheet(p).is_some()
     }
     fn is_file(&self, p: &Path) -> bool {
-        p.is_file() || index_target(p).is_some()
+        p.is_file() || probe_target(p).is_some()
     }
     fn read(&self, p: &Path) -> io::Result<Vec<u8>> {
         let bytes = if p.is_file() {
             std::fs::read(p)?
         } else {
-            match index_target(p) {
+            match probe_target(p) {
                 Some(real) => std::fs::read(real)?,
                 None => std::fs::read(p)?,
             }
@@ -154,12 +200,16 @@ fn strip_sass_import_ext(source: &str) -> String {
         let t = line.trim_start();
         let is_import = t.starts_with("@use") || t.starts_with("@forward") || t.starts_with("@import");
         if is_import && !line.contains("url(") {
+            // `~pkg/...` is the webpack-era spelling of a node_modules import that
+            // Vite's sass importer still accepts; the load paths cover it bare.
             out.push_str(
                 &line
                     .replace(".scss\"", "\"")
                     .replace(".scss'", "'")
                     .replace(".sass\"", "\"")
-                    .replace(".sass'", "'"),
+                    .replace(".sass'", "'")
+                    .replace("\"~", "\"")
+                    .replace("'~", "'"),
             );
         } else {
             out.push_str(line);
@@ -177,11 +227,61 @@ pub fn compile_sass_with(
     load_dir: Option<&Path>,
     additional_data: Option<&str>,
 ) -> Result<String, String> {
+    compile_sass_opts(
+        source,
+        &SassOptions {
+            load_dir,
+            additional_data,
+            load_paths: &[],
+        },
+    )
+}
+
+/// How a Sass stylesheet is compiled: the importing file's directory, the
+/// configured `css.preprocessorOptions.scss.loadPaths`/`includePaths`, and the
+/// `node_modules` directories above it (so `@use "bootstrap/scss/bootstrap"` and
+/// `@use "pkg"` resolve as in Vite), plus `additionalData` prepended.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SassOptions<'a> {
+    pub load_dir: Option<&'a Path>,
+    pub additional_data: Option<&'a str>,
+    pub load_paths: &'a [PathBuf],
+}
+
+/// Every `node_modules` directory from `dir` up to the filesystem root, nearest
+/// first: Sass' node resolution for bare `@use`/`@import` specifiers.
+pub fn node_modules_load_paths(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        if d.file_name().is_some_and(|n| n == "node_modules") {
+            cur = d.parent();
+            continue;
+        }
+        let nm = d.join("node_modules");
+        if nm.is_dir() {
+            out.push(nm);
+        }
+        cur = d.parent();
+    }
+    out
+}
+
+pub fn compile_sass_opts(source: &str, opts: &SassOptions<'_>) -> Result<String, String> {
     let fs = DottedFs;
     let mut options = grass::Options::default().fs(&fs);
-    if let Some(dir) = load_dir {
+    if let Some(dir) = opts.load_dir {
         options = options.load_path(dir);
     }
+    for p in opts.load_paths {
+        options = options.load_path(p);
+    }
+    if let Some(dir) = opts.load_dir {
+        for nm in node_modules_load_paths(dir) {
+            options = options.load_path(nm);
+        }
+    }
+    let additional_data = opts.additional_data;
     let stripped = strip_sass_import_ext(source);
     let source = match additional_data {
         Some(data) if !data.is_empty() => format!("{data}\n{stripped}"),
@@ -496,6 +596,56 @@ mod tests {
         let css = compile_sass(src, Some(&base.join("comp")))
             .unwrap_or_else(|e| panic!("nested dotted @use should resolve: {e}"));
         assert!(css.contains("color: #0f0") || css.contains("color: green"), "{css}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sass_resolves_node_modules_packages_like_vite() {
+        // `@use "pkg"` -> package.json `sass` (then `style`) entry; `@use
+        // "pkg/path"` -> a file inside the package; `~pkg` is accepted; the
+        // node_modules directory is found above the importing file.
+        let base = std::env::temp_dir().join(format!("oj-css-nm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pkg = base.join("node_modules/@acme/tokens");
+        std::fs::create_dir_all(pkg.join("src")).unwrap();
+        std::fs::create_dir_all(base.join("src/deep")).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"@acme/tokens","main":"index.js","sass":"src/index.scss"}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("src/index.scss"), "$brand: #123456;\n").unwrap();
+        std::fs::write(pkg.join("src/_mixins.scss"), "@mixin pad { padding: 4px; }\n").unwrap();
+        let styled = base.join("node_modules/plain-css");
+        std::fs::create_dir_all(&styled).unwrap();
+        std::fs::write(styled.join("package.json"), r#"{"name":"plain-css","style":"dist/x.css"}"#).unwrap();
+        std::fs::create_dir_all(styled.join("dist")).unwrap();
+        std::fs::write(styled.join("dist/x.css"), ".plain { color: green; }\n").unwrap();
+
+        let dir = base.join("src/deep");
+        let scss = "@use \"@acme/tokens\" as t;\n@use \"~@acme/tokens/src/mixins\";\n@import \"plain-css\";\n.a { color: t.$brand; @include mixins.pad; }";
+        let css = compile_sass(scss, Some(&dir)).unwrap();
+        assert!(css.contains("#123456"), "package sass entry resolved: {css}");
+        assert!(css.contains("padding: 4px"), "~pkg/path resolved: {css}");
+        assert!(css.contains(".plain"), "style entry resolved: {css}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sass_load_paths_from_config_resolve_bare_imports() {
+        let base = std::env::temp_dir().join(format!("oj-css-lp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("styles")).unwrap();
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::write(base.join("styles/_theme.scss"), "$accent: #abc;\n").unwrap();
+        let opts = SassOptions {
+            load_dir: Some(&base.join("src")),
+            additional_data: Some("$pad: 2px;"),
+            load_paths: &[base.join("styles")],
+        };
+        let css = compile_sass_opts("@use \"theme\";\n.a { color: theme.$accent; padding: $pad; }", &opts).unwrap();
+        assert!(css.contains("#abc") && css.contains("2px"), "{css}");
+        assert!(compile_sass("@use \"theme\";", Some(&base.join("src"))).is_err(), "not on the load path without config");
         let _ = std::fs::remove_dir_all(&base);
     }
 

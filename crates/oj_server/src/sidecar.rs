@@ -181,11 +181,22 @@ impl Sidecar {
     }
 
     pub async fn compile(&self, css: &str, from: &str) -> Result<String, String> {
+        self.compile_with(css, from, serde_json::Value::Null).await
+    }
+
+    /// `options` is the user's `css.preprocessorOptions.<lang>` object (Less/Stylus
+    /// options), handed to the preprocessor as-is.
+    pub async fn compile_with(
+        &self,
+        css: &str,
+        from: &str,
+        options: serde_json::Value,
+    ) -> Result<String, String> {
         let id = self.counter.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
         let from = absolute_from(&self.base, from);
-        let request = serde_json::json!({ "id": id, "base": self.base, "css": css, "from": from });
+        let request = serde_json::json!({ "id": id, "base": self.base, "css": css, "from": from, "options": options });
         {
             let mut stdin = self.stdin.lock().await;
             if stdin

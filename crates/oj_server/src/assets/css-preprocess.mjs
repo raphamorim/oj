@@ -12,19 +12,24 @@ const load = (base, spec) => {
   return import(pathToFileURL(req.resolve(spec)).href).then((m) => m.default ?? m);
 };
 
-async function less(base, css, from) {
+// `opts` is css.preprocessorOptions.less / .stylus, passed through like Vite
+// does (javascriptEnabled, globalVars, modifyVars, paths, define, ...).
+async function less(base, css, from, opts = {}) {
   const less = await load(base, "less");
-  const out = await less.render(css, { filename: from, paths: [path.dirname(from)] });
+  const { paths = [], ...rest } = opts;
+  const out = await less.render(css, { ...rest, filename: from, paths: [path.dirname(from), ...paths] });
   return out.css;
 }
 
-async function stylus(base, css, from) {
+async function stylus(base, css, from, opts = {}) {
   const stylus = await load(base, "stylus");
+  const { paths = [], define, imports, ...rest } = opts;
   return await new Promise((resolve, reject) => {
-    stylus(css)
-      .set("filename", from)
-      .set("paths", [path.dirname(from)])
-      .render((err, out) => (err ? reject(err) : resolve(out)));
+    const s = stylus(css).set("filename", from).set("paths", [path.dirname(from), ...paths]);
+    for (const [k, v] of Object.entries(rest)) s.set(k, v);
+    if (define && typeof define === "object") for (const [k, v] of Object.entries(define)) s.define(k, v);
+    if (Array.isArray(imports)) for (const i of imports) s.import(i);
+    s.render((err, out) => (err ? reject(err) : resolve(out)));
   });
 }
 
@@ -43,12 +48,13 @@ rl.on("line", async (line) => {
     return;
   }
   const { id, base, css, from } = msg;
+  const opts = msg.options && typeof msg.options === "object" ? msg.options : {};
   const ext = String(from || "").split("?")[0].split(".").pop().toLowerCase();
   inflight += 1;
   try {
     let out = css;
-    if (ext === "less") out = await less(base, css, from);
-    else if (ext === "styl" || ext === "stylus") out = await stylus(base, css, from);
+    if (ext === "less") out = await less(base, css, from, opts);
+    else if (ext === "styl" || ext === "stylus") out = await stylus(base, css, from, opts);
     process.stdout.write(JSON.stringify({ id, css: out }) + "\n");
   } catch (e) {
     process.stdout.write(JSON.stringify({ id, error: String((e && e.message) || e) }) + "\n");

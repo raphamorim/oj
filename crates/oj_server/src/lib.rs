@@ -255,6 +255,7 @@ struct ServerState {
     has_postcss: bool,
     scss_additional_data: Option<String>,
     sass_additional_data: Option<String>,
+    css_config: Option<oj_config::CssConfig>,
     preload_snapshot: Vec<String>,
     proxy: Vec<(String, oj_config::ProxyEntry)>,
     http: reqwest::Client,
@@ -683,6 +684,7 @@ impl DevServer {
             has_postcss: has_postcss_config(&root),
             scss_additional_data: oj_config::css_additional_data(&config, "scss"),
             sass_additional_data: oj_config::css_additional_data(&config, "sass"),
+            css_config: config.css.clone(),
             fs_allow: Arc::new(Mutex::new({
                 let mut set: std::collections::HashSet<PathBuf> = server_cfg
                     .fs
@@ -948,7 +950,7 @@ async fn ssr_module(
     let ext = path.extension().and_then(|e| e.to_str());
     if !from_plugin && ext.is_some_and(is_style_ext) {
         let source = if is_preprocessor(id) {
-            match run_preprocess_sidecar(&state, id, &source).await {
+            match run_preprocess_sidecar(&state, id, &source, serde_json::Value::Null).await {
                 Ok(css) => css,
                 Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
             }
@@ -1030,6 +1032,26 @@ fn sass_additional_data_for(state: &ServerState, url: &str) -> Option<String> {
     } else {
         state.scss_additional_data.clone()
     }
+}
+
+/// `css.preprocessorOptions.<scss|sass>.loadPaths` / `includePaths`, resolved
+/// against the app root.
+fn sass_load_paths_for(state: &ServerState, url: &str) -> Vec<PathBuf> {
+    if !oj_css::is_sass(url) {
+        return Vec::new();
+    }
+    let Some(css) = &state.css_config else {
+        return Vec::new();
+    };
+    let cfg = oj_config::OjConfig {
+        css: Some(css.clone()),
+        ..Default::default()
+    };
+    let lang = if url.split('?').next().unwrap_or(url).ends_with(".sass") { "sass" } else { "scss" };
+    oj_config::css_load_paths(&cfg, lang)
+        .into_iter()
+        .map(|p| state.root.join(p))
+        .collect()
 }
 
 fn ssr_css_module(root: &Path, path: &Path, source: &str) -> Result<String, String> {
@@ -2259,7 +2281,25 @@ async fn ensure_module(
     };
 
     let source = if is_preprocessor(url) {
-        run_preprocess_sidecar(state, url, &source)
+        // css.preprocessorOptions.<less|stylus>: `additionalData` is prepended,
+        // everything else goes to the preprocessor as its options (Vite parity).
+        let lang = if sidecar::is_less(url) { "less" } else { "stylus" };
+        let cfg = state.css_config.clone().map(|c| oj_config::OjConfig {
+            css: Some(c),
+            ..Default::default()
+        });
+        let (data, opts) = match &cfg {
+            Some(c) => (
+                oj_config::css_additional_data(c, lang),
+                oj_config::css_preprocessor_json(c, lang),
+            ),
+            None => (None, serde_json::Value::Null),
+        };
+        let with_data = match data {
+            Some(d) if !d.is_empty() => format!("{d}\n{source}"),
+            _ => source,
+        };
+        run_preprocess_sidecar(state, url, &with_data, opts)
             .await
             .map_err(|e| format!("css preprocess error for {url}: {e}"))?
     } else {
@@ -2328,6 +2368,7 @@ async fn ensure_module(
     };
     let url_owned = url.to_string();
     let sass_data = sass_additional_data_for(state, &url_owned);
+    let sass_load_paths = sass_load_paths_for(state, &url_owned);
     let bundle = state.bundle;
     let hmr_state = Arc::clone(state);
     let plugin_fallback = state.plugins.is_some() && !bundle;
@@ -2363,7 +2404,14 @@ async fn ensure_module(
         }
         if is_css {
             let css_src = if oj_css::is_sass(&url_owned) {
-                oj_css::compile_sass_with(&source, Some(&dir), sass_data.as_deref())?
+                oj_css::compile_sass_opts(
+                    &source,
+                    &oj_css::SassOptions {
+                        load_dir: Some(&dir),
+                        additional_data: sass_data.as_deref(),
+                        load_paths: &sass_load_paths,
+                    },
+                )?
             } else {
                 source.clone()
             };
@@ -3057,13 +3105,14 @@ async fn run_preprocess_sidecar(
     state: &Arc<ServerState>,
     url: &str,
     source: &str,
+    options: serde_json::Value,
 ) -> Result<String, String> {
     let sidecar = state
         .preprocess
         .get_or_try_init(|| Sidecar::spawn_preprocess(&state.root))
         .await
         .map_err(|e| e.to_string())?;
-    sidecar.compile(source, url).await
+    sidecar.compile_with(source, url, options).await
 }
 
 async fn run_svelte_sidecar(
