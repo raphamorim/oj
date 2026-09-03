@@ -22,6 +22,9 @@ pub struct OjConfig {
     pub env_dir: Option<String>,
     pub build: Option<BuildConfig>,
     pub preview: Option<PreviewConfig>,
+    /// Vite's `appType`: `spa` (default, html fallback to index.html), `mpa`
+    /// (no SPA fallback) or `custom`.
+    pub app_type: Option<String>,
     pub virtual_modules: Option<BTreeMap<String, String>>,
     pub bundle: Option<bool>,
     pub environments: Option<BTreeMap<String, serde_json::Value>>,
@@ -103,6 +106,14 @@ pub struct PreviewConfig {
     pub port: Option<u16>,
     pub host: Option<String>,
     pub headers: Option<BTreeMap<String, String>>,
+    /// Vite's preview options inherit from `server` when unset (resolvePreviewOptions).
+    pub strict_port: Option<bool>,
+    /// `true` or a path to open in the browser once the server listens.
+    pub open: Option<serde_json::Value>,
+    pub cors: Option<CorsConfig>,
+    pub allowed_hosts: Option<AllowedHosts>,
+    /// Accepted for compatibility; the preview server does not proxy yet (warned about).
+    pub proxy: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]

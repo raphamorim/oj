@@ -332,6 +332,24 @@ function extractServerFlags(s) {
   else if (s.open === false) out.open = false;
   return Object.keys(out).length ? out : null;
 }
+// `preview.*` as resolved by Vite (inheriting `server.*` except the port).
+function extractPreview(p) {
+  if (!p || typeof p !== "object") return null;
+  const out = {};
+  if (typeof p.port === "number") out.port = p.port;
+  if (typeof p.host === "string") out.host = p.host;
+  else if (p.host === true) out.host = "true";
+  if (typeof p.strictPort === "boolean") out.strictPort = p.strictPort;
+  if (p.open === true || typeof p.open === "string") out.open = p.open;
+  const cors = extractCors(p.cors);
+  if (cors !== null && cors !== undefined) out.cors = cors;
+  const hosts = extractAllowedHosts(p.allowedHosts);
+  if (hosts !== null && hosts !== undefined) out.allowedHosts = hosts;
+  const headers = stringMap(p.headers);
+  if (headers) out.headers = headers;
+  if (p.proxy && typeof p.proxy === "object" && Object.keys(p.proxy).length) out.proxy = {};
+  return Object.keys(out).length ? out : null;
+}
 function extractEnvPrefix(p) {
   if (typeof p === "string") return [p];
   if (Array.isArray(p)) return p.filter((x) => typeof x === "string");
@@ -457,6 +475,8 @@ if (isMainRun) try {
       envDir: typeof c.envDir === "string" ? c.envDir : null,
       cors: extractCors(c.server?.cors),
       allowedHosts: extractAllowedHosts(c.server?.allowedHosts),
+      preview: extractPreview(c.preview),
+      appType: typeof c.appType === "string" ? c.appType : null,
     }),
   );
 } catch (e) {

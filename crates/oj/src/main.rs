@@ -108,15 +108,25 @@ enum Command {
     },
     Preview {
         root: Option<PathBuf>,
-        #[arg(long)]
+        /// The build output to serve (default: build.outDir). `--out` is an alias.
+        #[arg(long = "outDir", alias = "out")]
         out: Option<PathBuf>,
         #[arg(long)]
         port: Option<u16>,
         #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
         host: Option<String>,
         /// Use this vite.config instead of the one found in the root.
-        #[arg(long)]
+        #[arg(short = 'c', long)]
         config: Option<PathBuf>,
+        /// Exit if the port is already in use (Vite's --strictPort).
+        #[arg(long = "strictPort")]
+        strict_port: bool,
+        /// Open the browser on startup, optionally at a path (Vite's --open).
+        #[arg(long, num_args = 0..=1, default_missing_value = "/")]
+        open: Option<String>,
+        /// Public base path (default: the config's `base`).
+        #[arg(long)]
+        base: Option<String>,
     },
 }
 
@@ -240,6 +250,9 @@ async fn run() -> anyhow::Result<()> {
             port,
             host,
             config,
+            strict_port,
+            open,
+            base,
         } => {
             set_config_override(&PathBuf::from("."), config);
             let root = root
@@ -268,22 +281,98 @@ async fn run() -> anyhow::Result<()> {
             } else {
                 root.join(out_dir)
             };
-            let port = port
-                .or_else(|| config.preview.as_ref().and_then(|p| p.port))
-                .unwrap_or(4173);
-            let base = config.base.clone().unwrap_or_else(|| "/".into());
-            let headers: Vec<(String, String)> = config
-                .preview
-                .as_ref()
-                .and_then(|p| p.headers.clone())
-                .or_else(|| config.server.as_ref().and_then(|s| s.headers.clone()))
-                .map(|m| m.into_iter().collect())
-                .unwrap_or_default();
-            let host = host
-                .or_else(|| config.preview.as_ref().and_then(|p| p.host.clone()))
-                .or_else(|| config.server.as_ref().and_then(|s| s.host.clone()));
-            oj_server::preview(out_dir, port, base, headers, host).await
+            let mut opts = preview_options(&config, out_dir);
+            if let Some(p) = port {
+                opts.port = p;
+            }
+            if let Some(h) = host {
+                opts.host = Some(h);
+            }
+            if let Some(b) = base {
+                opts.base = b;
+            }
+            if strict_port {
+                opts.strict_port = true;
+            }
+            if let Some(o) = open {
+                opts.open = Some(o);
+            }
+            oj_server::preview(opts).await
         }
+    }
+}
+
+/// Vite's `resolvePreviewOptions`: every preview option falls back to the
+/// `server` one except the port (4173), so dev and preview run side by side.
+fn preview_options(config: &oj_config::OjConfig, out_dir: PathBuf) -> oj_server::PreviewOptions {
+    let preview = config.preview.clone().unwrap_or_default();
+    let server = config.server.clone().unwrap_or_default();
+    if preview.proxy.as_ref().is_some_and(|p| !p.is_null()) || server.proxy.is_some() {
+        eprintln!("oj preview: (!) preview.proxy / server.proxy is not applied by the preview server yet.");
+    }
+    let open = match preview.open.as_ref() {
+        Some(serde_json::Value::Bool(true)) => Some("/".to_string()),
+        Some(serde_json::Value::String(p)) => Some(p.clone()),
+        Some(_) => None,
+        None => server.open.filter(|o| *o).map(|_| "/".to_string()),
+    };
+    let base = config.base.clone().unwrap_or_else(|| "/".into());
+    let base = if base.is_empty() || base.starts_with('.') {
+        "/".to_string()
+    } else {
+        format!("/{}/", base.trim_matches('/')).replace("//", "/")
+    };
+    oj_server::PreviewOptions {
+        dir: out_dir,
+        port: preview.port.unwrap_or(4173),
+        base,
+        headers: preview
+            .headers
+            .or(server.headers)
+            .map(|m| m.into_iter().collect())
+            .unwrap_or_default(),
+        host: preview.host.or(server.host),
+        strict_port: preview.strict_port.or(server.strict_port).unwrap_or(false),
+        open,
+        cors: preview.cors.or(server.cors),
+        allowed_hosts: preview.allowed_hosts.or(server.allowed_hosts),
+        spa_fallback: config.app_type.as_deref().unwrap_or("spa") == "spa",
+        assets_dir: oj_config::build_assets_dir(config),
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    #[test]
+    fn preview_options_inherit_from_server_except_port() {
+        let config: oj_config::OjConfig = serde_json::from_str(
+            r#"{"base":"app","appType":"mpa","build":{"assetsDir":"static"},
+                "server":{"port":3000,"strictPort":true,"open":true,"host":"0.0.0.0","cors":false,"allowedHosts":["a.test"],"headers":{"x-a":"1"}},
+                "preview":{"headers":{"x-b":"2"}}}"#,
+        )
+        .unwrap();
+        let o = preview_options(&config, PathBuf::from("dist"));
+        assert_eq!(o.port, 4173, "the port never inherits from server");
+        assert_eq!(o.base, "/app/");
+        assert!(o.strict_port);
+        assert_eq!(o.open.as_deref(), Some("/"));
+        assert_eq!(o.host.as_deref(), Some("0.0.0.0"));
+        assert!(matches!(o.cors, Some(oj_config::CorsConfig::Toggle(false))));
+        assert!(matches!(o.allowed_hosts, Some(oj_config::AllowedHosts::List(ref l)) if l == &["a.test"]));
+        assert_eq!(o.headers, vec![("x-b".to_string(), "2".to_string())], "preview.headers wins over server.headers");
+        assert!(!o.spa_fallback, "appType mpa has no index.html fallback");
+        assert_eq!(o.assets_dir, "static");
+
+        let config: oj_config::OjConfig =
+            serde_json::from_str(r#"{"preview":{"port":5000,"open":"/docs","strictPort":false},"server":{"strictPort":true}}"#).unwrap();
+        let o = preview_options(&config, PathBuf::from("dist"));
+        assert_eq!(o.port, 5000);
+        assert_eq!(o.open.as_deref(), Some("/docs"));
+        assert!(!o.strict_port, "an explicit preview.strictPort wins");
+        assert!(o.spa_fallback);
+        assert_eq!(o.base, "/");
     }
 }
 

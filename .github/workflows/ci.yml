@@ -277,3 +277,5 @@ jobs:
         run: node e2e/rolldown-options.mjs
       - name: ssr options (build.ssr, ssr.external/noExternal, ssrManifest assets, client base)
         run: node e2e/ssr-options.mjs
+      - name: preview options (cors, allowedHosts, headers, strictPort, appType mpa)
+        run: node e2e/preview-options.mjs
