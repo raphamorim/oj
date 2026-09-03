@@ -456,6 +456,21 @@ fn start_script_env(root: &Path, command: &str, mode: &str) -> anyhow::Result<Ve
     if !defines.is_empty() {
         vars.push(("OJ_DEFINE".into(), serde_json::Value::Object(defines).to_string()));
     }
+    // The user's `resolve.conditions` (the ssr environment's first), added to
+    // Node's export conditions by the SSR loader the way Vite's resolver honors
+    // them; the `development|production` placeholder is the dev one here.
+    if let Some(user) = oj_config::user_resolve_conditions(&config, "ssr") {
+        let conditions: Vec<String> = user
+            .into_iter()
+            .map(|c| if c == "development|production" { "development".to_string() } else { c })
+            .collect();
+        if !conditions.is_empty() {
+            vars.push((
+                "OJ_RESOLVE_CONDITIONS".into(),
+                serde_json::to_string(&conditions).unwrap_or_default(),
+            ));
+        }
+    }
     // `ssr.noExternal`/`external`, consumed by the SSR loader to transform (rather
     // than hand to Node) the dependencies Vite would bundle.
     let externals = oj_config::ssr_externals(&config);
@@ -1235,6 +1250,7 @@ mod tests {
             root.join("oj.config.json"),
             r#"{
               "envPrefix": ["VITE_", "APP_"],
+              "resolve": { "conditions": ["custom", "development|production"] },
               "define": { "__SHARED__": "1" },
               "environments": {
                 "client": { "define": { "__SIDE__": "\"client\"" } },
@@ -1256,6 +1272,7 @@ mod tests {
         assert_eq!(get("OJ_ENV_PREFIX").as_deref(), Some(r#"["VITE_","APP_"]"#));
         assert_eq!(get("OJ_DEFINE").as_deref(), Some(r#"{"__SHARED__":"1"}"#));
         assert_eq!(get("OJ_DEFINE_CLIENT").as_deref(), Some(r#"{"__SIDE__":"\"client\""}"#));
+        assert_eq!(get("OJ_RESOLVE_CONDITIONS").as_deref(), Some(r#"["custom","development"]"#));
         let ssr: serde_json::Value = serde_json::from_str(&get("OJ_DEFINE_SSR").unwrap()).unwrap();
         assert_eq!(ssr["__SIDE__"], "\"server\"");
         assert_eq!(ssr["__ONLY_SSR__"], "true");
@@ -1270,6 +1287,7 @@ mod tests {
         assert!(!names.contains(&"OJ_ENV_PREFIX"));
         assert!(!names.contains(&"OJ_DEFINE_CLIENT"));
         assert!(!names.contains(&"OJ_DEFINE_SSR"));
+        assert!(!names.contains(&"OJ_RESOLVE_CONDITIONS"));
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&plain);
     }

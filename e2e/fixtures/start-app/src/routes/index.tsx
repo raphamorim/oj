@@ -30,6 +30,8 @@ import { GlobWidget } from "../widgets/glob-widget.jsx";
 import { plainGlobTitles } from "../generated/glob-plain.js";
 import { genericGlobTitles } from "../generated/glob-generic";
 import { envProbe } from "../lib/env-probe.js";
+// JSON named exports (Vite's json.namedExports default): server and client.
+import { title as alphaTitle } from "../content/alpha.json";
 
 declare const __FIXTURE_DEFINE__: string;
 // Per-environment define (environments.{client,ssr}.define): a different value
@@ -82,6 +84,7 @@ function Index() {
       <p data-testid="glob-js">{plainGlobTitles}</p>
       <p data-testid="glob-ts-generic">{genericGlobTitles}</p>
       <p data-testid="js-env">{envProbe}</p>
+      <p data-testid="json-named">{`json-named:${alphaTitle}`}</p>
       <p data-testid="define">{__FIXTURE_DEFINE__}</p>
       <p data-testid="env-define" suppressHydrationWarning>{__FIXTURE_SIDE__}</p>
       <p data-testid="raw">{notes.trim()}</p>

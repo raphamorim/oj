@@ -636,16 +636,11 @@ pub fn resolve_conditions(config: &OjConfig, env_name: &str) -> Vec<String> {
     resolve_conditions_for(config, env_name, true)
 }
 
-/// Export conditions for an environment, as Vite resolves them: the default set
-/// is `browser`/`node`, `module`, and `development` or `production` (per `dev`),
-/// plus `import` and `default`, which the resolver always matches. A user
-/// `resolve.conditions` list replaces the defaults (Vite parity: no implicit
-/// `module` or dev/prod) but Vite's `development|production` placeholder is
-/// mapped to the active one, and `import`/`default` are always kept so a
-/// dual-package `exports` map still resolves.
-pub fn resolve_conditions_for(config: &OjConfig, env_name: &str, dev: bool) -> Vec<String> {
-    let dev_prod = if dev { "development" } else { "production" };
-    let user = config
+/// The user's own `resolve.conditions` for an environment (its
+/// `environments.<name>.resolve.conditions` first, then the top-level list),
+/// verbatim, or None when the config leaves the defaults in place.
+pub fn user_resolve_conditions(config: &OjConfig, env_name: &str) -> Option<Vec<String>> {
+    config
         .environments
         .as_ref()
         .and_then(|e| e.get(env_name))
@@ -657,8 +652,19 @@ pub fn resolve_conditions_for(config: &OjConfig, env_name: &str, dev: bool) -> V
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect::<Vec<_>>()
         })
-        .or_else(|| config.resolve.as_ref().and_then(|r| r.conditions.clone()));
-    if let Some(user) = user {
+        .or_else(|| config.resolve.as_ref().and_then(|r| r.conditions.clone()))
+}
+
+/// Export conditions for an environment, as Vite resolves them: the default set
+/// is `browser`/`node`, `module`, and `development` or `production` (per `dev`),
+/// plus `import` and `default`, which the resolver always matches. A user
+/// `resolve.conditions` list replaces the defaults (Vite parity: no implicit
+/// `module` or dev/prod) but Vite's `development|production` placeholder is
+/// mapped to the active one, and `import`/`default` are always kept so a
+/// dual-package `exports` map still resolves.
+pub fn resolve_conditions_for(config: &OjConfig, env_name: &str, dev: bool) -> Vec<String> {
+    let dev_prod = if dev { "development" } else { "production" };
+    if let Some(user) = user_resolve_conditions(config, env_name) {
         let mut out: Vec<String> = Vec::new();
         for c in user {
             let c = if c == "development|production" { dev_prod.to_string() } else { c };

@@ -10,7 +10,7 @@ import { loadPluginContainerSync } from "./container-bridge.mjs";
 import { transformGlob } from "./glob-transform.mjs";
 import {
   EXTS, isFile, JS_TO_TS, probe, RESERVED, nearestPkgType,
-  hasEsmSyntax, isCjsFile, cjsFacade, stripJsonc, readJsonc, rewriteServerFns, substituteAlias,
+  hasEsmSyntax, isCjsFile, cjsFacade, jsonToEsm, stripJsonc, readJsonc, rewriteServerFns, substituteAlias,
   parseImportsField, mergeTsConfig,
   PACK_FMT, PACK_PREFIX, packHash, packLine, packIntegrityFail, scanPack,
 } from "./loader-util.mjs";
@@ -650,8 +650,24 @@ function resolveDirEntry(dir) {
 
 const isRequire = (context) => context.conditions && context.conditions.includes("require");
 
+// The config's `resolve.conditions` (OJ_RESOLVE_CONDITIONS from oj), added to
+// Node's export conditions for every resolution, as Vite's resolver honors a
+// user condition (`exports: { custom: ... }`) for the modules it resolves.
+const EXTRA_CONDITIONS = (() => {
+  try {
+    const list = JSON.parse(process.env.OJ_RESOLVE_CONDITIONS || "null");
+    return Array.isArray(list) ? list.filter((c) => typeof c === "string" && c) : [];
+  } catch { return []; }
+})();
+function withUserConditions(context) {
+  if (!EXTRA_CONDITIONS.length || !Array.isArray(context.conditions)) return context;
+  const missing = EXTRA_CONDITIONS.filter((c) => !context.conditions.includes(c));
+  return missing.length ? { ...context, conditions: [...context.conditions, ...missing] } : context;
+}
+
 export function resolve(spec, context, next) {
   if (isRequire(context)) return next(spec, context);
+  context = withUserConditions(context);
   if (context.parentURL) context = { ...context, parentURL: stripQ(context.parentURL) };
   const key = (context.parentURL ?? "") + "\0" + spec;
   const rc = EPOCH ? resolveCache.get(key) : undefined;
@@ -866,7 +882,7 @@ export function load(url, context, next) {
     return { format: "module", source: src, shortCircuit: true };
   }
   if (clean.endsWith(".json")) {
-    return { format: "module", source: `export default ${readFileSync(fileURLToPath(clean), "utf8")};`, shortCircuit: true };
+    return { format: "module", source: jsonToEsm(readFileSync(fileURLToPath(clean), "utf8")), shortCircuit: true };
   }
   // TypeScript/JSX always; plain .js/.mjs/.mts/.cts for the app's own modules
   // too, so import.meta.env, define, import.meta.glob and server functions are
@@ -882,7 +898,9 @@ export function load(url, context, next) {
     && !isCjsFile(fileURLToPath(clean));
   if (srcLang && (srcLang !== "js" || ownsJs)) {
     const path = fileURLToPath(clean);
-    const userFile = container && !path.includes("/node_modules/");
+    // App source and `ssr.noExternal` deps go through the plugin pipeline
+    // (load, transform): Vite runs noExternal deps through its plugins too.
+    const userFile = container && (!inDeps || isNoExternalDep(path));
     let diskRaw = null;
     if (userFile) {
       try { diskRaw = readFileSync(path, "utf8"); } catch {}
