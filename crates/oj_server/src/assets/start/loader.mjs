@@ -703,6 +703,19 @@ function resolveSpec(clean, context, next) {
   return { result: r, via: "default" };
 }
 
+// Inline the transform's source map so Node (started with --enable-source-maps)
+// reports stack frames at the original .tsx positions, as Vite's
+// ssrFixStacktrace does for its runner.
+function withInlineMap(out) {
+  if (!out || !out.map) return out.code;
+  try {
+    const map = typeof out.map === "string" ? out.map : JSON.stringify(out.map);
+    return out.code + "\n//# sourceMappingURL=data:application/json;base64," + Buffer.from(map).toString("base64") + "\n";
+  } catch {
+    return out.code;
+  }
+}
+
 // oxc `lang` for a module url, or null for anything the transform does not own.
 function SRC_LANG_OF(clean) {
   if (clean.endsWith(".tsx")) return "tsx";
@@ -837,8 +850,9 @@ export function load(url, context, next) {
       jsx: jsxTransformOptions(),
       define: DEFINE,
     });
-    cachePut(raw.includes("import.meta.glob") ? null : key, out.code);
-    return { format: "module", source: out.code, shortCircuit: true };
+    const code = withInlineMap(out);
+    cachePut(raw.includes("import.meta.glob") ? null : key, code);
+    return { format: "module", source: code, shortCircuit: true };
   }
   if (url.includes("?ojv=") && isTanstack(url)) {
     return { format: "module", source: readFileSync(fileURLToPath(clean), "utf8"), shortCircuit: true };
@@ -862,8 +876,9 @@ export function load(url, context, next) {
         lang: "jsx", jsx: jsxTransformOptions(),
         define: DEFINE,
       });
-      cachePut(compiled.includes("import.meta.glob") ? null : key, out.code);
-      return { format: "module", source: out.code, shortCircuit: true };
+      const code = withInlineMap(out);
+      cachePut(compiled.includes("import.meta.glob") ? null : key, code);
+      return { format: "module", source: code, shortCircuit: true };
     }
   }
   // A user plugin's load() may override a real on-disk .js/.mjs file (Vite:

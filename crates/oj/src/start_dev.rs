@@ -646,7 +646,9 @@ async fn spawn_start_runner(root: &Path, cache: &Path) -> anyhow::Result<Runner>
 
 async fn spawn_node_service(root: &Path, script: &Path) -> anyhow::Result<Runner> {
     let mut cmd = tokio::process::Command::new("node");
-    cmd.arg(script)
+    // The SSR loader inlines source maps into every transformed module; this
+    // flag makes Node apply them to stack traces (original .tsx positions).
+    cmd.arg("--enable-source-maps").arg(script)
         .env("OJ_APP_ROOT", root)
         .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
         .env("NODE_ENV", "development")

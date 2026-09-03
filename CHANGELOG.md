@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `oj dev --ssr`: server modules now compile as dev + ssr (`import.meta.env.SSR` true, `DEV` true, `MODE` the dev mode), matching Vite's SSR transform; they used to compile with production options. The module runner's realm now exposes the web platform globals server code expects (`fetch`, `Request`/`Response`/`Headers`, streams, `crypto`, `AbortController`, `structuredClone`, `setImmediate`, `MessageChannel`, `WebSocket`, ...), shared from the host realm so `instanceof` holds.
+- TanStack Start dev: the SSR loader inlines a source map into every transformed module and Node runs with `--enable-source-maps`, so server stack traces point at the original `.tsx` positions (Vite's `ssrFixStacktrace`).
 - TanStack Start dev: requests reach the SSR runner over a loopback HTTP server instead of JSON lines on stdin, so request and response bodies stay binary (no lossy UTF-8 decoding, no stripped `content-length` semantics), responses stream through (the live-reload client is appended after the final chunk), and requests run concurrently: a loader that fetches the app's own route during SSR no longer deadlocks behind the single-flight runner.
 - TanStack Start dev: a GET whose last path segment has an extension (`/robots.txt`, `/users/john.doe`, `sitemap.xml`) is served statically when a file or module owns it and otherwise reaches the app's SSR handler (server routes, dotted route params), as under `vite dev`; it used to 404 at the static server.
 - TanStack Start: the config's `define` map is applied in the dev SSR loader and in both production bundles (client and server), so `__APP_VERSION__`-style globals no longer throw a ReferenceError during SSR.
