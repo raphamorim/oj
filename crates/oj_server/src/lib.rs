@@ -757,6 +757,14 @@ impl DevServer {
         });
         if let Some(host) = &state.plugins {
             host.set_ws_sender(state.reload_tx.clone());
+            let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+            host.set_server_events_sender(ev_tx);
+            let st = Arc::clone(&state);
+            tokio::spawn(async move {
+                while let Some(ev) = ev_rx.recv().await {
+                    handle_plugin_server_event(&st, &ev).await;
+                }
+            });
         }
         {
             let state = Arc::clone(&state);
@@ -2617,6 +2625,17 @@ impl MemoryCache {
         Some(Arc::clone(&entry.module))
     }
 
+    fn remove(&mut self, url: &str) {
+        if let Some(old) = self.map.remove(url) {
+            self.total -= old.bytes;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.total = 0;
+    }
+
     fn put(&mut self, url: &str, key: &str, module: &Arc<CachedModule>) {
         let bytes = module_weight(module) + url.len() + key.len() + MEMORY_ENTRY_OVERHEAD;
         self.seq += 1;
@@ -3062,6 +3081,49 @@ async fn compile_tailwind(
     let css = run_css_sidecar(state, url, source).await?;
     state.tailwind_urls.lock().unwrap().insert(url.to_string());
     Ok(css)
+}
+
+/// A plugin drove `server.moduleGraph.invalidateModule(...)` or `server.restart()`
+/// from the host. Invalidation drops the module's compiled output (so its next
+/// request recompiles, re-running plugin transforms) and, for a file in the app,
+/// propagates an HMR update exactly as a change to that file would; a virtual id
+/// only loses its cache, as in Vite (plugins push their own ws message then).
+async fn handle_plugin_server_event(state: &Arc<ServerState>, ev: &serde_json::Value) {
+    match ev.get("action").and_then(|a| a.as_str()) {
+        Some("restart") => {
+            println!("oj: plugin requested server.restart()");
+            restart_process();
+        }
+        Some("invalidateAll") => {
+            state.mtime_keys.lock().unwrap().clear();
+            state.memory.lock().unwrap().clear();
+            let _ = state
+                .reload_tx
+                .send(serde_json::json!({ "type": "full-reload", "reason": "plugin invalidateAll" }).to_string());
+        }
+        Some("invalidate") => {
+            let Some(id) = ev.get("id").and_then(|i| i.as_str()) else {
+                return;
+            };
+            let clean = id.split('?').next().unwrap_or(id);
+            let path = Path::new(clean);
+            let url = if path.is_absolute() && path.starts_with(&state.root) {
+                url_of(&state.root, path)
+            } else if clean.starts_with('/') {
+                clean.to_string()
+            } else {
+                return;
+            };
+            state.mtime_keys.lock().unwrap().remove(&url);
+            state.memory.lock().unwrap().remove(&url);
+            if path.is_file() && state.graph.lock().unwrap().contains(Path::new(&url)) {
+                for message in decide(state, &[path.to_path_buf()]).await {
+                    let _ = state.reload_tx.send(message);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn handle_client_message(state: &Arc<ServerState>, text: &str) {

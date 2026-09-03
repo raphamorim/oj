@@ -572,6 +572,9 @@ pub struct PluginHost {
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Option<String>, String>>>>,
     counter: AtomicU64,
     ws_out: Mutex<Option<tokio::sync::broadcast::Sender<String>>>,
+    /// `{ ojServer: { action, ... } }` lines from the host: a plugin invalidating
+    /// a module via server.moduleGraph, or server.restart().
+    server_events: Mutex<Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>>,
     // In an Option so it can be taken + killed explicitly (the reader task holds
     // an Arc clone, so dropping the caller's Arc alone never triggers kill_on_drop).
     child: Mutex<Option<tokio::process::Child>>,
@@ -683,6 +686,7 @@ impl PluginHost {
             pending: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(1),
             ws_out: Mutex::new(None),
+            server_events: Mutex::new(None),
             child: Mutex::new(Some(child)),
         });
 
@@ -700,6 +704,13 @@ impl PluginHost {
                     let args = msg["args"].as_array().cloned().unwrap_or_default();
                     handle_ctx_rpc(rpc, &method, &args, &resolver, &root_buf, &reader_ref.stdin)
                         .await;
+                    continue;
+                }
+                if let Some(ev) = msg.get("ojServer") {
+                    let tx = reader_ref.server_events.lock().unwrap().clone();
+                    if let Some(tx) = tx {
+                        let _ = tx.send(ev.clone());
+                    }
                     continue;
                 }
                 if let Some(ws) = msg.get("ojWs") {
@@ -1031,6 +1042,13 @@ impl PluginHost {
         if let Some(mut child) = self.child.lock().unwrap().take() {
             let _ = child.start_kill();
         }
+    }
+
+    pub fn set_server_events_sender(
+        &self,
+        tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    ) {
+        *self.server_events.lock().unwrap() = Some(tx);
     }
 
     pub fn set_ws_sender(&self, tx: tokio::sync::broadcast::Sender<String>) {

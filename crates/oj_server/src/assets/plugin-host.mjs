@@ -272,6 +272,38 @@ environment.config.consumer =
 // resolved environment config until runConfigHooks recomputes it.
 let resolvedConfig = environment.config;
 
+// When the app has Vite installed and its config is a vite.config, ask that Vite
+// to resolve the user's config once (fresh plugin instances, whose config hooks
+// run in that resolve) and use the result as the base the plugins see: real
+// build.outDir/sourcemap/rollupOptions, cacheDir, env, envPrefix, assetsInclude(),
+// css, ssr, worker, createResolver, logger. oj's own plugin instances are spliced
+// in and their config hooks still run on top. Without Vite the synthesized
+// defaults stand. OJ_PLUGIN_SYNTH_CONFIG=1 forces the synthesized path.
+let userResolvedViteConfig = null;
+async function loadUserResolvedViteConfig() {
+  if (initial.pluginsFormat !== "vite" || process.env.OJ_PLUGIN_SYNTH_CONFIG === "1") return null;
+  const appRoot = initial.config?.root ?? process.cwd();
+  let vite;
+  try {
+    vite = await import(createRequire(appRoot + "/package.json").resolve("vite"));
+  } catch {
+    return null;
+  }
+  if (typeof vite.resolveConfig !== "function") return null;
+  try {
+    const rc = await vite.resolveConfig(
+      { root: appRoot, configFile: pluginsPath, mode: env.mode, logLevel: "silent" },
+      env.command,
+      env.mode,
+      env.mode,
+    );
+    return rc && typeof rc === "object" ? rc : null;
+  } catch (e) {
+    process.stderr.write(`${OJ} plugin host: vite.resolveConfig failed, using synthesized config: ${(e && e.message) || e}\n`);
+    return null;
+  }
+}
+
 async function loadViteConfig(configPath) {
   const appRoot = initial.config?.root ?? process.cwd();
   const req = createRequire(appRoot + "/package.json");
@@ -533,7 +565,14 @@ function deepMerge(a, b) {
 }
 
 async function runConfigHooks() {
+  userResolvedViteConfig = await loadUserResolvedViteConfig();
   let config = initial.config ?? {};
+  if (userResolvedViteConfig) {
+    // The user's resolved config is the base; oj's own values (root, base,
+    // define, server, environments) overlay it; the plugin list is replaced below.
+    const { plugins: _fresh, ...base } = userResolvedViteConfig;
+    config = deepMerge(base, config);
+  }
   // Vite hands the config hook the user config, whose `plugins` is the flat
   // plugin array; plugins like @crxjs read `config.plugins` to find sibling
   // plugins. Use the apply-filtered active set (not allPlugins) so command-
@@ -612,6 +651,67 @@ plugins = plugins.filter((p) => {
 process.stderr.write(
   `${OJ} plugin host: ${plugins.length} plugin(s) active for ${env.command}: ${plugins.map((p) => `${p.name}[${p.enforce ?? "-"}]`).join(",")}\n`,
 );
+
+// Events for the Rust server (not the browser): a plugin invalidating a module
+// through server.moduleGraph, or asking for server.restart().
+function ojServerEvent(action, data) {
+  process.stdout.write(JSON.stringify({ ojServer: { action, ...(data ?? {}) } }) + "\n");
+}
+
+// A ModuleGraph stand-in for plugins that reach into `server.moduleGraph` from
+// configureServer / hotUpdate: `getModuleById(id)` hands back a node for the id
+// (Vite returns undefined for ids it has never seen; plugins guard on that and
+// then call invalidateModule, so an always-present node keeps that path working),
+// and `invalidateModule` tells oj to drop the module's compiled output and
+// propagate an update, as Vite's graph does.
+const graphNodes = new Map();
+function moduleNode(id) {
+  let n = graphNodes.get(id);
+  if (!n) {
+    n = {
+      id,
+      url: id,
+      file: String(id).split("?", 1)[0],
+      type: "js",
+      info: null,
+      importers: new Set(),
+      importedModules: new Set(),
+      acceptedHmrDeps: new Set(),
+      acceptedHmrExports: null,
+      isSelfAccepting: false,
+      lastHMRTimestamp: 0,
+      lastInvalidationTimestamp: 0,
+      transformResult: null,
+      ssrTransformResult: null,
+      ssrModule: null,
+      ssrError: null,
+    };
+    graphNodes.set(id, n);
+  }
+  return n;
+}
+const moduleGraph = {
+  getModuleById: (id) => (id == null ? undefined : moduleNode(String(id))),
+  getModuleByUrl: async (url) => (url == null ? undefined : moduleNode(String(url))),
+  getModulesByFile: (file) => new Set([moduleNode(String(file))]),
+  invalidateModule(mod) {
+    if (!mod) return;
+    mod.lastInvalidationTimestamp = Date.now();
+    mod.transformResult = null;
+    mod.ssrTransformResult = null;
+    ojServerEvent("invalidate", { id: mod.id });
+  },
+  invalidateAll() {
+    for (const m of graphNodes.values()) m.transformResult = null;
+    ojServerEvent("invalidateAll");
+  },
+  onFileChange(file) {
+    ojServerEvent("invalidate", { id: String(file) });
+  },
+  urlToModuleMap: graphNodes,
+  idToModuleMap: graphNodes,
+  fileToModulesMap: new Map(),
+};
 
 const wsListeners = new Map();
 function ojWsSend(event, data) {
@@ -768,8 +868,10 @@ async function setupConfigureServer() {
     ws: wsApi,
     hot: wsApi,
     watcher: fileWatcher,
-    moduleGraph: { getModuleById: () => null, getModuleByUrl: async () => null, getModulesByFile: () => null, invalidateModule: noop, onFileChange: noop },
-    restart: async () => {},
+    moduleGraph,
+    // Vite restarts the dev server (re-reading the config); oj re-execs itself,
+    // which is how it already handles a config-file change.
+    restart: async () => ojServerEvent("restart"),
     close: async () => {},
     transformIndexHtml: async (_url, html) => transformIndexHtml(html),
     transformRequest: async () => null,
