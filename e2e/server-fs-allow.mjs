@@ -60,6 +60,40 @@ try {
   const body = await ok.text();
   if (!body.includes("42")) throw new Error(`served /@fs file missing its content:\n${body}`);
   console.log("with allow:     /@fs outside root -> 200");
+  child.kill("SIGKILL");
+  child = null;
+
+  // Case C: server.fs.strict: false -> Vite's isFileLoadingAllowed skips the
+  // allow list entirely, so the outside file is served; the deny list still
+  // applies (a `.env` next to it stays 403).
+  fs.writeFileSync(path.join(shared, ".env"), "SECRET=1\n");
+  child = await startApp(5335, "export default { server: { fs: { strict: false } } };\n");
+  const lax = await fetch(fsUrl(5335));
+  if (lax.status !== 200) throw new Error(`strict:false should serve /@fs outside root, got ${lax.status}`);
+  const stillDenied = await fetch(`http://localhost:5335/@fs${path.join(shared, ".env")}`);
+  if (stillDenied.status !== 403) throw new Error(`strict:false must keep fs.deny, got ${stillDenied.status}`);
+  child.kill("SIGKILL");
+  child = null;
+  console.log("strict:false:   /@fs outside root -> 200, denied .env -> 403");
+
+  // Case D: the default allow list is Vite's searchForWorkspaceRoot, where a
+  // `.git` directory is NOT a workspace marker: a project nested inside a
+  // repository must not expose the repository over /@fs.
+  fs.mkdirSync(path.join(workspace, ".git"), { recursive: true });
+  fs.writeFileSync(path.join(workspace, "package.json"), '{"name":"repo"}');
+  child = await startApp(5336, null);
+  const repoFile = await fetch(fsUrl(5336));
+  if (repoFile.status !== 403) throw new Error(`.git parent must not widen fs.allow, got ${repoFile.status}`);
+  child.kill("SIGKILL");
+  child = null;
+  console.log("nested in repo: /@fs sibling dir -> 403 (.git is not a workspace marker)");
+
+  // Case E: a real workspace marker (pnpm-workspace.yaml) does widen it.
+  fs.writeFileSync(path.join(workspace, "pnpm-workspace.yaml"), "packages:\n  - app\n");
+  child = await startApp(5337, null);
+  const wsFile = await fetch(fsUrl(5337));
+  if (wsFile.status !== 200) throw new Error(`pnpm workspace root should be allowed, got ${wsFile.status}`);
+  console.log("pnpm workspace: /@fs sibling dir -> 200");
   console.log("\nserver.fs.allow VERIFIED");
 } catch (e) {
   failed = true;

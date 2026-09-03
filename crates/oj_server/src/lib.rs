@@ -259,6 +259,9 @@ struct ServerState {
     compile_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     crawl_done: tokio::sync::watch::Receiver<bool>,
     fs_allow: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+    /// `server.fs.strict` (default true). When false the allow list is not
+    /// consulted for `/@fs/` paths; the deny list always is, as in Vite.
+    fs_strict: bool,
     fs_deny: Vec<(glob::Pattern, bool)>,
     dir_cache: Arc<Mutex<DirCache>>,
     patch_seq: std::sync::atomic::AtomicU64,
@@ -778,30 +781,30 @@ impl DevServer {
             css_config: config.css.clone(),
             css_resolve,
             fs_allow: Arc::new(Mutex::new({
-                let mut set: std::collections::HashSet<PathBuf> = server_cfg
-                    .fs
-                    .as_ref()
-                    .and_then(|f| f.allow.as_ref())
-                    .map(|allow| {
-                        allow
-                            .iter()
-                            .map(|p| {
-                                let pb = PathBuf::from(p);
-                                if pb.is_absolute() {
-                                    pb
-                                } else {
-                                    root.join(&pb)
-                                }
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                // Vite defaults server.fs.allow to [searchForWorkspaceRoot(root)], so
-                // workspace packages (shared UI, fonts) are served without an explicit
-                // allow entry. Match that instead of allow-listing package-by-package.
-                set.insert(workspace_root(&root));
-                set
+                // Vite: `allow: raw?.fs?.allow ?? [searchForWorkspaceRoot(root)]`. The
+                // workspace root is the DEFAULT, not an addition: a user allow list
+                // replaces it (so it can narrow serving), and without one workspace
+                // packages (shared UI, fonts) are served without per-package entries.
+                match server_cfg.fs.as_ref().and_then(|f| f.allow.as_ref()) {
+                    Some(allow) => allow
+                        .iter()
+                        .map(|p| {
+                            let pb = PathBuf::from(p);
+                            if pb.is_absolute() {
+                                pb
+                            } else {
+                                root.join(&pb)
+                            }
+                        })
+                        .collect(),
+                    None => std::iter::once(workspace_root(&root)).collect(),
+                }
             })),
+            fs_strict: server_cfg
+                .fs
+                .as_ref()
+                .and_then(|f| f.strict)
+                .unwrap_or(true),
             fs_deny: compile_fs_deny(&oj_config::server_fs_deny(&config)),
             dir_cache: Arc::new(Mutex::new(DirCache::new())),
             patch_seq: std::sync::atomic::AtomicU64::new(0),
@@ -4088,17 +4091,17 @@ pub(crate) fn is_node_builtin(spec: &str) -> bool {
 }
 
 // Vite's searchForWorkspaceRoot: walk up from the app root and stop at the first
-// workspace marker (pnpm-workspace.yaml / lerna.json / .git, or a package.json with
-// a `workspaces` field); otherwise the farthest ancestor that still has a
-// package.json. oj seeds server.fs.allow with this, matching Vite's default.
+// workspace marker (pnpm-workspace.yaml / lerna.json, or a package.json with a
+// `workspaces` field); otherwise searchForPackageRoot, the NEAREST ancestor with
+// a package.json (the root itself, normally). `.git` is deliberately not a
+// marker (Vite comments it out): a project nested somewhere inside a repository
+// must not expose the whole repository over /@fs by default. oj seeds
+// server.fs.allow with this, matching Vite's default.
 fn workspace_root(root: &Path) -> PathBuf {
-    let mut pkg_root = root.to_path_buf();
+    let mut pkg_root: Option<PathBuf> = None;
     let mut dir = root;
     loop {
-        if dir.join("pnpm-workspace.yaml").exists()
-            || dir.join("lerna.json").exists()
-            || dir.join(".git").exists()
-        {
+        if dir.join("pnpm-workspace.yaml").exists() || dir.join("lerna.json").exists() {
             return dir.to_path_buf();
         }
         if dir.join("package.json").exists() {
@@ -4107,11 +4110,13 @@ fn workspace_root(root: &Path) -> PathBuf {
                     return dir.to_path_buf();
                 }
             }
-            pkg_root = dir.to_path_buf();
+            if pkg_root.is_none() {
+                pkg_root = Some(dir.to_path_buf());
+            }
         }
         match dir.parent() {
             Some(p) => dir = p,
-            None => return pkg_root,
+            None => return pkg_root.unwrap_or_else(|| root.to_path_buf()),
         }
     }
 }
@@ -5834,7 +5839,9 @@ async fn serve_worker_chunk(State(state): State<Arc<ServerState>>, uri: Uri) -> 
 // module identity it asked for; both resolve to the same bytes.
 fn fs_gate(state: &ServerState, candidate: &Path) -> Option<PathBuf> {
     let real = std::fs::canonicalize(candidate).ok()?;
-    let allowed = {
+    // Vite's isFileLoadingAllowed: `server.fs.strict: false` skips the allow
+    // list entirely (the deny list below still applies).
+    let allowed = !state.fs_strict || {
         let allow = state.fs_allow.lock().unwrap();
         allow.iter().any(|root| {
             // Fast path: roots are normally already canonical (the resolver
@@ -6895,7 +6902,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let app = base.join("packages/web");
         std::fs::create_dir_all(&app).unwrap();
-        std::fs::create_dir_all(base.join(".git")).unwrap(); // workspace root marker
+        // Workspace root marker: Vite's searchForWorkspaceRoot is the stopDir of
+        // its postcss-load-config search (`.git` is not a marker in Vite).
+        std::fs::write(base.join("pnpm-workspace.yaml"), "packages: ['packages/*']").unwrap();
         assert!(find_postcss_config(&app).is_none());
         // A config at the workspace root applies to the package.
         std::fs::write(base.join(".postcssrc.json"), r#"{"plugins":{}}"#).unwrap();

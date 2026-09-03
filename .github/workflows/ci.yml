@@ -152,6 +152,9 @@ jobs:
       - name: relative imports claimed by a resolveId filter go to the plugins first
         if: matrix.mode == 'unbundled'
         run: node e2e/plugin-resolve-relative.mjs
+      - name: server.fs allow list, strict:false, workspace-root default
+        if: matrix.mode == 'unbundled'
+        run: node e2e/server-fs-allow.mjs
 
   # i need to fix this or automate
   build:

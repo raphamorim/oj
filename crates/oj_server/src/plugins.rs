@@ -186,6 +186,7 @@ pub struct ViteValues {
     pub host: Option<String>,
     pub hmr_disabled: bool,
     pub fs_allow: Option<Vec<String>>,
+    pub fs_strict: Option<bool>,
     pub define: Option<serde_json::Map<String, serde_json::Value>>,
     pub alias: Option<serde_json::Map<String, serde_json::Value>>,
     pub headers: Option<serde_json::Map<String, serde_json::Value>>,
@@ -384,6 +385,7 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
                 .filter_map(|x| x.as_str().map(str::to_string))
                 .collect()
         }),
+        fs_strict: json.get("fsStrict").and_then(|v| v.as_bool()),
         define: json.get("define").and_then(|v| v.as_object()).cloned(),
         alias: json.get("alias").and_then(|v| v.as_object()).cloned(),
         headers: json.get("headers").and_then(|v| v.as_object()).cloned(),
@@ -498,7 +500,12 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
             sc.hmr = Some(oj_config::HmrConfig::Toggle(false));
         }
     }
-    if v.port.is_some() || v.host.is_some() || v.headers.is_some() || v.fs_allow.is_some() {
+    if v.port.is_some()
+        || v.host.is_some()
+        || v.headers.is_some()
+        || v.fs_allow.is_some()
+        || v.fs_strict.is_some()
+    {
         let sc = config.server.get_or_insert_with(Default::default);
         if sc.port.is_none() {
             sc.port = v.port;
@@ -507,10 +514,10 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
             sc.host = v.host;
         }
         if sc.fs.is_none() {
-            if let Some(allow) = v.fs_allow {
+            if v.fs_allow.is_some() || v.fs_strict.is_some() {
                 sc.fs = Some(oj_config::FsConfig {
-                    allow: Some(allow),
-                    strict: None,
+                    allow: v.fs_allow,
+                    strict: v.fs_strict,
                     deny: None,
                 });
             }
@@ -1522,6 +1529,7 @@ mod vite_values_tests {
             host: Some("localhost".into()),
             hmr_disabled: false,
             fs_allow: None,
+            fs_strict: None,
             define: None,
             alias: None,
             headers: None,
@@ -1561,6 +1569,7 @@ mod vite_values_tests {
             host: None,
             hmr_disabled: false,
             fs_allow: None,
+            fs_strict: None,
             define: None,
             alias: None,
             headers: None,
@@ -1585,6 +1594,29 @@ mod vite_values_tests {
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/oj-base/"));
         assert_eq!(config.public_dir.as_deref(), Some("my-public"));
+    }
+
+    #[test]
+    fn merge_adopts_server_fs_strict() {
+        // `server.fs.strict: false` in a vite config reaches oj's FsConfig (Vite
+        // skips the allow check entirely when strict is off) even with no allow list.
+        let v = parse_vite_values(&serde_json::json!({ "fsStrict": false }));
+        assert_eq!(v.fs_strict, Some(false));
+        let mut config = oj_config::OjConfig::default();
+        merge_vite_values(&mut config, v);
+        let fs = config.server.unwrap().fs.unwrap();
+        assert_eq!(fs.strict, Some(false));
+        assert!(fs.allow.is_none());
+
+        // Alongside an allow list both land; an oj-side fs config still wins.
+        let v = parse_vite_values(&serde_json::json!({ "fsStrict": true, "fsAllow": ["../shared"] }));
+        let mut config = oj_config::OjConfig::default();
+        merge_vite_values(&mut config, v);
+        let fs = config.server.unwrap().fs.unwrap();
+        assert_eq!(fs.strict, Some(true));
+        assert_eq!(fs.allow.as_deref(), Some(&["../shared".to_string()][..]));
+        let absent = parse_vite_values(&serde_json::json!({}));
+        assert_eq!(absent.fs_strict, None);
     }
 
     #[test]
