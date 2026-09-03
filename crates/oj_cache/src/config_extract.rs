@@ -17,6 +17,8 @@ pub struct ConfigExtractStore {
 pub struct CachedExtract {
     pub output: String,
     pub stderr: String,
+    /// The config file and everything it imported, as stamped for invalidation.
+    pub deps: Vec<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -77,6 +79,7 @@ impl ConfigExtractStore {
             }
         }
         Some(CachedExtract {
+            deps: entry.files.iter().map(|f| PathBuf::from(&f.path)).collect(),
             output: entry.output,
             stderr: entry.stderr,
         })

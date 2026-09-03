@@ -182,6 +182,7 @@ jobs:
           node e2e/hmr-client-options.mjs
           node e2e/html-fallback-dev.mjs
           node e2e/hmr-glob-add-delete.mjs
+          node e2e/watch-config-deps-ignored.mjs
 
   # i need to fix this or automate
   build:

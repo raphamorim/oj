@@ -290,6 +290,7 @@ fn extract_vite_values_with(
             if !hit.stderr.is_empty() {
                 eprint!("{}", hit.stderr);
             }
+            let _ = CONFIG_DEPS.set(hit.deps);
             crate::boot_phase("vite-extract cache hit");
             return Some(parse_vite_values(&json));
         }
@@ -339,6 +340,7 @@ fn extract_vite_values_with(
                 .collect()
         })
         .unwrap_or_default();
+    let _ = CONFIG_DEPS.set(deps.clone());
     store.store(
         &vite,
         command,
@@ -368,6 +370,14 @@ pub fn extraction_env_hash(vars: impl Iterator<Item = (String, String)>) -> Stri
         hasher.update(&[0]);
     }
     hasher.finalize().to_hex().to_string()
+}
+
+/// The files the config file imported, as the extractor reported them (Vite's
+/// `configFileDependencies`): the dev server restarts when one changes.
+static CONFIG_DEPS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+
+pub fn config_dependencies() -> &'static [PathBuf] {
+    CONFIG_DEPS.get().map(Vec::as_slice).unwrap_or(&[])
 }
 
 #[inline]
@@ -758,6 +768,17 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
                 .get("hmr")
                 .and_then(|h| serde_json::from_value::<oj_config::HmrOptions>(h.clone()).ok())
                 .map(oj_config::HmrConfig::Options);
+        }
+        if sc.watch.is_none() {
+            sc.watch = sf
+                .get("watch")
+                .and_then(|w| serde_json::from_value::<oj_config::WatchConfig>(w.clone()).ok());
+        }
+        if let Some(strict) = sf.get("fsStrict").and_then(|b| b.as_bool()) {
+            let fs = sc.fs.get_or_insert_with(Default::default);
+            if fs.strict.is_none() {
+                fs.strict = Some(strict);
+            }
         }
         if sf.get("skipWebSocketTokenCheck").and_then(|b| b.as_bool()) == Some(true) {
             let legacy = config.legacy.get_or_insert_with(Default::default);
