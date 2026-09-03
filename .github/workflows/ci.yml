@@ -74,6 +74,9 @@ jobs:
       - name: client env define (dotenv + process env + plugin config mutations)
         if: matrix.mode == 'unbundled'
         run: node e2e/env-define.mjs
+      - name: a vite.config that fails to load is an error, not an empty config
+        if: matrix.mode == 'unbundled'
+        run: node e2e/config-load-failure.mjs
 
   # i need to fix this or automate
   build:
