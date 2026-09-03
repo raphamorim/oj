@@ -27,7 +27,7 @@ const fixtures = [
   },
   {
     name: "attribute-name boundaries",
-    stylesheet: "<link data-href='/ignored.css' href='/site.css'>",
+    stylesheet: "<link rel='stylesheet' data-href='/ignored.css' href='/site.css'>",
     entry: "<script data-type='module' data-src='/ignored.js' type='module' src='/main.js'></script>",
   },
 ];
@@ -45,7 +45,13 @@ for (const fixture of fixtures) {
 
     const html = fs.readFileSync(path.join(project, "dist", "index.html"), "utf8");
     assert.match(html, /\/assets\/main-[^"'\s>]+\.js/, `${fixture.name} must rewrite the module entry:\n${html}`);
-    assert.equal(fs.readFileSync(path.join(project, "dist", "site.css"), "utf8"), "body { color: red; }");
+    // The stylesheet goes through the CSS pipeline (hashed, minified) and the
+    // link is rewritten to it, whatever the attribute quoting.
+    const cssRef = html.match(/\/assets\/site-[^"'\s>]+\.css/);
+    assert.ok(cssRef, `${fixture.name} must rewrite the stylesheet link:\n${html}`);
+    const css = fs.readFileSync(path.join(project, "dist", cssRef[0].replace(/^\//, "")), "utf8");
+    assert.match(css, /color:\s*red/, `${fixture.name} must emit the stylesheet`);
+    assert.ok(!fs.existsSync(path.join(project, "dist", "site.css")), `${fixture.name}: stylesheet is not copied verbatim`);
   } finally {
     fs.rmSync(project, { recursive: true, force: true });
   }
