@@ -12,6 +12,10 @@ import { loadPluginContainer } from "./vite-plugin-bridge.mjs";
 import { transformGlob } from "./glob-transform.mjs";
 
 const APP = process.env.OJ_APP_ROOT ?? process.cwd();
+// Set by `oj build` per Vite's NODE_ENV rule (shell wins, else .env NODE_ENV=development, else production).
+const NODE_ENV = process.env.NODE_ENV || "production";
+const MODE = process.env.OJ_MODE || "production";
+const PROCESS_ENV_JSON = JSON.stringify({ NODE_ENV, TSS_SERVER_FN_BASE: "/_serverFn/" });
 const { build } = await importPkg(APP, "rolldown", ["vite", "@tanstack/react-start"]);
 const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
 const OJ = _ojTTY ? "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m" : "oj";
@@ -165,8 +169,8 @@ const client = await build({
   transform: {
     jsx: { runtime: "automatic" },
     define: {
-      "process.env": '{"NODE_ENV":"production","TSS_SERVER_FN_BASE":"/_serverFn/"}',
-      global: "globalThis", ...viteEnvDefine({ ssr: false, mode: "production" }),
+      "process.env": PROCESS_ENV_JSON,
+      global: "globalThis", ...viteEnvDefine({ ssr: false, mode: MODE }),
     },
   },
   resolve: { conditionNames: ["browser", "module", "import"], alias: clientAlias },
@@ -183,7 +187,7 @@ const client = await build({
     entryFileNames: "assets/[name]-[hash].js",
     chunkFileNames: "assets/[name]-[hash].js",
     assetFileNames: "assets/[name]-[hash][extname]",
-    banner: 'globalThis.process=globalThis.process||{env:{NODE_ENV:"production",TSS_SERVER_FN_BASE:"/_serverFn/"}};globalThis.global=globalThis.global||globalThis;',
+    banner: `globalThis.process=globalThis.process||{env:${PROCESS_ENV_JSON}};globalThis.global=globalThis.global||globalThis;`,
   },
 });
 const entryChunk = client.output.find((o) => o.type === "chunk" && o.isEntry);
@@ -214,8 +218,8 @@ await build({
   transform: {
     jsx: { runtime: "automatic" },
     define: {
-      "process.env.NODE_ENV": '"production"', "process.env.TSS_SERVER_FN_BASE": '"/_serverFn/"',
-      ...viteEnvDefine({ ssr: true, mode: "production" }),
+      "process.env.NODE_ENV": JSON.stringify(NODE_ENV), "process.env.TSS_SERVER_FN_BASE": '"/_serverFn/"',
+      ...viteEnvDefine({ ssr: true, mode: MODE }),
     },
   },
   resolve: {

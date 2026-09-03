@@ -370,7 +370,7 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
     });
 }
 
-pub async fn start_build(root: PathBuf) -> anyhow::Result<()> {
+pub async fn start_build(root: PathBuf, mode: &str) -> anyhow::Result<()> {
     let root = root
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("app root not found: {}: {e}", root.display()))?;
@@ -385,11 +385,20 @@ pub async fn start_build(root: PathBuf) -> anyhow::Result<()> {
         .and_then(|b| b.prerender)
         .unwrap_or_default()
         .join(",");
+    // Vite's rule: the shell's NODE_ENV wins, else `.env[.mode]` NODE_ENV=development
+    // makes a development build, else production. build.mjs derives DEV/PROD and
+    // process.env.NODE_ENV from what it receives here.
+    let node_env = oj_env::resolve_node_env(
+        std::env::var("NODE_ENV").ok().filter(|v| !v.is_empty()).as_deref(),
+        &oj_env::load(&root, mode),
+        "production",
+    );
     let status = std::process::Command::new("node")
         .arg(cache.join("build.mjs"))
         .env("OJ_APP_ROOT", &root)
         .env("OJ_CACHE_ROOT", oj_cache::cache_root(&root))
-        .env("NODE_ENV", "production")
+        .env("NODE_ENV", &node_env)
+        .env("OJ_MODE", mode)
         .env("OJ_PRERENDER", &prerender)
         .env("NODE_COMPILE_CACHE", oj_server::node_compile_cache(&root))
         .current_dir(&root)

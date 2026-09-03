@@ -150,7 +150,7 @@ async fn run() -> anyhow::Result<()> {
             });
             let mode = mode.unwrap_or_else(|| "production".to_string());
             if oj_server::is_tanstack_start_app(&root) {
-                start_dev::start_build(root).await
+                start_dev::start_build(root, &mode).await
             } else {
                 build::build(root, out, ssr, &mode).await
             }

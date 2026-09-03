@@ -69,7 +69,9 @@ export async function importPkg(root, spec, preferred = []) {
 }
 
 export function viteEnvDefine({ ssr = false, mode = "development", env: envSource = process.env } = {}) {
-  const env = { MODE: mode, DEV: mode !== "production", PROD: mode === "production", SSR: !!ssr, BASE_URL: "/" };
+  // Vite: DEV/PROD follow NODE_ENV (isProduction), MODE is the mode itself.
+  const nodeEnv = envSource.NODE_ENV || (mode === "production" ? "production" : "development");
+  const env = { MODE: mode, DEV: nodeEnv !== "production", PROD: nodeEnv === "production", SSR: !!ssr, BASE_URL: "/" };
   for (const [k, v] of Object.entries(envSource)) if (k.startsWith("VITE_")) env[k] = v;
   return { "import.meta.env": JSON.stringify(env) };
 }

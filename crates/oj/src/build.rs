@@ -134,14 +134,49 @@ fn manual_chunks(ro: Option<&serde_json::Value>) -> Option<rolldown_common::Code
     ))
 }
 
-fn target_transform(
+/// rolldown's oxc transform settings: `build.target`, and the JSX runtime /
+/// importSource / pragmas from `oxc.jsx` or `esbuild.jsx*` (what plugin-react's
+/// `jsxImportSource` becomes). `development` follows NODE_ENV as in Vite, so a
+/// development-mode build uses `jsx-dev-runtime`.
+fn transform_options(
     config: &oj_config::OjConfig,
+    is_production: bool,
 ) -> Option<rolldown_common::BundlerTransformOptions> {
-    let target = config.build.as_ref().and_then(|b| b.target.clone())?;
+    let jsx = oj_config::jsx_settings(config);
+    let classic = jsx.runtime.as_deref() == Some("classic");
     Some(rolldown_common::BundlerTransformOptions {
-        target: Some(rolldown_common::Either::Left(target)),
+        target: config
+            .build
+            .as_ref()
+            .and_then(|b| b.target.clone())
+            .map(rolldown_common::Either::Left),
+        jsx: Some(rolldown_common::Either::Right(rolldown_common::JsxOptions {
+            runtime: Some(if classic { "classic".into() } else { "automatic".into() }),
+            development: Some(!is_production),
+            import_source: if classic { None } else { jsx.import_source },
+            pragma: if classic { jsx.pragma } else { None },
+            pragma_frag: if classic { jsx.pragma_frag } else { None },
+            ..Default::default()
+        })),
         ..Default::default()
     })
+}
+
+/// The three spellings Vite's define plugin replaces for NODE_ENV.
+fn node_env_defines(node_env: &str) -> Vec<(String, String)> {
+    let json = serde_json::Value::String(node_env.to_string()).to_string();
+    [
+        "process.env.NODE_ENV",
+        "global.process.env.NODE_ENV",
+        "globalThis.process.env.NODE_ENV",
+    ]
+    .iter()
+    .map(|k| (k.to_string(), json.clone()))
+    .collect()
+}
+
+fn shell_node_env() -> Option<String> {
+    std::env::var("NODE_ENV").ok().filter(|v| !v.is_empty())
 }
 
 fn is_build_asset(id: &str) -> bool {
@@ -1402,12 +1437,16 @@ pub async fn build(
     };
     let minify = build_cfg.minify.unwrap_or(true);
     let sourcemap = build_cfg.sourcemap.unwrap_or(false);
+    let loaded_env = oj_env::load(&root, mode);
+    let node_env = oj_env::resolve_node_env(shell_node_env().as_deref(), &loaded_env, "production");
+    let is_production = node_env == "production";
 
     if let Some(entry) = ssr.or_else(|| build_cfg.ssr.clone()) {
         return build_ssr_app(
             &root,
             &out_dir,
             &entry,
+            mode,
             minify,
             sourcemap,
             build_cfg.prerender.clone(),
@@ -1416,7 +1455,7 @@ pub async fn build(
     }
 
     if let Some(lib) = build_cfg.lib.clone() {
-        return build_library(&root, &out_dir, lib, minify, sourcemap).await;
+        return build_library(&root, &out_dir, lib, mode, minify, sourcemap).await;
     }
 
     let base = normalize_base(config.base.as_deref().unwrap_or("/"));
@@ -1552,7 +1591,7 @@ pub async fn build(
         .with_plugins(oj_plugins)
         .with_options(BundlerOptions {
             input: Some(inputs),
-            transform: target_transform(&config),
+            transform: transform_options(&config, is_production),
             code_splitting: manual_chunks(ro_opts),
             cwd: Some(root.clone()),
             dir: Some(out_dir.display().to_string()),
@@ -1579,11 +1618,10 @@ pub async fn build(
                 .unwrap_or(sourcemap)
                 .then_some(SourceMapType::File),
             define: Some({
-                let env = oj_env::with_process_env(oj_env::load(&root, mode), std::env::vars(), &["VITE_"]);
-                let mut pairs: Vec<(String, String)> =
-                    vec![("process.env.NODE_ENV".into(), "'production'".into())];
+                let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &["VITE_"]);
+                let mut pairs: Vec<(String, String)> = node_env_defines(&node_env);
                 pairs.extend(oj_env::import_meta_env_defines(
-                    &env, mode, false, &base, &["VITE_"],
+                    &env, mode, !is_production, &base, &["VITE_"],
                 ));
                 pairs.extend(oj_config::config_defines(&config));
                 pairs.extend(oj_config::environment_defines(&config, "client"));
@@ -1646,8 +1684,8 @@ pub async fn build(
     // %VITE_*% / import.meta.env substitution (Vite's htmlEnvHook), applied to
     // each page before the plugin transformIndexHtml below.
     let html_env = {
-        let env = oj_env::with_process_env(oj_env::load(&root, mode), std::env::vars(), &["VITE_"]);
-        let mut defines = oj_env::import_meta_env_defines(&env, mode, false, &base, &["VITE_"]);
+        let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &["VITE_"]);
+        let mut defines = oj_env::import_meta_env_defines(&env, mode, !is_production, &base, &["VITE_"]);
         defines.extend(oj_config::config_defines(&config));
         oj_env::html_env_map(&defines)
     };
@@ -1970,6 +2008,7 @@ pub(crate) async fn build_ssr(
     root: &Path,
     out_dir: &Path,
     entry: &str,
+    mode: &str,
     sourcemap: bool,
 ) -> anyhow::Result<()> {
     use rolldown::{IsExternal, Platform};
@@ -1990,8 +2029,11 @@ pub(crate) async fn build_ssr(
     let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
 
     let mut config =
-        oj_config::load_with(root, "build", "production").map_err(|e| anyhow::anyhow!("{e}"))?;
-    oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", "production");
+        oj_config::load_with(root, "build", mode).map_err(|e| anyhow::anyhow!("{e}"))?;
+    oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", mode);
+    let node_env =
+        oj_env::resolve_node_env(shell_node_env().as_deref(), &oj_env::load(root, mode), "production");
+    let is_production = node_env == "production";
     let ssr_base = config.base.clone().unwrap_or_else(|| "/".into());
     let plugin_host = user_plugin_host(
         root,
@@ -2039,7 +2081,7 @@ pub(crate) async fn build_ssr(
             cwd: Some(root.to_path_buf()),
             dir: Some(out_dir.display().to_string()),
             resolve: rolldown_resolve(root, &config, "ssr"),
-            transform: target_transform(&config),
+            transform: transform_options(&config, is_production),
             platform: Some(Platform::Node),
             external: Some(external),
             format: Some(OutputFormat::Esm),
@@ -2052,20 +2094,17 @@ pub(crate) async fn build_ssr(
                 .unwrap_or(sourcemap)
                 .then_some(SourceMapType::File),
             define: Some({
-                let mut pairs = vec![
-                    (
-                        "process.env.NODE_ENV".to_string(),
-                        "'production'".to_string(),
-                    ),
+                let mut pairs = node_env_defines(&node_env);
+                pairs.extend([
                     ("import.meta.env.SSR".to_string(), "true".to_string()),
-                    ("import.meta.env.PROD".to_string(), "true".to_string()),
-                    ("import.meta.env.DEV".to_string(), "false".to_string()),
+                    ("import.meta.env.PROD".to_string(), is_production.to_string()),
+                    ("import.meta.env.DEV".to_string(), (!is_production).to_string()),
                     (
                         "import.meta.env.MODE".to_string(),
-                        "\"production\"".to_string(),
+                        serde_json::Value::String(mode.to_string()).to_string(),
                     ),
                     ("import.meta.env.BASE_URL".to_string(), "\"/\"".to_string()),
-                ];
+                ]);
                 pairs.extend(oj_config::config_defines(&config));
                 pairs.extend(oj_config::environment_defines(&config, "ssr"));
                 pairs.into_iter().collect()
@@ -2418,6 +2457,7 @@ pub(crate) async fn build_ssr_app(
     root: &Path,
     out_dir: &Path,
     entry: &str,
+    mode: &str,
     minify: bool,
     sourcemap: bool,
     prerender: Option<Vec<String>>,
@@ -2425,13 +2465,13 @@ pub(crate) async fn build_ssr_app(
     let _ = fs::remove_dir_all(out_dir);
     fs::create_dir_all(out_dir)?;
 
-    build_ssr(root, out_dir, entry, sourcemap).await?;
+    build_ssr(root, out_dir, entry, mode, sourcemap).await?;
 
     let Some(client_entry) = derive_client_entry(root, entry) else {
         println!("oj build (ssr): server bundle only (no *-client sibling to hydrate)");
         return Ok(());
     };
-    let (js, css) = build_client_entry(root, out_dir, &client_entry, minify, sourcemap).await?;
+    let (js, css) = build_client_entry(root, out_dir, &client_entry, mode, minify, sourcemap).await?;
 
     build_server_fns(root, out_dir).await?;
     if has_server_modules(root) {
@@ -2485,6 +2525,7 @@ async fn build_client_entry(
     root: &Path,
     out_dir: &Path,
     entry: &str,
+    mode: &str,
     minify: bool,
     sourcemap: bool,
 ) -> anyhow::Result<(String, Option<String>)> {
@@ -2501,8 +2542,11 @@ async fn build_client_entry(
     let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
 
     let mut config =
-        oj_config::load_with(root, "build", "production").map_err(|e| anyhow::anyhow!("{e}"))?;
-    oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", "production");
+        oj_config::load_with(root, "build", mode).map_err(|e| anyhow::anyhow!("{e}"))?;
+    oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", mode);
+    let loaded_env = oj_env::load(root, mode);
+    let node_env = oj_env::resolve_node_env(shell_node_env().as_deref(), &loaded_env, "production");
+    let is_production = node_env == "production";
     let client_base = config.base.clone().unwrap_or_else(|| "/".into());
     let plugin_host = user_plugin_host(
         root,
@@ -2543,7 +2587,7 @@ async fn build_client_entry(
             cwd: Some(root.to_path_buf()),
             dir: Some(out_dir.display().to_string()),
             resolve: rolldown_resolve(root, &config, "client"),
-            transform: target_transform(&config),
+            transform: transform_options(&config, is_production),
             entry_filenames: Some("assets/[name]-[hash].js".to_string().into()),
             chunk_filenames: Some("assets/[name]-[hash].js".to_string().into()),
             minify: Some(RawMinifyOptions::Bool(
@@ -2553,15 +2597,12 @@ async fn build_client_entry(
                 .unwrap_or(sourcemap)
                 .then_some(SourceMapType::File),
             define: Some({
-                let env = oj_env::with_process_env(oj_env::load(root, "production"), std::env::vars(), &["VITE_"]);
-                let mut pairs = vec![(
-                    "process.env.NODE_ENV".to_string(),
-                    "'production'".to_string(),
-                )];
+                let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &["VITE_"]);
+                let mut pairs = node_env_defines(&node_env);
                 pairs.extend(oj_env::import_meta_env_defines(
                     &env,
-                    "production",
-                    false,
+                    mode,
+                    !is_production,
                     "/",
                     &["VITE_"],
                 ));
@@ -2626,9 +2667,12 @@ async fn build_library(
     root: &Path,
     out_dir: &Path,
     lib: oj_config::LibConfig,
+    mode: &str,
     minify: bool,
     sourcemap: bool,
 ) -> anyhow::Result<()> {
+    let node_env =
+        oj_env::resolve_node_env(shell_node_env().as_deref(), &oj_env::load(root, mode), "production");
     let entry_import = if lib.entry.starts_with('.') {
         lib.entry.clone()
     } else {
@@ -2687,13 +2731,7 @@ async fn build_library(
                 chunk_filenames: Some(format!("{file_name}-[hash].{ext}").into()),
                 minify: Some(RawMinifyOptions::Bool(minify)),
                 sourcemap: sourcemap.then_some(SourceMapType::File),
-                define: Some(
-                    std::iter::once((
-                        "process.env.NODE_ENV".to_string(),
-                        "'production'".to_string(),
-                    ))
-                    .collect(),
-                ),
+                define: Some(node_env_defines(&node_env).into_iter().collect()),
                 ..Default::default()
             })
             .build()

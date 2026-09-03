@@ -129,6 +129,27 @@ pub fn with_process_env(
     map.into_iter().collect()
 }
 
+/// Vite's NODE_ENV rule (config.ts): the shell's `NODE_ENV` wins when set;
+/// otherwise a `NODE_ENV=development` in a loaded `.env` file makes this a
+/// development build (`vite build --mode development` with `.env.development`
+/// carrying it), any other `.env` value is ignored with a warning as Vite does;
+/// otherwise the command's default (`production` for build, `development` for
+/// serve). `import.meta.env.DEV`/`PROD` and `process.env.NODE_ENV` follow it.
+pub fn resolve_node_env(shell: Option<&str>, loaded: &[(String, String)], default: &str) -> String {
+    if let Some(v) = shell.filter(|v| !v.is_empty()) {
+        return v.to_string();
+    }
+    if let Some((_, v)) = loaded.iter().find(|(k, _)| k == "NODE_ENV") {
+        if v == "development" {
+            return v.clone();
+        }
+        eprintln!(
+            "oj: NODE_ENV={v} is not supported in the .env file. Only NODE_ENV=development is supported to create a development build of your project."
+        );
+    }
+    default.to_string()
+}
+
 pub fn import_meta_env_defines(
     loaded: &[(String, String)],
     mode: &str,
@@ -215,6 +236,19 @@ pub fn replace_html_env(html: &str, env: &BTreeMap<String, String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_env_shell_wins_then_dotenv_development_then_default() {
+        let dev_file = vec![("NODE_ENV".to_string(), "development".to_string())];
+        let prod_file = vec![("NODE_ENV".to_string(), "production".to_string())];
+        assert_eq!(resolve_node_env(Some("production"), &dev_file, "production"), "production");
+        assert_eq!(resolve_node_env(Some("test"), &[], "production"), "test");
+        assert_eq!(resolve_node_env(Some(""), &dev_file, "production"), "development", "empty shell value is unset");
+        assert_eq!(resolve_node_env(None, &dev_file, "production"), "development");
+        assert_eq!(resolve_node_env(None, &prod_file, "development"), "development", "only development flips");
+        assert_eq!(resolve_node_env(None, &[], "production"), "production");
+        assert_eq!(resolve_node_env(None, &[], "development"), "development");
+    }
 
     fn base() -> BTreeMap<String, String> {
         BTreeMap::new()
