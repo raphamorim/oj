@@ -13,7 +13,9 @@ pub struct OjConfig {
     /// the CLI's `--mode` wins over it.
     pub mode: Option<String>,
     pub base: Option<String>,
-    pub public_dir: Option<String>,
+    /// Vite's `publicDir`: a directory (default `public`), or `false` for no
+    /// public directory at all. See `public_dir`.
+    pub public_dir: Option<BoolOrString>,
     pub server: Option<ServerConfig>,
     pub resolve: Option<ResolveConfig>,
     pub css: Option<CssConfig>,
@@ -46,6 +48,18 @@ pub struct OjConfig {
 pub enum BoolOrString {
     Bool(bool),
     Str(String),
+}
+
+impl From<&str> for BoolOrString {
+    fn from(s: &str) -> Self {
+        BoolOrString::Str(s.to_string())
+    }
+}
+
+impl From<String> for BoolOrString {
+    fn from(s: String) -> Self {
+        BoolOrString::Str(s)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -444,7 +444,7 @@ if (isMainRun) try {
       __ok: true,
       __deps: deps ?? [],
       base: typeof c.base === "string" ? c.base : null,
-      publicDir: typeof c.publicDir === "string" ? c.publicDir : null,
+      publicDir: typeof c.publicDir === "string" ? c.publicDir : c.publicDir === false ? false : null,
       port: typeof c.server?.port === "number" ? c.server.port : null,
       host: typeof c.server?.host === "string" ? c.server.host : null,
       hmr: c.server?.hmr === false ? false : null,

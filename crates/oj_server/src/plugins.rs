@@ -181,7 +181,8 @@ pub fn plugin_source(root: &Path) -> Option<PluginSource> {
 #[derive(Debug, Default)]
 pub struct ViteValues {
     pub base: Option<String>,
-    pub public_dir: Option<String>,
+    /// `publicDir`: a path, or `false` (no public directory).
+    pub public_dir: Option<oj_config::BoolOrString>,
     pub port: Option<u16>,
     pub host: Option<String>,
     pub hmr_disabled: bool,
@@ -374,10 +375,11 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
             .get("base")
             .and_then(|v| v.as_str())
             .map(str::to_string),
-        public_dir: json
-            .get("publicDir")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
+        public_dir: match json.get("publicDir") {
+            Some(serde_json::Value::String(s)) => Some(oj_config::BoolOrString::Str(s.clone())),
+            Some(serde_json::Value::Bool(false)) => Some(oj_config::BoolOrString::Bool(false)),
+            _ => None,
+        },
         port: json.get("port").and_then(|v| v.as_u64()).map(|p| p as u16),
         host: json
             .get("host")
@@ -1560,7 +1562,7 @@ mod vite_values_tests {
         });
         let v = parse_vite_values(&json);
         assert_eq!(v.base.as_deref(), Some("/app/"));
-        assert_eq!(v.public_dir.as_deref(), Some("/abs/shared/public"));
+        assert_eq!(v.public_dir, Some("/abs/shared/public".into()));
         assert_eq!(v.port, Some(3010));
         assert_eq!(v.host.as_deref(), Some("0.0.0.0"));
         assert!(v.define.unwrap().contains_key("__X__"));
@@ -1613,7 +1615,7 @@ mod vite_values_tests {
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/vite-base/"));
-        assert_eq!(config.public_dir.as_deref(), Some("shared/public"));
+        assert_eq!(config.public_dir, Some("shared/public".into()));
         assert_eq!(config.server.unwrap().port, Some(3010));
     }
 
@@ -1655,7 +1657,7 @@ mod vite_values_tests {
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/oj-base/"));
-        assert_eq!(config.public_dir.as_deref(), Some("my-public"));
+        assert_eq!(config.public_dir, Some("my-public".into()));
     }
 
     #[test]

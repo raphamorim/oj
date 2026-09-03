@@ -161,6 +161,9 @@ jobs:
       - name: worker build forms (?worker, inline, url, new URL) and worker-only chunks skip document helpers
         if: matrix.mode == 'unbundled'
         run: node e2e/worker-build.mjs
+      - name: publicDir files served verbatim; publicDir path and false honored
+        if: matrix.mode == 'unbundled'
+        run: node e2e/public-dir.mjs
 
   # i need to fix this or automate
   build:

@@ -76,6 +76,16 @@ pub fn build_css_minify(config: &OjConfig) -> bool {
     }
 }
 
+/// The public directory, absolute: Vite's `publicDir` (default `<root>/public`),
+/// or None when the config sets `publicDir: false`.
+pub fn public_dir(config: &OjConfig, root: &Path) -> Option<PathBuf> {
+    match config.public_dir.as_ref() {
+        Some(BoolOrString::Bool(false)) => None,
+        Some(BoolOrString::Str(s)) if !s.is_empty() => Some(root.join(s)),
+        _ => Some(root.join("public")),
+    }
+}
+
 /// `build.assetsDir` (Vite default `assets`), normalized without surrounding slashes.
 pub fn build_assets_dir(config: &OjConfig) -> String {
     let dir = config
@@ -1565,5 +1575,21 @@ mod proxy_secure_tests {
         assert!(proxy["/a"].secure());
         assert!(proxy["/b"].secure());
         assert!(!proxy["/c"].secure());
+    }
+}
+
+#[cfg(test)]
+mod public_dir_tests {
+    use super::*;
+
+    #[test]
+    fn public_dir_reads_path_default_and_false() {
+        let root = Path::new("/app");
+        let none: OjConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(public_dir(&none, root), Some(PathBuf::from("/app/public")));
+        let custom: OjConfig = serde_json::from_str(r#"{"publicDir":"static"}"#).unwrap();
+        assert_eq!(public_dir(&custom, root), Some(PathBuf::from("/app/static")));
+        let off: OjConfig = serde_json::from_str(r#"{"publicDir":false}"#).unwrap();
+        assert_eq!(public_dir(&off, root), None);
     }
 }

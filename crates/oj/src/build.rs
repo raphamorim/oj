@@ -232,11 +232,7 @@ struct WorkerBundleOpts {
 fn css_resolve_of(root: &Path, config: &oj_config::OjConfig, env: &str) -> oj_css::CssResolveConfig {
     oj_css::CssResolveConfig {
         root: root.to_path_buf(),
-        public_dir: config
-            .public_dir
-            .as_ref()
-            .map(|p| root.join(p))
-            .unwrap_or_else(|| root.join("public")),
+        public_dir: oj_config::public_dir(config, root).unwrap_or_default(),
         alias: oj_config::resolve_alias(config, env),
     }
 }
@@ -2677,11 +2673,7 @@ pub async fn build(
     };
     let mut emitted: Vec<(String, usize)> = Vec::new();
     let has_postcss = oj_server::has_postcss_config(&root);
-    let public_dir = config
-        .public_dir
-        .as_ref()
-        .map(|p| root.join(p))
-        .unwrap_or_else(|| root.join("public"));
+    let public_dir = oj_config::public_dir(&config, &root);
     let link_css_transform_enabled: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::new();
     let link_css_resolve = css_resolve_of(&root, &config, "client");
     let css_asset_opts = CssAssetOpts {
@@ -2943,7 +2935,7 @@ pub async fn build(
                         url,
                         &doc.dir,
                         &root,
-                        &public_dir,
+                        public_dir.as_deref(),
                         &out_dir,
                         &page_base,
                         css_asset_opts,
@@ -3037,8 +3029,8 @@ pub async fn build(
         )?;
     }
 
-    if build_cfg.copy_public_dir.unwrap_or(true) {
-        copy_public_dir(&public_dir, &out_dir)?;
+    if let (true, Some(public_dir)) = (build_cfg.copy_public_dir.unwrap_or(true), &public_dir) {
+        copy_public_dir(public_dir, &out_dir)?;
     }
 
     println!(
@@ -3550,7 +3542,7 @@ fn html_asset_url(
     value: &str,
     html_dir: &Path,
     root: &Path,
-    public_dir: &Path,
+    public_dir: Option<&Path>,
     out_dir: &Path,
     page_base: &str,
     opts: CssAssetOpts<'_>,
@@ -3565,7 +3557,7 @@ fn html_asset_url(
     // Vite keeps only a `#fragment` on an emitted asset; the public path keeps its
     // query as written.
     let fragment = query.find('#').map(|i| &query[i..]).unwrap_or("");
-    if let Some(rest) = clean.strip_prefix('/') {
+    if let (Some(rest), Some(public_dir)) = (clean.strip_prefix('/'), public_dir) {
         if public_dir.join(rest).is_file() {
             return Some(format!("{}{query}", with_base(clean, page_base)));
         }
