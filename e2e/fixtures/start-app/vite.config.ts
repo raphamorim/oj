@@ -75,7 +75,9 @@ export default defineConfig({
     // exportType:"default" makes a bare `.svg` import a component; the second
     // include pattern also claims the explicit `foo.svg?react` query form.
     svgr({ svgrOptions: { exportType: "default" }, include: ["src/**/*.svg", "src/**/*.svg?react"] }),
-    tanstackStart(),
+    // The app's own server entry (src/ssr-entry.ts), as an SSR error wrapper
+    // configures it: dev and the prod bundle must serve through it.
+    tanstackStart({ server: { entry: "ssr-entry" } }),
     react(),
   ],
 });

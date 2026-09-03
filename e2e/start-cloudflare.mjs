@@ -73,7 +73,9 @@ function makeApp() {
     'import { defineConfig } from "vite";',
     'import { defineConfig } from "vite";\nimport { cloudflare } from "@cloudflare/vite-plugin";',
   );
-  const config = withImport.replace("    tanstackStart(),", '    cloudflare({ viteEnvironment: { name: "ssr" } }),\n    tanstackStart(),');
+  // Insert the Cloudflare plugin ahead of tanstackStart(...) whatever options the
+  // fixture passes it.
+  const config = withImport.replace(/^(\s*)tanstackStart\(/m, '$1cloudflare({ viteEnvironment: { name: "ssr" } }),\n$1tanstackStart(');
   if (config === original || config === withImport) throw new Error("fixture vite.config.ts changed shape; update this script");
   fs.writeFileSync(path.join(app, "vite.config.ts"), config);
 }
