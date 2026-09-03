@@ -697,24 +697,29 @@ fn has_nested_quotes(text: &str) -> bool {
     false
 }
 
+/// Emit an asset file, or inline it as a data URL when it is under
+/// `assetsInlineLimit`; `no_inline` (`?no-inline`, Vite's asset plugin) always
+/// emits.
 fn emit_or_inline(
     ctx: &rolldown_plugin::SharedLoadPluginContext,
     root: &Path,
     file: &str,
     bytes: Vec<u8>,
     inline_limit: u64,
+    no_inline: bool,
 ) -> anyhow::Result<String> {
     let path = std::path::Path::new(file);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    // Vite's shouldInline: strictly below the limit.
-    if (bytes.len() as u64) < inline_limit && ext != "svg" {
+    // Vite's shouldInline: strictly below the limit; `?no-inline` always emits.
+    let inline = !no_inline && (bytes.len() as u64) < inline_limit;
+    if inline && ext != "svg" {
         return Ok(export_default_url(&format!(
             "data:{};base64,{}",
             asset_mime(ext),
             b64(&bytes)
         )));
     }
-    if (bytes.len() as u64) < inline_limit && ext == "svg" {
+    if inline && ext == "svg" {
         let text = String::from_utf8_lossy(&bytes);
         return Ok(export_default_url(&svg_data_url(&text)));
     }
@@ -861,7 +866,7 @@ fn split_asset_query(spec: &str) -> Option<(String, String)> {
         }
         return Some((base.to_string(), q));
     }
-    for kind in ["url", "init", "raw", "inline", "react"] {
+    for kind in ["url", "init", "raw", "inline", "react", "no-inline"] {
         if params.len() == 1 && has(kind) {
             return Some((base.to_string(), kind.to_string()));
         }
@@ -1083,7 +1088,18 @@ impl Plugin for OjCssPlugin {
                 }
                 let bytes =
                     std::fs::read(file).map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
-                let code = emit_or_inline(&ctx, &root, file, bytes, inline_limit)?;
+                let code = emit_or_inline(&ctx, &root, file, bytes, inline_limit, false)?;
+                return Ok(Some(rolldown_plugin::HookLoadOutput {
+                    code: arcstr::ArcStr::from(code),
+                    module_type: Some(rolldown_common::ModuleType::Js),
+                    ..Default::default()
+                }));
+            }
+            if let Some(file) = id.strip_suffix("?no-inline") {
+                // `?no-inline`: the asset's URL, emitted as a file whatever its size.
+                let bytes =
+                    std::fs::read(file).map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
+                let code = emit_or_inline(&ctx, &root, file, bytes, inline_limit, true)?;
                 return Ok(Some(rolldown_plugin::HookLoadOutput {
                     code: arcstr::ArcStr::from(code),
                     module_type: Some(rolldown_common::ModuleType::Js),
@@ -1115,7 +1131,7 @@ impl Plugin for OjCssPlugin {
             if !id.contains('?') && is_build_asset(&id) {
                 let bytes =
                     std::fs::read(&id).map_err(|e| anyhow::anyhow!("cannot read {id}: {e}"))?;
-                let code = emit_or_inline(&ctx, &root, &id, bytes, inline_limit)?;
+                let code = emit_or_inline(&ctx, &root, &id, bytes, inline_limit, false)?;
                 return Ok(Some(rolldown_plugin::HookLoadOutput {
                     code: arcstr::ArcStr::from(code),
                     module_type: Some(rolldown_common::ModuleType::Js),

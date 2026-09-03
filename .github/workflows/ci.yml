@@ -167,6 +167,9 @@ jobs:
       - name: css.modules options (localsConvention, generateScopedName, globalModulePaths, composes from)
         if: matrix.mode == 'unbundled'
         run: node e2e/css-modules-options.mjs
+      - name: ?no-inline asset query (dev url module, build never inlines)
+        if: matrix.mode == 'unbundled'
+        run: node e2e/assets-no-inline.mjs
 
   # i need to fix this or automate
   build:

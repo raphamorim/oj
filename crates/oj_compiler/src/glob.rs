@@ -56,10 +56,53 @@ struct GlobExpander<'a, 'd> {
     uid: usize,
 }
 
+#[derive(Default)]
 struct GlobOptions {
     eager: bool,
     import: Option<String>,
     query: String,
+    /// Vite's `base`: globs resolve against, and keys are relative to, this
+    /// directory (`./x` / `../x` from the importer; `/x` from the root is not
+    /// resolvable here and is treated as importer-relative).
+    base: Option<String>,
+    /// Vite's `exhaustive`: also match dotfiles and `node_modules`.
+    exhaustive: bool,
+}
+
+/// `to` as an import specifier relative to `from_dir` (`./x` or `../x`),
+/// both lexical paths under the same root.
+fn relative_spec(from_dir: &Path, to: &Path) -> String {
+    let from: Vec<_> = from_dir.components().collect();
+    let to_parts: Vec<_> = to.components().collect();
+    let common = from.iter().zip(&to_parts).take_while(|(a, b)| a == b).count();
+    let mut out = String::new();
+    for _ in common..from.len() {
+        out.push_str("../");
+    }
+    if out.is_empty() {
+        out.push_str("./");
+    }
+    let rest: Vec<String> = to_parts[common..]
+        .iter()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    out.push_str(&rest.join("/"));
+    out
+}
+
+/// `dir/base` normalized lexically (`.` and `..` folded).
+fn join_normalized(dir: &Path, base: &str) -> std::path::PathBuf {
+    let mut out = dir.to_path_buf();
+    for c in Path::new(base).components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir | std::path::Component::RootDir => {}
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 impl<'a> GlobExpander<'a, '_> {
@@ -77,16 +120,21 @@ impl<'a> GlobExpander<'a, '_> {
         let opts = args
             .get(1)
             .map(collect_options)
-            .unwrap_or(Some(GlobOptions {
-                eager: false,
-                import: None,
-                query: String::new(),
-            }))?;
+            .unwrap_or(Some(GlobOptions::default()))?;
 
-        let matches = glob_matches(self.dir, &patterns);
+        // With `base`, globs resolve against and keys are relative to the base
+        // directory, while the import specifiers stay relative to the importer
+        // (Vite's importMetaGlob resolvePaths).
+        let base_dir = opts.base.as_deref().map(|b| join_normalized(self.dir, b));
+        let glob_dir = base_dir.as_deref().unwrap_or(self.dir);
+        let matches = glob_matches(glob_dir, &patterns, opts.exhaustive);
         let mut entries: Vec<String> = Vec::new();
         for key in &matches {
-            let spec = format!("{key}{}", opts.query);
+            let import_path = match &base_dir {
+                Some(b) => relative_spec(self.dir, &join_normalized(b, key)),
+                None => key.clone(),
+            };
+            let spec = format!("{import_path}{}", opts.query);
             if opts.eager {
                 let ident = format!("__oj_glob_{}", self.uid);
                 self.uid += 1;
@@ -304,7 +352,7 @@ impl<'a> VisitMut<'a> for NewUrlAsset<'a, '_, '_> {
                     return;
                 }
                 Some(UrlSpec::Template { pattern, arg }) => {
-                    let mut matches = glob_matches(self.dir, &[pattern]);
+                    let mut matches = glob_matches(self.dir, &[pattern], true);
                     matches.sort();
                     if !matches.is_empty() {
                         let mut entries = Vec::new();
@@ -402,7 +450,7 @@ impl<'a> DynImportVars<'a, '_, '_> {
         if !(pattern.starts_with("./") || pattern.starts_with("../")) {
             return None;
         }
-        let mut matches = glob_matches(self.dir, &[pattern]);
+        let mut matches = glob_matches(self.dir, &[pattern], true);
         matches.sort();
         if matches.is_empty() {
             return None;
@@ -468,11 +516,7 @@ fn collect_options(arg: &Argument) -> Option<GlobOptions> {
     let Some(Expression::ObjectExpression(obj)) = arg.as_expression() else {
         return None;
     };
-    let mut opts = GlobOptions {
-        eager: false,
-        import: None,
-        query: String::new(),
-    };
+    let mut opts = GlobOptions::default();
     for prop in &obj.properties {
         let ObjectPropertyKind::ObjectProperty(p) = prop else {
             continue;
@@ -508,13 +552,37 @@ fn collect_options(arg: &Argument) -> Option<GlobOptions> {
                     opts.query = format!("?{}", s.value);
                 }
             }
+            "base" => {
+                if let Expression::StringLiteral(s) = &p.value {
+                    opts.base = Some(s.value.to_string());
+                }
+            }
+            "exhaustive" => {
+                if let Expression::BooleanLiteral(b) = &p.value {
+                    opts.exhaustive = b.value;
+                }
+            }
             _ => {}
         }
     }
     Some(opts)
 }
 
-fn glob_matches(dir: &Path, patterns: &[String]) -> Vec<String> {
+/// Whether a matched path is hidden from a non-exhaustive glob, as Vite's
+/// `dot: false` + `ignore: ['**/node_modules/**']` hide it: a `node_modules`
+/// segment, or a dot-led segment the pattern did not spell out literally.
+fn hidden_by_default(rel: &str, pattern: &str) -> bool {
+    let pattern_dots: Vec<&str> = pattern
+        .split('/')
+        .filter(|seg| seg.starts_with('.') && *seg != "." && *seg != "..")
+        .collect();
+    rel.split('/').any(|seg| {
+        seg == "node_modules"
+            || (seg.starts_with('.') && !pattern_dots.iter().any(|p| glob::Pattern::new(p).is_ok_and(|g| g.matches(seg))))
+    })
+}
+
+fn glob_matches(dir: &Path, patterns: &[String], exhaustive: bool) -> Vec<String> {
     let (negatives, positives): (Vec<&String>, Vec<&String>) =
         patterns.iter().partition(|p| p.starts_with('!'));
     let neg_patterns: Vec<glob::Pattern> = negatives
@@ -537,6 +605,9 @@ fn glob_matches(dir: &Path, patterns: &[String]) -> Vec<String> {
             };
             let rel = rel.to_string_lossy().replace('\\', "/");
             if neg_patterns.iter().any(|n| n.matches(&rel)) {
+                continue;
+            }
+            if !exhaustive && hidden_by_default(&rel, pat) {
                 continue;
             }
             let key = if rel.starts_with('.') {
@@ -636,6 +707,45 @@ mod tests {
         );
         assert!(out.contains("import * as __oj_glob_0"), "{out}");
         assert!(out.contains(r#""./locales/en.json": __oj_glob_"#), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glob_base_option_keys_relative_to_base_and_imports_relative_to_importer() {
+        let dir = fixture_dir("base");
+        std::fs::create_dir_all(dir.join("src/pages")).unwrap();
+        // Importer in src/pages, base "../../locales" (a sibling of src).
+        let out = expand_source(
+            &dir.join("src/pages"),
+            "const m = import.meta.glob('./*.json', { base: '../../locales' });\n",
+        );
+        assert!(
+            out.contains(r#""./en.json": () => import("../../locales/en.json")"#),
+            "key relative to base, import relative to importer: {out}"
+        );
+        // A base under the importer directory.
+        let out = expand_source(&dir, "const m = import.meta.glob('./*.json', { base: './locales', eager: true });\n");
+        assert!(out.contains(r#"import * as __oj_glob_0 from "./locales/_ignore.json""#), "{out}");
+        assert!(out.contains(r#""./_ignore.json": __oj_glob_0"#), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glob_hides_dotfiles_and_node_modules_unless_exhaustive() {
+        let dir = fixture_dir("exhaustive");
+        std::fs::write(dir.join("locales/.hidden.json"), "{}").unwrap();
+        std::fs::create_dir_all(dir.join("locales/node_modules/dep")).unwrap();
+        std::fs::write(dir.join("locales/node_modules/dep/x.json"), "{}").unwrap();
+        let out = expand_source(&dir, "const m = import.meta.glob('./locales/**/*.json');\n");
+        assert!(out.contains("en.json"), "{out}");
+        assert!(!out.contains(".hidden.json"), "dotfiles hidden by default: {out}");
+        assert!(!out.contains("node_modules"), "node_modules hidden by default: {out}");
+        let out = expand_source(&dir, "const m = import.meta.glob('./locales/**/*.json', { exhaustive: true });\n");
+        assert!(out.contains(".hidden.json"), "{out}");
+        assert!(out.contains("node_modules/dep/x.json"), "{out}");
+        // A dot-led segment spelled out in the pattern is not hidden.
+        let out = expand_source(&dir, "const m = import.meta.glob('./locales/.hidden.json');\n");
+        assert!(out.contains(".hidden.json"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
