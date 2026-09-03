@@ -84,6 +84,15 @@ async function assertServerRoutes(port, label) {
   must(seen.host === `localhost:${port}`, `${label}: Host should be the server's own, got ${seen.host}`);
   must(seen.forwardedHost === "preview.example.com", `${label}: x-forwarded-host should pass through, got ${seen.forwardedHost}`);
   console.log(`${label}: proxied request keeps Host and passes x-forwarded-host through`);
+
+  // The fixture configures its own Start server entry (src/ssr-entry.ts, a
+  // wrapper around the default handler, as an SSR error wrapper is). Vite runs
+  // the configured entry; so must oj, in dev and in the prod server bundle.
+  for (const route of ["/", "/api/request-url"]) {
+    const res = await fetch(`http://localhost:${port}${route}`);
+    must(res.headers.get("x-server-entry") === "fixture", `${label}: ${route} did not go through the configured server entry (x-server-entry=${res.headers.get("x-server-entry")})`);
+  }
+  console.log(`${label}: configured tanstackStart server.entry wraps the handler`);
 }
 
 async function devPhase() {

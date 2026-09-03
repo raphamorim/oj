@@ -579,6 +579,9 @@ const ALIASES = {
   "tanstack-start-manifest:v": pathResolve(HERE, "manifest-dev.ts"),
   "tanstack-start-injected-head-scripts:v": pathResolve(HERE, "injected-head-scripts.ts"),
   "@cloudflare/vite-plugin/server": pathResolve(HERE, "cf-server.mjs"),
+  // Start's default server entry is oj's runner entry: an app `server.entry` that
+  // wraps it (as Vite runs it) wraps oj's handler.
+  "@tanstack/react-start/server-entry": pathResolve(HERE, "server-entry.tsx"),
 };
 
 const IMPORT_RULES = (() => {

@@ -488,7 +488,31 @@ fn start_script_env(root: &Path, command: &str, mode: &str) -> anyhow::Result<Ve
         ))
         .unwrap_or_default(),
     ));
+    if let Some(entry) = configured_start_server_entry(&config, root) {
+        vars.push(("OJ_START_SERVER_ENTRY".into(), entry.to_string_lossy().into_owned()));
+    }
     Ok(vars)
+}
+
+/// The app's own TanStack Start server entry (`tanstackStart({ server: { entry } })`),
+/// when it configures one. Start's plugin publishes the resolved entry paths as
+/// `resolve.alias` entries (`virtual:tanstack-start-server-entry` -> file), which
+/// Vite's dev server imports as the SSR handler; oj reads the same alias. Only an
+/// app file counts: unconfigured, the alias points at Start's own package entry,
+/// which oj replaces with its runner entry as before.
+fn configured_start_server_entry(config: &oj_config::OjConfig, root: &Path) -> Option<PathBuf> {
+    let target = oj_config::resolve_alias(config, "ssr")
+        .into_iter()
+        .find(|(find, _)| find == "virtual:tanstack-start-server-entry")
+        .map(|(_, replacement)| replacement)?;
+    let path = PathBuf::from(target.split('?').next().unwrap_or(&target));
+    let path = if path.is_absolute() { path } else { root.join(path) };
+    let real = path.canonicalize().ok()?;
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if !real.starts_with(&root) || real.components().any(|c| c.as_os_str() == "node_modules") || !real.is_file() {
+        return None;
+    }
+    Some(real)
 }
 
 pub async fn start_build(root: PathBuf, mode: &str, out: Option<PathBuf>) -> anyhow::Result<()> {
@@ -1611,5 +1635,41 @@ mod tests {
             Some(PathBuf::from("/out/vite.config.mjs")),
         );
         assert_eq!(config_path(root, None), None);
+    }
+
+    #[test]
+    fn configured_start_server_entry_reads_the_start_alias_for_app_files_only() {
+        let root = std::env::temp_dir().join(format!("oj-start-entry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/@tanstack/react-start/dist")).unwrap();
+        std::fs::write(root.join("src/ssr-entry.ts"), "export default {};").unwrap();
+        std::fs::write(root.join("node_modules/@tanstack/react-start/dist/server-entry.js"), "").unwrap();
+        let cfg = |target: &str| -> oj_config::OjConfig {
+            serde_json::from_str(&format!(
+                r#"{{"resolve":{{"alias":{{"virtual:tanstack-start-server-entry":"{}"}}}}}}"#,
+                target.replace('\\', "/")
+            ))
+            .unwrap()
+        };
+        let app = root.join("src/ssr-entry.ts");
+        assert_eq!(
+            configured_start_server_entry(&cfg(&app.to_string_lossy()), &root),
+            Some(app.canonicalize().unwrap()),
+            "an app file named by the Start alias is the server entry"
+        );
+        assert_eq!(configured_start_server_entry(&cfg("src/ssr-entry.ts"), &root).is_some(), true, "root-relative works too");
+        let pkg = root.join("node_modules/@tanstack/react-start/dist/server-entry.js");
+        assert_eq!(configured_start_server_entry(&cfg(&pkg.to_string_lossy()), &root), None, "Start's own default entry is not an app entry");
+        assert_eq!(configured_start_server_entry(&cfg("src/missing.ts"), &root), None);
+        let none: oj_config::OjConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(configured_start_server_entry(&none, &root), None);
+        let env_scoped: oj_config::OjConfig = serde_json::from_str(&format!(
+            r#"{{"environments":{{"ssr":{{"resolve":{{"alias":{{"virtual:tanstack-start-server-entry":"{}"}}}}}}}}}}"#,
+            app.to_string_lossy().replace('\\', "/")
+        ))
+        .unwrap();
+        assert!(configured_start_server_entry(&env_scoped, &root).is_some(), "environments.ssr.resolve.alias counts");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

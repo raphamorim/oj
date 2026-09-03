@@ -303,9 +303,17 @@ const serverDefine = {
   "process.env.NODE_ENV": JSON.stringify(NODE_ENV), "process.env.TSS_SERVER_FN_BASE": '"/_serverFn/"',
   ...viteEnvDefine({ ssr: true, mode: MODE, base: BASE }),
 };
+// The bundle's entry is the app's own Start server entry when configured
+// (`tanstackStart({ server: { entry } })`, published by the plugin as the
+// `virtual:tanstack-start-server-entry` alias and exported by oj as
+// OJ_START_SERVER_ENTRY), else oj's; either way `@tanstack/react-start/server-entry`
+// inside it is oj's handler, so a wrapping entry composes as it does under Vite.
+const OJ_SERVER_ENTRY = join(HERE, "server-entry.tsx");
+const SERVER_ENTRY = process.env.OJ_START_SERVER_ENTRY || OJ_SERVER_ENTRY;
 const serverAlias = {
   ...clientAlias,
   "#tanstack-start-server-fn-resolver": join(HERE, "server-fn-resolver.mjs"),
+  "@tanstack/react-start/server-entry": OJ_SERVER_ENTRY,
 };
 const serverPlugins = () => [
   makeVitePlugins({ container: serverContainer, fallback: clientContainer, appRoot: APP, mode: "prod", emit }),
@@ -325,7 +333,7 @@ if (cfEnv) {
   // virtual Worker entry wrapping oj's server entry, and the plugin's
   // generateBundle/writeBundle emitting wrangler.json and the deploy config.
   workerDir = workerOutDir(cfEnv, APP, DIST, serverContainer.config);
-  const serverEntry = join(HERE, "server-entry.tsx");
+  const serverEntry = SERVER_ENTRY;
   const worker = await build({
     input: { index: CLOUDFLARE_WORKER_ENTRY },
     platform: "neutral",
@@ -343,7 +351,6 @@ if (cfEnv) {
       conditionNames: [...cfEnv.conditions, "import", NODE_ENV === "production" ? "production" : "development"],
       alias: {
         ...serverAlias,
-        "@tanstack/react-start/server-entry": serverEntry,
         "@cloudflare/vite-plugin/server": join(HERE, "cf-server-worker.mjs"),
       },
     },
@@ -378,7 +385,7 @@ if (cfEnv) {
   await serverContainer.writeBundle(bundle);
 } else {
   const server = await build({
-    input: { "server-bundle": join(HERE, "server-entry.tsx") },
+    input: { "server-bundle": SERVER_ENTRY },
     platform: "node",
     // Vite's `ssr.external`: those dependencies stay bare imports of the bundle.
     external: ssrExternalRule(APP),

@@ -27,7 +27,10 @@ const phase = (label) => {
   if (process.env.OJ_BOOT_PHASES) process.stderr.write(`[oj-phase] ${Date.now()} runner: ${label}\n`);
 };
 phase("main begin");
-const ENTRY = pathToFileURL(process.env.OJ_RUNNER_ENTRY || join(HERE, "server-entry.tsx")).href;
+// The app's own Start server entry (`tanstackStart({ server: { entry } })`) when
+// configured, as Vite's dev server imports it; inside it, `@tanstack/react-start/
+// server-entry` is oj's handler (loader alias), so a wrapper composes the same way.
+const ENTRY = pathToFileURL(process.env.OJ_RUNNER_ENTRY || process.env.OJ_START_SERVER_ENTRY || join(HERE, "server-entry.tsx")).href;
 const LOADER = pathToFileURL(process.env.OJ_RUNNER_LOADER || join(HERE, "loader.mjs")).href;
 const loaderApi = await import(LOADER);
 if (loaderApi.resolve || loaderApi.load) module.registerHooks({ resolve: loaderApi.resolve, load: loaderApi.load });
