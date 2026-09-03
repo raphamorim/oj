@@ -4,7 +4,7 @@ import { pathToFileURL, fileURLToPath } from "node:url";
 import { readFileSync, unlinkSync, statSync, openSync, readSync, realpathSync } from "node:fs";
 import { writeFile, appendFile, rename, mkdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { resolve as pathResolve, dirname } from "node:path";
+import { resolve as pathResolve, dirname, sep } from "node:path";
 import { importPkg, viteEnvDefine, environmentDefines, emptyVirtualStub, jsxTransformOptions } from "./resolve-pkg.mjs";
 import { loadPluginContainerSync } from "./container-bridge.mjs";
 import { transformGlob } from "./glob-transform.mjs";
@@ -684,6 +684,39 @@ const EXTERNAL_CONDITIONS = (() => {
   } catch {}
   return ["module-sync"];
 })();
+// Vite's `isInNodeModules(resolved.id)` leg of `isExternalizable`: a bare
+// import whose package realpaths OUTSIDE node_modules (linked/workspace) is
+// not externalized and keeps the environment's conditions. Decided from the
+// package directory, not the resolved file — conditions pick files within a
+// package, never which package directory a specifier maps to — so one
+// resolution suffices (Node's resolver caches by specifier+parent and would
+// ignore a conditions-changed retry).
+const linkedPkgMemo = new Map();
+function isLinkedPkg(pkg, parentURL) {
+  let dir;
+  try {
+    dir = parentURL && parentURL.startsWith("file:") ? dirname(fileURLToPath(stripQ(parentURL))) : APP;
+  } catch {
+    dir = APP;
+  }
+  const memoKey = dir + "\0" + pkg;
+  const hit = linkedPkgMemo.get(memoKey);
+  if (hit !== undefined) return hit;
+  let linked = false;
+  for (let i = 0; i < 40; i++) {
+    try {
+      const real = realpathSync(pathResolve(dir, "node_modules", pkg));
+      linked = !real.includes(`${sep}node_modules${sep}`);
+      break;
+    } catch {}
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  linkedPkgMemo.set(memoKey, linked);
+  return linked;
+}
+
 function withExternalConditions(context) {
   if (!EXTERNAL_CONDITIONS.length || !Array.isArray(context.conditions)) return context;
   const missing = EXTERNAL_CONDITIONS.filter((c) => !context.conditions.includes(c));
@@ -693,8 +726,9 @@ function withExternalConditions(context) {
 export function resolve(spec, context, next) {
   if (isRequire(context)) return next(spec, context);
   const barePkg = pkgNameOfSpec(spec);
-  context = barePkg && !isNoExternalPkg(barePkg) ? withExternalConditions(context) : withUserConditions(context);
   if (context.parentURL) context = { ...context, parentURL: stripQ(context.parentURL) };
+  const external = !!barePkg && !isNoExternalPkg(barePkg) && !isLinkedPkg(barePkg, context.parentURL);
+  context = external ? withExternalConditions(context) : withUserConditions(context);
   const key = (context.parentURL ?? "") + "\0" + spec;
   const rc = EPOCH ? resolveCache.get(key) : undefined;
   if (rc !== undefined) {

@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
@@ -100,6 +100,57 @@ test("SSR loader: JSON named exports and resolve.conditions reach Node's resolve
       OJ_SSR_EXTERNALS: JSON.stringify({ noExternal: ["condpkg"] }),
     });
     assert.equal(noExt.which, "custom");
+  } finally {
+    rmSync(app, { recursive: true, force: true });
+  }
+});
+
+test("SSR loader: linked (workspace) packages take the environment's conditions, not externalConditions", () => {
+  const app = realpathSync(mkdtempSync(join(tmpdir(), "oj-ssr-linked-cond-")));
+  const source = join(app, "src");
+  const linkedsrc = join(app, "linkedsrc");
+  const rolldown = join(app, "node_modules", "rolldown");
+  for (const directory of [source, linkedsrc, rolldown]) mkdirSync(directory, { recursive: true });
+
+  writeFileSync(join(app, "package.json"), JSON.stringify({ name: "synthetic-linked-cond-app", type: "module" }));
+  writeFileSync(join(rolldown, "package.json"), JSON.stringify({
+    name: "rolldown", type: "module", exports: { "./experimental": "./experimental.mjs" },
+  }));
+  writeFileSync(join(rolldown, "experimental.mjs"), "export const transformSync = (_path, code) => ({ code });\n");
+  // A workspace-style package: symlinked into node_modules, real files outside it.
+  writeFileSync(join(linkedsrc, "package.json"), JSON.stringify({
+    name: "linkedpkg", type: "module",
+    exports: { ".": { custom: "./custom.js", default: "./plain.js" } },
+  }));
+  writeFileSync(join(linkedsrc, "custom.js"), 'export const which = "custom";\n');
+  writeFileSync(join(linkedsrc, "plain.js"), 'export const which = "plain";\n');
+  symlinkSync(linkedsrc, join(app, "node_modules", "linkedpkg"), "dir");
+
+  const entry = join(source, "entry.ts");
+  writeFileSync(entry, ['import { which } from "linkedpkg";', "export default { which };"].join("\n"));
+
+  const runner = [
+    'import { registerHooks } from "node:module";',
+    `const loader = await import(${JSON.stringify(pathToFileURL(loader).href)});`,
+    "registerHooks({ resolve: loader.resolve, load: loader.load });",
+    `process.stdout.write(JSON.stringify((await import(${JSON.stringify(pathToFileURL(entry).href)})).default));`,
+  ].join("\n");
+  try {
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", runner], {
+      encoding: "utf8",
+      timeout: 10_000,
+      env: {
+        ...process.env,
+        OJ_APP_ROOT: app,
+        OJ_CACHE_ROOT: join(app, "cache"),
+        OJ_SSR_LOADER_CACHE: "off",
+        OJ_RESOLVE_CONDITIONS: JSON.stringify(["custom"]),
+      },
+    });
+    assert.equal(result.status, 0, result.stderr || result.error?.message);
+    // Vite's isExternalizable: resolved outside node_modules (via the symlink's
+    // realpath) means NOT external, so the environment's `custom` applies.
+    assert.equal(JSON.parse(result.stdout).which, "custom");
   } finally {
     rmSync(app, { recursive: true, force: true });
   }
