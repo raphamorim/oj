@@ -275,3 +275,5 @@ jobs:
         run: node e2e/build-cli-flags.mjs
       - name: rollupOptions.output (fileNames, external, format, banner, globals, paths, treeshake)
         run: node e2e/rolldown-options.mjs
+      - name: ssr options (build.ssr, ssr.external/noExternal, ssrManifest assets, client base)
+        run: node e2e/ssr-options.mjs

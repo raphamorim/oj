@@ -403,11 +403,18 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
 /// (shell wins, as in Vite's loadEnv) and the JSX settings from the config
 /// (`OJ_JSX`, consumed by `jsxTransformOptions` in resolve-pkg.mjs).
 fn start_script_env(root: &Path, command: &str, mode: &str) -> anyhow::Result<Vec<(String, String)>> {
-    let mut vars: Vec<(String, String)> = oj_env::load(root, mode)
-        .into_iter()
-        .filter(|(k, _)| k.starts_with("VITE_") && std::env::var_os(k).is_none())
-        .collect();
     let mut config = oj_config::load(root).unwrap_or_default();
+    // `.env` files come from `envDir` and only `envPrefix` variables are exposed
+    // (Vite's loadEnv), not the root and `VITE_` unconditionally.
+    let env_dir = match config.env_dir.as_deref() {
+        Some(d) => root.join(d),
+        None => root.to_path_buf(),
+    };
+    let prefixes = oj_config::env_prefixes(&config);
+    let mut vars: Vec<(String, String)> = oj_env::load(&env_dir, mode)
+        .into_iter()
+        .filter(|(k, _)| prefixes.iter().any(|p| k.starts_with(p)) && std::env::var_os(k).is_none())
+        .collect();
     oj_server::plugins::adopt_vite_config_values(&mut config, root, command, mode)
         .map_err(|e| anyhow::anyhow!(e))?;
     let jsx = oj_config::jsx_settings(&config);
@@ -490,9 +497,13 @@ pub async fn start_build(root: PathBuf, mode: &str, out: Option<PathBuf>) -> any
     // Vite's rule: the shell's NODE_ENV wins, else `.env[.mode]` NODE_ENV=development
     // makes a development build, else production. build.mjs derives DEV/PROD and
     // process.env.NODE_ENV from what it receives here.
+    let env_dir = match config.env_dir.as_deref() {
+        Some(d) => root.join(d),
+        None => root.to_path_buf(),
+    };
     let node_env = oj_env::resolve_node_env(
         std::env::var("NODE_ENV").ok().filter(|v| !v.is_empty()).as_deref(),
-        &oj_env::load(&root, mode),
+        &oj_env::load(&env_dir, mode),
         "production",
     );
     let status = std::process::Command::new("node")

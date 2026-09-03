@@ -27,6 +27,22 @@ use rolldown_plugin::{
 /// building without the option.
 const FN_MARKER: &str = "__oj_fn__";
 
+/// rolldown's batched diagnostics rendered the way Vite prints them (message,
+/// file and frame), instead of a `Debug` dump.
+macro_rules! rolldown_failure {
+    ($($label:tt)*) => {
+        |errs| {
+            let detail = errs
+                .into_vec()
+                .iter()
+                .map(|e| e.to_diagnostic().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            anyhow::anyhow!("{}:\n{detail}", format!($($label)*))
+        }
+    };
+}
+
 fn warn_fn_option(key: &str, hint: &str) {
     eprintln!(
         "oj build: (!) build.rollupOptions.{key} is a function, which oj cannot run (the \
@@ -863,11 +879,11 @@ async fn bundle_worker_inline(
             ..Default::default()
         })
         .build()
-        .map_err(|errs| anyhow::anyhow!("inline worker init failed: {errs:?}"))?;
+        .map_err(rolldown_failure!("inline worker init failed"))?;
     let out = bundler
         .generate()
         .await
-        .map_err(|errs| anyhow::anyhow!("inline worker build failed for {file}:\n{errs:?}"))?;
+        .map_err(rolldown_failure!("inline worker build failed for {file}"))?;
     let mut code = String::new();
     for asset in &out.assets {
         if let rolldown_common::Output::Chunk(chunk) = asset {
@@ -946,7 +962,8 @@ impl Plugin for OjCssPlugin {
             if has_glob {
                 expanded = oj_compiler::glob::expand_source(&expanded, path);
             }
-            if has_dynamic {
+            // Vite's dynamicImportVarsOptions.exclude defaults to node_modules.
+            if has_dynamic && !id.contains("/node_modules/") {
                 expanded = oj_compiler::glob::expand_dynamic_import_vars_source(&expanded, path);
             }
             if has_new_url {
@@ -2522,7 +2539,7 @@ pub async fn build(
             ..Default::default()
         })
         .build()
-        .map_err(|errs| anyhow::anyhow!("rolldown init failed: {errs:?}"))?;
+        .map_err(rolldown_failure!("rolldown init failed"))?;
 
     let output = match bundler.write().await {
         Ok(output) => output,
@@ -3745,12 +3762,13 @@ pub(crate) async fn build_ssr(
             ..Default::default()
         })
         .build()
-        .map_err(|errs| anyhow::anyhow!("rolldown init failed: {errs:?}"))?;
+        .map_err(rolldown_failure!("rolldown init failed"))?;
 
     let output = match bundler.write().await {
         Ok(output) => output,
         Err(errs) => {
-            return Err(fail_with_plugin_hooks(anyhow::anyhow!("ssr build failed:\n{errs:?}"), &plugin_host).await);
+            let err = (rolldown_failure!("ssr build failed"))(errs);
+            return Err(fail_with_plugin_hooks(err, &plugin_host).await);
         }
     };
     bundler
@@ -3826,8 +3844,11 @@ async fn build_server_fns(root: &Path, out_dir: &Path, mode: &str) -> anyhow::Re
     oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", mode)
         .map_err(|e| anyhow::anyhow!(e))?;
     apply_cli_options(&mut config);
-    let node_env =
-        oj_env::resolve_node_env(shell_node_env().as_deref(), &oj_env::load(root, mode), "production");
+    let node_env = oj_env::resolve_node_env(
+        shell_node_env().as_deref(),
+        &oj_env::load(&env_dir_of(root, &config), mode),
+        "production",
+    );
     let is_production = node_env == "production";
     let entry_path = root.join("_oj_server_fns_entry.tsx");
     fs::write(&entry_path, OJ_SERVER_FNS_JS)?;
@@ -3881,11 +3902,11 @@ async fn build_server_fns(root: &Path, out_dir: &Path, mode: &str) -> anyhow::Re
                 ..Default::default()
             })
             .build()
-            .map_err(|errs| anyhow::anyhow!("server-fns init failed: {errs:?}"))?;
+            .map_err(rolldown_failure!("server-fns init failed"))?;
         bundler
             .write()
             .await
-            .map_err(|errs| anyhow::anyhow!("server-fns build failed:\n{errs:?}"))?;
+            .map_err(rolldown_failure!("server-fns build failed"))?;
         bundler
             .close()
             .await
@@ -4199,7 +4220,8 @@ async fn build_client_entry(
     let env_prefix_refs: Vec<&str> = env_prefixes.iter().map(String::as_str).collect();
     let node_env = oj_env::resolve_node_env(shell_node_env().as_deref(), &loaded_env, "production");
     let is_production = node_env == "production";
-    let client_base = config.base.clone().unwrap_or_else(|| "/".into());
+    let client_base = normalize_base(config.base.as_deref().unwrap_or("/"));
+    let assets_dir = oj_config::build_assets_dir(&config);
     let plugin_host = user_plugin_host(
         root,
         &client_base,
@@ -4246,8 +4268,8 @@ async fn build_client_entry(
             dir: Some(out_dir.display().to_string()),
             resolve: rolldown_resolve(root, &config, "client"),
             transform: transform_options(&config, is_production),
-            entry_filenames: Some("assets/[name]-[hash].js".to_string().into()),
-            chunk_filenames: Some("assets/[name]-[hash].js".to_string().into()),
+            entry_filenames: Some(format!("{assets_dir}/[name]-[hash].js").into()),
+            chunk_filenames: Some(format!("{assets_dir}/[name]-[hash].js").into()),
             minify: Some(rolldown_minify(
                 oj_config::environment_build_bool(&config, "client", "minify").unwrap_or(minify),
             )),
@@ -4260,7 +4282,7 @@ async fn build_client_entry(
                     &env,
                     mode,
                     !is_production,
-                    "/",
+                    &client_base,
                     &env_prefix_refs,
                 ));
                 pairs.extend(oj_config::config_defines(&config));
@@ -4271,12 +4293,13 @@ async fn build_client_entry(
             ..Default::default()
         })
         .build()
-        .map_err(|errs| anyhow::anyhow!("rolldown init failed: {errs:?}"))?;
+        .map_err(rolldown_failure!("rolldown init failed"))?;
 
     let output = match bundler.write().await {
         Ok(output) => output,
         Err(errs) => {
-            return Err(fail_with_plugin_hooks(anyhow::anyhow!("client build failed:\n{errs:?}"), &plugin_host).await);
+            let err = (rolldown_failure!("client build failed"))(errs);
+            return Err(fail_with_plugin_hooks(err, &plugin_host).await);
         }
     };
     bundler
@@ -4294,7 +4317,7 @@ async fn build_client_entry(
     for asset in &output.assets {
         if let rolldown_common::Output::Chunk(c) = asset {
             if c.is_entry {
-                js = Some(format!("/{}", c.filename));
+                js = Some(with_base(&c.filename, &client_base));
             }
         }
     }
@@ -4316,9 +4339,12 @@ async fn build_client_entry(
             combined.hash(&mut h);
             h.finish()
         });
-        let name = format!("assets/style-{}.css", &hash[..8]);
+        let name = format!("{assets_dir}/style-{}.css", &hash[..8]);
+        if let Some(parent) = out_dir.join(&name).parent() {
+            fs::create_dir_all(parent)?;
+        }
         fs::write(out_dir.join(&name), combined)?;
-        Some(format!("/{name}"))
+        Some(with_base(&name, &client_base))
     };
     Ok((js, css))
 }
@@ -4502,12 +4528,12 @@ async fn build_library(
                 ..Default::default()
             })
             .build()
-            .map_err(|errs| anyhow::anyhow!("rolldown init failed: {errs:?}"))?;
+            .map_err(rolldown_failure!("rolldown init failed"))?;
 
         let output = bundler
             .write()
             .await
-            .map_err(|errs| anyhow::anyhow!("lib build ({fmt}) failed:\n{errs:?}"))?;
+            .map_err(rolldown_failure!("lib build ({fmt}) failed"))?;
         for asset in &output.assets {
             if let rolldown_common::Output::Chunk(c) = asset {
                 emitted.push((c.filename.to_string(), c.code.len()));
@@ -5071,6 +5097,7 @@ fn ssr_manifest(
         .iter()
         .map(|(c, css)| (c.as_str(), css.as_str()))
         .collect();
+    let imported_assets = chunk_imported_assets(&output.assets);
     let mut manifest = serde_json::Map::new();
     for asset in &output.assets {
         let rolldown_common::Output::Chunk(chunk) = asset else {
@@ -5108,6 +5135,12 @@ fn ssr_manifest(
             }
         } else if let Some(css) = combined_css {
             urls.push(with_base(css, base).into());
+        }
+        // importedAssets are listed for entry and non-entry chunks alike (Vite).
+        if let Some(assets) = imported_assets.get(file.as_str()) {
+            for a in assets {
+                urls.push(with_base(a, base).into());
+            }
         }
         for module_id in &chunk.modules.keys {
             let mid = module_id.to_string();
@@ -5178,17 +5211,55 @@ fn push_css_manifest_row(rows: &mut Vec<ManifestAsset>, root: &Path, src: &str, 
     });
 }
 
-/// Asset rows for the manifest, and each chunk's `assets` list: an asset a
-/// module imported (`import url from './big.png'`) is emitted with the module's
-/// root-relative path as its original file name, so the chunk containing that
-/// module imported it (Vite's viteMetadata.importedAssets).
+/// Vite's `viteMetadata.importedAssets` per chunk: an asset a module imported
+/// (`import url from './big.png'`) was emitted with the module's root-relative
+/// path as its original file name, so the chunk containing that module
+/// imported it. Keyed by chunk file name.
+fn chunk_imported_assets(
+    bundle: &[rolldown_common::Output],
+) -> std::collections::HashMap<String, Vec<String>> {
+    use rolldown_common::Output;
+    let mut by_original: Vec<(&str, String)> = Vec::new();
+    for out in bundle {
+        let Output::Asset(asset) = out else { continue };
+        if asset.names.is_empty() {
+            continue;
+        }
+        if let Some(orig) = asset.original_file_names.first() {
+            by_original.push((orig.as_str(), asset.filename.to_string()));
+        }
+    }
+    let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    if by_original.is_empty() {
+        return map;
+    }
+    for out in bundle {
+        let Output::Chunk(chunk) = out else { continue };
+        let mut assets: Vec<String> = Vec::new();
+        for id in &chunk.module_ids {
+            let id = id.as_ref();
+            let rel = id.split(['?', '#']).next().unwrap_or(id);
+            for (orig, file) in &by_original {
+                if rel.ends_with(orig) && !assets.contains(file) {
+                    assets.push(file.clone());
+                }
+            }
+        }
+        if !assets.is_empty() {
+            map.insert(chunk.filename.to_string(), assets);
+        }
+    }
+    map
+}
+
+/// Asset rows for the manifest, and each chunk's `assets` list (Vite keys an
+/// asset row by its original file name, `_<basename>` when unknown).
 fn manifest_asset_rows(
     bundle: &[rolldown_common::Output],
     entries: &mut [ManifestEntry],
     rows: &mut Vec<ManifestAsset>,
 ) {
     use rolldown_common::Output;
-    let mut by_original: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
     for out in bundle {
         let Output::Asset(asset) = out else { continue };
         if asset.names.is_empty() {
@@ -5196,10 +5267,7 @@ fn manifest_asset_rows(
         }
         let file = asset.filename.to_string();
         let key = match asset.original_file_names.first() {
-            Some(orig) => {
-                by_original.insert(orig.as_str(), file.clone());
-                orig.clone()
-            }
+            Some(orig) => orig.clone(),
             None => format!(
                 "_{}",
                 Path::new(&file).file_name().and_then(|n| n.to_str()).unwrap_or(&file)
@@ -5215,23 +5283,9 @@ fn manifest_asset_rows(
             name: asset.names.first().cloned(),
         });
     }
-    if by_original.is_empty() {
-        return;
-    }
-    for out in bundle {
-        let Output::Chunk(chunk) = out else { continue };
-        let Some(entry) = entries.iter_mut().find(|e| e.file == chunk.filename.as_str()) else {
-            continue;
-        };
-        for id in &chunk.module_ids {
-            let id = id.as_ref();
-            let rel = id.split(['?', '#']).next().unwrap_or(id);
-            let hit = by_original.iter().find(|(orig, _)| rel.ends_with(orig.as_ref() as &str));
-            if let Some((_, file)) = hit {
-                if !entry.assets.contains(file) {
-                    entry.assets.push(file.clone());
-                }
-            }
+    for (file, assets) in chunk_imported_assets(bundle) {
+        if let Some(entry) = entries.iter_mut().find(|e| e.file == file) {
+            entry.assets = assets;
         }
     }
 }

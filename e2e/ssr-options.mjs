@@ -93,6 +93,25 @@ try {
   assert.ok(ssrManifest[lazyChunk].some((u) => /^\/assets\/lazy-.*\.css$/.test(u)), "css deps of the lazy chunk listed");
   build({ build: { ssrManifest: "custom-ssr.json" } });
   assert.ok(fs.existsSync(path.join(app, "dist", "custom-ssr.json")), "ssrManifest file name honored");
+  // importedAssets: a module's imported asset url is listed for its chunk (Vite).
+  fs.writeFileSync(path.join(app, "src", "big.png"), Buffer.alloc(9000, 1));
+  fs.writeFileSync(path.join(app, "src", "lazy.js"), `import "./lazy.css";\nimport big from "./big.png";\nexport const lazy = "LAZY_MARKER" + big;\n`);
+  build({ base: "/app/", build: { ssrManifest: true } });
+  const withAssets = JSON.parse(fs.readFileSync(path.join(app, "dist", ".vite", "ssr-manifest.json"), "utf8"));
+  assert.ok(withAssets["src/lazy.js"].some((u) => /^\/app\/assets\/big-.*\.png$/.test(u)), `imported asset url listed under base: ${withAssets["src/lazy.js"]}`);
+  assert.ok(withAssets["src/big.png"]?.some((u) => /^\/app\/assets\/big-.*\.png$/.test(u)), "the asset module itself maps to its url");
+  fs.writeFileSync(path.join(app, "src", "lazy.js"), `import "./lazy.css";\nexport const lazy = "LAZY_MARKER";\n`);
+
+  // SSR app (server entry + client sibling): the client entry honors `base` for
+  // import.meta.env.BASE_URL and the script/style urls the server injects.
+  fs.writeFileSync(path.join(app, "src", "entry-client.js"), `import "./lazy.css";\nwindow.__B = import.meta.env.BASE_URL;\n`);
+  build({ base: "/app/", build: { ssr: "src/entry-server.js", assetsDir: "static" } });
+  const serverMjs = fs.readFileSync(path.join(app, "dist", "server.mjs"), "utf8");
+  assert.match(serverMjs, /"\/app\/static\/entry-client-[^"]+\.js"/, `server injects the client script under base + assetsDir: ${serverMjs.match(/CLIENT_JS = "[^"]*"/)?.[0]}`);
+  assert.match(serverMjs, /"\/app\/static\/style-[^"]+\.css"/, "server injects the client stylesheet under base + assetsDir");
+  const clientJs = fs.readdirSync(path.join(app, "dist", "static")).find((f) => f.startsWith("entry-client-") && f.endsWith(".js"));
+  assert.ok(fs.readFileSync(path.join(app, "dist", "static", clientJs), "utf8").match(/["'`]\/app\/["'`]/), "client BASE_URL define is the base");
+  fs.rmSync(path.join(app, "src", "entry-client.js"));
 
   // manualChunks object: bare names hit node_modules, ./paths hit source files.
   build({ build: { rollupOptions: { output: { manualChunks: { vendor: ["dep-ext"], utils: ["./src/utils/index.js"] } } } } });
