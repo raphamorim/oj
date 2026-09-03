@@ -2846,7 +2846,8 @@ pub async fn notify_plugin_mw_invalidate(port: u16, paths: &[String]) {
 /// Proxy one request to a loopback HTTP service (the plugin middleware server or
 /// the Start SSR runner) and stream its response back. Bodies are passed as
 /// bytes, so binary uploads and responses survive; the original `Host` travels
-/// as `x-forwarded-host` so the service can build the app's own absolute URLs.
+/// as `x-oj-host` (see `loopback_request_headers`) so the service can build the
+/// app's own absolute URLs.
 /// Stream the response through instead of buffering it: TanStack Start streams
 /// its dehydrated data (queryStream + deferred promises) into the HTML, and
 /// buffering withholds the whole document until the SSR stream closes, so the
@@ -2860,6 +2861,30 @@ pub async fn proxy_to_loopback(
     body: Option<Vec<u8>>,
 ) -> Result<Response, String> {
     proxy_to_loopback_streaming(port, method, path_and_query, headers, body.map(Body::from)).await
+}
+
+/// The headers a request forwarded to a loopback service (the plugin middleware
+/// server, the Start SSR runner) carries. hyper writes the loopback `Host`
+/// itself, so the browser's `Host` travels as `x-oj-host` and the service
+/// rebuilds `Host` from it. Only the first `Host` is taken: Node discards
+/// duplicate `Host` headers and keeps the first, so a joined value would never
+/// reach an app under Vite. A proxy's own `x-forwarded-host` passes through
+/// untouched, as under Vite where the app reads it next to the dev server's
+/// `Host`; sending it as `x-forwarded-host` too made Node join the two into
+/// `proxy-host, localhost:port`, which no URL parser accepts. An incoming
+/// `x-oj-host` is dropped so a client cannot spoof it.
+pub fn loopback_request_headers(headers: &HeaderMap) -> Vec<(header::HeaderName, header::HeaderValue)> {
+    let mut out = Vec::with_capacity(headers.len() + 1);
+    if let Some(host) = headers.get(header::HOST) {
+        out.push((header::HeaderName::from_static("x-oj-host"), host.clone()));
+    }
+    for (name, value) in headers.iter() {
+        if name == header::HOST || name.as_str() == "x-oj-host" {
+            continue;
+        }
+        out.push((name.clone(), value.clone()));
+    }
+    out
 }
 
 /// `proxy_to_loopback` with the request body streamed through as it arrives
@@ -2876,11 +2901,7 @@ pub async fn proxy_to_loopback_streaming(
     let target = format!("http://127.0.0.1:{port}{path_and_query}");
     let m = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
     let mut out = client.request(m, &target);
-    for (name, value) in headers.iter() {
-        if name == header::HOST {
-            out = out.header("x-forwarded-host", value);
-            continue;
-        }
+    for (name, value) in loopback_request_headers(headers) {
         out = out.header(name, value);
     }
     if let Some(b) = body {
@@ -9003,5 +9024,27 @@ mod adapter_tests {
         let mut html = HeaderMap::new();
         html.insert(header::ACCEPT, "text/html,*/*".parse().unwrap());
         assert!(is_spa_navigation("some.thing", &html));
+    }
+
+    #[test]
+    fn loopback_headers_carry_host_as_x_oj_host_and_pass_forwarded_host_through() {
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "localhost:8080".parse().unwrap());
+        h.append("x-forwarded-host", "app.example.com".parse().unwrap());
+        h.append("x-forwarded-host", "edge.example.com".parse().unwrap());
+        h.insert("x-oj-host", "spoofed.example.com".parse().unwrap());
+        h.insert(header::ACCEPT, "text/html".parse().unwrap());
+        let out = loopback_request_headers(&h);
+        let get = |n: &str| {
+            out.iter()
+                .filter(|(k, _)| k.as_str() == n)
+                .map(|(_, v)| v.to_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(get("x-oj-host"), ["localhost:8080"]);
+        assert_eq!(get("x-forwarded-host"), ["app.example.com", "edge.example.com"]);
+        assert!(get("host").is_empty(), "hyper writes the loopback Host itself");
+        assert_eq!(get("accept"), ["text/html"]);
+        assert!(loopback_request_headers(&HeaderMap::new()).is_empty());
     }
 }

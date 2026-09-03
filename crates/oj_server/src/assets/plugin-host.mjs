@@ -1177,6 +1177,8 @@ async function setupConfigureServer() {
     }
     const headers = { ...req.headers };
     delete headers["x-oj-forward-to"];
+    // The runner rebuilds Host from x-oj-host (Node sets the loopback Host).
+    if (headers.host) headers["x-oj-host"] = headers.host;
     delete headers.host;
     const up = http.request({ host: "127.0.0.1", port, method: req.method, path: req.url, headers }, (r) => {
       res.writeHead(r.statusCode, r.headers);
@@ -1266,6 +1268,12 @@ async function setupConfigureServer() {
   if (stack.length === 0) return;
 
   const srv = http.createServer((req, res) => {
+    // The browser's Host travels as x-oj-host (hyper owns the loopback Host):
+    // middlewares read req.headers.host as they do under Vite.
+    if (typeof req.headers["x-oj-host"] === "string") {
+      req.headers.host = req.headers["x-oj-host"].split(",")[0].trim() || req.headers.host;
+      delete req.headers["x-oj-host"];
+    }
     if (req.method === "POST" && req.url === "/__oj_invalidate") {
       let body = "";
       req.on("data", (c) => (body += c));

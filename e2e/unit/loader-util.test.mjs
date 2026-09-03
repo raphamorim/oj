@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   probe, isCjsFile, hasEsmSyntax, nearestPkgType, cjsFacade, stripJsonc, readJsonc,
-  rewriteServerFns, substituteAlias, parseImportsField, mergeTsConfig,
+  rewriteServerFns, substituteAlias, parseImportsField, mergeTsConfig, requestHost,
 } from "../../crates/oj_server/src/assets/start/loader-util.mjs";
 import { sep } from "node:path";
 
@@ -354,4 +354,13 @@ test("readJsonc accepts TypeScript configuration with a UTF-8 byte-order mark", 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("requestHost prefers x-oj-host, keeps only the first host like Node, falls back to localhost", () => {
+  assert.equal(requestHost("localhost:8080", "127.0.0.1:41234"), "localhost:8080");
+  assert.equal(requestHost(undefined, "127.0.0.1:41234"), "127.0.0.1:41234");
+  assert.equal(requestHost("preview.example.com, localhost:8080"), "preview.example.com");
+  assert.equal(requestHost(["a.example.com", "b.example.com"]), "a.example.com");
+  assert.equal(requestHost("", " "), "localhost");
+  assert.equal(requestHost(undefined, undefined), "localhost");
 });

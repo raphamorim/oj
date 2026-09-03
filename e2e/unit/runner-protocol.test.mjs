@@ -22,7 +22,7 @@ export default {
     console.log("APP_LOG_MUST_NOT_CORRUPT_PROTOCOL");
     const echo = request.method === "GET" ? "" : await request.text();
     return new Response(
-      JSON.stringify({ path: url.pathname, host: url.host, method: request.method, echo }),
+      JSON.stringify({ path: url.pathname, host: url.host, hostHeader: request.headers.get("host"), forwardedHost: request.headers.get("x-forwarded-host"), method: request.method, echo }),
       {
         status: url.pathname === "/missing" ? 404 : 200,
         headers: { "content-type": "application/json", "x-custom": "runner-ok" },
@@ -84,30 +84,41 @@ test("runner serves requests over loopback http and commands over stdin", async 
   try {
     await r.ready();
 
-    const g = await r.req({ method: "GET", url: "/hello", headers: { "x-forwarded-host": "example.test" } });
+    // The browser's Host arrives as x-oj-host (hyper owns the loopback Host);
+    // a proxy's x-forwarded-host is the app's to read, as under Vite (srvx
+    // only consults it behind a trusted proxy).
+    const g = await r.req({ method: "GET", url: "/hello", headers: { "x-oj-host": "example.test", "x-forwarded-host": "proxy.example.test" } });
     assert.equal(g.status, 200);
     assert.equal(g.headers["x-custom"], "runner-ok");
     const gbody = JSON.parse(g.body);
     assert.equal(gbody.path, "/hello");
     assert.equal(gbody.host, "example.test");
+    assert.equal(gbody.hostHeader, "example.test");
+    assert.equal(gbody.forwardedHost, "proxy.example.test");
     assert.equal(gbody.method, "GET");
 
-    const p = await r.req({ method: "POST", url: "/submit", headers: { "x-forwarded-host": "h" }, body: "payload" });
+    // Node keeps only the first of duplicate Host headers; a joined value is
+    // cut the same way instead of failing URL parsing.
+    const joined = await r.req({ url: "/hello", headers: { "x-oj-host": "first.test, second.test" } });
+    assert.equal(joined.status, 200);
+    assert.equal(JSON.parse(joined.body).host, "first.test");
+
+    const p = await r.req({ method: "POST", url: "/submit", headers: { "x-oj-host": "h" }, body: "payload" });
     assert.equal(JSON.parse(p.body).echo, "payload");
 
     const reloaded = await r.cmd({ cmd: "reload" });
     assert.equal(reloaded.reloaded, true);
-    const after = await r.req({ url: "/hello", headers: { "x-forwarded-host": "h" } });
+    const after = await r.req({ url: "/hello", headers: { "x-oj-host": "h" } });
     assert.equal(after.status, 200);
 
     // An exception escaping the handler is a 500 HTML page with message and
     // stack, like Vite's errorMiddleware fallback body.
-    const boom = await r.req({ url: "/boom", headers: { "x-forwarded-host": "h" } });
+    const boom = await r.req({ url: "/boom", headers: { "x-oj-host": "h" } });
     assert.equal(boom.status, 500);
     assert.match(boom.headers["content-type"], /text\/html/);
     assert.match(boom.body, /<h1>Internal Server Error<\/h1><h2>kaboom<\/h2><pre>Error: kaboom/);
 
-    const missing = await r.req({ url: "/missing", headers: { "x-forwarded-host": "h" } });
+    const missing = await r.req({ url: "/missing", headers: { "x-oj-host": "h" } });
     assert.equal(missing.status, 404);
 
     assert.match(r.getStderr(), /APP_LOG_MUST_NOT_CORRUPT_PROTOCOL/);
