@@ -557,8 +557,11 @@ impl DevServer {
                     } else {
                         println!("  plugins: {plugins_label}");
                         if !is_start {
+                            // Vite awaits the client buildStart while initing the
+                            // server; a rejection fails startup rather than serving.
                             if let Err(e) = host.build_start().await {
-                                eprintln!("oj: plugin buildStart failed: {e}");
+                                host.shutdown();
+                                anyhow::bail!("plugin buildStart failed:\n{e}");
                             }
                         }
                         Some(host)
