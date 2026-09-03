@@ -140,6 +140,9 @@ jobs:
       - name: stylesheet Vite parity (alias, root-absolute, hacks, css modules, ?inline, postcss order)
         if: matrix.mode == 'unbundled'
         run: node e2e/css-vite-parity.mjs
+      - name: start prod build for @cloudflare/vite-plugin is a Worker bundle that renders in workerd
+        if: matrix.mode == 'unbundled'
+        run: node e2e/start-cloudflare.mjs
 
   # i need to fix this or automate
   build:
