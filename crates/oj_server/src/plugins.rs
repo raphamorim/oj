@@ -247,25 +247,30 @@ pub fn extract_vite_values(root: &Path, command: &str, mode: &str) -> Option<Vit
         eprint!("{stderr}");
     }
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    if json.get("__ok").and_then(|v| v.as_bool()) == Some(true) {
-        let deps: Vec<PathBuf> = json
-            .get("__deps")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|d| d.as_str().map(PathBuf::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        store.store(
-            &vite,
-            command,
-            mode,
-            &deps,
-            &String::from_utf8_lossy(&out.stdout),
-            &stderr,
-        );
+    // The extractor reports a config that failed to evaluate as `__ok: false`
+    // (having printed the cause to stderr above). That is not a config with no
+    // values, so never parse it into an empty ViteValues: return None and let the
+    // caller decide whether a present-but-broken vite.config is an error.
+    if json.get("__ok").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
     }
+    let deps: Vec<PathBuf> = json
+        .get("__deps")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|d| d.as_str().map(PathBuf::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    store.store(
+        &vite,
+        command,
+        mode,
+        &deps,
+        &String::from_utf8_lossy(&out.stdout),
+        &stderr,
+    );
     crate::boot_phase("vite-extract cache miss (subprocess ran)");
     Some(parse_vite_values(&json))
 }
@@ -316,11 +321,23 @@ pub fn adopt_vite_config_values(
     root: &Path,
     command: &str,
     mode: &str,
-) {
+) -> Result<(), String> {
     let Some(v) = extract_vite_values(root, command, mode) else {
-        return;
+        // No vite.config is fine: nothing to adopt. A vite.config that exists but
+        // failed to evaluate is not: Vite fails hard here ("failed to load config
+        // from ..."), and silently carrying on would build or serve with defaults
+        // the app never asked for. An explicit oj.plugins file takes precedence over
+        // vite.config (the extractor skips it then), so only the vite path is an
+        // error. The extractor has already printed the underlying cause to stderr.
+        if plugins_file(root).is_none() {
+            if let Some(path) = vite_config_file(root) {
+                return Err(format!("failed to load config from {}", path.display()));
+            }
+        }
+        return Ok(());
     };
     merge_vite_values(config, v);
+    Ok(())
 }
 
 fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {

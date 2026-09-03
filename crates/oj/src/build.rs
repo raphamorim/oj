@@ -1428,7 +1428,8 @@ pub async fn build(
 
     let mut config =
         oj_config::load_with(&root, "build", mode).map_err(|e| anyhow::anyhow!("{e}"))?;
-    oj_server::plugins::adopt_vite_config_values(&mut config, &root, "build", mode);
+    oj_server::plugins::adopt_vite_config_values(&mut config, &root, "build", mode)
+        .map_err(|e| anyhow::anyhow!(e))?;
     let build_cfg = config.build.clone().unwrap_or_default();
     let ro_opts = oj_config::rolldown_options(&config);
     let out = out
@@ -2111,7 +2112,8 @@ pub(crate) async fn build_ssr(
 
     let mut config =
         oj_config::load_with(root, "build", mode).map_err(|e| anyhow::anyhow!("{e}"))?;
-    oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", mode);
+    oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", mode)
+        .map_err(|e| anyhow::anyhow!(e))?;
     let loaded_env = oj_env::load(root, mode);
     let node_env = oj_env::resolve_node_env(shell_node_env().as_deref(), &loaded_env, "production");
     let is_production = node_env == "production";
@@ -2268,7 +2270,8 @@ async fn build_server_fns(root: &Path, out_dir: &Path, mode: &str) -> anyhow::Re
     use rolldown::{IsExternal, Platform};
     let mut config =
         oj_config::load_with(root, "build", mode).map_err(|e| anyhow::anyhow!("{e}"))?;
-    oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", mode);
+    oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", mode)
+        .map_err(|e| anyhow::anyhow!(e))?;
     let node_env =
         oj_env::resolve_node_env(shell_node_env().as_deref(), &oj_env::load(root, mode), "production");
     let is_production = node_env == "production";
@@ -2624,7 +2627,8 @@ async fn build_client_entry(
 
     let mut config =
         oj_config::load_with(root, "build", mode).map_err(|e| anyhow::anyhow!("{e}"))?;
-    oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", mode);
+    oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", mode)
+        .map_err(|e| anyhow::anyhow!(e))?;
     let loaded_env = oj_env::load(root, mode);
     let node_env = oj_env::resolve_node_env(shell_node_env().as_deref(), &loaded_env, "production");
     let is_production = node_env == "production";
