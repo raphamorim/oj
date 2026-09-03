@@ -613,6 +613,12 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
         if build.ssr_manifest.is_none() {
             build.ssr_manifest = bool_or_str("ssrManifest");
         }
+        if build.lib.is_none() {
+            build.lib = vb
+                .get("lib")
+                .cloned()
+                .and_then(|l| serde_json::from_value::<oj_config::LibConfig>(l).ok());
+        }
     }
     if v.cors.is_some() || v.allowed_hosts.is_some() {
         let sc = config.server.get_or_insert_with(Default::default);

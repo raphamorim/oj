@@ -219,6 +219,20 @@ function extractBuild(b) {
   if (typeof b.ssr === "string" || typeof b.ssr === "boolean") out.ssr = b.ssr;
   if (typeof b.ssrManifest === "string" || typeof b.ssrManifest === "boolean") out.ssrManifest = b.ssrManifest;
   if (typeof b.copyPublicDir === "boolean") out.copyPublicDir = b.copyPublicDir;
+  if (b.lib && typeof b.lib === "object") {
+    const lib = {};
+    const e = b.lib.entry;
+    const isStrList = (v) => Array.isArray(v) && v.every((s) => typeof s === "string");
+    const isStrMap = (v) => v && typeof v === "object" && !Array.isArray(v) && Object.values(v).every((s) => typeof s === "string");
+    if (typeof e === "string" || isStrList(e) || isStrMap(e)) lib.entry = e;
+    if (typeof b.lib.name === "string") lib.name = b.lib.name;
+    if (isStrList(b.lib.formats)) lib.formats = b.lib.formats;
+    if (typeof b.lib.fileName === "string") lib.fileName = b.lib.fileName;
+    else if (typeof b.lib.fileName === "function") warn("build.lib.fileName is a function and cannot be applied; the default file name is used");
+    if (typeof b.lib.cssFileName === "string") lib.cssFileName = b.lib.cssFileName;
+    if (lib.entry) out.lib = lib;
+    else warn("build.lib.entry is required when build.lib is set");
+  }
   return Object.keys(out).length ? out : null;
 }
 

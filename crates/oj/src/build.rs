@@ -3791,22 +3791,88 @@ async fn build_library(
     minify: bool,
     sourcemap: oj_config::Sourcemap,
 ) -> anyhow::Result<()> {
-    let node_env =
-        oj_env::resolve_node_env(shell_node_env().as_deref(), &oj_env::load(root, mode), "production");
+    let loaded_env = oj_env::load(&env_dir_of(root, config), mode);
+    let node_env = oj_env::resolve_node_env(shell_node_env().as_deref(), &loaded_env, "production");
     let is_production = node_env == "production";
-    let entry_import = if lib.entry.starts_with('.') {
-        lib.entry.clone()
-    } else {
-        format!("./{}", lib.entry)
-    };
-    let file_name = lib.file_name.clone().unwrap_or_else(|| {
-        Path::new(&lib.entry)
+    let env_prefixes = env_prefixes_of(config);
+    let env_prefix_refs: Vec<&str> = env_prefixes.iter().map(String::as_str).collect();
+    let import_of = |p: &str| if p.starts_with('.') { p.to_string() } else { format!("./{p}") };
+    let stem_of = |p: &str| {
+        Path::new(p)
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("index")
             .to_string()
+    };
+    // Vite: a string entry is named by its stem, a list by each stem, an object
+    // by its aliases (`resolveRolldownOptions`).
+    let entries: Vec<(String, String)> = match &lib.entry {
+        oj_config::LibEntry::One(p) => vec![(stem_of(p), import_of(p))],
+        oj_config::LibEntry::Many(ps) => ps.iter().map(|p| (stem_of(p), import_of(p))).collect(),
+        oj_config::LibEntry::Named(m) => m.iter().map(|(k, p)| (k.clone(), import_of(p))).collect(),
+    };
+    if entries.is_empty() {
+        bail!("build.lib.entry resolved to no entries");
+    }
+    let multiple = entries.len() > 1;
+    // Vite's `resolveLibFilename`: `fileName`, else the (unscoped) package.json
+    // name for a single string entry, else the entry's own name; the extension
+    // follows the package `type` (`resolveOutputJsExtension`).
+    let pkg: Option<serde_json::Value> = fs::read_to_string(root.join("package.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let pkg_type_module = pkg
+        .as_ref()
+        .and_then(|p| p.get("type"))
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| t == "module");
+    let pkg_name = pkg
+        .as_ref()
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        .map(|n| n.strip_prefix('@').and_then(|s| s.split_once('/')).map(|(_, rest)| rest).unwrap_or(n).to_string());
+    let single_string_entry = matches!(lib.entry, oj_config::LibEntry::One(_));
+    let base_name: Option<String> = match (&lib.file_name, multiple) {
+        (Some(f), false) => Some(f.clone()),
+        (Some(_), true) => {
+            eprintln!("oj build: (!) build.lib.fileName is ignored with multiple entries; each entry keeps its own name");
+            None
+        }
+        (None, false) if single_string_entry && pkg.is_some() => Some(
+            pkg_name
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Name in package.json is required if option \"build.lib.fileName\" is not provided."))?,
+        ),
+        (None, false) => Some(entries[0].0.clone()),
+        (None, true) => None,
+    };
+    let js_ext = |fmt: &str| -> &'static str {
+        if pkg_type_module {
+            if matches!(fmt, "cjs" | "umd") { "cjs" } else { "js" }
+        } else if matches!(fmt, "es" | "esm") {
+            "mjs"
+        } else {
+            "js"
+        }
+    };
+    // Vite's `resolveBuildOutputs`: default formats are es+umd for one entry and
+    // es+cjs for several; umd/iife need a single entry and `build.lib.name`.
+    let formats = lib.formats.clone().unwrap_or_else(|| {
+        if multiple { vec!["es".into(), "cjs".into()] } else { vec!["es".into(), "umd".into()] }
     });
-    let formats = lib.formats.clone().unwrap_or_else(|| vec!["es".into()]);
+    for fmt in &formats {
+        if lib_format(fmt).is_none() {
+            bail!("unknown lib format: {fmt} (es, cjs, umd, iife)");
+        }
+        if matches!(fmt.as_str(), "umd" | "iife") {
+            if multiple {
+                bail!("Multiple entry points are not supported when output formats include \"umd\" or \"iife\".");
+            }
+            if lib.name.is_none() {
+                bail!("Option \"build.lib.name\" is required when output formats include \"umd\" or \"iife\".");
+            }
+        }
+    }
 
     prepare_out_dir(root, out_dir, config.build.as_ref().and_then(|b| b.empty_out_dir))?;
     let started = Instant::now();
@@ -3814,17 +3880,32 @@ async fn build_library(
     let mut emitted: Vec<(String, usize)> = Vec::new();
 
     for fmt in &formats {
-        let (ext, needs_name) = lib_format(fmt)
-            .ok_or_else(|| anyhow::anyhow!("unknown lib format: {fmt} (es, cjs, umd, iife)"))?;
         let format = match fmt.as_str() {
             "es" | "esm" => OutputFormat::Esm,
             "cjs" => OutputFormat::Cjs,
             "umd" => OutputFormat::Umd,
             _ => OutputFormat::Iife,
         };
-        if needs_name && lib.name.is_none() {
-            bail!("build.lib.name is required for the '{fmt}' format");
-        }
+        let ext = js_ext(fmt);
+        // `name.js` / `name.cjs` for es and cjs, `name.umd.js` / `name.iife.js`
+        // otherwise (Vite `resolveLibFilename`).
+        let name_pattern = base_name.clone().unwrap_or_else(|| "[name]".to_string());
+        let entry_file = if matches!(fmt.as_str(), "es" | "esm" | "cjs") {
+            format!("{name_pattern}.{ext}")
+        } else {
+            format!("{name_pattern}.{fmt}.{ext}")
+        };
+        // An ES library keeps its whitespace so `/* @__PURE__ */` annotations
+        // survive for the consumer's tree-shaking (Vite `codegen: false`).
+        let minify_opts = if minify && matches!(fmt.as_str(), "es" | "esm") {
+            RawMinifyOptions::Object(rolldown_common::RawMinifyOptionsDetailed {
+                mangle: Some(rolldown_common::RawMangleOptions::default()),
+                compress: Some(rolldown_common::RawCompressOptions::default()),
+                remove_whitespace: false,
+            })
+        } else {
+            RawMinifyOptions::Bool(minify)
+        };
 
         let mut bundler = BundlerBuilder::default()
             .with_plugins(vec![Arc::new(OjCssPlugin {
@@ -3840,21 +3921,39 @@ async fn build_library(
                 html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
             })])
             .with_options(BundlerOptions {
-                input: Some(vec![InputItem {
-                    name: Some(file_name.clone()),
-                    import: entry_import.clone(),
-                    ..Default::default()
-                }]),
+                input: Some(
+                    entries
+                        .iter()
+                        .map(|(name, import)| InputItem {
+                            name: Some(name.clone()),
+                            import: import.clone(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                ),
                 cwd: Some(root.to_path_buf()),
                 dir: Some(out_dir.display().to_string()),
+                resolve: rolldown_resolve(root, config, "client"),
                 format: Some(format),
                 name: lib.name.clone(),
-                entry_filenames: Some(format!("{file_name}.{ext}").into()),
-                chunk_filenames: Some(format!("{file_name}-[hash].{ext}").into()),
-                minify: Some(RawMinifyOptions::Bool(minify)),
+                entry_filenames: Some(entry_file.into()),
+                chunk_filenames: Some(format!("[name]-[hash].{ext}").into()),
+                asset_filenames: Some("[name].[ext]".to_string().into()),
+                code_splitting: matches!(fmt.as_str(), "umd" | "iife")
+                    .then_some(rolldown_common::CodeSplittingMode::Bool(false)),
+                minify: Some(minify_opts),
                 sourcemap: sourcemap_type(sourcemap),
                 transform: transform_options(config, is_production),
-                define: Some(node_env_defines(&node_env).into_iter().collect()),
+                // Vite's define plugin adds no `process.env` defines for a library
+                // (rolldown's own browser-platform NODE_ENV default still applies,
+                // as under Vite); import.meta.env and the user's `define` do.
+                define: Some({
+                    let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &env_prefix_refs);
+                    let mut pairs = oj_env::import_meta_env_defines(&env, mode, !is_production, "/", &env_prefix_refs);
+                    pairs.extend(oj_config::config_defines(config));
+                    pairs.extend(oj_config::environment_defines(config, "client"));
+                    pairs.into_iter().collect()
+                }),
                 ..Default::default()
             })
             .build()
@@ -3878,7 +3977,14 @@ async fn build_library(
             .map(|(_, css)| css)
             .collect::<Vec<_>>()
             .join("\n");
-        let css_name = format!("{file_name}.css");
+        // Vite: `build.lib.cssFileName`, else the library's file name / package name.
+        let css_stem = lib
+            .css_file_name
+            .clone()
+            .or_else(|| base_name.clone())
+            .or_else(|| pkg_name.clone())
+            .unwrap_or_else(|| "style".to_string());
+        let css_name = format!("{css_stem}.css");
         fs::write(out_dir.join(&css_name), &combined)?;
         emitted.push((css_name, combined.len()));
     }
@@ -3896,12 +4002,11 @@ async fn build_library(
     Ok(())
 }
 
-fn lib_format(fmt: &str) -> Option<(&'static str, bool)> {
+/// The library formats Vite accepts; `true` when the format needs `build.lib.name`.
+fn lib_format(fmt: &str) -> Option<bool> {
     match fmt {
-        "es" | "esm" => Some(("js", false)),
-        "cjs" => Some(("cjs", false)),
-        "umd" => Some(("umd.js", true)),
-        "iife" => Some(("iife.js", true)),
+        "es" | "esm" | "cjs" => Some(false),
+        "umd" | "iife" => Some(true),
         _ => None,
     }
 }
@@ -4925,6 +5030,68 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// `build.lib` from vite.config: Vite's entry forms, default formats
+    /// (es+umd for one entry, es+cjs for several), file names from the package
+    /// name and `type`, and `cssFileName`.
+    #[tokio::test]
+    async fn vite_config_build_lib_is_honored_with_vite_naming() {
+        // One string entry in a `type: module` package named `@scope/my-lib`.
+        let root = scratch("vite-lib-single");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("package.json"), r#"{"name":"@scope/my-lib","type":"module"}"#).unwrap();
+        fs::write(root.join("src/index.ts"), "import './style.css';\nexport const add = (a: number, b: number) => a + b;\n").unwrap();
+        fs::write(root.join("src/style.css"), ".a{color:red}").unwrap();
+        fs::write(
+            root.join("vite.config.mjs"),
+            "export default { build: { lib: { entry: 'src/index.ts', name: 'MyLib' } } };",
+        )
+        .unwrap();
+        build(root.clone(), None, None, Some("production"), false)
+            .await
+            .expect("vite.config build.lib should build");
+        assert!(root.join("dist/my-lib.js").is_file(), "es output named after the unscoped package");
+        assert!(root.join("dist/my-lib.umd.cjs").is_file(), "umd is a default format; .cjs under type module");
+        assert!(root.join("dist/my-lib.css").is_file());
+        assert!(!root.join("dist/index.js").exists());
+        fs::remove_dir_all(&root).unwrap();
+
+        // Several aliased entries in a commonjs package: es+cjs, per-entry names.
+        let root = scratch("vite-lib-multi");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("package.json"), r#"{"name":"multi"}"#).unwrap();
+        fs::write(root.join("src/a.ts"), "export const a = 1;\n").unwrap();
+        fs::write(root.join("src/b.ts"), "export const b = 2;\n").unwrap();
+        fs::write(
+            root.join("vite.config.mjs"),
+            "export default { build: { lib: { entry: { main: 'src/a.ts', extra: 'src/b.ts' }, cssFileName: 'theme' } } };",
+        )
+        .unwrap();
+        build(root.clone(), None, None, Some("production"), false)
+            .await
+            .expect("multi-entry lib should build");
+        for f in ["main.mjs", "extra.mjs", "main.js", "extra.js"] {
+            assert!(root.join("dist").join(f).is_file(), "missing {f}");
+        }
+        assert!(!root.join("dist/main.umd.js").exists(), "umd is not a default with several entries");
+        fs::remove_dir_all(&root).unwrap();
+
+        // umd without a name is Vite's error, not a silent es-only build.
+        let root = scratch("vite-lib-noname");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("package.json"), r#"{"name":"noname"}"#).unwrap();
+        fs::write(root.join("src/index.ts"), "export const a = 1;\n").unwrap();
+        fs::write(
+            root.join("vite.config.mjs"),
+            "export default { build: { lib: { entry: 'src/index.ts', formats: ['umd'] } } };",
+        )
+        .unwrap();
+        let err = build(root.clone(), None, None, Some("production"), false)
+            .await
+            .expect_err("umd needs build.lib.name");
+        assert!(err.to_string().contains("build.lib.name"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn manifest_matches_vite_shape() {
         let mk = |key: &str,
@@ -5021,11 +5188,11 @@ mod tests {
 
     #[test]
     fn lib_format_mapping() {
-        assert_eq!(lib_format("es"), Some(("js", false)));
-        assert_eq!(lib_format("esm"), Some(("js", false)));
-        assert_eq!(lib_format("cjs"), Some(("cjs", false)));
-        assert_eq!(lib_format("umd"), Some(("umd.js", true)));
-        assert_eq!(lib_format("iife"), Some(("iife.js", true)));
+        assert_eq!(lib_format("es"), Some(false));
+        assert_eq!(lib_format("esm"), Some(false));
+        assert_eq!(lib_format("cjs"), Some(false));
+        assert_eq!(lib_format("umd"), Some(true));
+        assert_eq!(lib_format("iife"), Some(true));
         assert_eq!(lib_format("amd"), None);
     }
 
