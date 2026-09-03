@@ -356,6 +356,9 @@ async fn compile_stylesheet(
     if oj_server::sidecar::is_tailwind_css(&source) || has_postcss {
         source = expand_css_via_sidecar(root, std::path::Path::new(path), &source)?;
     }
+    // Plain `@import`s are inlined (postcss-import parity) so the concatenated
+    // chunk stylesheet does not carry imports that 404 from `assets/`.
+    source = oj_css::inline_imports(&source, std::path::Path::new(path)).map_err(|e| anyhow::anyhow!(e))?;
     let css_id = match std::path::Path::new(path).strip_prefix(root) {
         Ok(rel) => format!("/{}", rel.display()),
         Err(_) => path.to_string(),
@@ -1780,6 +1783,11 @@ pub async fn build(
         oj_env::html_env_map(&defines)
     };
     let mut emitted: Vec<(String, usize)> = Vec::new();
+    let asset_names_pattern = ro_output_str(ro_opts, "assetFileNames");
+    let css_asset_opts = CssAssetOpts {
+        inline_limit: assets_inline_limit_of(&config),
+        asset_names: asset_names_pattern.as_deref(),
+    };
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
     let mut imports_map: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
@@ -1858,12 +1866,12 @@ pub async fn build(
                         .parent()
                         .map(Path::to_path_buf)
                         .unwrap_or_else(|| root.to_path_buf());
-                    rebase_css_urls(&css, &dir, &out_dir, &base, &mut emitted, &mut seen_assets)
+                    rebase_css_urls(&css, &dir, &out_dir, &base, css_asset_opts, &mut emitted, &mut seen_assets)
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
             let hash = content_hash(combined.as_bytes());
-            let css_name = format!("assets/style-{}.css", &hash[..8]);
+            let css_name = render_asset_name(css_asset_opts.asset_names, "style", &hash, "css");
             fs::write(out_dir.join(&css_name), &combined)?;
             emitted.push((css_name.clone(), combined.len()));
             for entry in &mut manifest_entries {
@@ -1951,6 +1959,7 @@ pub async fn build(
                 &out_dir,
                 &root,
                 &base,
+                css_asset_opts,
                 &mut emitted,
                 &mut manifest_entries,
                 &mut rewritten_html,
@@ -2933,11 +2942,37 @@ fn content_hash(bytes: &[u8]) -> String {
 
 /// Emit a CSS-referenced asset (font/image) under a content hash and return its
 /// base-prefixed URL, or None to leave the `url()` untouched (data:/absolute/external).
+/// How files oj writes itself (CSS url() assets, chunk stylesheets) are named
+/// and when they are inlined: `build.assetsInlineLimit` and
+/// `build.rollupOptions.output.assetFileNames`.
+#[derive(Debug, Clone, Copy)]
+struct CssAssetOpts<'a> {
+    inline_limit: u64,
+    asset_names: Option<&'a str>,
+}
+
+/// Render Vite/rolldown `assetFileNames` placeholders (`[name]`, `[hash]`,
+/// `[ext]`, `[extname]`); the default is Vite's `assets/[name]-[hash][extname]`.
+fn render_asset_name(pattern: Option<&str>, name: &str, hash: &str, ext: &str) -> String {
+    let pattern = pattern.unwrap_or("assets/[name]-[hash][extname]");
+    let extname = if ext.is_empty() {
+        String::new()
+    } else {
+        format!(".{ext}")
+    };
+    pattern
+        .replace("[name]", name)
+        .replace("[hash]", &hash[..hash.len().min(8)])
+        .replace("[extname]", &extname)
+        .replace("[ext]", ext)
+}
+
 fn emit_css_url(
     inner: &str,
     css_dir: &Path,
     out_dir: &Path,
     base: &str,
+    opts: CssAssetOpts<'_>,
     emitted: &mut Vec<(String, usize)>,
     seen: &mut std::collections::HashMap<PathBuf, String>,
 ) -> Option<String> {
@@ -2958,14 +2993,18 @@ fn emit_css_url(
         return Some(format!("{url}{suffix}"));
     }
     let data = std::fs::read(&abs).ok()?;
+    let ext = abs.extension().and_then(|s| s.to_str()).unwrap_or("");
+    // Small assets referenced from CSS are inlined as in Vite (assetsInlineLimit),
+    // except an svg with a fragment, which must stay a file to keep its `#id`.
+    if (data.len() as u64) <= opts.inline_limit && !suffix.starts_with('#') {
+        if ext.eq_ignore_ascii_case("svg") {
+            return Some(svg_data_url(&String::from_utf8_lossy(&data)));
+        }
+        return Some(format!("data:{};base64,{}", asset_mime(ext), b64(&data)));
+    }
     let hash = content_hash(&data);
     let stem = abs.file_stem().and_then(|s| s.to_str()).unwrap_or("asset");
-    let ext = abs
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(|e| format!(".{e}"))
-        .unwrap_or_default();
-    let name = format!("assets/{}-{}{}", sanitize_asset_name(stem), &hash[..8], ext);
+    let name = render_asset_name(opts.asset_names, &sanitize_asset_name(stem), &hash, ext);
     let dest = out_dir.join(&name);
     if let Some(p) = dest.parent() {
         let _ = std::fs::create_dir_all(p);
@@ -2985,6 +3024,7 @@ fn rebase_css_urls(
     css_dir: &Path,
     out_dir: &Path,
     base: &str,
+    opts: CssAssetOpts<'_>,
     emitted: &mut Vec<(String, usize)>,
     seen: &mut std::collections::HashMap<PathBuf, String>,
 ) -> String {
@@ -3003,7 +3043,7 @@ fn rebase_css_urls(
             .trim()
             .trim_matches(|c| c == '"' || c == '\'')
             .trim();
-        match emit_css_url(inner, css_dir, out_dir, base, emitted, seen) {
+        match emit_css_url(inner, css_dir, out_dir, base, opts, emitted, seen) {
             Some(url) => {
                 out.push_str("url(\"");
                 out.push_str(&url);
@@ -3034,6 +3074,7 @@ fn emit_split_css(
     out_dir: &Path,
     root: &Path,
     base: &str,
+    opts: CssAssetOpts<'_>,
     emitted: &mut Vec<(String, usize)>,
     manifest_entries: &mut [ManifestEntry],
     rewritten_html: &mut String,
@@ -3077,6 +3118,7 @@ fn emit_split_css(
                     &dir,
                     out_dir,
                     base,
+                    opts,
                     emitted,
                     &mut seen_assets,
                 ));
@@ -3086,11 +3128,10 @@ fn emit_split_css(
             continue;
         }
         let hash = content_hash(css.as_bytes());
-        let css_name = format!(
-            "assets/{}-{}.css",
-            sanitize_asset_name(&chunk.name),
-            &hash[..8]
-        );
+        let css_name = render_asset_name(opts.asset_names, &sanitize_asset_name(&chunk.name), &hash, "css");
+        if let Some(parent) = out_dir.join(&css_name).parent() {
+            fs::create_dir_all(parent)?;
+        }
         fs::write(out_dir.join(&css_name), &css)?;
         emitted.push((css_name.clone(), css.len()));
         for entry in manifest_entries.iter_mut() {
@@ -3651,6 +3692,14 @@ mod tests {
             let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
             assert_eq!(b64(&bytes).len() % 4, 0, "len {len}");
         }
+    }
+
+    #[test]
+    fn asset_file_names_render_vite_placeholders() {
+        assert_eq!(render_asset_name(None, "bg", "0123456789abcdef", "png"), "assets/bg-01234567.png");
+        assert_eq!(render_asset_name(Some("static/[name].[hash][extname]"), "bg", "0123456789abcdef", "png"), "static/bg.01234567.png");
+        assert_eq!(render_asset_name(Some("[ext]/[name]-[hash].[ext]"), "app", "abcdef0123456789", "css"), "css/app-abcdef01.css");
+        assert_eq!(render_asset_name(None, "x", "abcd", ""), "assets/x-abcd");
     }
 
     #[test]

@@ -2415,6 +2415,9 @@ async fn ensure_module(
             } else {
                 source.clone()
             };
+            // Plain `@import`s are inlined (postcss-import parity) so the injected
+            // stylesheet does not @import a bare specifier or a wrong-relative url.
+            let css_src = oj_css::inline_imports(&css_src, &file_owned)?;
             let output = oj_css::compile_css_rebased(&url_owned, &css_src, false)?;
             return Ok(CachedModule {
                 is_boundary: true,
