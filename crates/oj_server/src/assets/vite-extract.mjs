@@ -159,6 +159,7 @@ function extractProxy(proxy) {
       const entry = { target: v.target };
       if (typeof v.changeOrigin === "boolean") entry.changeOrigin = v.changeOrigin;
       if (typeof v.ws === "boolean") entry.ws = v.ws;
+      if (typeof v.secure === "boolean") entry.secure = v.secure;
       if (typeof v.rewrite === "function") {
         warn(`server.proxy["${ctx}"].rewrite is a function; oj applies only {from,to} string rewrites`);
       }

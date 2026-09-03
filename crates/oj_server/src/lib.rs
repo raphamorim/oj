@@ -266,6 +266,8 @@ struct ServerState {
     preload_snapshot: Vec<String>,
     proxy: Vec<(String, oj_config::ProxyEntry)>,
     http: reqwest::Client,
+    /// For `server.proxy` entries with `secure: false`: accepts any certificate.
+    http_insecure: reqwest::Client,
     virtual_modules: std::collections::BTreeMap<String, String>,
     jsx_overrides: std::collections::BTreeMap<String, String>,
     jsx: oj_compiler::JsxConfig,
@@ -745,6 +747,10 @@ impl DevServer {
             preload_snapshot: load_graph_snapshot(&root),
             proxy,
             http: reqwest::Client::new(),
+            http_insecure: reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             virtual_modules: config.virtual_modules.clone().unwrap_or_default(),
             jsx_overrides,
             jsx,
@@ -1761,7 +1767,8 @@ async fn proxy_middleware(
         }
     };
 
-    let mut out = state.http.request(method, &target).body(body);
+    let client = if entry.secure() { &state.http } else { &state.http_insecure };
+    let mut out = client.request(method, &target).body(body);
     for (name, value) in req_headers.iter() {
         if entry.change_origin() && name == header::HOST {
             continue;
@@ -1827,6 +1834,120 @@ fn ws_forwardable_header(name: &header::HeaderName) -> bool {
     )
 }
 
+trait ProxyIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> ProxyIo for T {}
+type ProxyUpstreamIo = Box<dyn ProxyIo>;
+
+/// `host:port` of a url authority, with the scheme's default port and IPv6
+/// brackets handled.
+fn split_host_port(authority: &str, default_port: u16) -> (String, u16) {
+    let authority = authority.split('@').next_back().unwrap_or(authority);
+    if let Some(rest) = authority.strip_prefix('[') {
+        if let Some((host, tail)) = rest.split_once(']') {
+            let port = tail
+                .strip_prefix(':')
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(default_port);
+            return (host.to_string(), port);
+        }
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() => match port.parse() {
+            Ok(p) => (host.to_string(), p),
+            Err(_) => (authority.to_string(), default_port),
+        },
+        _ => (authority.to_string(), default_port),
+    }
+}
+
+/// A rustls client config for a proxied `wss://` target: the platform trust store
+/// (what reqwest verifies with for the HTTP side), or no verification at all when
+/// the proxy entry says `secure: false` (http-proxy's `secure`), for self-signed
+/// dev backends.
+fn proxy_tls_config(secure: bool) -> Result<rustls::ClientConfig, String> {
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(std::sync::Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?;
+    let verifier: std::sync::Arc<dyn rustls::client::danger::ServerCertVerifier> = if secure {
+        std::sync::Arc::new(
+            rustls_platform_verifier::Verifier::new(std::sync::Arc::clone(&provider))
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        std::sync::Arc::new(AcceptAnyCertificate(provider))
+    };
+    Ok(builder
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth())
+}
+
+/// `secure: false`: the certificate is not checked; signatures still are, so the
+/// connection is at least the one the server we reached is speaking on.
+#[derive(Debug)]
+struct AcceptAnyCertificate(std::sync::Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyCertificate {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Dial the upstream of a proxied WebSocket: plain TCP for `ws://`, TLS for
+/// `wss://` (see `proxy_tls_config`).
+async fn connect_proxy_ws_upstream(url: &str, secure: bool) -> Result<ProxyUpstreamIo, String> {
+    let (tls, rest) = if let Some(r) = url.strip_prefix("wss://") {
+        (true, r)
+    } else if let Some(r) = url.strip_prefix("ws://") {
+        (false, r)
+    } else {
+        return Err(format!("unsupported websocket target {url}"));
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let (host, port) = split_host_port(authority, if tls { 443 } else { 80 });
+    let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
+        .await
+        .map_err(|e| format!("connect {host}:{port}: {e}"))?;
+    if !tls {
+        return Ok(Box::new(tcp));
+    }
+    let config = proxy_tls_config(secure)?;
+    let name = rustls::pki_types::ServerName::try_from(host.clone())
+        .map_err(|e| format!("invalid server name {host}: {e}"))?;
+    let stream = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
+        .connect(name, tcp)
+        .await
+        .map_err(|e| format!("tls to {host}:{port}: {e}"))?;
+    Ok(Box::new(stream))
+}
+
 /// `server.proxy` with `ws: true`: accept the browser's WebSocket, open one to
 /// the target with the same path, query, subprotocols and cookies, and relay
 /// messages both ways until either side closes (Vite: http-proxy `ws`).
@@ -1845,13 +1966,6 @@ async fn proxy_websocket(
         Err(rejection) => return rejection.into_response(),
     };
     let url = ws_target_url(target);
-    if url.starts_with("wss://") {
-        return (
-            StatusCode::BAD_GATEWAY,
-            format!("oj proxy: wss:// targets are not supported yet ({url})"),
-        )
-            .into_response();
-    }
     // tungstenite takes a ready-made request as-is: the handshake headers have
     // to be present (it generates them only for a bare url), then the browser's
     // remaining headers (cookies, origin, subprotocols) ride along.
@@ -1875,14 +1989,26 @@ async fn proxy_websocket(
             builder = builder.header(name, value);
         }
     }
-    let _ = entry;
     let upstream_req = match builder.body(()) {
         Ok(r) => r,
         Err(e) => {
             return (StatusCode::BAD_GATEWAY, format!("oj proxy: ws request: {e}")).into_response()
         }
     };
-    let (upstream, upstream_resp) = match tokio_tungstenite::connect_async(upstream_req).await {
+    // `wss://` targets are dialed over TLS here (system trust store, or any
+    // certificate when the entry says `secure: false`), then tungstenite runs its
+    // handshake over that stream, as http-proxy does for a `wss:` target.
+    let io = match connect_proxy_ws_upstream(&url, entry.secure()).await {
+        Ok(io) => io,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("oj proxy: websocket to {url} failed: {e}"),
+            )
+                .into_response()
+        }
+    };
+    let (upstream, upstream_resp) = match tokio_tungstenite::client_async(upstream_req, io).await {
         Ok(pair) => pair,
         Err(e) => {
             return (
@@ -6620,6 +6746,21 @@ mod tests {
     fn ws_proxy_target_and_header_rules() {
         assert_eq!(ws_target_url("http://localhost:4000"), "ws://localhost:4000");
         assert_eq!(ws_target_url("https://api.test"), "wss://api.test");
+    }
+
+    #[test]
+    fn split_host_port_handles_defaults_and_ipv6() {
+        assert_eq!(split_host_port("api.test", 443), ("api.test".into(), 443));
+        assert_eq!(split_host_port("api.test:8443", 443), ("api.test".into(), 8443));
+        assert_eq!(split_host_port("[::1]:9000", 80), ("::1".into(), 9000));
+        assert_eq!(split_host_port("[::1]", 80), ("::1".into(), 80));
+        assert_eq!(split_host_port("user:pw@host:1", 80), ("host".into(), 1));
+    }
+
+    #[test]
+    fn proxy_tls_configs_build_for_both_secure_settings() {
+        assert!(proxy_tls_config(false).is_ok(), "accept-any config");
+        assert!(proxy_tls_config(true).is_ok(), "platform verifier config");
         assert_eq!(ws_target_url("ws://x:1"), "ws://x:1");
         assert!(ws_forwardable_header(&header::COOKIE));
         assert!(ws_forwardable_header(&header::SEC_WEBSOCKET_PROTOCOL));

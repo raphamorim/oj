@@ -210,6 +210,12 @@ impl ProxyEntry {
     pub fn ws(&self) -> bool {
         matches!(self, ProxyEntry::Options(o) if o.ws.unwrap_or(false))
     }
+    pub fn secure(&self) -> bool {
+        match self {
+            ProxyEntry::Options(o) => o.secure.unwrap_or(true),
+            ProxyEntry::Target(_) => true,
+        }
+    }
     pub fn rewrite(&self) -> Option<(&str, &str)> {
         match self {
             ProxyEntry::Options(o) => o.rewrite.as_ref().map(|r| (r.from.as_str(), r.to.as_str())),
@@ -224,6 +230,9 @@ pub struct ProxyOptions {
     pub target: String,
     pub change_origin: Option<bool>,
     pub ws: Option<bool>,
+    /// Verify the target's TLS certificate (http-proxy's `secure`, default true);
+    /// `false` accepts a self-signed dev backend.
+    pub secure: Option<bool>,
     pub rewrite: Option<ProxyRewrite>,
 }
 

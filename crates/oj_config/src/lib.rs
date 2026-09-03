@@ -1455,3 +1455,21 @@ mod preprocessor_options_tests {
         assert!(css_load_paths(&cfg, "sass").is_empty());
     }
 }
+
+#[cfg(test)]
+mod proxy_secure_tests {
+    use super::*;
+
+    #[test]
+    fn proxy_secure_defaults_on_and_reads_false() {
+        let cfg: OjConfig = serde_json::from_str(r#"{"server":{"proxy":{
+            "/a": "https://a.test",
+            "/b": { "target": "https://b.test", "ws": true },
+            "/c": { "target": "https://c.test", "secure": false }
+        }}}"#).unwrap();
+        let proxy = cfg.server.unwrap().proxy.unwrap();
+        assert!(proxy["/a"].secure());
+        assert!(proxy["/b"].secure());
+        assert!(!proxy["/c"].secure());
+    }
+}

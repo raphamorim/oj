@@ -1947,10 +1947,14 @@ dependencies = [
  "rolldown",
  "rolldown_common",
  "rolldown_plugin",
+ "rustls",
+ "rustls-pki-types",
+ "rustls-platform-verifier",
  "serde_json",
  "simdutf8",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
 ]
 

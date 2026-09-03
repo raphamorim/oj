@@ -5,6 +5,11 @@ All notable changes to oj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `server.proxy` now reaches `wss://` (and `https://`) targets: a proxied WebSocket upgrade to a TLS target is dialed over TLS with the system trust store, the same store oj's HTTP proxying verifies against, and tunneled as before. `secure: false` on an entry (http-proxy's option, which Vite passes through) accepts a self-signed development backend for both the WebSocket tunnel and plain requests; by default an unverifiable certificate is refused with 502. No new crypto stack: the TLS client is the rustls provider reqwest already links.
+
 ## [0.1.12] - 2026-09-03
 
 A Vite-parity release: four oj-versus-Vite audit rounds closed every P0 and P1 gap found across the resolver, dev server and HMR, plugin API, production build, CSS and assets, and SSR, and 47 contributor pull requests were landed. Thanks to @williamhogman and @mikn.
