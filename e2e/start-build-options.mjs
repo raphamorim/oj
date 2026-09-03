@@ -50,6 +50,10 @@ const waitUp = async (port) => {
   throw new Error(`server on :${port} did not start`);
 };
 
+// A dist/ left by an earlier fixture build would read as "--out ignored" below;
+// the assertion is about this build writing there, so start from a clean slate.
+fs.rmSync(path.join(app, "dist"), { recursive: true, force: true });
+
 try {
   const stderr = execSync(`${oj} build ${app} --config ${config} --out ${out} 2>&1 1>/dev/null`, {
     cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "inherit"],
