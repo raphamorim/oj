@@ -2372,7 +2372,7 @@ pub async fn build(
     // `assets/[name]-[hash][extname]`); an explicit `output.*FileNames` wins.
     let assets_dir = oj_config::build_assets_dir(&config);
     let asset_names_pattern = ro_output_str(ro_opts, "assetFileNames")
-        .unwrap_or_else(|| format!("{assets_dir}/[name]-[hash][extname]"));
+        .unwrap_or_else(|| oj_config::assets_dir_path(&assets_dir, "[name]-[hash][extname]"));
 
     prepare_out_dir(&root, &out_dir, empty_out_dir)?;
 
@@ -2573,12 +2573,12 @@ pub async fn build(
             resolve: rolldown_resolve(&root, &config, "client"),
             entry_filenames: Some(
                 ro_output_str(ro_opts, "entryFileNames")
-                    .unwrap_or_else(|| format!("{assets_dir}/[name]-[hash].js"))
+                    .unwrap_or_else(|| oj_config::assets_dir_path(&assets_dir, "[name]-[hash].js"))
                     .into(),
             ),
             chunk_filenames: Some(
                 ro_output_str(ro_opts, "chunkFileNames")
-                    .unwrap_or_else(|| format!("{assets_dir}/[name]-[hash].js"))
+                    .unwrap_or_else(|| oj_config::assets_dir_path(&assets_dir, "[name]-[hash].js"))
                     .into(),
             ),
             asset_filenames: Some(asset_names_pattern.clone().into()),
@@ -4323,8 +4323,8 @@ async fn build_client_entry(
             dir: Some(out_dir.display().to_string()),
             resolve: rolldown_resolve(root, &config, "client"),
             transform: transform_options(&config, is_production),
-            entry_filenames: Some(format!("{assets_dir}/[name]-[hash].js").into()),
-            chunk_filenames: Some(format!("{assets_dir}/[name]-[hash].js").into()),
+            entry_filenames: Some(oj_config::assets_dir_path(&assets_dir, "[name]-[hash].js").into()),
+            chunk_filenames: Some(oj_config::assets_dir_path(&assets_dir, "[name]-[hash].js").into()),
             minify: Some(rolldown_minify(
                 oj_config::environment_build_bool(&config, "client", "minify").unwrap_or(minify),
             )),
@@ -4391,7 +4391,7 @@ async fn build_client_entry(
             combined.hash(&mut h);
             h.finish()
         });
-        let name = format!("{assets_dir}/style-{}.css", &hash[..8]);
+        let name = oj_config::assets_dir_path(&assets_dir, &format!("style-{}.css", &hash[..8]));
         if let Some(parent) = out_dir.join(&name).parent() {
             fs::create_dir_all(parent)?;
         }

@@ -123,18 +123,28 @@ pub fn public_dir(config: &OjConfig, root: &Path) -> Option<PathBuf> {
     }
 }
 
-/// `build.assetsDir` (Vite default `assets`), normalized without surrounding slashes.
+/// `build.assetsDir`, normalized to a `/`-separated outDir-relative directory
+/// with no surrounding slashes (Vite's default is `assets`; an empty string
+/// puts hashed files at the outDir root).
 pub fn build_assets_dir(config: &OjConfig) -> String {
-    let dir = config
+    let raw = config
         .build
         .as_ref()
         .and_then(|b| b.assets_dir.as_deref())
-        .unwrap_or("assets")
-        .trim_matches('/');
-    if dir.is_empty() {
-        "assets".to_string()
+        .unwrap_or("assets");
+    raw.replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_matches('/')
+        .to_string()
+}
+
+/// `tail` under `build.assetsDir`, as Vite spells its default output patterns
+/// (`path.posix.join(assetsDir, "[name]-[hash].js")`).
+pub fn assets_dir_path(assets_dir: &str, tail: &str) -> String {
+    if assets_dir.is_empty() {
+        tail.to_string()
     } else {
-        dir.to_string()
+        format!("{assets_dir}/{tail}")
     }
 }
 
