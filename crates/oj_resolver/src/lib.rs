@@ -70,6 +70,25 @@ pub fn default_main_fields() -> Vec<String> {
         .to_vec()
 }
 
+/// Vite's TS-output remap (resolve.ts `tryCleanFsResolve` / `isPossibleTsOutput`):
+/// an import ending in `.js`/`.jsx`/`.mjs`/`.cjs` with no such file on disk
+/// resolves to its TypeScript source (`.ts` then `.tsx`, `.tsx`, `.mts`, `.cts`),
+/// so a NodeNext-style `import "./x.js"` works from source. The real extension
+/// leads so an existing `.js` wins over a sibling `.ts`, as Vite tries the exact
+/// file first. It applies to every filesystem path, aliased and tsconfig-paths
+/// imports included, not only relative ones. Shared with the build.
+pub fn default_extension_alias() -> Vec<(String, Vec<String>)> {
+    [
+        (".js", &[".js", ".ts", ".tsx"][..]),
+        (".jsx", &[".jsx", ".tsx"][..]),
+        (".mjs", &[".mjs", ".mts"][..]),
+        (".cjs", &[".cjs", ".cts"][..]),
+    ]
+    .iter()
+    .map(|(ext, alts)| (ext.to_string(), alts.iter().map(|s| s.to_string()).collect()))
+    .collect()
+}
+
 impl OjResolver {
     pub fn new(root: &Path) -> Self {
         Self::with_conditions(
@@ -119,6 +138,7 @@ impl OjResolver {
             alias_fields: vec![vec!["browser".to_string()]],
             condition_names: settings.conditions,
             alias,
+            extension_alias: default_extension_alias(),
             symlinks: !settings.preserve_symlinks,
             tsconfig: tsconfig.is_file().then(|| {
                 TsconfigDiscovery::Manual(TsconfigOptions {
@@ -233,6 +253,35 @@ mod tests {
         // Subpaths of a deduped package dedupe too.
         let deduped2 = OjResolver::with_options(&root, &conds, &[], &["dep".to_string()]);
         assert!(deduped2.resolve(&nested_dir, "dep").is_ok());
+    }
+
+    #[test]
+    fn remaps_ts_output_extensions_for_every_fs_path() {
+        // Vite's tryCleanFsResolve: a `.js`/`.jsx`/`.mjs`/`.cjs` import with no
+        // file on disk resolves to its TS source, for relative, aliased and
+        // tsconfig-paths imports alike; an existing `.js` still wins over `.ts`.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/tsout");
+        let src = root.join("src/lib");
+        let r = OjResolver::with_options(
+            &root,
+            &["import", "default"].map(String::from),
+            &[("~".to_string(), "./src".to_string())],
+            &[],
+        );
+        let ends = |spec: &str, suffix: &str| {
+            let p = r.resolve(&src, spec).unwrap_or_else(|e| panic!("{spec}: {e}"));
+            assert!(p.ends_with(suffix), "{spec} -> {p:?}, want *{suffix}");
+        };
+        ends("../utils/a.js", "utils/a.ts");
+        ends("@/utils/a.js", "utils/a.ts");
+        ends("~/utils/a.js", "utils/a.ts");
+        ends("@/utils/comp.js", "utils/comp.tsx");
+        ends("@/utils/j.jsx", "utils/j.tsx");
+        ends("@/utils/m.mjs", "utils/m.mts");
+        ends("@/utils/c.cjs", "utils/c.cts");
+        ends("@/utils/both.js", "utils/both.js");
+        ends("@/utils/a", "utils/a.ts");
+        assert!(r.resolve(&src, "@/utils/missing.js").is_err());
     }
 
     #[test]

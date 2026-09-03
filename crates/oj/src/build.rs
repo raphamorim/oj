@@ -1250,6 +1250,8 @@ fn rolldown_resolve(
         main_fields,
         condition_names,
         symlinks,
+        // `.js` -> `.ts` remap for every fs path (aliases included), as in dev.
+        extension_alias: Some(oj_resolver::default_extension_alias()),
         ..Default::default()
     })
 }

@@ -86,6 +86,9 @@ jobs:
       - name: plain .svg import goes through the svgr plugin transform
         if: matrix.mode == 'unbundled'
         run: node e2e/svgr-plugin.mjs
+      - name: .js-suffixed aliased and tsconfig-paths imports remap to .ts (dev + build)
+        if: matrix.mode == 'unbundled'
+        run: node e2e/ts-output-remap.mjs
 
   # i need to fix this or automate
   build:

@@ -14,6 +14,7 @@ oj_cache.workspace = true
 oj_compiler.workspace = true
 oj_env.workspace = true
 oj_config.workspace = true
+oj_resolver.workspace = true
 oj_server.workspace = true
 anyhow.workspace = true
 clap.workspace = true
