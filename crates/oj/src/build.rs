@@ -1128,14 +1128,10 @@ impl Plugin for OjCssPlugin {
                 &id,
             )
             .await?;
+            // A CSS module: the class map as default plus named exports per
+            // identifier-safe class (Vite's dataToEsm with namedExports).
             let js = match &output.exports {
-                Some(exports) => {
-                    let map: serde_json::Map<String, serde_json::Value> = exports
-                        .iter()
-                        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                        .collect();
-                    format!("export default {};", serde_json::Value::Object(map))
-                }
+                Some(exports) => oj_css::css_modules_esm(exports),
                 None => "export default void 0;".to_string(),
             };
             collected
