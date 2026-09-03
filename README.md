@@ -110,6 +110,7 @@ node e2e/rolldown-options.mjs                     # build.rollupOptions filename
 node e2e/preprocessors.mjs                        # less + stylus css (installs both, then dev+build)
 node e2e/assets-inline.mjs                        # assetsInlineLimit: small assets become data uris
 node e2e/config-proxy.mjs                         # adopt vite.config server.proxy + ignored-config warnings
+node e2e/proxy-regex-context.mjs                  # server.proxy "^..." regex contexts (path + query), like Vite
 node e2e/config-function.mjs                      # oj.config function form ({ command, mode }) => config
 node e2e/build-target-raw-inline.mjs              # build.target downleveling + ?raw/?inline in build
 node e2e/manual-chunks.mjs                        # rollupOptions output.manualChunks vendor splitting
@@ -119,6 +120,9 @@ node e2e/html-entry.mjs                           # relative index.html script e
 node e2e/svelte.mjs                               # svelte 5 components in dev, bundle, and build
 node e2e/build-mode.mjs                           # build --mode (import.meta.env.MODE + .env.<mode>)
 node e2e/hmr-protocol.mjs                         # hmr client derives wss (behind https proxy)
+node e2e/hmr-overlay-recovery.mjs                 # startup compile error: buffered overlay, reload on first update
+node e2e/hmr-json-update.mjs                      # editing an imported .json hot-updates its boundary (?t= stamp)
+node e2e/hmr-unresolved-import.mjs                # missing ./import fails with an overlay; creating the file recovers
 node e2e/host-binding.mjs                         # dev/preview --host + server.host bind all interfaces
 node e2e/plugin-ws.mjs                             # plugin server.ws custom events (send/on) round-trip
 node e2e/plugin-ws-execute.mjs                     # post -> ws broadcast -> client reply -> collect (bridge execute)
