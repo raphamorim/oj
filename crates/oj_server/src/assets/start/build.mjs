@@ -16,6 +16,10 @@ const APP = process.env.OJ_APP_ROOT ?? process.cwd();
 const NODE_ENV = process.env.NODE_ENV || "production";
 const MODE = process.env.OJ_MODE || "production";
 const PROCESS_ENV_JSON = JSON.stringify({ NODE_ENV, TSS_SERVER_FN_BASE: "/_serverFn/" });
+// The config's `define` map (OJ_DEFINE from oj), as Vite's define plugin applies it.
+const USER_DEFINE = (() => {
+  try { return JSON.parse(process.env.OJ_DEFINE || "{}") || {}; } catch { return {}; }
+})();
 const { build } = await importPkg(APP, "rolldown", ["vite", "@tanstack/react-start"]);
 const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
 const OJ = _ojTTY ? "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m" : "oj";
@@ -169,6 +173,7 @@ const client = await build({
   transform: {
     jsx: jsxTransformOptions(NODE_ENV !== "production"),
     define: {
+      ...USER_DEFINE,
       "process.env": PROCESS_ENV_JSON,
       global: "globalThis", ...viteEnvDefine({ ssr: false, mode: MODE }),
     },
@@ -218,6 +223,7 @@ await build({
   transform: {
     jsx: jsxTransformOptions(NODE_ENV !== "production"),
     define: {
+      ...USER_DEFINE,
       "process.env.NODE_ENV": JSON.stringify(NODE_ENV), "process.env.TSS_SERVER_FN_BASE": '"/_serverFn/"',
       ...viteEnvDefine({ ssr: true, mode: MODE }),
     },
