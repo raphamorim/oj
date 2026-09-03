@@ -3,12 +3,29 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use lightningcss::css_modules;
 use lightningcss::dependencies::{Dependency, DependencyOptions};
+use lightningcss::error::{Error as CssError, ParserError};
 use lightningcss::printer::PrinterOptions;
 use lightningcss::stylesheet::{MinifyOptions, ParserOptions, StyleSheet};
 use lightningcss::targets::{Browsers, Targets};
+
+/// Recovered parse errors, printed the way a PostCSS plugin warning would be:
+/// the stylesheet still compiles, the developer still learns what was dropped.
+fn report_css_warnings(name: &str, warnings: &RwLock<Vec<CssError<ParserError<'_>>>>) {
+    let Ok(list) = warnings.read() else {
+        return;
+    };
+    const SHOWN: usize = 5;
+    for w in list.iter().take(SHOWN) {
+        eprintln!("oj: css warning in {name}: {w}");
+    }
+    if list.len() > SHOWN {
+        eprintln!("oj: css warning in {name}: {} more", list.len() - SHOWN);
+    }
+}
 
 #[derive(Debug)]
 pub struct CssOutput {
@@ -325,17 +342,26 @@ fn compile_css_impl(
     source_map: bool,
 ) -> Result<CssOutput, String> {
     let is_module = is_css_module(url);
+    let warnings = Arc::new(RwLock::new(Vec::new()));
     let options = ParserOptions {
         filename: url.to_string(),
         css_modules: is_module.then(|| css_modules::Config {
             pattern: css_modules::Pattern::parse("[name]_[local]_[hash]").expect("static pattern"),
             ..css_modules::Config::default()
         }),
+        // Vite's default pipeline (postcss) never rejects a stylesheet over a
+        // legacy hack (`*zoom: 1`, `_height`, IE `filter: progid:...`) or a
+        // stray invalid rule; lightningcss does unless it may recover, in which
+        // case the offending declaration/rule is dropped and reported as a
+        // warning instead of failing the whole file.
+        error_recovery: true,
+        warnings: Some(Arc::clone(&warnings)),
         ..ParserOptions::default()
     };
 
     let mut stylesheet = StyleSheet::parse(source, options)
         .map_err(|err| format!("css parse error in {url}: {err}"))?;
+    report_css_warnings(url, &warnings);
 
     let targets = default_targets();
     stylesheet
@@ -636,14 +662,18 @@ fn rebase_to_dir(css: &str, file: &Path, from_dir: &Path, to_dir: &Path) -> Resu
         return Ok(css.to_string());
     }
     let name = file.to_string_lossy().into_owned();
+    let warnings = Arc::new(RwLock::new(Vec::new()));
     let stylesheet = StyleSheet::parse(
         css,
         ParserOptions {
             filename: name.clone(),
+            error_recovery: true,
+            warnings: Some(Arc::clone(&warnings)),
             ..ParserOptions::default()
         },
     )
     .map_err(|err| format!("css parse error in {name}: {err}"))?;
+    report_css_warnings(&name, &warnings);
     let result = stylesheet
         .to_css(PrinterOptions {
             analyze_dependencies: Some(DependencyOptions::default()),
@@ -1181,7 +1211,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_errors_are_reported_not_panicked() {
-        assert!(compile_css("/x.css", "!!not-css!!", false).is_err());
+    fn parse_errors_are_recovered_not_panicked() {
+        // Vite's postcss pipeline never fails a stylesheet over garbage it
+        // cannot parse; the invalid rule is dropped and nothing else is lost.
+        let out = compile_css("/x.css", "!!not-css!! {}\n.ok { color: red }", true).unwrap();
+        assert_eq!(out.css, ".ok{color:red}");
+    }
+
+    #[test]
+    fn legacy_hacks_do_not_fail_the_stylesheet() {
+        // Bootstrap-3 era vendor CSS: `*zoom`, `_height` and IE `filter:
+        // progid:` are declaration-level hacks postcss keeps and Vite serves.
+        // lightningcss keeps `_height` and `progid:` verbatim but cannot parse
+        // the star hack; with error recovery it drops just that declaration
+        // and the rest of the rule (and file) survives.
+        let src = ".clearfix { *zoom: 1; _height: 1px; color: red; }\n\
+                   .g { filter: progid:DXImageTransform.Microsoft.gradient(startColorstr='#fff', endColorstr='#000'); background: blue; }\n\
+                   .b { color: green; }";
+        let out = compile_css("/vendor.css", src, true).unwrap();
+        assert!(out.css.contains(".clearfix{_height:1px;color:red}"), "{}", out.css);
+        assert!(out.css.contains("progid:DXImageTransform") && out.css.contains("background:#00f"), "{}", out.css);
+        assert!(out.css.contains(".b{color:green}"), "{}", out.css);
+        // The rebased (dev) path parses the same way.
+        assert!(compile_css_rebased("/src/vendor.css", src, false).is_ok());
     }
 }

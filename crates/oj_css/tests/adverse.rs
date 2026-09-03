@@ -260,9 +260,10 @@ fn a_url_that_is_not_a_path_is_still_usable_as_a_filename() {
         let out = compile_css(url, ".a { color: red }", true).unwrap();
         assert_eq!(out.css, ".a{color:red}");
     }
-    // The url appears in the error message for a parse failure.
-    let err = compile_css("/src/Weird Name.css", "!!!", false).unwrap_err();
-    assert!(err.contains("Weird Name.css"), "{err}");
+    // A parse failure is recovered from (the invalid rule is dropped and
+    // reported as a warning labelled with the url), never a hard error.
+    let out = compile_css("/src/Weird Name.css", "!!!", false).unwrap();
+    assert_eq!(out.css.trim(), "");
 }
 
 #[test]
