@@ -184,58 +184,11 @@ fn shell_node_env() -> Option<String> {
 }
 
 fn is_build_asset(id: &str) -> bool {
-    matches!(
-        std::path::Path::new(id.split('?').next().unwrap_or(id))
-            .extension()
-            .and_then(|e| e.to_str()),
-        Some(
-            "png"
-                | "jpg"
-                | "jpeg"
-                | "gif"
-                | "webp"
-                | "avif"
-                | "ico"
-                | "bmp"
-                | "svg"
-                | "woff"
-                | "woff2"
-                | "ttf"
-                | "otf"
-                | "eot"
-                | "mp4"
-                | "webm"
-                | "mov"
-                | "mp3"
-                | "wav"
-                | "ogg"
-        )
-    )
+    oj_compiler::assets::is_asset_url(id)
 }
 
 fn asset_mime(ext: &str) -> &'static str {
-    match ext {
-        "svg" => "image/svg+xml",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "avif" => "image/avif",
-        "ico" => "image/x-icon",
-        "woff" => "font/woff",
-        "woff2" => "font/woff2",
-        "ttf" => "font/ttf",
-        "otf" => "font/otf",
-        "eot" => "application/vnd.ms-fontobject",
-        "bmp" => "image/bmp",
-        "mp4" => "video/mp4",
-        "webm" => "video/webm",
-        "mov" => "video/quicktime",
-        "mp3" => "audio/mpeg",
-        "wav" => "audio/wav",
-        "ogg" => "audio/ogg",
-        _ => "application/octet-stream",
-    }
+    oj_compiler::assets::asset_mime(ext)
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -3530,6 +3483,11 @@ mod tests {
         }
         // A query does not change the classification.
         assert!(is_build_asset("/src/a.png?url"));
+        // Same list as the dev server, case-insensitive like Vite.
+        assert!(is_build_asset("/src/photo.JPG"));
+        assert!(is_build_asset("/src/doc.pdf"));
+        assert!(is_build_asset("/src/site.webmanifest"));
+        assert_eq!(asset_mime("PNG"), "image/png");
         assert!(!is_build_asset("/src/a.tsx"));
         assert!(!is_build_asset("/src/a.png.tsx"));
         assert!(!is_build_asset(""));

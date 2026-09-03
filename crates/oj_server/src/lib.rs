@@ -2901,15 +2901,11 @@ fn wants_raw_resource(headers: &HeaderMap) -> bool {
 }
 
 // Assets that, when imported from JS, resolve to a URL-exporting module (Vite's
-// default asset handling). svg is excluded: it is routed to vite-plugin-svgr.
+// default asset handling, case-insensitive). svg is excluded here: it is routed
+// through the compile path so vite-plugin-svgr can componentize it, falling back
+// to a URL module there.
 fn is_importable_asset_ext(ext: &str) -> bool {
-    matches!(
-        ext,
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "ico" | "bmp"
-            | "woff" | "woff2" | "ttf" | "otf" | "eot"
-            | "mp4" | "webm" | "ogg" | "mp3" | "wav" | "flac" | "m4a" | "aac" | "mov"
-            | "pdf" | "webmanifest"
-    )
+    oj_compiler::assets::is_asset_ext(ext) && !ext.eq_ignore_ascii_case("svg")
 }
 
 // Node core modules. When one reaches the browser graph (usually via config-time
@@ -4176,30 +4172,8 @@ fn decode_at_id(seg: &str) -> String {
 }
 
 fn is_asset_ext(ext: &str) -> bool {
-    matches!(
-        ext,
-        "png"
-            | "jpg"
-            | "jpeg"
-            | "gif"
-            | "webp"
-            | "avif"
-            | "ico"
-            | "bmp"
-            | "svg"
-            | "woff"
-            | "woff2"
-            | "ttf"
-            | "otf"
-            | "eot"
-            | "mp4"
-            | "webm"
-            | "mov"
-            | "mp3"
-            | "wav"
-            | "ogg"
-            | "wasm"
-    )
+    // A plain `.wasm` import is served as a URL module (Vite asks for `?init`).
+    oj_compiler::assets::is_asset_ext(ext) || ext.eq_ignore_ascii_case("wasm")
 }
 
 fn is_asset_path(file: &Path) -> bool {
@@ -4228,7 +4202,8 @@ fn content_type(ext: &str) -> &'static str {
         "webp" => "image/webp",
         "gif" => "image/gif",
         "txt" | "map2" => "text/plain; charset=utf-8",
-        _ => "application/octet-stream",
+        // Any other known asset type (case-insensitive), else octet-stream.
+        other => oj_compiler::assets::asset_mime(other),
     }
 }
 
@@ -5625,8 +5600,15 @@ mod tests {
         assert!(is_importable_asset_ext("webp"));
         assert!(is_importable_asset_ext("png"));
         assert!(is_importable_asset_ext("woff2"));
+        // Vite's list is case-insensitive and includes documents and more media.
+        assert!(is_importable_asset_ext("PNG"));
+        assert!(is_importable_asset_ext("pdf"));
+        assert!(is_importable_asset_ext("flac"));
+        assert!(is_asset_ext("Jpg"));
+        assert_eq!(content_type("JPG"), "image/jpeg");
         // svg is routed to vite-plugin-svgr, not URL-exported here.
         assert!(!is_importable_asset_ext("svg"));
+        assert!(!is_importable_asset_ext("SVG"));
         assert!(!is_importable_asset_ext("css"));
         assert!(!is_importable_asset_ext("js"));
     }

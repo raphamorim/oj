@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
+pub mod assets;
 pub mod bundle;
 pub mod cjs;
 pub mod glob;
