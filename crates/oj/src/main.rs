@@ -62,6 +62,9 @@ enum Command {
         ssr: Option<String>,
         #[arg(long)]
         mode: Option<String>,
+        /// Empty outDir even when it is outside the project root (Vite's --emptyOutDir).
+        #[arg(long = "emptyOutDir")]
+        empty_out_dir: bool,
     },
     Preview {
         root: Option<PathBuf>,
@@ -139,6 +142,7 @@ async fn run() -> anyhow::Result<()> {
             out,
             ssr,
             mode,
+            empty_out_dir,
         } => {
             let root = root.unwrap_or_else(|| {
                 let playground = PathBuf::from("playground");
@@ -152,7 +156,7 @@ async fn run() -> anyhow::Result<()> {
             if oj_server::is_tanstack_start_app(&root) {
                 start_dev::start_build(root, &mode).await
             } else {
-                build::build(root, out, ssr, &mode).await
+                build::build(root, out, ssr, &mode, empty_out_dir).await
             }
         }
         Command::Preview {

@@ -33,6 +33,66 @@ fn define_value(v: &serde_json::Value) -> String {
     }
 }
 
+/// `build.sourcemap` resolved: Vite's `true` -> separate `.map` files, `"inline"`,
+/// `"hidden"` (maps written, no `sourceMappingURL` comment), default off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sourcemap {
+    Off,
+    File,
+    Inline,
+    Hidden,
+}
+
+pub fn build_sourcemap(config: &OjConfig) -> Sourcemap {
+    match config.build.as_ref().and_then(|b| b.sourcemap.as_ref()) {
+        None | Some(BoolOrString::Bool(false)) => Sourcemap::Off,
+        Some(BoolOrString::Bool(true)) => Sourcemap::File,
+        Some(BoolOrString::Str(s)) => match s.as_str() {
+            "inline" => Sourcemap::Inline,
+            "hidden" => Sourcemap::Hidden,
+            "false" => Sourcemap::Off,
+            _ => Sourcemap::File,
+        },
+    }
+}
+
+/// `build.minify`: Vite's default is on; a minifier name (`"oxc"`, `"esbuild"`,
+/// `"terser"`) selects the tool in Vite and just means "on" here.
+pub fn build_minify(config: &OjConfig) -> bool {
+    match config.build.as_ref().and_then(|b| b.minify.as_ref()) {
+        None => true,
+        Some(BoolOrString::Bool(b)) => *b,
+        Some(BoolOrString::Str(s)) => s != "false",
+    }
+}
+
+/// Vite 8's `'baseline-widely-available'` default target (constants.ts).
+pub const BASELINE_WIDELY_AVAILABLE: &[&str] =
+    &["chrome111", "edge111", "firefox114", "safari16.4", "ios16.4"];
+/// Vite's legacy `'modules'` target.
+pub const MODULES_TARGET: &[&str] = &["es2020", "edge88", "firefox78", "chrome87", "safari14"];
+
+/// `build.target` as the engine list oxc lowers to. Vite's named presets expand
+/// to their browser lists; unset means Vite's default baseline (Vite lowers to
+/// it by default too, oj used to emit `esnext`).
+pub fn build_targets(config: &OjConfig) -> Vec<String> {
+    let raw: Vec<String> = match config.build.as_ref().and_then(|b| b.target.as_ref()) {
+        None => vec!["baseline-widely-available".into()],
+        Some(t) => t.to_vec(),
+    };
+    let mut out = Vec::new();
+    for t in raw {
+        match t.as_str() {
+            "baseline-widely-available" => {
+                out.extend(BASELINE_WIDELY_AVAILABLE.iter().map(|s| s.to_string()))
+            }
+            "modules" => out.extend(MODULES_TARGET.iter().map(|s| s.to_string())),
+            _ => out.push(t),
+        }
+    }
+    out
+}
+
 pub fn rolldown_options(config: &OjConfig) -> Option<&serde_json::Value> {
     let build = config.build.as_ref()?;
     build
@@ -873,5 +933,48 @@ mod jsx_settings_tests {
         c.oxc = Some(serde_json::Value::Bool(false));
         c.esbuild = Some(serde_json::Value::Bool(false));
         assert_eq!(jsx_settings(&c), JsxSettings::default());
+    }
+}
+
+#[cfg(test)]
+mod build_option_tests {
+    use super::*;
+
+    fn cfg(json: &str) -> OjConfig {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn sourcemap_accepts_bool_and_vite_strings() {
+        assert_eq!(build_sourcemap(&cfg("{}")), Sourcemap::Off);
+        assert_eq!(build_sourcemap(&cfg(r#"{"build":{"sourcemap":true}}"#)), Sourcemap::File);
+        assert_eq!(build_sourcemap(&cfg(r#"{"build":{"sourcemap":false}}"#)), Sourcemap::Off);
+        assert_eq!(build_sourcemap(&cfg(r#"{"build":{"sourcemap":"inline"}}"#)), Sourcemap::Inline);
+        assert_eq!(build_sourcemap(&cfg(r#"{"build":{"sourcemap":"hidden"}}"#)), Sourcemap::Hidden);
+    }
+
+    #[test]
+    fn minify_accepts_bool_and_minifier_names() {
+        assert!(build_minify(&cfg("{}")));
+        assert!(!build_minify(&cfg(r#"{"build":{"minify":false}}"#)));
+        assert!(build_minify(&cfg(r#"{"build":{"minify":"terser"}}"#)));
+        assert!(build_minify(&cfg(r#"{"build":{"minify":"esbuild","terserOptions":{"compress":{}}}}"#)));
+    }
+
+    #[test]
+    fn target_expands_vite_presets_and_accepts_arrays() {
+        assert_eq!(build_targets(&cfg("{}")), BASELINE_WIDELY_AVAILABLE);
+        assert_eq!(build_targets(&cfg(r#"{"build":{"target":"es2015"}}"#)), vec!["es2015"]);
+        assert_eq!(build_targets(&cfg(r#"{"build":{"target":"modules"}}"#)), MODULES_TARGET);
+        assert_eq!(
+            build_targets(&cfg(r#"{"build":{"target":["es2020","safari14"]}}"#)),
+            vec!["es2020", "safari14"]
+        );
+    }
+
+    #[test]
+    fn empty_out_dir_parses() {
+        assert_eq!(cfg(r#"{"build":{"emptyOutDir":false}}"#).build.unwrap().empty_out_dir, Some(false));
+        assert_eq!(cfg("{}").build.and_then(|b| b.empty_out_dir), None);
     }
 }

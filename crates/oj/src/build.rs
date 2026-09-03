@@ -145,11 +145,7 @@ fn transform_options(
     let jsx = oj_config::jsx_settings(config);
     let classic = jsx.runtime.as_deref() == Some("classic");
     Some(rolldown_common::BundlerTransformOptions {
-        target: config
-            .build
-            .as_ref()
-            .and_then(|b| b.target.clone())
-            .map(rolldown_common::Either::Left),
+        target: Some(rolldown_common::Either::Right(oj_config::build_targets(config))),
         // `runtime` stays None unless configured: rolldown only merges the
         // tsconfig `compilerOptions.jsx`/`jsxFactory`/`jsxImportSource` into the
         // transform when no runtime is set, and a project configured that way
@@ -181,6 +177,68 @@ fn node_env_defines(node_env: &str) -> Vec<(String, String)> {
 
 fn shell_node_env() -> Option<String> {
     std::env::var("NODE_ENV").ok().filter(|v| !v.is_empty())
+}
+
+fn sourcemap_type(s: oj_config::Sourcemap) -> Option<SourceMapType> {
+    match s {
+        oj_config::Sourcemap::Off => None,
+        oj_config::Sourcemap::File => Some(SourceMapType::File),
+        oj_config::Sourcemap::Inline => Some(SourceMapType::Inline),
+        oj_config::Sourcemap::Hidden => Some(SourceMapType::Hidden),
+    }
+}
+
+/// `environments.<env>.build.sourcemap` (boolean) overrides the top-level setting.
+fn env_sourcemap(
+    config: &oj_config::OjConfig,
+    env: &str,
+    default: oj_config::Sourcemap,
+) -> Option<SourceMapType> {
+    match oj_config::environment_build_bool(config, env, "sourcemap") {
+        Some(true) => Some(SourceMapType::File),
+        Some(false) => None,
+        None => sourcemap_type(default),
+    }
+}
+
+/// Vite's `emptyOutDir` rule (watch.ts `resolveEmptyOutDir`, prepareOutDir.ts):
+/// unset means "empty it when it is inside the project root"; an outDir outside
+/// root is left alone with a warning unless `build.emptyOutDir` / `--emptyOutDir`
+/// says so. A `.git` directory inside outDir always survives.
+fn prepare_out_dir(root: &Path, out_dir: &Path, empty: Option<bool>) -> anyhow::Result<()> {
+    let empty = match empty {
+        Some(b) => b,
+        None => {
+            let inside = out_dir
+                .canonicalize()
+                .map(|o| o.starts_with(root))
+                .unwrap_or_else(|_| out_dir.starts_with(root));
+            if !inside && out_dir.exists() {
+                eprintln!(
+                    "oj build: (!) outDir {} is not inside project root and will not be emptied.\n\
+                     Use --emptyOutDir to override.",
+                    out_dir.display()
+                );
+            }
+            inside
+        }
+    };
+    if empty && out_dir.is_dir() {
+        for entry in fs::read_dir(out_dir)? {
+            let entry = entry?;
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            let p = entry.path();
+            if entry.file_type()?.is_dir() {
+                fs::remove_dir_all(&p)?;
+            } else {
+                fs::remove_file(&p)?;
+            }
+        }
+    }
+    fs::create_dir_all(out_dir)?;
+    Ok(())
 }
 
 fn is_build_asset(id: &str) -> bool {
@@ -1421,6 +1479,7 @@ pub async fn build(
     out: Option<PathBuf>,
     ssr: Option<String>,
     mode: &str,
+    empty_out_dir_flag: bool,
 ) -> anyhow::Result<()> {
     let root = root
         .canonicalize()
@@ -1439,8 +1498,13 @@ pub async fn build(
     } else {
         root.join(&out)
     };
-    let minify = build_cfg.minify.unwrap_or(true);
-    let sourcemap = build_cfg.sourcemap.unwrap_or(false);
+    let minify = oj_config::build_minify(&config);
+    let sourcemap = oj_config::build_sourcemap(&config);
+    let empty_out_dir = if empty_out_dir_flag {
+        Some(true)
+    } else {
+        build_cfg.empty_out_dir
+    };
     let loaded_env = oj_env::load(&root, mode);
     let node_env = oj_env::resolve_node_env(shell_node_env().as_deref(), &loaded_env, "production");
     let is_production = node_env == "production";
@@ -1454,6 +1518,7 @@ pub async fn build(
             minify,
             sourcemap,
             build_cfg.prerender.clone(),
+            empty_out_dir,
         )
         .await;
     }
@@ -1464,8 +1529,7 @@ pub async fn build(
 
     let base = normalize_base(config.base.as_deref().unwrap_or("/"));
 
-    let _ = fs::remove_dir_all(&out_dir);
-    fs::create_dir_all(&out_dir)?;
+    prepare_out_dir(&root, &out_dir, empty_out_dir)?;
 
     let started = Instant::now();
 
@@ -1618,9 +1682,7 @@ pub async fn build(
             minify: Some(RawMinifyOptions::Bool(
                 oj_config::environment_build_bool(&config, "client", "minify").unwrap_or(minify),
             )),
-            sourcemap: oj_config::environment_build_bool(&config, "client", "sourcemap")
-                .unwrap_or(sourcemap)
-                .then_some(SourceMapType::File),
+            sourcemap: env_sourcemap(&config, "client", sourcemap),
             define: Some({
                 let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &["VITE_"]);
                 let mut pairs: Vec<(String, String)> = node_env_defines(&node_env);
@@ -2013,7 +2075,7 @@ pub(crate) async fn build_ssr(
     out_dir: &Path,
     entry: &str,
     mode: &str,
-    sourcemap: bool,
+    sourcemap: oj_config::Sourcemap,
 ) -> anyhow::Result<()> {
     use rolldown::{IsExternal, Platform};
 
@@ -2094,9 +2156,7 @@ pub(crate) async fn build_ssr(
             minify: Some(RawMinifyOptions::Bool(
                 oj_config::environment_build_bool(&config, "ssr", "minify").unwrap_or(false),
             )),
-            sourcemap: oj_config::environment_build_bool(&config, "ssr", "sourcemap")
-                .unwrap_or(sourcemap)
-                .then_some(SourceMapType::File),
+            sourcemap: env_sourcemap(&config, "ssr", sourcemap),
             define: Some({
                 let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &["VITE_"]);
                 let mut pairs = node_env_defines(&node_env);
@@ -2463,11 +2523,11 @@ pub(crate) async fn build_ssr_app(
     entry: &str,
     mode: &str,
     minify: bool,
-    sourcemap: bool,
+    sourcemap: oj_config::Sourcemap,
     prerender: Option<Vec<String>>,
+    empty_out_dir: Option<bool>,
 ) -> anyhow::Result<()> {
-    let _ = fs::remove_dir_all(out_dir);
-    fs::create_dir_all(out_dir)?;
+    prepare_out_dir(root, out_dir, empty_out_dir)?;
 
     build_ssr(root, out_dir, entry, mode, sourcemap).await?;
 
@@ -2531,7 +2591,7 @@ async fn build_client_entry(
     entry: &str,
     mode: &str,
     minify: bool,
-    sourcemap: bool,
+    sourcemap: oj_config::Sourcemap,
 ) -> anyhow::Result<(String, Option<String>)> {
     let entry_import = if entry.starts_with('.') {
         entry.to_string()
@@ -2597,9 +2657,7 @@ async fn build_client_entry(
             minify: Some(RawMinifyOptions::Bool(
                 oj_config::environment_build_bool(&config, "client", "minify").unwrap_or(minify),
             )),
-            sourcemap: oj_config::environment_build_bool(&config, "client", "sourcemap")
-                .unwrap_or(sourcemap)
-                .then_some(SourceMapType::File),
+            sourcemap: env_sourcemap(&config, "client", sourcemap),
             define: Some({
                 let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &["VITE_"]);
                 let mut pairs = node_env_defines(&node_env);
@@ -2674,7 +2732,7 @@ async fn build_library(
     lib: oj_config::LibConfig,
     mode: &str,
     minify: bool,
-    sourcemap: bool,
+    sourcemap: oj_config::Sourcemap,
 ) -> anyhow::Result<()> {
     let node_env =
         oj_env::resolve_node_env(shell_node_env().as_deref(), &oj_env::load(root, mode), "production");
@@ -2693,8 +2751,7 @@ async fn build_library(
     });
     let formats = lib.formats.clone().unwrap_or_else(|| vec!["es".into()]);
 
-    let _ = fs::remove_dir_all(out_dir);
-    fs::create_dir_all(out_dir)?;
+    prepare_out_dir(root, out_dir, config.build.as_ref().and_then(|b| b.empty_out_dir))?;
     let started = Instant::now();
     let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let mut emitted: Vec<(String, usize)> = Vec::new();
@@ -2736,7 +2793,7 @@ async fn build_library(
                 entry_filenames: Some(format!("{file_name}.{ext}").into()),
                 chunk_filenames: Some(format!("{file_name}-[hash].{ext}").into()),
                 minify: Some(RawMinifyOptions::Bool(minify)),
-                sourcemap: sourcemap.then_some(SourceMapType::File),
+                sourcemap: sourcemap_type(sourcemap),
                 transform: transform_options(config, is_production),
                 define: Some(node_env_defines(&node_env).into_iter().collect()),
                 ..Default::default()
