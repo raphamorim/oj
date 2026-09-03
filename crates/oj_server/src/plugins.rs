@@ -152,12 +152,14 @@ pub fn vite_config_file(root: &Path) -> Option<std::path::PathBuf> {
     if let Some(p) = VITE_CONFIG_OVERRIDE.get() {
         return p.is_file().then(|| p.clone());
     }
+    // Vite's DEFAULT_CONFIG_FILES order (constants.ts): the first that exists
+    // wins, so a root with several config files picks the same one Vite does.
     [
-        "vite.config.ts",
-        "vite.config.mts",
-        "vite.config.mjs",
         "vite.config.js",
+        "vite.config.mjs",
+        "vite.config.ts",
         "vite.config.cjs",
+        "vite.config.mts",
         "vite.config.cts",
     ]
     .into_iter()
@@ -269,9 +271,10 @@ fn extract_vite_values_with(
     let store = oj_cache::config_extract::ConfigExtractStore::new(
         root,
         &format!(
-            "{}:{}",
+            "{}:{}:{}",
             env!("CARGO_PKG_VERSION"),
-            blake3::hash(VITE_EXTRACT_JS.as_bytes()).to_hex()
+            blake3::hash(VITE_EXTRACT_JS.as_bytes()).to_hex(),
+            extraction_env_hash(std::env::vars())
         ),
     );
     if let Some(hit) = store.lookup(&vite, command, mode_key) {
@@ -316,25 +319,9 @@ fn extract_vite_values_with(
     if json.get("__ok").and_then(|v| v.as_bool()) != Some(true) {
         return None;
     }
-    if json.get("__ok").and_then(|v| v.as_bool()) == Some(true) {
-        let deps: Vec<PathBuf> = json
-            .get("__deps")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|d| d.as_str().map(PathBuf::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        store.store(
-            &vite,
-            command,
-            mode_key,
-            &deps,
-            &String::from_utf8_lossy(&out.stdout),
-            &stderr,
-        );
-    }
+    // Stored once, under the same (config, command, mode_key) the lookup above
+    // uses: a default-mode evaluation must not also masquerade as the explicit
+    // `--mode <same>` entry, whose evaluation can differ.
     let deps: Vec<PathBuf> = json
         .get("__deps")
         .and_then(|v| v.as_array())
@@ -347,13 +334,32 @@ fn extract_vite_values_with(
     store.store(
         &vite,
         command,
-        mode,
+        mode_key,
         &deps,
         &String::from_utf8_lossy(&out.stdout),
         &stderr,
     );
     crate::boot_phase("vite-extract cache miss (subprocess ran)");
     Some(parse_vite_values(&json))
+}
+
+/// The part of the process environment a vite.config can observe while it
+/// evaluates (`process.env.VITE_*` and `NODE_ENV`), hashed into the extraction
+/// cache key so an env change re-evaluates the config instead of serving the
+/// values computed under the old one.
+pub fn extraction_env_hash(vars: impl Iterator<Item = (String, String)>) -> String {
+    let mut relevant: Vec<(String, String)> = vars
+        .filter(|(k, _)| k == "NODE_ENV" || k.starts_with("VITE_"))
+        .collect();
+    relevant.sort();
+    let mut hasher = blake3::Hasher::new();
+    for (k, v) in relevant {
+        hasher.update(k.as_bytes());
+        hasher.update(&[b'=']);
+        hasher.update(v.as_bytes());
+        hasher.update(&[0]);
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 #[inline]
@@ -780,6 +786,22 @@ async fn handle_ctx_rpc(
     let _ = stdin.write_all(format!("{reply}\n").as_bytes()).await;
 }
 
+/// How long one plugin hook may run before oj gives up on it. Vite has no
+/// hook timeout at all; oj's default of 20 s keeps a hung plugin from wedging
+/// the server, and `OJ_PLUGIN_TIMEOUT=<seconds>` raises it for plugins that
+/// legitimately take longer (a large first-run codegen, a cold type check).
+pub fn plugin_rpc_timeout() -> std::time::Duration {
+    plugin_rpc_timeout_from(std::env::var("OJ_PLUGIN_TIMEOUT").ok().as_deref())
+}
+
+fn plugin_rpc_timeout_from(raw: Option<&str>) -> std::time::Duration {
+    let secs = raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(20);
+    std::time::Duration::from_secs(secs)
+}
+
 impl std::fmt::Debug for PluginHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PluginHost")
@@ -903,9 +925,12 @@ impl PluginHost {
                 return Err("plugin host died".into());
             }
         }
-        match tokio::time::timeout(std::time::Duration::from_secs(20), rx).await {
+        match tokio::time::timeout(plugin_rpc_timeout(), rx).await {
             Ok(Ok(result)) => result,
-            _ => Err("plugin host timed out".into()),
+            _ => Err(format!(
+                "plugin host timed out after {}s running {hook} (raise OJ_PLUGIN_TIMEOUT for slow plugins)",
+                plugin_rpc_timeout().as_secs()
+            )),
         }
     }
 
@@ -1367,6 +1392,66 @@ mod vite_values_tests {
             assert_eq!(vite_config_file(&root), Some(path));
             std::fs::remove_dir_all(&root).unwrap();
         }
+    }
+
+    #[test]
+    fn plugin_rpc_timeout_defaults_and_reads_env_seconds() {
+        assert_eq!(plugin_rpc_timeout_from(None).as_secs(), 20);
+        assert_eq!(plugin_rpc_timeout_from(Some("90")).as_secs(), 90);
+        assert_eq!(plugin_rpc_timeout_from(Some(" 5 ")).as_secs(), 5);
+        // Garbage and zero fall back to the default rather than disabling the guard.
+        assert_eq!(plugin_rpc_timeout_from(Some("soon")).as_secs(), 20);
+        assert_eq!(plugin_rpc_timeout_from(Some("0")).as_secs(), 20);
+    }
+
+    #[test]
+    fn extraction_env_hash_tracks_vite_vars_and_node_env_only() {
+        let base = || {
+            vec![
+                ("PATH".to_string(), "/bin".to_string()),
+                ("VITE_API".to_string(), "a".to_string()),
+                ("NODE_ENV".to_string(), "development".to_string()),
+            ]
+        };
+        let h0 = extraction_env_hash(base().into_iter());
+        // Order-independent.
+        let mut rev = base();
+        rev.reverse();
+        assert_eq!(h0, extraction_env_hash(rev.into_iter()));
+        // Unrelated variables do not churn the key.
+        let mut plus = base();
+        plus.push(("TERM".to_string(), "xterm".to_string()));
+        assert_eq!(h0, extraction_env_hash(plus.into_iter()));
+        // A VITE_* or NODE_ENV change does.
+        let mut vite = base();
+        vite[1].1 = "b".to_string();
+        assert_ne!(h0, extraction_env_hash(vite.into_iter()));
+        let mut node = base();
+        node[2].1 = "production".to_string();
+        assert_ne!(h0, extraction_env_hash(node.into_iter()));
+    }
+
+    // Vite (constants.ts DEFAULT_CONFIG_FILES): js, mjs, ts, cjs, mts, cts; with
+    // both a .ts and a .js present, Vite loads the .js.
+    #[test]
+    fn config_discovery_precedence_matches_vite() {
+        let root = std::env::temp_dir().join(format!("oj-config-precedence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let order = ["js", "mjs", "ts", "cjs", "mts", "cts"];
+        for ext in order.iter().rev() {
+            std::fs::write(root.join(format!("vite.config.{ext}")), "export default {};").unwrap();
+        }
+        for ext in order {
+            assert_eq!(
+                vite_config_file(&root),
+                Some(root.join(format!("vite.config.{ext}"))),
+                "with every later format present, .{ext} wins"
+            );
+            std::fs::remove_file(root.join(format!("vite.config.{ext}"))).unwrap();
+        }
+        assert_eq!(vite_config_file(&root), None);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
