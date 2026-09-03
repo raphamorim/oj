@@ -219,6 +219,10 @@ pub struct ViteValues {
     /// `server.cors` (bool or options object) and `server.allowedHosts` (true or list).
     pub cors: Option<serde_json::Value>,
     pub allowed_hosts: Option<serde_json::Value>,
+    /// `preview.*` (port, host, strictPort, open, cors, allowedHosts, headers, proxy).
+    pub preview: Option<serde_json::Value>,
+    /// `appType` (`spa` | `mpa` | `custom`).
+    pub app_type: Option<String>,
 }
 
 /// Why a run of the extractor produced nothing usable, or None when it did.
@@ -414,6 +418,8 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
         env_dir: json.get("envDir").and_then(|v| v.as_str()).map(str::to_string),
         cors: json.get("cors").filter(|v| !v.is_null()).cloned(),
         allowed_hosts: json.get("allowedHosts").filter(|v| !v.is_null()).cloned(),
+        preview: json.get("preview").filter(|v| !v.is_null()).cloned(),
+        app_type: json.get("appType").and_then(|v| v.as_str()).map(str::to_string),
     }
 }
 
@@ -677,6 +683,22 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
         if sc.allowed_hosts.is_none() {
             sc.allowed_hosts = v.allowed_hosts.and_then(|a| serde_json::from_value(a).ok());
         }
+    }
+    if let Some(preview) = v.preview {
+        if let Ok(parsed) = serde_json::from_value::<oj_config::PreviewConfig>(preview) {
+            let pc = config.preview.get_or_insert_with(Default::default);
+            pc.port = pc.port.or(parsed.port);
+            pc.host = pc.host.take().or(parsed.host);
+            pc.strict_port = pc.strict_port.or(parsed.strict_port);
+            pc.open = pc.open.take().or(parsed.open);
+            pc.cors = pc.cors.take().or(parsed.cors);
+            pc.allowed_hosts = pc.allowed_hosts.take().or(parsed.allowed_hosts);
+            pc.headers = pc.headers.take().or(parsed.headers);
+            pc.proxy = pc.proxy.take().or(parsed.proxy);
+        }
+    }
+    if config.app_type.is_none() {
+        config.app_type = v.app_type;
     }
     if config.oxc.is_none() {
         config.oxc = v.oxc;
@@ -1586,6 +1608,8 @@ mod vite_values_tests {
             env_dir: None,
             cors: None,
             allowed_hosts: None,
+            preview: None,
+            app_type: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/vite-base/"));
@@ -1626,6 +1650,8 @@ mod vite_values_tests {
             env_dir: None,
             cors: None,
             allowed_hosts: None,
+            preview: None,
+            app_type: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/oj-base/"));
