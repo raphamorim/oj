@@ -738,6 +738,7 @@ impl DevServer {
                 extensions: oj_config::resolve_extensions(&config),
                 main_fields: oj_config::resolve_main_fields(&config),
                 preserve_symlinks: oj_config::resolve_preserve_symlinks(&config),
+                server: false,
             },
         ));
         let css_resolve = oj_css::CssResolveConfig {
@@ -763,6 +764,8 @@ impl DevServer {
                     extensions: oj_config::resolve_extensions(&config),
                     main_fields: oj_config::resolve_main_fields(&config),
                     preserve_symlinks: oj_config::resolve_preserve_symlinks(&config),
+                    // Vite's server environment: no `browser` main field or remap.
+                    server: true,
                 },
             )),
             cache: PersistentCache::new(oj_cache::cache_root(&root), env!("CARGO_PKG_VERSION"))

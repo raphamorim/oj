@@ -49,6 +49,11 @@ pub struct ResolveSettings {
     pub extensions: Option<Vec<String>>,
     pub main_fields: Option<Vec<String>>,
     pub preserve_symlinks: bool,
+    /// Resolving for a server (SSR) environment: Vite's DEFAULT_SERVER_MAIN_FIELDS
+    /// drop `browser`, and the package.json `browser` object remap only applies
+    /// when the effective mainFields include `browser` (resolve.ts
+    /// tryResolveBrowserMapping), so Node-side code gets the Node build.
+    pub server: bool,
 }
 
 /// Extensions probed for an extensionless import, in priority order: Vite's
@@ -70,6 +75,14 @@ pub fn default_main_fields() -> Vec<String> {
     ["module", "browser", "jsnext:main", "jsnext", "main"]
         .map(String::from)
         .to_vec()
+}
+
+/// Vite's DEFAULT_SERVER_MAIN_FIELDS: the client list without `browser`.
+pub fn default_server_main_fields() -> Vec<String> {
+    default_main_fields()
+        .into_iter()
+        .filter(|f| f != "browser")
+        .collect()
 }
 
 /// Vite's TS-output remap (resolve.ts `tryCleanFsResolve` / `isPossibleTsOutput`):
@@ -134,10 +147,24 @@ impl OjResolver {
                 (find.clone(), vec![AliasValue::Path(target)])
             })
             .collect();
+        let main_fields = settings.main_fields.unwrap_or_else(|| {
+            if settings.server {
+                default_server_main_fields()
+            } else {
+                default_main_fields()
+            }
+        });
+        // Vite applies the package.json `browser` object only when mainFields
+        // include `browser` (the client default; a server list opts in by naming it).
+        let alias_fields = if main_fields.iter().any(|f| f == "browser") {
+            vec![vec!["browser".to_string()]]
+        } else {
+            Vec::new()
+        };
         let options = ResolveOptions {
             extensions: settings.extensions.unwrap_or_else(default_extensions),
-            main_fields: settings.main_fields.unwrap_or_else(default_main_fields),
-            alias_fields: vec![vec!["browser".to_string()]],
+            main_fields,
+            alias_fields,
             condition_names: settings.conditions,
             alias,
             extension_alias: default_extension_alias(),
@@ -369,6 +396,43 @@ mod tests {
             .resolve(&dir, "dual-pkg")
             .unwrap()
             .ends_with("default.js"));
+    }
+
+    #[test]
+    fn server_resolver_ignores_the_browser_field_like_vite_ssr() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/mainfields");
+        let server = OjResolver::with_settings(
+            &dir,
+            ResolveSettings {
+                conditions: ["node", "import", "default"].map(String::from).to_vec(),
+                server: true,
+                ..ResolveSettings::default()
+            },
+        );
+        // DEFAULT_SERVER_MAIN_FIELDS has no `browser`, so the `browser` object
+        // remap (./node.js -> ./browser.js) does not apply on the server.
+        assert!(
+            server.resolve(&dir, "br-pkg").unwrap().ends_with("node.js"),
+            "ssr keeps the node build: {:?}",
+            server.resolve(&dir, "br-pkg")
+        );
+        assert!(server.resolve(&dir, "mf-pkg").unwrap().ends_with("esm.js"), "module still leads");
+        // Naming `browser` in a server mainFields opts back in (Vite: mapping
+        // applies whenever the effective mainFields include it).
+        let opted_in = OjResolver::with_settings(
+            &dir,
+            ResolveSettings {
+                conditions: ["node", "import", "default"].map(String::from).to_vec(),
+                main_fields: Some(["browser", "module", "main"].map(String::from).to_vec()),
+                server: true,
+                ..ResolveSettings::default()
+            },
+        );
+        assert!(opted_in.resolve(&dir, "br-pkg").unwrap().ends_with("browser.js"));
+        assert_eq!(
+            default_server_main_fields(),
+            ["module", "jsnext:main", "jsnext", "main"].map(String::from)
+        );
     }
 
     #[test]
