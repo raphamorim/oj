@@ -15,6 +15,9 @@ const CONFIG_FILES = [
 const hookHandler = (h) => (typeof h === "function" ? h : typeof h?.handler === "function" ? h.handler : null);
 // Vite fails a module whose plugin hook throws, naming the plugin; the loader
 // surfaces this as the request's error instead of silently skipping the plugin.
+// Framework plugins oj reimplements (vite:*, tanstack*) run here without the
+// lifecycle oj replaced (their generators are never initialized), so their
+// failures stay skipped as before; only user plugins fail the module.
 function pluginError(e, plugin, id) {
   const err = e instanceof Error ? e : new Error((e && e.message) || String(e));
   if (err.ojDecorated) return err;
@@ -194,7 +197,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
       const h = hookHandler(p.resolveId);
       if (!h || !idAllowed(hookFilter(p.resolveId), id)) continue;
       let r;
-      try { r = await h.call(ctx, id, importer, { isEntry: false }); } catch (e) { throw pluginError(e, p, importer || id); }
+      try { r = await h.call(ctx, id, importer, { isEntry: false }); } catch (e) { if (ojReimplemented(p.name)) continue; throw pluginError(e, p, importer || id); }
       if (r != null) return typeof r === "string" ? r : r.id;
     }
     return null;
@@ -206,7 +209,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
       const h = hookHandler(p.load);
       if (!h || !idAllowed(hookFilter(p.load), id)) continue;
       let r;
-      try { r = await h.call(ctx, id); } catch (e) { throw pluginError(e, p, id); }
+      try { r = await h.call(ctx, id); } catch (e) { if (ojReimplemented(p.name)) continue; throw pluginError(e, p, id); }
       if (r != null) return typeof r === "string" ? r : r.code;
     }
     return null;
@@ -219,7 +222,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
       const h = hookHandler(p.transform);
       if (!h || !idAllowed(hookFilter(p.transform), id)) continue;
       let r;
-      try { r = await h.call(ctx, current, id); } catch (e) { throw pluginError(e, p, id); }
+      try { r = await h.call(ctx, current, id); } catch (e) { if (ojReimplemented(p.name)) continue; throw pluginError(e, p, id); }
       const next = r == null ? null : typeof r === "string" ? r : r.code;
       if (next != null) { current = next; changed = true; }
     }
