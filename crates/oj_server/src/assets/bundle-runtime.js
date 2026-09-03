@@ -238,8 +238,9 @@ function clearOverlay() {
     }
     if (msg.type === "patch") applyPatch(msg);
     else if (msg.type === "css-update") swapCss(msg);
+    else if (msg.type === "update") for (const u of msg.updates || []) { if (u.type === "css-update") swapCss(u); }
     else if (msg.type === "full-reload") location.reload();
-    else if (msg.type === "error") showOverlay(msg.message || "unknown error");
+    else if (msg.type === "error") showOverlay((msg.err && msg.err.message) || msg.message || "unknown error");
   });
   ws.addEventListener("open", () => console.log("[oj] dev server connected (bundle mode)"));
   ws.addEventListener("close", () => setTimeout(connect, 1000));

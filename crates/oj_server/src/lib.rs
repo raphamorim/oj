@@ -2116,8 +2116,7 @@ async fn serve_path(
                         .into_response(),
                     Err(err) => {
                         let _ = state.reload_tx.send(
-                            serde_json::json!({ "type": "error", "message": err.clone() })
-                                .to_string(),
+                            error_frame(&err),
                         );
                         (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {err}")).into_response()
                     }
@@ -2176,7 +2175,7 @@ async fn serve_compiled(
         Err(err) => {
             let _ = state
                 .reload_tx
-                .send(serde_json::json!({ "type": "error", "message": err.clone() }).to_string());
+                .send(error_frame(&err));
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {err}")).into_response();
         }
     };
@@ -3068,7 +3067,7 @@ async fn serve_css_wrapper(state: &Arc<ServerState>, file: &Path, url: &str) -> 
         Err(err) => {
             let _ = state
                 .reload_tx
-                .send(serde_json::json!({ "type": "error", "message": err.clone() }).to_string());
+                .send(error_frame(&err));
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {err}")).into_response();
         }
     };
@@ -3528,6 +3527,39 @@ function $RefreshReg$(type, id) {{ return RefreshRuntime.register(type, {id:?} +
 function $RefreshSig$() {{ return RefreshRuntime.createSignatureFunctionForTransform(); }}
 "#
     )
+}
+
+/// Vite's `ErrorPayload` (`{type:'error', err:{message, stack, id, loc, frame, plugin}}`).
+/// oj's messages are "title\n<file>:<line>:<col>...\nframe" style text; the file
+/// location is lifted into `id`/`loc` so a Vite-protocol overlay shows it.
+fn error_frame(message: &str) -> String {
+    let mut err = serde_json::json!({ "message": message, "stack": "", "plugin": "oj" });
+    static LOC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = LOC.get_or_init(|| {
+        regex::Regex::new(r"([^\s():]+\.[A-Za-z0-9]+):(\d+)(?::(\d+))?").expect("loc regex")
+    });
+    if let Some(c) = re.captures(message) {
+        err["id"] = serde_json::Value::String(c[1].to_string());
+        let line = c[2].parse::<u64>().unwrap_or(0);
+        let column = c.get(3).and_then(|m| m.as_str().parse::<u64>().ok()).unwrap_or(0);
+        err["loc"] = serde_json::json!({ "file": &c[1], "line": line, "column": column });
+    }
+    if let Some((_, frame)) = message.split_once('\n') {
+        if !frame.trim().is_empty() {
+            err["frame"] = serde_json::Value::String(frame.to_string());
+        }
+    }
+    serde_json::json!({ "type": "error", "err": err }).to_string()
+}
+
+/// One entry of Vite's `UpdatePayload.updates`.
+fn update_entry(kind: &str, path: &str, timestamp: u64) -> serde_json::Value {
+    serde_json::json!({
+        "type": kind,
+        "path": path,
+        "acceptedPath": path,
+        "timestamp": timestamp,
+    })
 }
 
 fn svelte_hot_glue(url: &str) -> String {
@@ -4725,7 +4757,7 @@ async fn serve_patch(State(state): State<Arc<ServerState>>, uri: Uri) -> Respons
             Ok(registration) => patch.push_str(&registration),
             Err(err) => {
                 let _ = state.reload_tx.send(
-                    serde_json::json!({ "type": "error", "message": err.clone() }).to_string(),
+                    error_frame(&err),
                 );
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -5275,7 +5307,7 @@ fn is_restart_trigger(path: &Path) -> bool {
             "postcss.config",
             "tailwind.config",
         ],
-        &["ts", "js", "mjs", "cjs", "mts", "cts"],
+        &["ts", "js", "mjs", "cjs", "mts", "cts", "json"],
     )
 }
 
@@ -5460,10 +5492,7 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
     if source_changed {
         let timestamp = now_millis() as u64;
         for url in state.tailwind_urls.lock().unwrap().iter() {
-            messages.push(
-                serde_json::json!({ "type": "css-update", "path": url, "timestamp": timestamp })
-                    .to_string(),
-            );
+            updates.push(update_entry("css-update", url, timestamp));
         }
     }
 
@@ -5534,7 +5563,7 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
                                             if is_style_url(&p) {
                                                 p.push_str("?import");
                                             }
-                                            serde_json::json!({ "path": p, "timestamp": timestamp })
+                                            update_entry("js-update", &p, timestamp)
                                         }));
                                         continue;
                                     }
@@ -5575,14 +5604,7 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
             let url = url_of(&state.root, path);
             if !state.graph.lock().unwrap().contains(Path::new(&url)) {
                 println!("oj: change {url} -> css-update");
-                messages.push(
-                    serde_json::json!({
-                        "type": "css-update",
-                        "path": url,
-                        "timestamp": now_millis() as u64,
-                    })
-                    .to_string(),
-                );
+                updates.push(update_entry("css-update", &url, now_millis() as u64));
                 continue;
             }
         }
@@ -5660,12 +5682,15 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
                         keys.remove(&d.display().to_string());
                     }
                 }
+                if boundaries.is_empty() {
+                    println!("oj: change {url} -> no update (nothing loaded imports it)");
+                }
                 updates.extend(boundaries.iter().map(|b| {
                     let mut path = format!("{}", b.display());
                     if is_style_url(&path) {
                         path.push_str("?import");
                     }
-                    serde_json::json!({ "path": path, "timestamp": timestamp })
+                    update_entry("js-update", &path, timestamp)
                 }));
             }
             HmrDecision::FullReload { reason } => {
@@ -5990,6 +6015,33 @@ mod tests {
         );
         assert!(v.contains(r#"createHotContext("/src/r.tsx?tsr-shared=1")"#), "{v}");
         assert!(v.contains(r#"from "/src/r.tsx?tsr-shared=1&t=1700000000000""#), "{v}");
+    }
+
+    #[test]
+    fn restart_triggers_include_every_config_flavor() {
+        for f in ["oj.config.ts", "oj.config.json", "vite.config.mts", ".env", ".env.staging", "postcss.config.cjs"] {
+            assert!(is_restart_trigger(Path::new(f)), "{f}");
+        }
+        for f in ["src/main.ts", "package.json", "config.json", "env.ts"] {
+            assert!(!is_restart_trigger(Path::new(f)), "{f}");
+        }
+    }
+
+    #[test]
+    fn error_frame_is_a_vite_error_payload() {
+        let f: serde_json::Value =
+            serde_json::from_str(&error_frame("compile error:\nsrc/App.tsx:3:7 Unexpected token\n  | <div>")).unwrap();
+        assert_eq!(f["type"], "error");
+        assert_eq!(f["err"]["message"], "compile error:\nsrc/App.tsx:3:7 Unexpected token\n  | <div>");
+        assert_eq!(f["err"]["id"], "src/App.tsx");
+        assert_eq!(f["err"]["loc"]["line"], 3);
+        assert_eq!(f["err"]["loc"]["column"], 7);
+        assert!(f["err"]["frame"].as_str().unwrap().contains("Unexpected token"));
+        let plain: serde_json::Value = serde_json::from_str(&error_frame("boom")).unwrap();
+        assert!(plain["err"]["id"].is_null() && plain["err"]["frame"].is_null());
+        let u = update_entry("css-update", "/a.css", 5);
+        assert_eq!(u["acceptedPath"], "/a.css");
+        assert_eq!(u["type"], "css-update");
     }
 
     #[test]

@@ -262,9 +262,12 @@ impl ModuleGraph {
             };
             match colors.get(current) {
                 Some(Color::Black) => continue,
-                Some(Color::Gray) => {
-                    return Err(format!("circular import involving {}", current.display()));
-                }
+                // An importer already on the current path is a circular import.
+                // Vite skips it (flagging `isWithinCircularImport`) and keeps
+                // searching the other importers for a boundary; only reaching an
+                // entry with no accepting module forces a full reload. Barrel-file
+                // cycles are common and must not turn every edit into a reload.
+                Some(Color::Gray) => continue,
                 None => {}
             }
             let Some(node) = self.modules.get(current) else {
@@ -552,12 +555,31 @@ mod tests {
 
     #[test]
     fn import_cycles_do_not_hang_propagation() {
+        // A pure cycle with no entry and no boundary: nothing is loaded from it,
+        // so, like Vite, there is nothing to update and nothing to reload.
         let mut g = ModuleGraph::new();
         g.add_import(&p("a.ts"), &p("b.ts"));
         g.add_import(&p("b.ts"), &p("a.ts"));
-        assert!(matches!(
+        assert_eq!(
             g.propagate_update(&p("a.ts")),
-            HmrDecision::FullReload { .. }
-        ));
+            HmrDecision::Update { boundaries: vec![] }
+        );
+    }
+
+    #[test]
+    fn a_cycle_on_the_way_to_a_boundary_does_not_force_a_reload() {
+        // App (boundary) -> a <-> b ; editing b must hot-update App.
+        let mut g = ModuleGraph::new();
+        g.add_import(&p("App.tsx"), &p("a.ts"));
+        g.add_import(&p("a.ts"), &p("b.ts"));
+        g.add_import(&p("b.ts"), &p("a.ts"));
+        g.set_self_accepting(&p("App.tsx"), true);
+        assert_eq!(
+            g.propagate_update(&p("b.ts")),
+            HmrDecision::Update { boundaries: vec![p("App.tsx")] }
+        );
+        // ...but a cycle whose other importer path reaches an entry still reloads.
+        g.add_import(&p("main.ts"), &p("b.ts"));
+        assert!(matches!(g.propagate_update(&p("b.ts")), HmrDecision::FullReload { .. }));
     }
 }
