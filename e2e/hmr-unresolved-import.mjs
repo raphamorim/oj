@@ -60,6 +60,20 @@ try {
   assert.match(body, /src\/App\.tsx:2:24/, `error does not point at the import specifier:\n${body}`);
   console.log("500 + resolve error:  yes");
 
+  // A bare specifier no package or plugin answers fails the same way (Vite
+  // does not ship the bare name for the browser to reject with its own error).
+  fs.writeFileSync(path.join(app, "src", "Bare.tsx"), `import missing from "not-installed-pkg";\nexport const bare = missing;\n`);
+  const bareRes = await fetch(`http://localhost:${PORT}/src/Bare.tsx`);
+  const bareBody = await bareRes.text();
+  assert.equal(bareRes.status, 500, `expected 500 for an unresolvable bare import, got ${bareRes.status}:\n${bareBody}`);
+  assert.match(bareBody, /Failed to resolve import "not-installed-pkg" from "src\/Bare\.tsx"\. Does the file exist\?/, bareBody);
+  assert.match(bareBody, /src\/Bare\.tsx:1:22/, `error does not point at the bare specifier:\n${bareBody}`);
+  console.log("bare import error:    yes");
+  // Make it valid again so the failed-importer retry below has one module to
+  // recover (the page never imports Bare.tsx; only App.tsx is under test).
+  fs.writeFileSync(path.join(app, "src", "Bare.tsx"), `export const bare = 1;\n`);
+  await sleep(500);
+
   const browser = await chromium.launch();
   const page = await browser.newPage();
   try {
