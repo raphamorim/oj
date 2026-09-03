@@ -124,7 +124,7 @@ export function mergeTsConfig(chain, fallbackBaseDir) {
   for (const { cfg, dir } of chain) {
     const co = cfg.compilerOptions || {};
     if (co.paths) paths = { ...paths, ...co.paths };
-    baseDir = co.baseUrl != null ? pathResolve(dir, co.baseUrl) : dir;
+    if (co.baseUrl != null) baseDir = pathResolve(dir, co.baseUrl);
   }
   return { rules: Object.entries(paths).map(([k, v]) => [k, Array.isArray(v) ? v : [v]]), baseDir };
 }

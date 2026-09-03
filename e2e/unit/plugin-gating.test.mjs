@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -115,4 +115,24 @@ test("hookHandler / hookFilter: function form and object form", () => {
 
   assert.equal(hookHandler(undefined), null);
   assert.equal(hookHandler({ handler: "not-a-fn" }), null);
+});
+
+test("generateBundle honors environment consumer gates", async () => {
+  const emitted = [];
+  const plugin = {
+    name: "synthetic-server-manifest",
+    applyToEnvironment: (environment) => environment.config.consumer === "server",
+    generateBundle() {
+      this.emitFile({ type: "asset", fileName: "server-manifest.json", source: "{}" });
+    },
+  };
+
+  await createPluginContainer({}, [plugin], { environment: "client" })
+    .generateBundle((asset) => emitted.push(asset));
+  assert.deepEqual(emitted, []);
+
+  await createPluginContainer({}, [plugin], { environment: "ssr" })
+    .generateBundle((asset) => emitted.push(asset));
+  assert.equal(emitted.length, 1);
+  assert.equal(emitted[0].fileName, "server-manifest.json");
 });
