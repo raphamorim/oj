@@ -275,3 +275,44 @@ it("optimize-deps: expands include globs like Vite and honors needsInterop", asy
 
   fs.rmSync(root, { recursive: true, force: true });
 });
+
+it("optimize-deps: resolve.dedupe bundles the root copy; entries are globs", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "oj-optdeps6-"));
+  fs.mkdirSync(path.join(root, "node_modules"), { recursive: true });
+  fs.symlinkSync(esbuildSrc, path.join(root, "node_modules", "esbuild"));
+  const esbuildScoped = path.join(repo, "e2e/fixtures/start-app/node_modules/@esbuild");
+  if (fs.existsSync(esbuildScoped)) fs.symlinkSync(esbuildScoped, path.join(root, "node_modules", "@esbuild"));
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "fx6" }));
+
+  const esmPkg = (dir, name, code) => {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name, version: "1.0.0", type: "module", main: "index.js" }));
+    fs.writeFileSync(path.join(dir, "index.js"), code);
+  };
+  // `shared` exists twice: at the root and nested under `consumer`.
+  esmPkg(path.join(root, "node_modules", "shared"), "shared", `export const copy = "ROOT_COPY";\n`);
+  esmPkg(path.join(root, "node_modules", "consumer"), "consumer", `import { copy } from "shared";\nexport const via = copy;\n`);
+  esmPkg(path.join(root, "node_modules", "consumer", "node_modules", "shared"), "shared", `export const copy = "NESTED_COPY";\n`);
+  fs.mkdirSync(path.join(root, "src", "pages"), { recursive: true });
+  fs.writeFileSync(path.join(root, "src", "pages", "home.js"), `import { via } from "consumer";\nexport const out = via;\n`);
+  const outDir = path.join(root, ".oj-cache", "deps");
+  const run = (extra) =>
+    JSON.parse(
+      execFileSync("node", [sidecar, JSON.stringify({ root, outDir, ...extra })], { encoding: "utf8" }),
+    ).metadata;
+
+  // Node resolution alone picks the nested copy; resolve.dedupe re-resolves the
+  // bare import from the project root (Vite: dedupe -> basedir = root).
+  const plain = run({ include: ["consumer"], entries: [path.join(root, "src/pages/home.js")] });
+  assert.match(fs.readFileSync(path.join(outDir, plain.consumer.file), "utf8"), /NESTED_COPY/);
+  const deduped = run({ include: ["consumer"], dedupe: ["shared"], entries: [path.join(root, "src/pages/home.js")] });
+  const bundled = fs.readFileSync(path.join(outDir, deduped.consumer.file), "utf8");
+  assert.match(bundled, /ROOT_COPY/, `dedupe must bundle the root copy:\n${bundled}`);
+  assert.doesNotMatch(bundled, /NESTED_COPY/);
+
+  // optimizeDeps.entries as a glob (relative to root) feeds the scan.
+  const globbed = run({ entries: ["src/**/*.js"], autoDiscover: true });
+  assert.deepEqual(Object.keys(globbed).sort(), ["consumer"], "the glob-matched entry was scanned");
+
+  fs.rmSync(root, { recursive: true, force: true });
+});
