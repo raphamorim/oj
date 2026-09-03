@@ -4077,8 +4077,16 @@ fn is_importable_asset_ext(ext: &str) -> bool {
 // tooling a dep drags along), Vite serves a browser-externalized stub rather than
 // 404ing the whole module chain; oj does the same so the app still mounts.
 pub(crate) fn is_node_builtin(spec: &str) -> bool {
-    let name = spec.strip_prefix("node:").unwrap_or(spec);
-    let base = name.split('/').next().unwrap_or(name);
+    // Vite's isNodeBuiltin: anything under the `node:` scheme is a builtin (this
+    // covers node:sqlite, node:sea, node:test and whatever Node adds next); the
+    // list below is `module.builtinModules` for the bare (scheme-less) names.
+    if spec.starts_with("node:") {
+        return true;
+    }
+    let base = spec.split('/').next().unwrap_or(spec);
+    if base.starts_with("_http_") || base.starts_with("_stream_") || base.starts_with("_tls_") {
+        return true;
+    }
     matches!(
         base,
         "assert" | "async_hooks" | "buffer" | "child_process" | "cluster" | "console"
@@ -5131,8 +5139,47 @@ async fn serve_plugin_resolve(state: &Arc<ServerState>, id: &str) -> Response {
     }
 }
 
+/// Vite's browser-externalized module for a node builtin that reaches the client
+/// graph (optimizer rolldownDepPlugin `browser-external` load): a Proxy whose
+/// property reads console.warn `Module "fs" has been externalized for browser
+/// compatibility. Cannot access "fs.readFileSync" in client code.` and yield
+/// undefined, so the app still mounts and the developer learns which dep pulled
+/// the builtin in. Skips the keys bundlers, interop helpers and devtools poke.
+fn browser_external_stub_source(spec: &str) -> String {
+    let id = serde_json::Value::String(spec.to_string());
+    format!(
+        "// oj: browser-externalized node builtin {id}\n\
+         const __oj_ext = Object.create(new Proxy({{}}, {{\n\
+         \x20 get(_, key) {{\n\
+         \x20   if (typeof key === \"string\" && key !== \"__esModule\" && key !== \"__proto__\" && key !== \"constructor\" && key !== \"splice\" && key !== \"then\") {{\n\
+         \x20     console.warn(`Module \"${{{id}}}\" has been externalized for browser compatibility. Cannot access \"${{{id}}}.${{key}}\" in client code. See https://vite.dev/guide/troubleshooting.html#module-externalized-for-browser-compatibility for more details.`);\n\
+         \x20   }}\n\
+         \x20 }}\n\
+         }}));\n\
+         export default __oj_ext;\n\
+         export const __cjs_exports = __oj_ext;\n"
+    )
+}
+
+fn browser_external_stub(spec: &str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        browser_external_stub_source(spec),
+    )
+        .into_response()
+}
+
 async fn serve_plugin_id(state: &Arc<ServerState>, spec: &str, importer: &str) -> Response {
+    // A plugin may polyfill a node builtin (vite-plugin-node-polyfills), so the
+    // host gets first refusal; with no host, or when no plugin claims it, the
+    // builtin is browser-externalized like Vite does.
     let Some(host) = &state.plugins else {
+        if is_node_builtin(spec) {
+            return browser_external_stub(spec);
+        }
         return (StatusCode::NOT_FOUND, "oj: no plugin host").into_response();
     };
     let id = match host.resolve_id(spec, importer).await {
@@ -5160,14 +5207,7 @@ async fn serve_plugin_id(state: &Arc<ServerState>, spec: &str, importer: &str) -
                 }
             }
             if is_node_builtin(spec) {
-                return (
-                    [
-                        (header::CONTENT_TYPE, "text/javascript"),
-                        (header::CACHE_CONTROL, "no-cache"),
-                    ],
-                    format!("// oj: browser-externalized node builtin {:?}\nexport default {{}};\nexport const __cjs_exports = {{}};\n", spec),
-                )
-                    .into_response();
+                return browser_external_stub(spec);
             }
             return (
                 StatusCode::NOT_FOUND,
@@ -7051,10 +7091,64 @@ mod tests {
         assert!(is_node_builtin("fs/promises"));
         assert!(is_node_builtin("crypto"));
         assert!(is_node_builtin("perf_hooks"));
-        // Not builtins: real packages and app specifiers.
+        // Vite's isNodeBuiltin: every `node:` id is a builtin, including the
+        // scheme-only modules and ones newer than any hardcoded list.
+        assert!(is_node_builtin("node:sqlite"));
+        assert!(is_node_builtin("node:sea"));
+        assert!(is_node_builtin("node:test"));
+        assert!(is_node_builtin("node:whatever-node-adds-next"));
+        assert!(is_node_builtin("_http_common"));
+        // Not builtins: real packages and app specifiers. The scheme-only names
+        // are not builtins when bare, exactly like Node.
+        assert!(!is_node_builtin("sqlite"));
+        assert!(!is_node_builtin("test"));
         assert!(!is_node_builtin("source-map-support"));
         assert!(!is_node_builtin("react"));
         assert!(!is_node_builtin("./local"));
+    }
+
+    #[test]
+    fn workspace_root_matches_vite_search_for_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        // A git repository is NOT a workspace marker (Vite comments `.git` out):
+        // the default fs.allow for a project nested in a repo stays the project.
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join("package.json"), "{}").unwrap();
+        let app = repo.join("apps/web");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("package.json"), r#"{"name":"web"}"#).unwrap();
+        assert_eq!(workspace_root(&app), app, "nearest package.json, not the repo");
+
+        // A pnpm workspace marker above it widens the root to the workspace.
+        std::fs::write(repo.join("pnpm-workspace.yaml"), "packages: ['apps/*']").unwrap();
+        assert_eq!(workspace_root(&app), repo);
+        std::fs::remove_file(repo.join("pnpm-workspace.yaml")).unwrap();
+
+        // ...as does a root package.json with a `workspaces` field.
+        std::fs::write(repo.join("package.json"), r#"{"workspaces":["apps/*"]}"#).unwrap();
+        assert_eq!(workspace_root(&app), repo);
+
+        // No package.json anywhere: the app root itself.
+        let bare = repo.join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::write(repo.join("package.json"), "{}").unwrap();
+        assert_eq!(workspace_root(&bare), repo, "nearest ancestor with a package.json");
+    }
+
+    #[test]
+    fn browser_external_stub_warns_like_vite_on_property_access() {
+        let src = browser_external_stub_source("node:fs");
+        assert!(src.contains("has been externalized for browser compatibility"));
+        assert!(src.contains("Cannot access \"${\"node:fs\"}.${key}\" in client code"));
+        // Interop reads names off __cjs_exports and probes __esModule first; the
+        // probe must stay silent and the module must still export both shapes.
+        assert!(src.contains("key !== \"__esModule\""));
+        assert!(src.contains("export default __oj_ext"));
+        assert!(src.contains("export const __cjs_exports = __oj_ext"));
+        // The stub is JS-safe for any id (quotes escaped through JSON).
+        let quoted = browser_external_stub_source("a\"b");
+        assert!(quoted.contains("\"a\\\"b\""));
     }
 
     #[test]
