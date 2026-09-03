@@ -412,6 +412,7 @@ if (isMainRun) try {
       fsAllow: Array.isArray(c.server?.fs?.allow)
         ? c.server.fs.allow.filter((x) => typeof x === "string")
         : null,
+      fsStrict: typeof c.server?.fs?.strict === "boolean" ? c.server.fs.strict : null,
       define: c.define && typeof c.define === "object" ? c.define : null,
       alias: extractAlias(c.resolve?.alias),
       headers: stringMap(c.server?.headers),
