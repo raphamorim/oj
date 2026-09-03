@@ -173,7 +173,7 @@ const client = await build({
       global: "globalThis", ...viteEnvDefine({ ssr: false, mode: MODE }),
     },
   },
-  resolve: { conditionNames: ["browser", "module", "import"], alias: clientAlias },
+  resolve: { conditionNames: ["browser", "module", "import", NODE_ENV === "production" ? "production" : "development"], alias: clientAlias },
   plugins: [
     makeVitePlugins({ container: clientContainer, appRoot: APP, mode: "prod", emit }),
     clientFnPlugin,

@@ -794,10 +794,7 @@ fn rolldown_resolve(
     env: &str,
 ) -> Option<rolldown_common::ResolveOptions> {
     let alias = oj_config::resolve_alias(config, env);
-    if alias.is_empty() {
-        return None;
-    }
-    let alias = alias
+    let alias: Vec<(String, Vec<Option<String>>)> = alias
         .into_iter()
         .map(|(find, replacement)| {
             let target = if replacement.starts_with('.') {
@@ -808,8 +805,13 @@ fn rolldown_resolve(
             (find, vec![Some(target)])
         })
         .collect();
+    // Vite resolves a build with the `production` condition (its
+    // `development|production` default); pass the same explicit list the dev
+    // server uses so a dep with a `development` export never differs between
+    // dev and build.
     Some(rolldown_common::ResolveOptions {
-        alias: Some(alias),
+        alias: (!alias.is_empty()).then_some(alias),
+        condition_names: Some(oj_config::resolve_conditions_for(config, env, false)),
         ..Default::default()
     })
 }

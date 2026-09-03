@@ -91,7 +91,7 @@ const result = await build({
     },
   },
   resolve: {
-    conditionNames: ["browser", "module", "import"],
+    conditionNames: ["browser", "module", "import", "development"],
     alias: {
       "#tanstack-router-entry": routerEntry(),
       "#tanstack-start-entry": join(HERE, "start-entry.ts"),

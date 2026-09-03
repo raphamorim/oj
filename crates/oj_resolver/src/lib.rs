@@ -51,11 +51,30 @@ pub struct ResolveSettings {
     pub preserve_symlinks: bool,
 }
 
+/// Extensions probed for an extensionless import, in priority order. Shared with
+/// the dependency optimizer so it resolves exactly like the dev server.
+pub fn default_extensions() -> Vec<String> {
+    [".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs", ".json"]
+        .map(String::from)
+        .to_vec()
+}
+
+/// Package entry fields for legacy deps without an `exports` map. `module` leads
+/// so a dep shipping both an ESM build and a `browser` STRING that points at a
+/// UMD/CJS bundle (e.g. transliteration) serves its ESM: real named exports, no
+/// CJS-interop guessing. The `browser` OBJECT remap (node-shim swaps) is
+/// unaffected: it runs through alias_fields, not here. Shared with the optimizer.
+pub fn default_main_fields() -> Vec<String> {
+    ["module", "browser", "jsnext:main", "jsnext", "main"]
+        .map(String::from)
+        .to_vec()
+}
+
 impl OjResolver {
     pub fn new(root: &Path) -> Self {
         Self::with_conditions(
             root,
-            &["browser", "import", "module", "default"].map(String::from),
+            &["browser", "import", "module", "development", "default"].map(String::from),
         )
     }
 
@@ -94,22 +113,9 @@ impl OjResolver {
                 (find.clone(), vec![AliasValue::Path(target)])
             })
             .collect();
-        let default_extensions = [".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs", ".json"]
-            .map(String::from)
-            .to_vec();
-        // Package entry resolution for legacy deps without an `exports` map
-        // (with one, condition_names decides and this is unused). `module`
-        // leads so a dep shipping both an ESM build and a `browser` STRING
-        // that points at a UMD/CJS bundle (e.g. transliteration) serves its
-        // ESM — real named exports, no CJS-interop guessing. The `browser`
-        // OBJECT remap (node-shim swaps) is unaffected: it runs through
-        // alias_fields below, not here.
-        let default_main_fields = ["module", "browser", "jsnext:main", "jsnext", "main"]
-            .map(String::from)
-            .to_vec();
         let options = ResolveOptions {
-            extensions: settings.extensions.unwrap_or(default_extensions),
-            main_fields: settings.main_fields.unwrap_or(default_main_fields),
+            extensions: settings.extensions.unwrap_or_else(default_extensions),
+            main_fields: settings.main_fields.unwrap_or_else(default_main_fields),
             alias_fields: vec![vec!["browser".to_string()]],
             condition_names: settings.conditions,
             alias,

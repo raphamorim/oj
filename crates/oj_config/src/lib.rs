@@ -150,25 +150,50 @@ pub fn environment_build_bool(config: &OjConfig, env_name: &str, field: &str) ->
         .and_then(|v| v.as_bool())
 }
 
+/// Export conditions for the dev server (Vite's `development` condition active).
 pub fn resolve_conditions(config: &OjConfig, env_name: &str) -> Vec<String> {
-    if let Some(c) = config
+    resolve_conditions_for(config, env_name, true)
+}
+
+/// Export conditions for an environment, as Vite resolves them: the default set
+/// is `browser`/`node`, `module`, and `development` or `production` (per `dev`),
+/// plus `import` and `default`, which the resolver always matches. A user
+/// `resolve.conditions` list replaces the defaults (Vite parity: no implicit
+/// `module` or dev/prod) but Vite's `development|production` placeholder is
+/// mapped to the active one, and `import`/`default` are always kept so a
+/// dual-package `exports` map still resolves.
+pub fn resolve_conditions_for(config: &OjConfig, env_name: &str, dev: bool) -> Vec<String> {
+    let dev_prod = if dev { "development" } else { "production" };
+    let user = config
         .environments
         .as_ref()
         .and_then(|e| e.get(env_name))
         .and_then(|e| e.get("resolve"))
         .and_then(|r| r.get("conditions"))
         .and_then(|c| c.as_array())
-    {
-        return c
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
-    }
-    if let Some(c) = config.resolve.as_ref().and_then(|r| r.conditions.as_ref()) {
-        return c.clone();
+        .map(|c| {
+            c.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .or_else(|| config.resolve.as_ref().and_then(|r| r.conditions.clone()));
+    if let Some(user) = user {
+        let mut out: Vec<String> = Vec::new();
+        for c in user {
+            let c = if c == "development|production" { dev_prod.to_string() } else { c };
+            if !out.contains(&c) {
+                out.push(c);
+            }
+        }
+        for always in ["import", "default"] {
+            if !out.iter().any(|c| c == always) {
+                out.push(always.to_string());
+            }
+        }
+        return out;
     }
     let base = if env_name == "ssr" { "node" } else { "browser" };
-    [base, "import", "module", "default"]
+    [base, "import", "module", dev_prod, "default"]
         .map(String::from)
         .to_vec()
 }
@@ -769,11 +794,15 @@ mod tests {
         assert_eq!(environment_build_bool(&cfg, "client", "minify"), None);
         assert_eq!(
             resolve_conditions(&cfg, "ssr"),
-            s(&["node", "import", "module", "default"])
+            s(&["node", "import", "module", "development", "default"])
         );
         assert_eq!(
             resolve_conditions(&cfg, "client"),
-            s(&["browser", "import", "module", "default"])
+            s(&["browser", "import", "module", "development", "default"])
+        );
+        assert_eq!(
+            resolve_conditions_for(&cfg, "client", false),
+            s(&["browser", "import", "module", "production", "default"])
         );
     }
 
@@ -797,13 +826,15 @@ mod tests {
         assert_eq!(defines.get("__FLAG__").unwrap(), "true");
         assert_eq!(defines.get("__COUNT__").unwrap(), "3");
 
+        // A user list replaces the defaults (no implicit module/dev-prod, like
+        // Vite) but import/default are always kept so exports maps still match.
         assert_eq!(
             resolve_conditions(&cfg, "ssr"),
-            vec!["node-only".to_string()]
+            vec!["node-only".to_string(), "import".to_string(), "default".to_string()]
         );
         assert_eq!(
             resolve_conditions(&cfg, "client"),
-            vec!["custom".to_string()]
+            vec!["custom".to_string(), "import".to_string(), "default".to_string()]
         );
 
         assert_eq!(
@@ -873,5 +904,26 @@ mod jsx_settings_tests {
         c.oxc = Some(serde_json::Value::Bool(false));
         c.esbuild = Some(serde_json::Value::Bool(false));
         assert_eq!(jsx_settings(&c), JsxSettings::default());
+    }
+
+    #[test]
+    fn user_conditions_map_vites_dev_prod_placeholder() {
+        let mut cfg = OjConfig::default();
+        cfg.resolve = Some(ResolveConfig {
+            conditions: Some(vec![
+                "custom".into(),
+                "development|production".into(),
+                "import".into(),
+            ]),
+            ..Default::default()
+        });
+        assert_eq!(
+            resolve_conditions_for(&cfg, "client", true),
+            ["custom", "development", "import", "default"].map(String::from).to_vec()
+        );
+        assert_eq!(
+            resolve_conditions_for(&cfg, "client", false),
+            ["custom", "production", "import", "default"].map(String::from).to_vec()
+        );
     }
 }
