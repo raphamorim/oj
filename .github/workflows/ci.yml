@@ -208,6 +208,8 @@ jobs:
           test -f /tmp/lib/dist/index.umd.js
       - name: ssr build + streaming prod server
         run: node e2e/ssr-prod.mjs
+      - name: ssr build passes --mode to both plugin hosts
+        run: node e2e/ssr-build-mode.mjs
       - name: ssr dev
         run: node e2e/ssr-dev.mjs
       - name: preview smoke
