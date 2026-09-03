@@ -137,6 +137,22 @@ async function applyUpdate(update) {
 
 let overlayEl = null;
 let overlayKeyHandler = null;
+let isFirstUpdate = true;
+
+// If this is the first update and an error overlay is already showing, the page
+// opened with a server compile error and the module script never finished
+// loading (one of its nested imports was a 500): the boundaries above the fixed
+// file were never registered, so a hot update has nothing to swap into. A full
+// reload is the only way to recover, as in Vite's clearOverlayOrReloadOnFirstUpdate.
+function clearOverlayOrReloadOnFirstUpdate() {
+  if (isFirstUpdate && overlayEl) {
+    location.reload();
+    return "reload";
+  }
+  clearOverlay();
+  isFirstUpdate = false;
+  return "continue";
+}
 
 function parseError(text) {
   const s = String(text);
@@ -259,6 +275,7 @@ let hadConnection = false;
     } else if (msg.type === "update") {
       // Vite's UpdatePayload: css-update entries swap stylesheets, js-update
       // entries re-import boundaries.
+      if (clearOverlayOrReloadOnFirstUpdate() === "reload") return;
       for (const u of msg.updates || []) {
         if (u.type === "css-update") swapCss(u);
         else queueUpdate(u);

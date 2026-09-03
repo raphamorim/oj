@@ -304,6 +304,10 @@ struct ServerState {
     rt: tokio::runtime::Handle,
     base: Option<String>,
     optimized: Arc<optimize::OptimizedDeps>,
+    /// An error frame broadcast while no client was connected (a compile error
+    /// hit by the page's first module requests, before its socket opened) is
+    /// kept and delivered to the next client, like Vite's ws `bufferedError`.
+    buffered_error: Mutex<Option<String>>,
 }
 
 pub struct BuiltApp {
@@ -782,6 +786,7 @@ impl DevServer {
             parsed_fired: Mutex::new(std::collections::HashSet::new()),
             rt: tokio::runtime::Handle::current(),
             base: config.base.clone().filter(|b| b != "/"),
+            buffered_error: Mutex::new(None),
             optimized: Arc::new(if bundle {
                 optimize::OptimizedDeps::disabled()
             } else {
@@ -1394,6 +1399,10 @@ fn hmr_socket(upgrade: WebSocketUpgrade, state: Arc<ServerState>, vite: bool) ->
         if vite {
             let connected = serde_json::json!({ "type": "connected" }).to_string();
             let _ = socket.send(Message::Text(connected.into())).await;
+        }
+        let buffered = state.buffered_error.lock().unwrap().take();
+        if let Some(frame) = buffered {
+            let _ = socket.send(Message::Text(frame.into())).await;
         }
         if state.hmr_gate.is_some() {
             let mode = serde_json::json!({
@@ -2515,9 +2524,7 @@ async fn serve_path(
                     )
                         .into_response(),
                     Err(err) => {
-                        let _ = state.reload_tx.send(
-                            error_frame(&err),
-                        );
+                        send_error(&state, &err);
                         (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {err}")).into_response()
                     }
                 };
@@ -2573,9 +2580,7 @@ async fn serve_compiled(
     let (key, module) = match ensure_module(state, file, url).await {
         Ok(pair) => pair,
         Err(err) => {
-            let _ = state
-                .reload_tx
-                .send(error_frame(&err));
+            send_error(state, &err);
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {err}")).into_response();
         }
     };
@@ -3617,9 +3622,7 @@ async fn serve_css_direct(state: &Arc<ServerState>, file: &Path, url: &str) -> R
         )
             .into_response(),
         Err(err) => {
-            let _ = state
-                .reload_tx
-                .send(serde_json::json!({ "type": "error", "message": err.clone() }).to_string());
+            send_error(state, &err);
             (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {err}")).into_response()
         }
     }
@@ -3629,9 +3632,7 @@ async fn serve_css_wrapper(state: &Arc<ServerState>, file: &Path, url: &str) -> 
     let (_, module) = match ensure_module(state, file, url).await {
         Ok(pair) => pair,
         Err(err) => {
-            let _ = state
-                .reload_tx
-                .send(error_frame(&err));
+            send_error(state, &err);
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {err}")).into_response();
         }
     };
@@ -4197,6 +4198,19 @@ function $RefreshSig$() {{ return RefreshRuntime.createSignatureFunctionForTrans
 /// Vite's `ErrorPayload` (`{type:'error', err:{message, stack, id, loc, frame, plugin}}`).
 /// oj's messages are "title\n<file>:<line>:<col>...\nframe" style text; the file
 /// location is lifted into `id`/`loc` so a Vite-protocol overlay shows it.
+/// Broadcast an error frame to the connected clients, or hold it for the next
+/// one when none is connected yet (Vite's ws server does the same: a page whose
+/// first module request 500s has not opened its socket by then, and without the
+/// buffered frame it would show a blank page instead of the overlay).
+fn send_error(state: &ServerState, message: &str) {
+    let frame = error_frame(message);
+    if state.reload_tx.receiver_count() == 0 {
+        *state.buffered_error.lock().unwrap() = Some(frame);
+    } else {
+        let _ = state.reload_tx.send(frame);
+    }
+}
+
 fn error_frame(message: &str) -> String {
     let mut err = serde_json::json!({ "message": message, "stack": "", "plugin": "oj" });
     static LOC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -5421,9 +5435,7 @@ async fn serve_patch(State(state): State<Arc<ServerState>>, uri: Uri) -> Respons
         match registration_for(&state, url).await {
             Ok(registration) => patch.push_str(&registration),
             Err(err) => {
-                let _ = state.reload_tx.send(
-                    error_frame(&err),
-                );
+                send_error(&state, &err);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("oj: patch: {err}"),
