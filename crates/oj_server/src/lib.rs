@@ -6357,10 +6357,13 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
 
         if let Some(host) = &state.plugins {
             let file = path.display().to_string();
+            // Vite's watcher hands plugins the change kind: a removed file still
+            // reaches watchChange / hotUpdate, with type "delete" (unlink).
+            let change_type = if path.exists() { "update" } else { "delete" };
             if state.plugins_watch_change {
-                let _ = host.watch_change(&file, "update").await;
+                let _ = host.watch_change(&file, change_type).await;
             }
-            if state.plugins_hot_update && path.exists() {
+            if state.plugins_hot_update {
                 let ts = now_millis() as u64;
                 let hmr_url = url_of(&state.root, path);
                 let modules_json = {
@@ -6381,7 +6384,7 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
                     }
                 };
                 match host
-                    .handle_hot_update(&file, ts, "update", &modules_json)
+                    .handle_hot_update(&file, ts, change_type, &modules_json)
                     .await
                 {
                     Ok(Some(d)) if d == "skip" => {
