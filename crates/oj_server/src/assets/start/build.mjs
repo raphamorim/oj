@@ -230,7 +230,7 @@ writeFileSync(
   `export const tsrStartManifest = () => (${JSON.stringify({ routes: { __root__: rootManifest } })});\n`,
 );
 
-await build({
+const server = await build({
   input: { "server-bundle": join(HERE, "server-entry.tsx") },
   platform: "node",
   transform: {
@@ -250,6 +250,10 @@ await build({
   },
   plugins: [
     makeVitePlugins({ container: serverContainer, fallback: clientContainer, appRoot: APP, mode: "prod", emit }),
+    {
+      name: "oj-server-render-chunk",
+      renderChunk: (code, chunk) => serverContainer?.renderChunk(code, chunk) ?? null,
+    },
     serverFnPlugin,
     assetsPlugin({ mode: "prod", server: true, emit }),
   ],
@@ -262,6 +266,10 @@ await build({
     banner: "import { createRequire as ___cr } from 'node:module'; const require = ___cr(import.meta.url || 'file:///worker.js');",
   },
 });
+// Vite runs writeBundle for the server environment as well, once its files exist.
+if (serverContainer) {
+  await serverContainer.writeBundle(Object.fromEntries(server.output.map((output) => [output.fileName, output])));
+}
 
 writeFileSync(join(DIST, "server.mjs"), SERVER);
 writeFileSync(join(DIST, "worker.mjs"), WORKER);
