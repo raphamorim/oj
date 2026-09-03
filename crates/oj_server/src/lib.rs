@@ -357,7 +357,8 @@ impl DevServer {
         boot_phase("build_app begin");
         prepare_cache_root(&root);
         let mut config = oj_config::load(&root).map_err(|e| anyhow::anyhow!("{e}"))?;
-        plugins::adopt_vite_config_values(&mut config, &root, "serve", "development");
+        plugins::adopt_vite_config_values(&mut config, &root, "serve", "development")
+            .map_err(|e| anyhow::anyhow!(e))?;
         boot_phase("vite config values adopted");
 
         // Feed optimizeDeps.include/exclude/needsInterop into partial bundling so
