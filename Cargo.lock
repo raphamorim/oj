@@ -1821,6 +1821,7 @@ dependencies = [
  "oj_config",
  "oj_css",
  "oj_env",
+ "oj_resolver",
  "oj_server",
  "rolldown",
  "rolldown_common",
