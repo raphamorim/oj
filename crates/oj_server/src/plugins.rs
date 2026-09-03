@@ -189,7 +189,6 @@ pub struct ViteValues {
     pub headers: Option<serde_json::Map<String, serde_json::Value>>,
     pub rollup_options: Option<serde_json::Value>,
     pub assets_inline_limit: Option<u64>,
-    pub copy_public_dir: Option<bool>,
     pub proxy: Option<serde_json::Value>,
     pub dedupe: Option<Vec<String>>,
     pub optimize_deps: Option<serde_json::Value>,
@@ -360,7 +359,6 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
         headers: json.get("headers").and_then(|v| v.as_object()).cloned(),
         rollup_options: json.get("rollupOptions").filter(|v| !v.is_null()).cloned(),
         assets_inline_limit: json.get("assetsInlineLimit").and_then(|v| v.as_u64()),
-        copy_public_dir: json.get("copyPublicDir").and_then(|v| v.as_bool()),
         proxy: json.get("proxy").filter(|v| !v.is_null()).cloned(),
         dedupe: json.get("dedupe").and_then(|v| v.as_array()).map(|a| {
             a.iter()
@@ -504,10 +502,6 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
         let build = config.build.get_or_insert_with(Default::default);
         build.assets_inline_limit.get_or_insert(limit);
     }
-    if let Some(copy_public_dir) = v.copy_public_dir {
-        let build = config.build.get_or_insert_with(Default::default);
-        build.copy_public_dir.get_or_insert(copy_public_dir);
-    }
     if let Some(proxy) = v.proxy {
         let sc = config.server.get_or_insert_with(Default::default);
         if sc.proxy.is_none() {
@@ -572,6 +566,9 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
         }
         if build.ssr.is_none() {
             build.ssr = bool_or_str("ssr");
+        }
+        if build.copy_public_dir.is_none() {
+            build.copy_public_dir = bool_of("copyPublicDir");
         }
         if build.ssr_manifest.is_none() {
             build.ssr_manifest = bool_or_str("ssrManifest");
@@ -1308,7 +1305,6 @@ mod vite_values_tests {
             headers: None,
             rollup_options: None,
             assets_inline_limit: None,
-            copy_public_dir: None,
             proxy: None,
             dedupe: None,
             optimize_deps: None,
@@ -1348,7 +1344,6 @@ mod vite_values_tests {
             headers: None,
             rollup_options: None,
             assets_inline_limit: None,
-            copy_public_dir: None,
             proxy: None,
             dedupe: None,
             optimize_deps: None,

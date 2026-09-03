@@ -209,6 +209,7 @@ function extractBuild(b) {
   }
   if (typeof b.ssr === "string" || typeof b.ssr === "boolean") out.ssr = b.ssr;
   if (typeof b.ssrManifest === "string" || typeof b.ssrManifest === "boolean") out.ssrManifest = b.ssrManifest;
+  if (typeof b.copyPublicDir === "boolean") out.copyPublicDir = b.copyPublicDir;
   return Object.keys(out).length ? out : null;
 }
 
@@ -377,8 +378,6 @@ if (isMainRun) try {
       rollupOptions: markFunctions(c.build?.rolldownOptions ?? c.build?.rollupOptions ?? null),
       assetsInlineLimit:
         typeof c.build?.assetsInlineLimit === "number" ? c.build.assetsInlineLimit : null,
-      copyPublicDir:
-        typeof c.build?.copyPublicDir === "boolean" ? c.build.copyPublicDir : null,
       dedupe: Array.isArray(c.resolve?.dedupe)
         ? c.resolve.dedupe.filter((x) => typeof x === "string")
         : null,
