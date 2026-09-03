@@ -188,7 +188,15 @@ function makeConfigResolver(config) {
       return undefined;
     }
 
-    try { return resolvePackage(specifier); } catch { return undefined; }
+    try { return resolvePackage(specifier); } catch {}
+    // An export reachable only under the "import" condition (a package's ESM-only
+    // subpath); this module lives in the app's cache dir, so Node's ESM resolver
+    // walks the app's node_modules from here.
+    try {
+      const url = import.meta.resolve(specifier);
+      if (url.startsWith("file:")) return fileURLToPath(url);
+    } catch {}
+    return undefined;
   };
 }
 
@@ -263,11 +271,30 @@ export function createPluginContainer(vite, allPlugins, {
     plugins: allPlugins,
     isProduction: mode === "production",
   };
+  // Vite resolves `build.outDir` ("dist") and an absolute `publicDir` ("" when
+  // disabled); build plugins compute output paths from both.
+  resolvedConfig.build = { outDir: "dist", ...resolvedConfig.build };
+  if (typeof resolvedConfig.publicDir !== "string" || !isAbsolute(resolvedConfig.publicDir)) {
+    resolvedConfig.publicDir = resolvedConfig.publicDir === false
+      ? ""
+      : pathResolve(resolvedConfig.root, typeof resolvedConfig.publicDir === "string" ? resolvedConfig.publicDir : "public");
+  }
   // Vite's config.createResolver, for plugins that resolve through the config
   // (aliases, extensions, packages) rather than through this.resolve.
   if (typeof resolvedConfig.createResolver !== "function") {
     resolvedConfig.createResolver = makeConfigResolver(resolvedConfig);
   }
+  // this.environment.config is the environment's resolved config: the top-level
+  // options with `environments[name]` (build, resolve, define, ...) layered on.
+  const environmentOptions = resolvedConfig.environments?.[environment] ?? {};
+  const environmentConfig = {
+    ...resolvedConfig,
+    ...environmentOptions,
+    build: { ...resolvedConfig.build, ...environmentOptions.build },
+    resolve: { ...resolvedConfig.resolve, ...environmentOptions.resolve },
+    define: { ...resolvedConfig.define, ...environmentOptions.define },
+    consumer,
+  };
   const environmentModules = new Map();
   const modulesByUrl = new Map();
   const modulesByFile = new Map();
@@ -307,7 +334,7 @@ export function createPluginContainer(vite, allPlugins, {
     environment: {
       name: environment,
       mode: command === "build" ? "build" : "dev",
-      config: { ...resolvedConfig, consumer },
+      config: environmentConfig,
       moduleGraph,
     },
     meta: { rollupVersion: "4.0.0", watchMode: command !== "build", framework: "oj" },
@@ -343,16 +370,29 @@ export function createPluginContainer(vite, allPlugins, {
     return initialization;
   }
 
+  // Vite's this.resolve runs the whole pipeline, ending in file and package
+  // resolution; a build plugin that hands back the path of a real module (a
+  // polyfill, the worker entry) needs that tail. The dev loader resolves files
+  // itself, so it keeps the plugins-only answer.
+  const fileResolver = command === "build" ? resolvedConfig.createResolver() : null;
   function pluginContext(plugin, base = ctx) {
     return Object.assign(Object.create(base), {
       async resolve(source, importer, options = {}) {
-        const resolved = await resolveId(source, importer, options.skipSelf === false ? undefined : plugin);
-        return resolved == null ? null : { id: resolved };
+        const resolved = await resolveIdResult(source, importer, options.skipSelf === false ? undefined : plugin);
+        if (resolved) return resolved;
+        if (!fileResolver || source.startsWith("\0") || /^[a-z]+:/i.test(source) && !isAbsolute(source)) return null;
+        try {
+          const file = await fileResolver(source, importer);
+          return file ? { id: file } : null;
+        } catch {
+          return null;
+        }
       },
     });
   }
 
-  async function resolveId(id, importer, skippedPlugin) {
+  // The full resolveId answer ({ id, external }); resolveId keeps the id-only form.
+  async function resolveIdResult(id, importer, skippedPlugin) {
     await initializePlugins();
     for (const p of byHook(plugins, "resolveId")) {
       if (p === skippedPlugin) continue;
@@ -361,9 +401,14 @@ export function createPluginContainer(vite, allPlugins, {
       if (!h || !idAllowed(hookFilter(p.resolveId), id)) continue;
       let r;
       try { r = await h.call(pluginContext(p), id, importer, { isEntry: false, ssr: environment === "ssr" }); } catch (e) { if (ojReimplemented(p.name)) continue; throw pluginError(e, p, importer || id); }
-      if (r != null) return typeof r === "string" ? r : r.id;
+      if (r != null) return typeof r === "string" ? { id: r } : { id: r.id, external: r.external };
     }
     return null;
+  }
+
+  async function resolveId(id, importer, skippedPlugin) {
+    const r = await resolveIdResult(id, importer, skippedPlugin);
+    return r ? r.id : null;
   }
 
   async function load(id) {
@@ -526,7 +571,7 @@ export function createPluginContainer(vite, allPlugins, {
   }
 
   return {
-    resolveId, load, transform, transformUserCode, buildStart, renderChunk, generateBundle, pluginCount: plugins.length, watchFiles, writeBundle, closeBundle, buildEnd, renderStart,
+    resolveId, resolveIdResult, load, transform, transformUserCode, buildStart, renderChunk, generateBundle, pluginCount: plugins.length, watchFiles, writeBundle, closeBundle, buildEnd, renderStart,
   };
 }
 
@@ -577,6 +622,26 @@ export async function loadPluginContainer(app, opts = {}) {
       process.stderr.write(`oj: plugin "${plugin.name || "?"}" config hook failed (skipped): ${e?.message ?? e}\n`);
     }
   }
+  // Then every plugin's `configEnvironment` hook, per environment (Vite's two
+  // defaults plus the ones the config hooks declared); its partial merges into
+  // that environment's options (e.g. a runtime plugin's `resolve.builtins`).
+  const merge = (a, b) => (typeof vite.mergeConfig === "function" ? vite.mergeConfig(a, b) : mergeConfigValues(a, b));
+  for (const name of new Set(["client", "ssr", ...Object.keys(config.environments ?? {})])) {
+    let environmentOptions = config.environments?.[name] ?? {};
+    let changed = false;
+    for (const plugin of all) {
+      if (ojReimplemented(plugin.name)) continue;
+      const handler = hookHandler(plugin.configEnvironment);
+      if (!handler || !applyMatches(plugin, command, mode)) continue;
+      try {
+        const partial = await handler.call(plugin, name, environmentOptions, { command, mode, isSsrTargetWebworker: false, isPreview: false });
+        if (partial) { environmentOptions = merge(environmentOptions, partial); changed = true; }
+      } catch (e) {
+        process.stderr.write(`oj: plugin "${plugin.name || "?"}" configEnvironment failed (skipped): ${e?.message ?? e}\n`);
+      }
+    }
+    if (changed) config = { ...config, environments: { ...config.environments, [name]: environmentOptions } };
+  }
   if (loaded) loaded.config = config;
   const container = createPluginContainer(vite, all, {
     ...opts,
@@ -595,7 +660,7 @@ export async function loadPluginContainer(app, opts = {}) {
       .map(([key, value]) => [key, typeof value === "string" ? value : JSON.stringify(value)])
       .filter(([, value]) => typeof value === "string"),
   );
-  return { ...container, publicDir, configDependencies, defines };
+  return { ...container, publicDir, configDependencies, defines, config };
 }
 
 export const __test = { matchOne, idAllowed, codeAllowed, byHook, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows };
