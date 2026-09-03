@@ -500,6 +500,21 @@ fn start_script_env(root: &Path, command: &str, mode: &str) -> anyhow::Result<Ve
             ));
         }
     }
+    // `resolve.externalConditions` (Vite: what externalized SSR deps resolve
+    // with instead of the environment's conditions); the loader defaults to
+    // module-sync when unset.
+    if let Some(user) = oj_config::user_external_conditions(&config, "ssr") {
+        let conditions: Vec<String> = user
+            .into_iter()
+            .map(|c| if c == "development|production" { "development".to_string() } else { c })
+            .collect();
+        if !conditions.is_empty() {
+            vars.push((
+                "OJ_EXTERNAL_CONDITIONS".into(),
+                serde_json::to_string(&conditions).unwrap_or_default(),
+            ));
+        }
+    }
     // `ssr.noExternal`/`external`, consumed by the SSR loader to transform (rather
     // than hand to Node) the dependencies Vite would bundle.
     let externals = oj_config::ssr_externals(&config);
@@ -1334,18 +1349,22 @@ mod tests {
             let browser_root = tmp("script-env-browser-cond");
             std::fs::write(
                 browser_root.join("oj.config.json"),
-                r#"{ "environments": { "ssr": { "resolve": { "conditions": ["module", "browser", "development|production"] } } } }"#,
+                r#"{ "environments": { "ssr": { "resolve": { "conditions": ["module", "browser", "development|production"], "externalConditions": ["custom-ext", "development|production"] } } } }"#,
             )
             .unwrap();
             let vars = start_script_env(&browser_root, "serve", "development").unwrap();
-            let cond = vars
-                .iter()
-                .find(|(n, _)| n == "OJ_RESOLVE_CONDITIONS")
-                .map(|(_, v)| v.clone());
+            let var = |k: &str| {
+                vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+            };
             assert_eq!(
-                cond.as_deref(),
+                var("OJ_RESOLVE_CONDITIONS").as_deref(),
                 Some(r#"["module","development"]"#),
                 "browser must be stripped from Node SSR conditions"
+            );
+            assert_eq!(
+                var("OJ_EXTERNAL_CONDITIONS").as_deref(),
+                Some(r#"["custom-ext","development"]"#),
+                "externalConditions pass through with dev/prod mapped"
             );
         }
         let ssr: serde_json::Value = serde_json::from_str(&get("OJ_DEFINE_SSR").unwrap()).unwrap();

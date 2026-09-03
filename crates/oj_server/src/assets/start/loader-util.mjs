@@ -279,3 +279,12 @@ export function requestHost(...candidates) {
   }
   return "localhost";
 }
+
+// Package name of a bare import specifier (`react`, `@scope/pkg/sub` ->
+// `@scope/pkg`); null for relative, absolute, #imports, and URL-scheme specs.
+export function pkgNameOfSpec(spec) {
+  if (!spec || spec.startsWith(".") || spec.startsWith("/") || spec.startsWith("#") || spec.includes(":")) return null;
+  const parts = spec.split("/");
+  if (spec.startsWith("@")) return parts.length >= 2 && parts[1] ? `${parts[0]}/${parts[1]}` : null;
+  return parts[0] || null;
+}

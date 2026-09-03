@@ -364,3 +364,19 @@ test("requestHost prefers x-oj-host, keeps only the first host like Node, falls 
   assert.equal(requestHost("", " "), "localhost");
   assert.equal(requestHost(undefined, undefined), "localhost");
 });
+
+test("pkgNameOfSpec: bare package names only", async () => {
+  const { pkgNameOfSpec } = await import("../../crates/oj_server/src/assets/start/loader-util.mjs");
+  assert.equal(pkgNameOfSpec("react"), "react");
+  assert.equal(pkgNameOfSpec("react-dom/server"), "react-dom");
+  assert.equal(pkgNameOfSpec("@scope/pkg"), "@scope/pkg");
+  assert.equal(pkgNameOfSpec("@scope/pkg/deep/sub"), "@scope/pkg");
+  assert.equal(pkgNameOfSpec("@lonescope"), null);
+  assert.equal(pkgNameOfSpec("./relative"), null);
+  assert.equal(pkgNameOfSpec("../up"), null);
+  assert.equal(pkgNameOfSpec("/root/abs"), null);
+  assert.equal(pkgNameOfSpec("#imports-alias"), null);
+  assert.equal(pkgNameOfSpec("node:fs"), null);
+  assert.equal(pkgNameOfSpec("file:///x.js"), null);
+  assert.equal(pkgNameOfSpec(""), null);
+});
