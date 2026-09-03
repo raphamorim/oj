@@ -77,6 +77,15 @@ jobs:
       - name: a vite.config that fails to load is an error, not an empty config
         if: matrix.mode == 'unbundled'
         run: node e2e/config-load-failure.mjs
+      # These drive a dev server (and svgr-plugin also a browser via playwright),
+      # so they belong here where e2e deps + chromium are installed, not in the
+      # prod build smoke job, which has neither.
+      - name: plugin load runs before the disk read (load-first)
+        if: matrix.mode == 'unbundled'
+        run: node e2e/plugin-load-first.mjs
+      - name: plain .svg import goes through the svgr plugin transform
+        if: matrix.mode == 'unbundled'
+        run: node e2e/svgr-plugin.mjs
 
   # i need to fix this or automate
   build:
@@ -156,10 +165,6 @@ jobs:
         run: node e2e/plugin-load-jsx.mjs
       - name: plugin transform runs on CSS sources before compile
         run: node e2e/css-plugin-transform.mjs
-      - name: plugin load runs before the disk read (load-first)
-        run: node e2e/plugin-load-first.mjs
-      - name: plain .svg import goes through the svgr plugin transform
-        run: node e2e/svgr-plugin.mjs
       - name: vite:css-post shim routes plugin CSS into output (UnoCSS pattern)
         run: node e2e/vite-css-post-shim.mjs
       - name: .vite/manifest.json is present in the generateBundle bundle
