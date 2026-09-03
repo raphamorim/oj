@@ -3,6 +3,15 @@
 
 const hotModules = new Map();
 
+// Filled in by the server from `server.hmr` (Vite's clientInjections): JSON
+// literals, `null` where the config is silent.
+const hmrProtocol = __HMR_PROTOCOL__;
+const hmrHostname = __HMR_HOSTNAME__;
+const hmrPort = __HMR_PORT__;
+const hmrPath = __HMR_PATH__;
+const enableOverlay = __HMR_ENABLE_OVERLAY__;
+const wsToken = __WS_TOKEN__;
+
 const customListeners = new Map();
 function emit(event, data) {
   const set = customListeners.get(event);
@@ -189,7 +198,6 @@ async function applyUpdate(update) {
 }
 
 let overlayEl = null;
-let overlayKeyHandler = null;
 let isFirstUpdate = true;
 
 // If this is the first update and an error overlay is already showing, the page
@@ -214,70 +222,98 @@ function parseError(text) {
   return { title, file: loc && loc[1], line: loc && loc[2], col: loc && loc[3], frame: s };
 }
 
-function showOverlay(text) {
-  clearOverlay();
-  const e = parseError(text);
-  overlayEl = document.createElement("div");
-  overlayEl.setAttribute("role", "dialog");
-  overlayEl.setAttribute("aria-label", "Build error");
-  overlayEl.style.cssText =
-    "position:fixed;inset:0;z-index:99999;background:rgba(10,10,14,.86);" +
-    "display:flex;align-items:flex-start;justify-content:center;padding:6vh 4vw;overflow:auto;" +
-    "font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace";
-  const card = document.createElement("div");
-  card.style.cssText =
-    "max-width:920px;width:100%;background:#16161c;border:1px solid #33333f;border-radius:12px;" +
-    "box-shadow:0 20px 60px rgba(0,0,0,.5);overflow:hidden;color:#e6e6ea";
-  const bar = document.createElement("div");
-  bar.style.cssText =
-    "display:flex;align-items:center;gap:10px;padding:12px 18px;background:#2a1417;border-bottom:1px solid #4a2028";
-  const brand = document.createElement("span");
-  brand.style.cssText = "font-weight:700;letter-spacing:.08em;color:#ff6b6b";
-  brand.textContent = "oj";
-  const label = document.createElement("span");
-  label.style.cssText = "color:#ff9a9a;font-weight:600";
-  label.textContent = "Build error";
-  bar.append(brand, label);
-  const body = document.createElement("div");
-  body.style.cssText = "padding:18px";
-  const title = document.createElement("div");
-  title.style.cssText = "color:#ff8a8a;font-weight:600;font-size:14px;white-space:pre-wrap;margin-bottom:10px";
-  title.textContent = e.title;
-  body.appendChild(title);
-  if (e.file) {
-    const loc = document.createElement("div");
-    loc.style.cssText = "color:#8ab4ff;margin-bottom:12px;font-size:12px";
-    loc.textContent = e.file + (e.line ? ":" + e.line + (e.col ? ":" + e.col : "") : "");
-    body.appendChild(loc);
+// Vite's `vite-error-overlay` custom element: framework runtimes look it up
+// with customElements.get() and construct it with an ErrorPayload `err`
+// ({message, stack, id, loc, frame, plugin}) to show their own runtime errors.
+export class ErrorOverlay extends HTMLElement {
+  constructor(err, _links = true) {
+    super();
+    const root = this.attachShadow({ mode: "open" });
+    const e = err && typeof err === "object" ? err : { message: String(err ?? "unknown error") };
+    const parsed = parseError(e.message || "unknown error");
+    const file = e.loc?.file || e.id || parsed.file;
+    const line = e.loc?.line ?? parsed.line;
+    const col = e.loc?.column ?? parsed.col;
+    const frame = e.frame && String(e.frame).trim() ? e.frame : parsed.frame;
+    const backdrop = document.createElement("div");
+    backdrop.setAttribute("role", "dialog");
+    backdrop.setAttribute("aria-label", "Build error");
+    backdrop.style.cssText =
+      "position:fixed;inset:0;z-index:99999;background:rgba(10,10,14,.86);" +
+      "display:flex;align-items:flex-start;justify-content:center;padding:6vh 4vw;overflow:auto;" +
+      "font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace";
+    const card = document.createElement("div");
+    card.style.cssText =
+      "max-width:920px;width:100%;background:#16161c;border:1px solid #33333f;border-radius:12px;" +
+      "box-shadow:0 20px 60px rgba(0,0,0,.5);overflow:hidden;color:#e6e6ea";
+    const bar = document.createElement("div");
+    bar.style.cssText =
+      "display:flex;align-items:center;gap:10px;padding:12px 18px;background:#2a1417;border-bottom:1px solid #4a2028";
+    const brand = document.createElement("span");
+    brand.style.cssText = "font-weight:700;letter-spacing:.08em;color:#ff6b6b";
+    brand.textContent = "oj";
+    const label = document.createElement("span");
+    label.style.cssText = "color:#ff9a9a;font-weight:600";
+    label.textContent = e.plugin && e.plugin !== "oj" ? `Build error (plugin: ${e.plugin})` : "Build error";
+    bar.append(brand, label);
+    const body = document.createElement("div");
+    body.style.cssText = "padding:18px";
+    const title = document.createElement("div");
+    title.style.cssText = "color:#ff8a8a;font-weight:600;font-size:14px;white-space:pre-wrap;margin-bottom:10px";
+    title.textContent = parsed.title;
+    body.appendChild(title);
+    if (file) {
+      const loc = document.createElement("div");
+      loc.style.cssText = "color:#8ab4ff;margin-bottom:12px;font-size:12px";
+      loc.textContent = file + (line ? ":" + line + (col ? ":" + col : "") : "");
+      body.appendChild(loc);
+    }
+    const pre = document.createElement("pre");
+    pre.style.cssText =
+      "margin:0;white-space:pre-wrap;background:#0d0d12;border:1px solid #26262f;border-radius:8px;" +
+      "padding:12px 14px;color:#c9c9d4;max-height:52vh;overflow:auto";
+    pre.textContent = frame;
+    body.appendChild(pre);
+    if (e.stack && String(e.stack).trim() && !String(frame).includes(String(e.stack).trim())) {
+      const stack = document.createElement("pre");
+      stack.style.cssText = "margin:12px 0 0;white-space:pre-wrap;color:#8d8d9c;font-size:12px";
+      stack.textContent = e.stack;
+      body.appendChild(stack);
+    }
+    const hint = document.createElement("div");
+    hint.style.cssText = "margin-top:12px;color:#6f6f80;font-size:12px";
+    hint.textContent = "Fix the file and save to retry · click outside or press Esc to dismiss";
+    body.appendChild(hint);
+    card.append(bar, body);
+    backdrop.appendChild(card);
+    // Dismiss on backdrop click only, so text inside the card stays selectable.
+    backdrop.addEventListener("click", (ev) => { if (ev.target === backdrop) this.close(); });
+    this._onKey = (ev) => { if (ev.key === "Escape") this.close(); };
+    window.addEventListener("keydown", this._onKey);
+    root.appendChild(backdrop);
   }
-  const frame = document.createElement("pre");
-  frame.style.cssText =
-    "margin:0;white-space:pre-wrap;background:#0d0d12;border:1px solid #26262f;border-radius:8px;" +
-    "padding:12px 14px;color:#c9c9d4;max-height:52vh;overflow:auto";
-  frame.textContent = e.frame;
-  body.appendChild(frame);
-  const hint = document.createElement("div");
-  hint.style.cssText = "margin-top:12px;color:#6f6f80;font-size:12px";
-  hint.textContent = "Fix the file and save to retry · click outside or press Esc to dismiss";
-  body.appendChild(hint);
-  card.append(bar, body);
-  overlayEl.appendChild(card);
-  // Dismiss on backdrop click only, so text inside the card stays selectable.
-  overlayEl.addEventListener("click", (ev) => { if (ev.target === overlayEl) clearOverlay(); });
-  overlayKeyHandler = (ev) => { if (ev.key === "Escape") clearOverlay(); };
-  window.addEventListener("keydown", overlayKeyHandler);
+  close() {
+    window.removeEventListener("keydown", this._onKey);
+    this.remove();
+    if (overlayEl === this) overlayEl = null;
+  }
+}
+
+const overlayId = "vite-error-overlay";
+if (typeof customElements !== "undefined" && !customElements.get(overlayId)) {
+  customElements.define(overlayId, ErrorOverlay);
+}
+
+function showOverlay(err) {
+  clearOverlay();
+  if (!enableOverlay) return;
+  overlayEl = new ErrorOverlay(err);
   document.body.appendChild(overlayEl);
 }
 
 function clearOverlay() {
-  if (overlayKeyHandler) {
-    window.removeEventListener("keydown", overlayKeyHandler);
-    overlayKeyHandler = null;
-  }
-  if (overlayEl) {
-    overlayEl.remove();
-    overlayEl = null;
-  }
+  document.querySelectorAll(overlayId).forEach((n) => n.close());
+  overlayEl = null;
 }
 
 function swapCss(update) {
@@ -314,9 +350,19 @@ let hadConnection = false;
 // The dev `base` this client is served under (Vite's __BASE__).
 const base = new URL(import.meta.url).pathname.replace(/@oj\/client\.js$/, "");
 
+// Where the socket lives (Vite's client): `server.hmr.{protocol,host,clientPort,
+// path}` override the page's own origin, and the per-process token lets the
+// server tell this page apart from another origin's.
+function socketUrl() {
+  const proto = hmrProtocol || (location.protocol === "https:" ? "wss" : "ws");
+  const hostname = hmrHostname || location.hostname;
+  const port = hmrPort || location.port;
+  const host = port ? `${hostname}:${port}` : hostname;
+  return `${proto}://${host}${hmrPath}?token=${wsToken}`;
+}
+
 (function connect() {
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(proto + "://" + location.host + "/__ws");
+  const ws = new WebSocket(socketUrl());
   socket = ws;
   ws.addEventListener("message", (event) => {
     let msg;
@@ -362,28 +408,45 @@ const base = new URL(import.meta.url).pathname.replace(/@oj\/client\.js$/, "");
       // Vite's ErrorPayload carries `err`; older oj frames carried `message`.
       const err = msg.err || { message: msg.message };
       emit("vite:error", { err });
-      showOverlay(err.message || "unknown error");
+      if (enableOverlay) showOverlay(err);
+      else console.error(`[oj] Internal Server Error\n${err.message}\n${err.stack || ""}`);
     } else if (msg.type === "custom") {
       emit(msg.event, msg.data);
     }
   });
   ws.addEventListener("open", () => {
-    if (hadConnection) {
-      // The server went away and came back (config or .env change restarts
-      // it): its module graph, defines and caches are new, so the page's
-      // modules are stale. Vite reloads here too.
-      console.log("[oj] dev server restarted, reloading");
-      emit("vite:ws:connect", { webSocket: ws });
-      location.reload();
-      return;
-    }
     hadConnection = true;
     emit("vite:ws:connect", { webSocket: ws });
     console.log("[oj] dev server connected");
   });
-  ws.addEventListener("close", () => {
+  ws.addEventListener("close", async () => {
     emit("vite:ws:disconnect", { webSocket: ws });
+    if (hadConnection) {
+      // The server went away (a config or .env change restarts it): its module
+      // graph, defines, caches and socket token are new, so the page's modules
+      // are stale. Like Vite's client, poll until it answers again, then reload
+      // (the fresh page loads a client carrying the new token).
+      console.log("[oj] dev server connection lost, polling for restart...");
+      await waitForSuccessfulPing();
+      console.log("[oj] dev server restarted, reloading");
+      location.reload();
+      return;
+    }
     console.log("[oj] dev server disconnected, retrying in 1s…");
     setTimeout(connect, 1000);
   });
 })();
+
+// Vite's waitForSuccessfulPing: any HTTP answer from the socket's host means
+// the server is back (the ws route itself replies to a plain GET).
+async function waitForSuccessfulPing(ms = 1000) {
+  const url = socketUrl().replace(/^ws/, "http").split("?")[0];
+  for (;;) {
+    try {
+      await fetch(url, { mode: "no-cors", headers: { Accept: "text/x-vite-ping" } });
+      return;
+    } catch {
+      await new Promise((r) => setTimeout(r, ms));
+    }
+  }
+}

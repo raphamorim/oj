@@ -327,13 +327,23 @@ function extractResolve(r) {
   if (typeof r.preserveSymlinks === "boolean") out.preserveSymlinks = r.preserveSymlinks;
   return Object.keys(out).length ? out : null;
 }
-function extractServerFlags(s) {
-  if (!s || typeof s !== "object") return null;
+function extractServerFlags(s, legacy) {
   const out = {};
-  if (typeof s.strictPort === "boolean") out.strictPort = s.strictPort;
-  // Vite admits `open: true | string`; oj opens the served url in both cases.
-  if (s.open === true || typeof s.open === "string") out.open = true;
-  else if (s.open === false) out.open = false;
+  if (s && typeof s === "object") {
+    if (typeof s.strictPort === "boolean") out.strictPort = s.strictPort;
+    // Vite admits `open: true | string`; oj opens the served url in both cases.
+    if (s.open === true || typeof s.open === "string") out.open = true;
+    else if (s.open === false) out.open = false;
+    // server.hmr object options reach the served client (Vite's clientInjections).
+    if (s.hmr && typeof s.hmr === "object") {
+      const h = {};
+      for (const k of ["path", "host", "protocol"]) if (typeof s.hmr[k] === "string") h[k] = s.hmr[k];
+      for (const k of ["port", "clientPort", "timeout"]) if (typeof s.hmr[k] === "number") h[k] = s.hmr[k];
+      if (typeof s.hmr.overlay === "boolean") h.overlay = s.hmr.overlay;
+      if (Object.keys(h).length) out.hmr = h;
+    }
+  }
+  if (legacy?.skipWebSocketTokenCheck === true) out.skipWebSocketTokenCheck = true;
   return Object.keys(out).length ? out : null;
 }
 // `preview.*` as resolved by Vite (inheriting `server.*` except the port).
@@ -485,7 +495,7 @@ if (isMainRun) try {
       ssr: extractSsr(c.ssr),
       mode: typeof c.mode === "string" ? c.mode : null,
       resolve: extractResolve(c.resolve),
-      serverFlags: extractServerFlags(c.server),
+      serverFlags: extractServerFlags(c.server, c.legacy),
       css: extractCss(c.css),
       envPrefix: extractEnvPrefix(c.envPrefix),
       envDir: typeof c.envDir === "string" ? c.envDir : null,

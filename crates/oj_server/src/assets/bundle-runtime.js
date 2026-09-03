@@ -227,7 +227,9 @@ function clearOverlay() {
 
 (function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(proto + "://" + location.host + "/__ws");
+  // The socket path and per-process token are filled in by the server (see
+  // client.js): a browser upgrade without the token is refused.
+  const ws = new WebSocket(proto + "://" + location.host + __HMR_PATH__ + "?token=" + __WS_TOKEN__);
   socket = ws;
   ws.addEventListener("message", (event) => {
     let msg;
@@ -242,6 +244,24 @@ function clearOverlay() {
     else if (msg.type === "full-reload") location.reload();
     else if (msg.type === "error") showOverlay((msg.err && msg.err.message) || msg.message || "unknown error");
   });
-  ws.addEventListener("open", () => console.log("[oj] dev server connected (bundle mode)"));
-  ws.addEventListener("close", () => setTimeout(connect, 1000));
+  let opened = false;
+  ws.addEventListener("open", () => {
+    opened = true;
+    console.log("[oj] dev server connected (bundle mode)");
+  });
+  ws.addEventListener("close", async () => {
+    if (!opened) return setTimeout(connect, 1000);
+    // The server restarted: its token and caches are new, so poll until it
+    // answers and reload (as client.js and Vite do).
+    const url = (location.protocol === "https:" ? "https" : "http") + "://" + location.host + __HMR_PATH__;
+    for (;;) {
+      try {
+        await fetch(url, { mode: "no-cors", headers: { Accept: "text/x-vite-ping" } });
+        break;
+      } catch {
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+    location.reload();
+  });
 })();
