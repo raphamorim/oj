@@ -167,7 +167,7 @@ async fn run() -> anyhow::Result<()> {
             set_config_override(&root, config);
             if oj_server::is_tanstack_start_app(&root) {
                 let mode = mode.unwrap_or_else(|| "production".to_string());
-                start_dev::start_build(root, &mode).await
+                start_dev::start_build(root, &mode, out).await
             } else {
                 build::build(root, out, ssr, mode.as_deref(), empty_out_dir).await
             }

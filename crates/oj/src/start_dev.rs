@@ -426,7 +426,7 @@ fn start_script_env(root: &Path, command: &str, mode: &str) -> anyhow::Result<Ve
     Ok(vars)
 }
 
-pub async fn start_build(root: PathBuf, mode: &str) -> anyhow::Result<()> {
+pub async fn start_build(root: PathBuf, mode: &str, out: Option<PathBuf>) -> anyhow::Result<()> {
     let root = root
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("app root not found: {}: {e}", root.display()))?;
@@ -435,12 +435,36 @@ pub async fn start_build(root: PathBuf, mode: &str) -> anyhow::Result<()> {
     oj_server::write_start_assets(&cache)?;
     generate_route_tree(&root, &cache)?;
     generate_server_fn_resolver(&root, &cache)?;
-    let prerender = oj_config::load(&root)
-        .ok()
-        .and_then(|c| c.build)
-        .and_then(|b| b.prerender)
-        .unwrap_or_default()
-        .join(",");
+    // The build options Vite resolves for a Start app too: `--out`/`build.outDir`,
+    // `base`, `build.sourcemap`, `build.minify` (consumed by build.mjs).
+    let mut config = oj_config::load_with(&root, "build", mode).unwrap_or_default();
+    oj_server::plugins::adopt_vite_config_values(&mut config, &root, "build", mode)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let build_cfg = config.build.clone().unwrap_or_default();
+    let prerender = build_cfg.prerender.clone().unwrap_or_default().join(",");
+    let out = out
+        .or_else(|| build_cfg.out_dir.as_ref().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("dist"));
+    let out_dir = if out.is_absolute() { out } else { root.join(out) };
+    if out_dir.canonicalize().ok().as_deref() == Some(root.as_path()) {
+        anyhow::bail!(
+            "build.outDir {} is the project root; refusing to empty it. Point outDir at a subdirectory.",
+            out_dir.display()
+        );
+    }
+    // Vite's `base`: "" and "./" are relative, anything else an absolute prefix.
+    let base = match config.base.as_deref().unwrap_or("/") {
+        "" | "./" => "./".to_string(),
+        "/" => "/".to_string(),
+        b => format!("/{}/", b.trim_matches('/')),
+    };
+    let sourcemap = match oj_config::build_sourcemap(&config) {
+        oj_config::Sourcemap::Off => "false",
+        oj_config::Sourcemap::File => "true",
+        oj_config::Sourcemap::Inline => "inline",
+        oj_config::Sourcemap::Hidden => "hidden",
+    };
+    let minify = oj_config::build_minify(&config);
     // Vite's rule: the shell's NODE_ENV wins, else `.env[.mode]` NODE_ENV=development
     // makes a development build, else production. build.mjs derives DEV/PROD and
     // process.env.NODE_ENV from what it receives here.
@@ -457,6 +481,10 @@ pub async fn start_build(root: PathBuf, mode: &str) -> anyhow::Result<()> {
         .env("OJ_MODE", mode)
         .envs(start_script_env(&root, "build", mode)?)
         .env("OJ_PRERENDER", &prerender)
+        .env("OJ_OUT_DIR", &out_dir)
+        .env("OJ_BASE", &base)
+        .env("OJ_SOURCEMAP", sourcemap)
+        .env("OJ_MINIFY", if minify { "true" } else { "false" })
         .env("NODE_COMPILE_CACHE", oj_server::node_compile_cache(&root))
         .current_dir(&root)
         .status()
@@ -465,11 +493,11 @@ pub async fn start_build(root: PathBuf, mode: &str) -> anyhow::Result<()> {
         anyhow::bail!("production build failed");
     }
     println!(
-        "  {} build (tanstack start) -> {}/dist",
+        "  {} build (tanstack start) -> {}",
         oj_server::oj_brand(),
-        root.display()
+        out_dir.display()
     );
-    println!("  run: node dist/server.mjs");
+    println!("  run: node {}", out_dir.join("server.mjs").display());
     Ok(())
 }
 
