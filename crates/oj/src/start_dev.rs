@@ -407,6 +407,8 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
 /// resolve-pkg.mjs).
 fn start_script_env(root: &Path, command: &str, mode: &str) -> anyhow::Result<Vec<(String, String)>> {
     let mut config = oj_config::load(root).unwrap_or_default();
+    oj_server::plugins::adopt_vite_config_values(&mut config, root, command, mode)
+        .map_err(|e| anyhow::anyhow!(e))?;
     // `.env` files come from `envDir` and only `envPrefix` variables are exposed
     // (Vite's loadEnv), not the root and `VITE_` unconditionally.
     let env_dir = match config.env_dir.as_deref() {
@@ -415,13 +417,6 @@ fn start_script_env(root: &Path, command: &str, mode: &str) -> anyhow::Result<Ve
     };
     let prefixes = oj_config::env_prefixes(&config);
     let mut vars: Vec<(String, String)> = oj_env::load(&env_dir, mode)
-        .into_iter()
-        .filter(|(k, _)| prefixes.iter().any(|p| k.starts_with(p)) && std::env::var_os(k).is_none())
-        .collect();
-    oj_server::plugins::adopt_vite_config_values(&mut config, root, command, mode)
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let prefixes = oj_config::env_prefixes(&config);
-    let mut vars: Vec<(String, String)> = oj_env::load(root, mode)
         .into_iter()
         .filter(|(k, _)| {
             prefixes.iter().any(|p| k.starts_with(p.as_str())) && std::env::var_os(k).is_none()
