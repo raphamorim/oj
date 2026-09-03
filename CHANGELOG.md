@@ -5,7 +5,7 @@ All notable changes to oj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.13] - 2026-09-03
 
 ### Added
 - `server.proxy` now reaches `wss://` targets (plain `https://` targets already worked): a proxied WebSocket upgrade to a TLS target is dialed over TLS with the system trust store, the same store oj's HTTP proxying verifies against, and tunneled as before. `secure: false` on an entry (http-proxy's option, which Vite passes through) accepts a self-signed development backend for both the WebSocket tunnel and plain requests; by default an unverifiable certificate is refused with 502. No new crypto stack: the TLS client is the rustls provider reqwest already links. On a proxied upgrade the browser's `Host` is kept unless `changeOrigin` asks for the target's (http-proxy's rule; it used to be replaced always), and `rewriteWsOrigin: true` swaps the `Origin` for the target's origin, as in Vite.
