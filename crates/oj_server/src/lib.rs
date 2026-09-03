@@ -6400,19 +6400,71 @@ fn html_entries(root: &Path) -> Vec<String> {
             continue;
         };
         let tag = &html[tag_start..tag_start + tag_end];
-        if !tag.contains("type=\"module\"") {
+        if !html_tag_attr(tag, "type").is_some_and(|t| t.eq_ignore_ascii_case("module")) {
             continue;
         }
-        if let Some(src_at) = tag.find("src=\"") {
-            let rest = &tag[src_at + 5..];
-            if let Some(end) = rest.find('"') {
-                if let Some(entry) = html_entry_src(&rest[..end]) {
-                    entries.push(entry);
-                }
-            }
+        if let Some(entry) = html_tag_attr(tag, "src").and_then(html_entry_src) {
+            entries.push(entry);
         }
     }
     entries
+}
+
+/// The value of attribute `name` in an opening tag (`<script type=...`),
+/// whether double-quoted, single-quoted or unquoted, with optional spaces
+/// around `=`; attribute names match case-insensitively and as whole words
+/// (`data-src` is not `src`).
+fn html_tag_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let bytes = tag.as_bytes();
+    let mut i = tag.find(char::is_whitespace)?;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' && bytes[i] != b'/' {
+            i += 1;
+        }
+        if i == start {
+            i += 1;
+            continue;
+        }
+        let attr = &tag[start..i];
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return None;
+        }
+        let (vs, ve) = if matches!(bytes[i], b'"' | b'\'') {
+            let q = bytes[i];
+            let s = i + 1;
+            i = s;
+            while i < bytes.len() && bytes[i] != q {
+                i += 1;
+            }
+            let e = i;
+            i += usize::from(i < bytes.len());
+            (s, e)
+        } else {
+            let s = i;
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            (s, i)
+        };
+        if attr.eq_ignore_ascii_case(name) {
+            return Some(&tag[vs..ve]);
+        }
+    }
+    None
 }
 
 fn spawn_crawl(state: Arc<ServerState>, done_tx: tokio::sync::watch::Sender<bool>) {
@@ -7944,6 +7996,28 @@ mod tests {
         assert_eq!(html_entry_src("https://cdn/x.js"), None);
         assert_eq!(html_entry_src("//cdn/x.js"), None);
         assert_eq!(html_entry_src("data:text/js,1"), None);
+    }
+
+    #[test]
+    fn html_entries_read_module_scripts_with_any_quoting() {
+        let root = std::env::temp_dir().join(format!("oj-html-entries-quoting-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("index.html"),
+            "<html><body>\
+             <script type='module' src='/src/a.ts'></script>\
+             <script type=module src=src/b.ts></script>\
+             <script type = \"module\" data-src=\"/ignored.js\" src = \"./src/c.ts\"></script>\
+             <script src=\"/legacy.js\"></script>\
+             <script type=\"module\">inline()</script>\
+             </body></html>",
+        )
+        .unwrap();
+        assert_eq!(
+            html_entries(&root),
+            vec!["/src/a.ts".to_string(), "/src/b.ts".to_string(), "/src/c.ts".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

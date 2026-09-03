@@ -285,3 +285,7 @@ jobs:
         run: node e2e/ssr-options.mjs
       - name: preview options (cors, allowedHosts, headers, strictPort, appType mpa)
         run: node e2e/preview-options.mjs
+      - name: build.assetsDir places chunks, css and url() assets
+        run: node e2e/build-assets-dir.mjs
+      - name: html attribute quoting (stylesheet links, module entries, inline module scripts)
+        run: node e2e/html-attribute-quotes.test.js
