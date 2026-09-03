@@ -421,6 +421,9 @@ function warnUnsupported(c) {
     warn("optimizeDeps.esbuildOptions/rollupOptions are not applied; include/exclude/entries are");
   }
   if (c.worker) warn("worker config is not applied");
+  if (typeof c.build?.assetsInlineLimit === "function") {
+    warn("build.assetsInlineLimit is a function and cannot be applied; the 4096 byte default is used");
+  }
   if (c.ssr?.resolve) warn("ssr.resolve is not applied (noExternal/external/target are)");
   if (c.server?.cors && typeof c.server.cors === "object" && c.server.cors.origin instanceof RegExp) {
     warn("server.cors.origin RegExp is not applied; the localhost default is used");

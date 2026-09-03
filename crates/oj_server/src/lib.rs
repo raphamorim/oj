@@ -4918,7 +4918,7 @@ fn rewrite_specifier(
     if let Some((base, query)) = spec.split_once('?') {
         if matches!(
             query,
-            "url" | "raw" | "inline" | "worker" | "sharedworker" | "init" | "react"
+            "url" | "raw" | "inline" | "worker" | "sharedworker" | "init" | "react" | "no-inline"
         ) {
             let resolved = rewrite_specifier(root, dir, resolver, fs_allow, dir_cache, base, false)
                 .or_else(|| {
@@ -5157,6 +5157,10 @@ fn query_asset_kind(query: Option<&str>) -> Option<&'static str> {
         if q.split('&').any(|kv| kv == kind) {
             return Some(kind);
         }
+    }
+    // `?no-inline` only differs from `?url` in the build (never inlined).
+    if q.split('&').any(|kv| kv == "no-inline") {
+        return Some("url");
     }
     None
 }
