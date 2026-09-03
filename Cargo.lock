@@ -593,6 +593,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32fast"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8498c871161e1742aaa9d52551b2d6ebdd4c3d45a3be423e3728f33b955be550"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -854,6 +863,7 @@ version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
+ "crc32fast",
  "miniz_oxide 0.8.9",
  "zlib-rs",
 ]
@@ -1815,6 +1825,7 @@ dependencies = [
  "axum",
  "blake3",
  "clap",
+ "flate2",
  "notify",
  "oj_cache",
  "oj_compiler",
