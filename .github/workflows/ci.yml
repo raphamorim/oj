@@ -158,6 +158,9 @@ jobs:
       - name: optimized deps are versioned and served immutable with an ETag
         if: matrix.mode == 'unbundled'
         run: node e2e/dep-optimize.mjs
+      - name: worker build forms (?worker, inline, url, new URL) and worker-only chunks skip document helpers
+        if: matrix.mode == 'unbundled'
+        run: node e2e/worker-build.mjs
 
   # i need to fix this or automate
   build:

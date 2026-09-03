@@ -210,6 +210,9 @@ struct OjCssPlugin {
     worker: Option<Arc<WorkerBundleOpts>>,
     /// Vite's resolved `build.cssMinify` (defaults to `build.minify`).
     css_minify: bool,
+    /// Source ids of `?worker` / `?worker&url` entries emitted as chunks, so the
+    /// document-only build helpers can skip chunks that only a worker loads.
+    worker_entries: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 /// The app build settings an inline worker bundle shares with its importer:
@@ -1024,6 +1027,7 @@ impl Plugin for OjCssPlugin {
         let routes_id = root.join("oj-routes.tsx").to_string_lossy().into_owned();
         let client = self.client;
         let inline_limit = self.inline_limit;
+        let worker_entries = Arc::clone(&self.worker_entries);
         let host = self.host.clone();
         let css_transform_enabled = Arc::clone(&self.css_transform_enabled);
         let self_has_postcss = self.has_postcss;
@@ -1238,6 +1242,7 @@ impl Plugin for OjCssPlugin {
                         worker: worker.clone(),
                         resolve: css_resolve.clone(),
                         css_minify: self_css_minify,
+                        worker_entries: Arc::clone(&worker_entries),
                     };
                     let code = bundle_worker_inline(&root, file, worker.as_ref(), nested).await?;
                     let literal = serde_json::Value::String(code).to_string();
@@ -1254,6 +1259,7 @@ impl Plugin for OjCssPlugin {
                     .and_then(|n| n.to_str())
                     .unwrap_or("worker")
                     .to_string();
+                worker_entries.lock().unwrap().insert(file.to_string());
                 let reference = ctx
                     .emit_chunk(rolldown_common::EmittedChunk {
                         id: file.to_string(),
@@ -2471,6 +2477,8 @@ pub async fn build(
     }
 
     let collected_css: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let worker_entries: Arc<Mutex<std::collections::HashSet<String>>> =
+        Arc::new(Mutex::new(std::collections::HashSet::new()));
     let css_split = css_code_split_of(&config);
     let plugin_host = user_plugin_host(
         &root,
@@ -2522,6 +2530,7 @@ pub async fn build(
             minify: client_minify,
         })),
         css_minify: oj_config::build_css_minify(&config),
+        worker_entries: Arc::clone(&worker_entries),
     }));
     let out_ov = ro_output_overrides(ro_opts);
     // Vite's build import analysis (preload wrapping, polyfill) only applies to
@@ -2552,6 +2561,9 @@ pub async fn build(
             name: out_ov.name,
             extend: out_ov.extend,
             treeshake: ro_treeshake(ro_opts),
+            // Vite sets `preserveEntrySignatures: false` for app builds; oj keeps
+            // rolldown's exports-only default because plugin-emitted chunks (crx
+            // pages, scripts) rely on their entry exports surviving.
             cwd: Some(root.clone()),
             dir: Some(out_dir.display().to_string()),
             resolve: rolldown_resolve(&root, &config, "client"),
@@ -3008,6 +3020,7 @@ pub async fn build(
             &page_entry_files,
             oj_config::module_preload_polyfill(&config),
             out_banner.as_deref(),
+            &worker_entries.lock().unwrap().clone(),
         )?;
     }
 
@@ -3751,6 +3764,7 @@ pub(crate) async fn build_ssr(
         html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
         worker: None,
         css_minify: oj_config::build_css_minify(&config),
+        worker_entries: Arc::new(Mutex::new(std::collections::HashSet::new())),
     }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
@@ -3767,6 +3781,7 @@ pub(crate) async fn build_ssr(
             platform: Some(if externals.webworker() { Platform::Browser } else { Platform::Node }),
             external: Some(external),
             format: Some(OutputFormat::Esm),
+            preserve_entry_signatures: Some(rolldown_common::PreserveEntrySignatures::AllowExtension),
             entry_filenames: Some(format!("{stem}.mjs").into()),
             chunk_filenames: Some(format!("{stem}-[hash].mjs").into()),
             minify: Some(rolldown_minify(
@@ -3914,6 +3929,7 @@ async fn build_server_fns(root: &Path, out_dir: &Path, mode: &str) -> anyhow::Re
                 html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 worker: None,
                 css_minify: oj_config::build_css_minify(&config),
+                worker_entries: Arc::new(Mutex::new(std::collections::HashSet::new())),
             })])
             .with_options(BundlerOptions {
                 input: Some(vec![InputItem {
@@ -4291,6 +4307,7 @@ async fn build_client_entry(
         html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
         worker: None,
         css_minify: oj_config::build_css_minify(&config),
+        worker_entries: Arc::new(Mutex::new(std::collections::HashSet::new())),
     }));
 
     let mut bundler = BundlerBuilder::default()
@@ -4527,6 +4544,7 @@ async fn build_library(
                 html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 worker: None,
                 css_minify: oj_config::build_css_minify(&config),
+                worker_entries: Arc::new(Mutex::new(std::collections::HashSet::new())),
             })])
             .with_options(BundlerOptions {
                 input: Some(
@@ -4544,6 +4562,7 @@ async fn build_library(
                 resolve: rolldown_resolve(root, config, "client"),
                 format: Some(format),
                 name: lib.name.clone(),
+                preserve_entry_signatures: Some(rolldown_common::PreserveEntrySignatures::Strict),
                 entry_filenames: Some(entry_file.into()),
                 chunk_filenames: Some(format!("[name]-[hash].{ext}").into()),
                 asset_filenames: Some("[name].[ext]".to_string().into()),
@@ -4992,17 +5011,43 @@ fn apply_preload_helper(
     page_entries: &[String],
     polyfill: bool,
     banner: Option<&str>,
+    worker_entries: &std::collections::HashSet<String>,
 ) -> anyhow::Result<()> {
     let css_of: std::collections::HashMap<&str, &str> = chunk_css
         .iter()
         .map(|(c, css)| (c.as_str(), css.as_str()))
         .collect();
     let relative = is_relative_base(base);
+    // Chunks only a worker ever loads run without a `document`: no preload
+    // wrapping, no stylesheet self-injection (Vite builds workers without its
+    // import analysis, `isWorker`).
+    let worker_only = {
+        let mut entries: Vec<(String, bool)> = Vec::new();
+        let mut dynamic_map: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for asset in &output.assets {
+            if let rolldown_common::Output::Chunk(chunk) = asset {
+                let file = chunk.filename.to_string();
+                dynamic_map.insert(file.clone(), chunk.dynamic_imports.iter().map(|d| d.to_string()).collect());
+                if chunk.is_entry {
+                    let is_worker = chunk
+                        .facade_module_id
+                        .as_ref()
+                        .is_some_and(|f| worker_entries.contains(f.as_ref() as &str));
+                    entries.push((file, is_worker));
+                }
+            }
+        }
+        worker_only_chunks(&entries, imports_map, &dynamic_map)
+    };
     for asset in &output.assets {
         let rolldown_common::Output::Chunk(chunk) = asset else {
             continue;
         };
         let file = chunk.filename.to_string();
+        if worker_only.contains(&file) {
+            continue;
+        }
         let path = out_dir.join(&file);
         let Ok(mut code) = fs::read_to_string(&path) else {
             continue;
@@ -5117,6 +5162,38 @@ fn apply_preload_helper(
         }
     }
     Ok(())
+}
+
+/// The chunks reachable (statically or dynamically) from worker entries but from
+/// no other entry.
+fn worker_only_chunks(
+    entries: &[(String, bool)],
+    imports_map: &std::collections::HashMap<String, Vec<String>>,
+    dynamic_map: &std::collections::HashMap<String, Vec<String>>,
+) -> std::collections::BTreeSet<String> {
+    let closure = |roots: &[&String]| -> std::collections::BTreeSet<String> {
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut stack: Vec<String> = roots.iter().map(|r| (*r).clone()).collect();
+        while let Some(f) = stack.pop() {
+            if !seen.insert(f.clone()) {
+                continue;
+            }
+            for m in [imports_map, dynamic_map] {
+                if let Some(deps) = m.get(&f) {
+                    stack.extend(deps.iter().cloned());
+                }
+            }
+        }
+        seen
+    };
+    let workers: Vec<&String> = entries.iter().filter(|(_, w)| *w).map(|(f, _)| f).collect();
+    if workers.is_empty() {
+        return std::collections::BTreeSet::new();
+    }
+    let others: Vec<&String> = entries.iter().filter(|(_, w)| !*w).map(|(f, _)| f).collect();
+    let from_workers = closure(&workers);
+    let from_others = closure(&others);
+    from_workers.difference(&from_others).cloned().collect()
 }
 
 /// Vite's `ssr-manifest.json` (ssrManifestPlugin): for every source module in the
@@ -6171,6 +6248,26 @@ mod tests {
         assert!(w.contains("larger than 500 kB after minification"));
         assert!(w.contains("build.chunkSizeWarningLimit"));
         fs::remove_dir_all(&out).unwrap();
+    }
+
+    #[test]
+    fn worker_only_chunks_exclude_anything_a_page_entry_reaches() {
+        let entries = vec![("main.js".to_string(), false), ("w.js".to_string(), true)];
+        let imports: std::collections::HashMap<String, Vec<String>> = [
+            ("main.js".to_string(), vec!["shared.js".to_string()]),
+            ("w.js".to_string(), vec!["shared.js".to_string(), "wlib.js".to_string()]),
+        ]
+        .into_iter()
+        .collect();
+        let dynamics: std::collections::HashMap<String, Vec<String>> =
+            [("w.js".to_string(), vec!["wlazy.js".to_string()])].into_iter().collect();
+        let only = worker_only_chunks(&entries, &imports, &dynamics);
+        assert_eq!(
+            only.into_iter().collect::<Vec<_>>(),
+            vec!["w.js".to_string(), "wlazy.js".to_string(), "wlib.js".to_string()],
+            "shared.js is reachable from the page, so it keeps the document helpers"
+        );
+        assert!(worker_only_chunks(&[("main.js".to_string(), false)], &imports, &dynamics).is_empty());
     }
 
     #[test]

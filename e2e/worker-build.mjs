@@ -29,7 +29,11 @@ fs.mkdirSync(path.join(app, "src", "img"), { recursive: true });
 fs.writeFileSync(path.join(app, "package.json"), JSON.stringify({ name: "worker-app", version: "1.0.0" }));
 fs.writeFileSync(path.join(app, "src", "img", "pic.png"), Buffer.alloc(6000, 3));
 fs.writeFileSync(path.join(app, "src", "img", "other.png"), Buffer.alloc(6000, 4));
-fs.writeFileSync(path.join(app, "src", "w.ts"), `const tag: string = "w";\nself.onmessage = (e) => self.postMessage(tag + ":" + e.data);\n`);
+fs.writeFileSync(path.join(app, "src", "w-lazy.ts"), `export const suffix: string = "!";\n`);
+fs.writeFileSync(
+  path.join(app, "src", "w.ts"),
+  `const tag: string = "w";\nself.onmessage = async (e) => { const { suffix } = await import("./w-lazy.ts"); self.postMessage(tag + ":" + e.data + suffix); };\n`,
+);
 fs.writeFileSync(
   path.join(app, "src", "main.js"),
   `import W from "./w.ts?worker";\nimport WI from "./w.ts?worker&inline";\nimport wUrl from "./w.ts?worker&url";\n` +
@@ -56,6 +60,14 @@ try {
   assert.match(main, /self\.onmessage|postMessage/, "inline worker code embedded in the main chunk");
   assert.match(main, /pic-[^.]+\.png/, "template-literal url matched the glob");
   assert.match(main, /other-[^.]+\.png/, "glob map includes every match");
+  // A worker chunk (and the chunks only it loads) runs without a document: no
+  // __vitePreload wrapping or stylesheet injection lands in it (Vite: isWorker).
+  const workerChunk = fs.readFileSync(path.join(assets, files.find((f) => /^w-[^.]+\.js$/.test(f))), "utf8");
+  assert.doesNotMatch(workerChunk, /__vitePreload|document\./, "worker chunk is free of document-only helpers");
+  assert.match(workerChunk, /import\(/, "the worker keeps its dynamic import");
+  const lazyChunk = files.find((f) => /^w-lazy-[^.]+\.js$/.test(f));
+  assert.ok(lazyChunk, `worker-only lazy chunk emitted: ${files}`);
+  assert.doesNotMatch(fs.readFileSync(path.join(assets, lazyChunk), "utf8"), /document\./, "worker-only chunk has no document access");
 
   srv = spawn(oj, ["preview", app, "--port", String(PORT)], { stdio: "ignore" });
   for (let i = 0; i < 100; i++) { try { if ((await fetch(`http://localhost:${PORT}/`)).ok) break; } catch {} await sleep(200); }
@@ -67,7 +79,7 @@ try {
     await page.goto(`http://localhost:${PORT}/`, { timeout: 30000 });
     await page.waitForFunction(() => Array.isArray(window.__W), { timeout: 20000 });
     const r = await page.evaluate(() => ({ w: window.__W, img: window.__IMG, wurl: window.__WURL }));
-    assert.deepEqual(r.w, ["w:a", "w:b", "w:c"], "all three worker forms answered");
+    assert.deepEqual(r.w, ["w:a!", "w:b!", "w:c!"], "all three worker forms answered (through the worker's dynamic import)");
     assert.match(r.img, /\/assets\/pic-[^.]+\.png$/, `template url resolved to the hashed asset: ${r.img}`);
     assert.match(r.wurl, /\/assets\/w-[^.]+\.js$/, `?worker&url is the chunk url: ${r.wurl}`);
     assert.equal(errors.length, 0, `page errors: ${errors.join("|")}`);
