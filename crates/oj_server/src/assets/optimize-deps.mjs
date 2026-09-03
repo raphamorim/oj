@@ -52,8 +52,6 @@ function detectEntries() {
   return found;
 }
 
-const entryList = entries && entries.length ? entries : detectEntries();
-
 const req = createRequire(path.join(root, "package.json"));
 
 // Vite's expandGlobIds (optimizer/resolve.ts): an include entry with a glob in
@@ -141,6 +139,43 @@ for (const inc of include) {
     if (!includeIds.includes(id)) includeIds.push(id);
   }
 }
+
+// optimizeDeps.entries are glob patterns relative to root (Vite scans them with
+// tinyglobby); a literal path is used as given.
+const entryList =
+  entries && entries.length
+    ? entries.flatMap((e) =>
+        isDynamicPattern(e)
+          ? globFiles(e, root)
+              .filter((f) => !f.split("/").includes("node_modules"))
+              .map((f) => path.join(root, f))
+          : [path.isAbsolute(e) ? e : path.join(root, e)],
+      )
+    : detectEntries();
+
+// resolve.dedupe: a bare import of a deduped package resolves from the project
+// root wherever the importer sits (Vite resolve.ts: dedupe -> basedir = root),
+// so the pre-bundle holds the one copy the dev server also serves, not a copy
+// nested under some dependency.
+const DEDUPE_PKGS = new Set(dedupe.map(npmPackageName).filter(Boolean));
+const dedupeFromRoot = {
+  name: "oj-dedupe-from-root",
+  setup(build) {
+    if (!DEDUPE_PKGS.size) return;
+    build.onResolve({ filter: /^[^./]/ }, async (args) => {
+      if (args.pluginData?.ojDedupe || args.kind === "entry-point" || path.isAbsolute(args.path)) return null;
+      if (!args.resolveDir || path.resolve(args.resolveDir) === path.resolve(root)) return null;
+      if (!DEDUPE_PKGS.has(npmPackageName(args.path))) return null;
+      const r = await build.resolve(args.path, {
+        kind: args.kind,
+        importer: args.importer,
+        resolveDir: root,
+        pluginData: { ojDedupe: true },
+      });
+      return r.errors.length ? null : { path: r.path, external: r.external, namespace: r.namespace };
+    });
+  },
+};
 // Vite 8 apps use rolldown for optimizeDeps and don't depend on esbuild directly,
 // but esbuild is still a Vite transitive dep -- resolve it from the app's Vite when
 // the app itself doesn't expose it, so the dep pre-bundler still runs.
@@ -467,7 +502,7 @@ if (Object.keys(entryPoints).length) {
     // pre-bundle. The import stays in the output and oj serves a browser stub,
     // matching Vite's esbuildDepPlugin, which also externalizes builtins.
     external: [...NODE_BUILTINS, ...(esbuildOptions.external ?? [])],
-    plugins: [...(esbuildOptions.plugins ?? []), externalizeNonJs],
+    plugins: [...(esbuildOptions.plugins ?? []), dedupeFromRoot, externalizeNonJs],
     logLevel: "silent",
     metafile: true,
     write: true,
