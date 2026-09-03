@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Raphael Amorim
 
 import vm from "node:vm";
-import readline from "node:readline";
+import http from "node:http";
 import { fstatSync, statSync } from "node:fs";
 import { SourceMap } from "node:module";
 import path from "node:path";
@@ -192,16 +192,23 @@ function invalidate() {
   return dirty.size;
 }
 
+// Evaluation of the entry is shared by concurrent requests: the first one
+// builds and evaluates, the rest await the same promise (a module runner's
+// import cache), and none of them serializes behind another request.
+let entryEval = null;
 async function entryNamespace() {
   invalidate();
-  let rec = registry.get(ENTRY);
-  if (!rec || !rec.evaluated) {
-    const mod = await build(ENTRY);
-    await mod.evaluate();
-    rec = registry.get(ENTRY);
-    rec.evaluated = true;
+  const rec = registry.get(ENTRY);
+  if (rec && rec.evaluated) return rec.mod.namespace;
+  if (!entryEval) {
+    entryEval = (async () => {
+      const mod = await build(ENTRY);
+      await mod.evaluate();
+      registry.get(ENTRY).evaluated = true;
+      return mod.namespace;
+    })().finally(() => { entryEval = null; });
   }
-  return rec.mod.namespace;
+  return entryEval;
 }
 
 async function moduleNamespace(id) {
@@ -215,66 +222,96 @@ async function moduleNamespace(id) {
   return rec.mod.namespace;
 }
 
-async function handleCall(emit, id, name, args) {
-  const ns = await moduleNamespace(id);
-  const fn = name === "default" ? ns.default : ns[name];
-  if (typeof fn !== "function") {
-    throw new Error(`server function "${name}" not found in ${id}`);
-  }
-  const result = await fn(...(Array.isArray(args) ? args : []));
-  emit({ result: JSON.stringify(result ?? null) });
-}
-
 const serialize = (data) => JSON.stringify(data ?? null).replace(/</g, "\\u003c");
 
 async function loadData(ns, url) {
   return typeof ns.load === "function" ? await ns.load(url) : null;
 }
 
-async function handleLoad(emit, url) {
-  emit({ data: serialize(await loadData(await entryNamespace(), url)) });
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
 }
 
-async function handleAction(emit, url, body) {
-  const ns = await entryNamespace();
-  if (typeof ns.action === "function") await ns.action(url, body);
-  emit({ data: serialize(await loadData(ns, url)) });
-}
-
-async function handleRender(emit, url) {
-  const ns = await entryNamespace();
-  const data = await loadData(ns, url);
-  const head = typeof ns.head === "function" ? String(await ns.head(url, data)) : "";
-  emit({ data: serialize(data), head });
-  if (typeof ns.renderStream === "function") {
-    const stream = await ns.renderStream(url, data);
-    const reader = stream.getReader();
-    const decoder = new TextDecoder();
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const chunk = decoder.decode(value, { stream: true });
-      if (chunk) emit({ chunk });
+// Requests arrive over a loopback HTTP server, as they do for the Start runner:
+// they run concurrently (a loader that fetches the app's own server during a
+// render no longer waits behind itself), action bodies arrive as bytes, and a
+// render streams its HTML. `/render` answers with one JSON line of metadata
+// (`{ data, head }`) followed by the HTML; the dev server wraps that in the
+// document shell.
+const JSON_TYPE = { "content-type": "application/json; charset=utf-8" };
+const server = http.createServer(async (req, res) => {
+  const reqUrl = new URL(req.url ?? "/", "http://runner");
+  const url = reqUrl.searchParams.get("url") ?? "/";
+  let streaming = false;
+  try {
+    // Every reply is computed before its head goes out, so a throwing loader
+    // or action is a 500 with the stack, never a 200 with an error body.
+    if (reqUrl.pathname === "/load") {
+      const data = serialize(await loadData(await entryNamespace(), url));
+      res.writeHead(200, JSON_TYPE);
+      res.end(data);
+    } else if (reqUrl.pathname === "/action") {
+      const bytes = await readBody(req);
+      const ns = await entryNamespace();
+      // The body as text (the historical signature) and as the raw bytes, so a
+      // binary payload is not lost in the decode.
+      if (typeof ns.action === "function") await ns.action(url, bytes.toString("utf8"), new Uint8Array(bytes));
+      const data = serialize(await loadData(ns, url));
+      res.writeHead(200, JSON_TYPE);
+      res.end(data);
+    } else if (reqUrl.pathname === "/call") {
+      const msg = JSON.parse((await readBody(req)).toString("utf8") || "{}");
+      const ns = await moduleNamespace(String(msg.module ?? ""));
+      const name = String(msg.name ?? "");
+      const fn = name === "default" ? ns.default : ns[name];
+      if (typeof fn !== "function") throw new Error(`server function "${name}" not found in ${msg.module}`);
+      const result = await fn(...(Array.isArray(msg.args) ? msg.args : []));
+      res.writeHead(200, JSON_TYPE);
+      res.end(JSON.stringify(result ?? null));
+    } else if (reqUrl.pathname === "/render") {
+      const ns = await entryNamespace();
+      const data = await loadData(ns, url);
+      const head = typeof ns.head === "function" ? String(await ns.head(url, data)) : "";
+      if (typeof ns.renderStream !== "function" && typeof ns.render !== "function") {
+        throw new Error(`SSR entry ${ENTRY} exports neither render() nor renderStream()`);
+      }
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      streaming = true;
+      res.write(JSON.stringify({ data: serialize(data), head }) + "\n");
+      if (typeof ns.renderStream === "function") {
+        const reader = (await ns.renderStream(url, data)).getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value && value.length) res.write(Buffer.from(value));
+        }
+      } else {
+        res.write(String(await ns.render(url, data)));
+      }
+      res.end();
+    } else {
+      res.writeHead(404, JSON_TYPE);
+      res.end(JSON.stringify({ error: `unknown runner endpoint ${reqUrl.pathname}` }));
     }
-    const tail = decoder.decode();
-    if (tail) emit({ chunk: tail });
-    emit({ end: true });
-  } else if (typeof ns.render === "function") {
-    emit({ html: String(await ns.render(url, data)) });
-  } else {
-    throw new Error(`SSR entry ${ENTRY} exports neither render() nor renderStream()`);
+  } catch (e) {
+    const text = e && e.stack ? rewriteStack(e.stack) : String(e);
+    if (streaming) {
+      // Mid-stream: the document is already open, so the error lands in it.
+      const esc = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      res.end(`<pre>[oj ssr] ${esc}</pre>`);
+    } else {
+      if (!res.headersSent) res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
+      res.end(text);
+    }
   }
-}
-
-let lock = Promise.resolve();
-function withLock(fn) {
-  const run = lock.then(fn, fn);
-  lock = run.then(
-    () => {},
-    () => {},
-  );
-  return run;
-}
+});
+await new Promise((r) => server.listen(0, "127.0.0.1", r));
+process.stdout.write(JSON.stringify({ port: server.address().port }) + "\n");
 
 function connectHmr() {
   if (typeof WebSocket === "undefined") return;
@@ -292,37 +329,20 @@ function connectHmr() {
       return;
     }
     if (msg.type === "error") return;
-    withLock(() => {
-      const dropped = invalidate();
-      if (dropped) process.stderr.write(`oj ssr: hmr push -> invalidated ${dropped} module(s)\n`);
-    });
+    const dropped = invalidate();
+    if (dropped) process.stderr.write(`oj ssr: hmr push -> invalidated ${dropped} module(s)\n`);
   });
   ws.addEventListener("close", () => setTimeout(connectHmr, 1000));
   ws.addEventListener("error", () => {});
 }
 connectHmr();
 
+// stdin is the parent's lifeline: when oj goes away the pipe closes and the
+// runner follows.
 try {
   if (fstatSync(0, { bigint: true }).isFIFO()) {
     process.stdin.once("end", () => process.exit(0));
     process.stdin.once("close", () => process.exit(0));
+    process.stdin.resume();
   }
 } catch {}
-
-const rl = readline.createInterface({ input: process.stdin });
-rl.on("line", (line) => {
-  let msg;
-  try {
-    msg = JSON.parse(line);
-  } catch {
-    return;
-  }
-  const emit = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
-  const url = typeof msg.url === "string" ? msg.url : "/";
-  const body = typeof msg.body === "string" ? msg.body : "";
-  const fail = (e) => emit({ error: e && e.stack ? rewriteStack(e.stack) : String(e) });
-  if (msg.cmd === "render") withLock(() => handleRender(emit, url)).catch(fail);
-  else if (msg.cmd === "load") withLock(() => handleLoad(emit, url)).catch(fail);
-  else if (msg.cmd === "action") withLock(() => handleAction(emit, url, body)).catch(fail);
-  else if (msg.cmd === "call") withLock(() => handleCall(emit, msg.module, msg.name, msg.args)).catch(fail);
-});

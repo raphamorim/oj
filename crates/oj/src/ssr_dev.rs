@@ -13,21 +13,24 @@ use axum::{
     middleware::Next,
     response::{Html, IntoResponse, Response},
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout};
-use tokio_stream::wrappers::ReceiverStream;
 
+/// The module runner process. Requests travel over its loopback HTTP server
+/// (announced on its first stdout line), so they run concurrently, action
+/// bodies stay bytes and renders stream; stdin only keeps it alive.
 struct Runner {
-    stdin: ChildStdin,
-    lines: Lines<BufReader<ChildStdout>>,
+    _stdin: ChildStdin,
+    _lines: Lines<BufReader<ChildStdout>>,
     _child: Child,
+    http_port: u16,
 }
 
 struct SsrState {
     client_url: Option<String>,
     proxy_prefixes: Vec<String>,
     root: PathBuf,
-    runner: Arc<tokio::sync::Mutex<Runner>>,
+    runner: Runner,
 }
 
 pub async fn ssr_dev(
@@ -60,7 +63,7 @@ pub async fn ssr_dev(
         client_url: client_url.clone(),
         proxy_prefixes: built.proxy_prefixes.clone(),
         root: built.root.clone(),
-        runner: Arc::new(tokio::sync::Mutex::new(runner)),
+        runner,
     });
 
     let app = built.router.layer(axum::middleware::from_fn_with_state(
@@ -154,10 +157,23 @@ async fn spawn_runner(root: &Path, base: &str, entry_abs: &Path) -> anyhow::Resu
 
     let stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    // The runner announces its loopback port as its first stdout line.
+    let line = tokio::time::timeout(std::time::Duration::from_secs(120), lines.next_line())
+        .await
+        .map_err(|_| anyhow::anyhow!("SSR runner did not announce its port"))?
+        .map_err(|e| anyhow::anyhow!("SSR runner stdout: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("SSR runner exited before announcing its port"))?;
+    let http_port = serde_json::from_str::<serde_json::Value>(&line)
+        .ok()
+        .and_then(|v| v.get("port").and_then(|p| p.as_u64()))
+        .ok_or_else(|| anyhow::anyhow!("SSR runner sent an unexpected first line: {line}"))?
+        as u16;
     Ok(Runner {
-        stdin,
-        lines: BufReader::new(stdout).lines(),
+        _stdin: stdin,
+        _lines: lines,
         _child: child,
+        http_port,
     })
 }
 
@@ -183,12 +199,11 @@ async fn ssr_route(State(state): State<Arc<SsrState>>, req: Request, next: Next)
                 .into_response();
         };
         let cmd = serde_json::json!({
-            "cmd": "call",
             "module": abs.to_string_lossy(),
             "name": payload.get("name").cloned().unwrap_or_default(),
             "args": payload.get("args").cloned().unwrap_or_else(|| serde_json::json!([])),
         });
-        return match run_command(&state, cmd, "result").await {
+        return match runner_json(&state, "/call", Some(Body::from(cmd.to_string()))).await {
             Ok(json) => ([(header::CONTENT_TYPE, "application/json")], json).into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
@@ -196,21 +211,18 @@ async fn ssr_route(State(state): State<Arc<SsrState>>, req: Request, next: Next)
     match classify(&req, &state.proxy_prefixes) {
         Route::Document => render_route(&state, req.uri().path()).await,
         Route::Loader => data_response(
-            run_command(
-                &state,
-                serde_json::json!({ "cmd": "load", "url": req.uri().path() }),
-                "data",
-            )
-            .await,
+            runner_json(&state, &runner_url("/load", req.uri().path()), None).await,
         ),
         Route::Action { json } => {
             let path = req.uri().path().to_string();
-            let bytes = axum::body::to_bytes(req.into_body(), 256 * 1024)
-                .await
-                .unwrap_or_default();
-            let body = String::from_utf8_lossy(&bytes).into_owned();
-            let cmd = serde_json::json!({ "cmd": "action", "url": path, "body": body });
-            let data = run_command(&state, cmd, "data").await;
+            // The body streams to the runner as bytes (no size cap, no lossy
+            // decode on the way), the way Vite pipes a request into the app.
+            let data = runner_json(
+                &state,
+                &runner_url("/action", &path),
+                Some(req.into_body()),
+            )
+            .await;
             if json {
                 data_response(data)
             } else if data.is_ok() {
@@ -252,38 +264,45 @@ fn classify(req: &Request, proxy_prefixes: &[String]) -> Route {
     }
 }
 
-async fn run_command(
-    state: &SsrState,
-    cmd: serde_json::Value,
-    reply_key: &str,
-) -> Result<String, String> {
-    let runner = Arc::clone(&state.runner);
-    let reply_key = reply_key.to_owned();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let mut guard = runner.lock_owned().await;
-        let result = async {
-            guard
-                .stdin
-                .write_all(format!("{cmd}\n").as_bytes())
-                .await
-                .map_err(|e| e.to_string())?;
-            guard.stdin.flush().await.map_err(|e| e.to_string())?;
-            match read_message(&mut guard.lines).await {
-                Some(v) if v.get(&reply_key).and_then(|d| d.as_str()).is_some() => {
-                    Ok(v[&reply_key].as_str().unwrap().to_owned())
-                }
-                Some(v) if v.get("error").and_then(|e| e.as_str()).is_some() => {
-                    Err(v["error"].as_str().unwrap().to_owned())
-                }
-                _ => Err("SSR runner did not respond".to_string()),
-            }
+/// A runner endpoint plus the app URL it should act on.
+fn runner_url(endpoint: &str, url: &str) -> String {
+    format!("{endpoint}?url={}", percent_encode(url))
+}
+
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
         }
-        .await;
-        let _ = tx.send(result);
-    });
-    rx.await
-        .unwrap_or_else(|_| Err("SSR runner task cancelled".to_string()))
+    }
+    out
+}
+
+/// POST (with a body) or GET (without) a runner endpoint and collect its
+/// JSON reply; a non-200 answer carries the runner's error text.
+async fn runner_json(state: &SsrState, path_and_query: &str, body: Option<Body>) -> Result<String, String> {
+    let method = if body.is_some() { "POST" } else { "GET" };
+    let resp = oj_server::proxy_to_loopback_streaming(
+        state.runner.http_port,
+        method,
+        path_and_query,
+        &header::HeaderMap::new(),
+        body,
+    )
+    .await
+    .map_err(|e| format!("SSR runner did not respond: {e}"))?;
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    if status.is_success() {
+        Ok(text)
+    } else {
+        Err(text)
+    }
 }
 
 fn data_response(data: Result<String, String>) -> Response {
@@ -293,76 +312,69 @@ fn data_response(data: Result<String, String>) -> Response {
     }
 }
 
+/// Render a document: the runner answers `/render` with one JSON line of
+/// metadata (`{ data, head }`) and then streams the HTML, which is wrapped in
+/// the document shell as it arrives (a streaming render reaches the browser
+/// progressively, as under Vite).
 async fn render_route(state: &SsrState, path: &str) -> Response {
-    let mut guard = Arc::clone(&state.runner).lock_owned().await;
-    let cmd = format!("{}\n", serde_json::json!({ "cmd": "render", "url": path }));
-    if guard.stdin.write_all(cmd.as_bytes()).await.is_err() || guard.stdin.flush().await.is_err() {
-        return error_page("SSR runner is not accepting input (did it crash?)");
-    }
-    let (data_json, head_html) = match read_message(&mut guard.lines).await {
-        Some(v) if v.get("data").and_then(|d| d.as_str()).is_some() => (
-            v["data"].as_str().unwrap().to_owned(),
-            v.get("head")
-                .and_then(|h| h.as_str())
-                .unwrap_or("")
-                .to_owned(),
-        ),
-        Some(v) if v.get("error").and_then(|e| e.as_str()).is_some() => {
-            return error_page(v["error"].as_str().unwrap());
-        }
-        _ => ("null".to_string(), String::new()),
-    };
-    let v = match read_message(&mut guard.lines).await {
-        Some(v) => v,
-        None => return error_page("SSR runner did not respond"),
-    };
-
-    if let Some(html) = v.get("html").and_then(|h| h.as_str()) {
-        return Html(page(state, html, &data_json, &head_html)).into_response();
-    }
-    if let Some(first_chunk) = v.get("chunk").and_then(|c| c.as_str()).map(str::to_owned) {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
-        let head = page_head(&data_json, &head_html);
-        let tail = page_tail(state);
-        tokio::spawn(async move {
-            let mut guard = guard;
-            let _ = tx.send(Ok(Bytes::from(head))).await;
-            let _ = tx.send(Ok(Bytes::from(first_chunk))).await;
-            while let Ok(Some(line)) = guard.lines.next_line().await {
-                match serde_json::from_str::<serde_json::Value>(&line) {
-                    Ok(v) if v.get("chunk").and_then(|c| c.as_str()).is_some() => {
-                        let _ = tx
-                            .send(Ok(Bytes::from(v["chunk"].as_str().unwrap().to_owned())))
-                            .await;
-                    }
-                    Ok(v) if v.get("error").and_then(|e| e.as_str()).is_some() => {
-                        let msg = html_escape(v["error"].as_str().unwrap());
-                        let _ = tx
-                            .send(Ok(Bytes::from(format!("<pre>[oj ssr] {msg}</pre>"))))
-                            .await;
-                        break;
-                    }
-                    _ => break,
-                }
-            }
-            let _ = tx.send(Ok(Bytes::from(tail))).await;
-        });
-        return (
-            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            Body::from_stream(ReceiverStream::new(rx)),
-        )
-            .into_response();
-    }
-    error_page(
-        v.get("error")
-            .and_then(|e| e.as_str())
-            .unwrap_or("unknown SSR error"),
+    use tokio_stream::StreamExt;
+    let resp = match oj_server::proxy_to_loopback_streaming(
+        state.runner.http_port,
+        "GET",
+        &runner_url("/render", path),
+        &header::HeaderMap::new(),
+        None,
     )
-}
-
-async fn read_message(lines: &mut Lines<BufReader<ChildStdout>>) -> Option<serde_json::Value> {
-    let line = lines.next_line().await.ok().flatten()?;
-    serde_json::from_str(&line).ok()
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => return error_page(&format!("SSR runner did not respond: {e}")),
+    };
+    if !resp.status().is_success() {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        return error_page(&String::from_utf8_lossy(&bytes));
+    }
+    let mut stream = resp.into_body().into_data_stream();
+    // Collect the metadata line; whatever follows it is HTML.
+    let mut buf: Vec<u8> = Vec::new();
+    let meta_end = loop {
+        if let Some(i) = buf.iter().position(|b| *b == b'\n') {
+            break Some(i);
+        }
+        match stream.next().await {
+            Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+            _ => break None,
+        }
+    };
+    let Some(meta_end) = meta_end else {
+        return error_page(&format!(
+            "SSR runner sent no render metadata: {}",
+            String::from_utf8_lossy(&buf)
+        ));
+    };
+    let meta: serde_json::Value = serde_json::from_slice(&buf[..meta_end]).unwrap_or_default();
+    let data_json = meta
+        .get("data")
+        .and_then(|d| d.as_str())
+        .unwrap_or("null")
+        .to_owned();
+    let head_html = meta
+        .get("head")
+        .and_then(|h| h.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let rest = Bytes::copy_from_slice(&buf[meta_end + 1..]);
+    let head = tokio_stream::once(Ok::<_, axum::Error>(Bytes::from(page_head(&data_json, &head_html))));
+    let first = tokio_stream::once(Ok::<_, axum::Error>(rest));
+    let tail = tokio_stream::once(Ok::<_, axum::Error>(Bytes::from(page_tail(state))));
+    let body = head.chain(first).chain(stream).chain(tail);
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        Body::from_stream(body),
+    )
+        .into_response()
 }
 
 fn page_head(data_json: &str, head_html: &str) -> String {
@@ -381,15 +393,6 @@ fn page_tail(state: &SsrState) -> String {
         None => String::new(),
     };
     format!("</div>\n{entry}\n</body>\n</html>\n")
-}
-
-fn page(state: &SsrState, body: &str, data_json: &str, head_html: &str) -> String {
-    format!(
-        "{}{}{}",
-        page_head(data_json, head_html),
-        body,
-        page_tail(state)
-    )
 }
 
 fn error_page(msg: &str) -> Response {
