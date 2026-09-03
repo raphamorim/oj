@@ -308,6 +308,10 @@ struct ServerState {
     /// hit by the page's first module requests, before its socket opened) is
     /// kept and delivered to the next client, like Vite's ws `bufferedError`.
     buffered_error: Mutex<Option<String>>,
+    /// Modules whose last transform failed on an unresolvable relative import
+    /// (Vite's `_hasResolveFailedErrorModules`): a file appearing on disk
+    /// re-processes them so the overlay clears once the missing file exists.
+    resolve_failed: Mutex<std::collections::HashSet<String>>,
 }
 
 pub struct BuiltApp {
@@ -787,6 +791,7 @@ impl DevServer {
             rt: tokio::runtime::Handle::current(),
             base: config.base.clone().filter(|b| b != "/"),
             buffered_error: Mutex::new(None),
+            resolve_failed: Mutex::new(std::collections::HashSet::new()),
             optimized: Arc::new(if bundle {
                 optimize::OptimizedDeps::disabled()
             } else {
@@ -3171,6 +3176,11 @@ async fn ensure_module(
                 watch_files: Vec::new(),
             });
         }
+        // The first relative import nothing on disk satisfies. Vite's import
+        // analysis fails the transform for it ("Failed to resolve import ...");
+        // shipping the specifier unchanged would only surface as a 404 in the
+        // browser, with no overlay and no recovery when the file is created.
+        let unresolved: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
         let rewrite_with = |spec: &str, resolver: &OjResolver| {
             if spec == "virtual:oj-routes" {
                 return Some("/@oj/routes.js".to_string());
@@ -3220,6 +3230,9 @@ async fn ensure_module(
                     hex_encode(&importer_abs)
                 ));
             }
+            if !is_dep && relative_import_missing(&dir, resolver, spec) {
+                unresolved.borrow_mut().get_or_insert_with(|| spec.to_string());
+            }
             None
         };
         let mut rewrite = |spec: &str| rewrite_with(spec, &resolver);
@@ -3232,6 +3245,9 @@ async fn ensure_module(
                 &mut rewrite,
             )
             .map_err(|err| format!("compile error:\n{err}"))?;
+            if let Some(spec) = unresolved.borrow().as_ref() {
+                return Err(unresolved_import_error(&root, &file_owned, &source, spec));
+            }
             Ok(CachedModule {
                 is_boundary: factory.is_boundary(),
                 hot: None,
@@ -3331,6 +3347,9 @@ async fn ensure_module(
                 )
             }
             .map_err(|err| format!("compile error:\n{err}"))?;
+            if let Some(spec) = unresolved.borrow().as_ref() {
+                return Err(unresolved_import_error(&root, &file_owned, &source, spec));
+            }
             Ok(CachedModule {
                 is_boundary: is_svelte || (!is_dep && output.has_refresh_registrations()),
                 hot: output.hot_accept.map(|h| oj_cache::HotMeta {
@@ -3359,7 +3378,21 @@ async fn ensure_module(
             module.watch_files = plugin_watch_files;
             Arc::new(module)
         }
-        Ok(Err(err)) => return Err(err),
+        Ok(Err(err)) => {
+            if is_unresolved_import_error(&err) {
+                let clean = url.split('?').next().unwrap_or(url).to_string();
+                state.resolve_failed.lock().unwrap().insert(clean);
+                // Vite clears the importer's isSelfAccepting here (#9534) so the
+                // update a later `create` triggers climbs to a boundary the page
+                // did load rather than stopping at a module it never evaluated.
+                state
+                    .graph
+                    .lock()
+                    .unwrap()
+                    .set_self_accepting(Path::new(url), false);
+            }
+            return Err(err);
+        }
         Err(join_err) => return Err(format!("compiler task failed: {join_err}")),
     };
     if state.persistent_cache {
@@ -3369,6 +3402,11 @@ async fn ensure_module(
     }
     memory_put(state, url, &key, &module);
     register_in_graph(state, url, &module);
+    state
+        .resolve_failed
+        .lock()
+        .unwrap()
+        .remove(url.split('?').next().unwrap_or(url));
     if state.plugins_use_module_parsed && !is_dep && !is_server {
         state.parsed_fired.lock().unwrap().insert(key.clone());
     }
@@ -4481,6 +4519,48 @@ fn url_of(root: &Path, file: &Path) -> String {
         Ok(rel) => format!("/{}", rel.display()),
         Err(_) => format!("/@fs{}", file.display()),
     }
+}
+
+/// A `./` or `../` import that neither exists on disk nor resolves (with the
+/// configured extensions and index files). The query is dropped first: an
+/// unknown query on an existing file is a legitimate specifier the browser
+/// requests as-is, not a missing module.
+fn relative_import_missing(dir: &Path, resolver: &OjResolver, spec: &str) -> bool {
+    if !(spec.starts_with("./") || spec.starts_with("../")) {
+        return false;
+    }
+    let base = spec.split('?').next().unwrap_or(spec);
+    !normalize(&dir.join(base)).is_file() && resolver.resolve(dir, base).is_err_and(|e| !e.ignored)
+}
+
+const UNRESOLVED_IMPORT_MARK: &str = "Failed to resolve import \"";
+
+fn is_unresolved_import_error(err: &str) -> bool {
+    err.contains(UNRESOLVED_IMPORT_MARK)
+}
+
+/// Vite's import-analysis error for a missing import ("Failed to resolve import
+/// "./x" from "src/a.tsx". Does the file exist?"), in oj's `title\nfile:line:col
+/// message\nframe` shape so the overlay lifts the location out of it. The
+/// position is where the specifier is quoted in the (plugin-transformed) source.
+fn unresolved_import_error(root: &Path, file: &Path, source: &str, spec: &str) -> String {
+    let rel = file.strip_prefix(root).unwrap_or(file).display().to_string();
+    let quoted = ['"', '\'', '`']
+        .iter()
+        .find_map(|q| source.find(&format!("{q}{spec}{q}")).map(|p| p + 1));
+    let (line, col) = match quoted {
+        Some(pos) => {
+            let before = &source[..pos];
+            let line = before.matches('\n').count() + 1;
+            let col = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+            (line, col)
+        }
+        None => (1, 1),
+    };
+    let frame = source.lines().nth(line - 1).unwrap_or("");
+    format!(
+        "compile error:\n{rel}:{line}:{col} {UNRESOLVED_IMPORT_MARK}{spec}\" from \"{rel}\". Does the file exist?\n{line:>4} | {frame}\n"
+    )
 }
 
 fn normalize(path: &Path) -> PathBuf {
@@ -6176,7 +6256,32 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
         }
     }
 
-    for path in paths {
+    // A file appearing on disk may be the one a module failed to import: Vite
+    // adds `_hasResolveFailedErrorModules` to a `create` event's module set so
+    // those importers are re-processed (hmr.ts). notify does not tell a create
+    // from a modify reliably, so a file that exists but is not in the graph is
+    // taken as new; the importers then go through the loop as changed files.
+    let mut paths: Vec<PathBuf> = paths.to_vec();
+    let new_file = paths.iter().any(|p| {
+        p.is_file()
+            && !state
+                .graph
+                .lock()
+                .unwrap()
+                .contains(Path::new(&url_of(&state.root, p)))
+    });
+    if new_file {
+        // The resolver caches misses too: without this a created `./dir/index.ts`
+        // or extension-probed file stays "not found" for the importer's retry.
+        state.resolver.clear_cache();
+        state.ssr_resolver.clear_cache();
+        let failed: Vec<String> = state.resolve_failed.lock().unwrap().drain().collect();
+        for url in failed {
+            paths.push(state.root.join(url.trim_start_matches('/')));
+        }
+    }
+
+    for path in &paths {
         if path.components().any(|c| {
             let c = c.as_os_str();
             c == "node_modules" || c == ".oj-cache" || c == "dist"
@@ -6903,6 +7008,53 @@ mod tests {
         assert_eq!(stamp_import_url("/logo.svg?url", 5), "/logo.svg?url");
         assert_eq!(stamp_import_url("/@oj-deps/react.js", 5), "/@oj-deps/react.js");
         assert_eq!(stamp_import_url("/@fs/x/node_modules/a/index.js", 5), "/@fs/x/node_modules/a/index.js");
+    }
+
+    #[test]
+    fn unresolved_import_error_points_at_the_specifier() {
+        let root = Path::new("/app");
+        let file = Path::new("/app/src/App.tsx");
+        let source = "import { useState } from \"react\";\nimport { Later } from './Later';\n";
+        let err = unresolved_import_error(root, file, source, "./Later");
+        assert!(is_unresolved_import_error(&err));
+        assert!(
+            err.contains("src/App.tsx:2:24 Failed to resolve import \"./Later\" from \"src/App.tsx\". Does the file exist?"),
+            "{err}"
+        );
+        assert!(err.contains("   2 | import { Later } from './Later';"), "{err}");
+        // The overlay's ErrorPayload lifts the location out of the message.
+        let frame: serde_json::Value = serde_json::from_str(&error_frame(&err)).unwrap();
+        assert_eq!(frame["err"]["id"], "src/App.tsx");
+        assert_eq!(frame["err"]["loc"]["line"], 2);
+        assert_eq!(frame["err"]["loc"]["column"], 24);
+        // A specifier not found verbatim (plugin-rewritten source) still errors.
+        let err = unresolved_import_error(root, file, "export {};\n", "./gone");
+        assert!(err.contains("src/App.tsx:1:1 Failed to resolve import \"./gone\""), "{err}");
+        assert!(!is_unresolved_import_error("compile error:\nparse error in x.tsx"));
+    }
+
+    #[test]
+    fn relative_import_missing_only_for_unresolvable_relative_specifiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/widgets")).unwrap();
+        std::fs::write(root.join("src/util.ts"), "export const u = 1;\n").unwrap();
+        std::fs::write(root.join("src/widgets/index.ts"), "export const w = 1;\n").unwrap();
+        let resolver = OjResolver::new(root);
+        let src = root.join("src");
+        assert!(relative_import_missing(&src, &resolver, "./nope"));
+        assert!(relative_import_missing(&src, &resolver, "../nope.js"));
+        assert!(!relative_import_missing(&src, &resolver, "./util"), "extension probing");
+        assert!(!relative_import_missing(&src, &resolver, "./util.ts"));
+        assert!(!relative_import_missing(&src, &resolver, "./widgets"), "directory index");
+        assert!(!relative_import_missing(&src, &resolver, "./util.ts?worker&inline"), "query dropped");
+        assert!(!relative_import_missing(&src, &resolver, "react"), "bare specifiers are not ours");
+        assert!(!relative_import_missing(&src, &resolver, "/src/nope.ts"), "root-absolute is not ours");
+        // A miss cached by the resolver clears once the file exists.
+        assert!(relative_import_missing(&src, &resolver, "./later"));
+        std::fs::write(root.join("src/later.ts"), "export {};\n").unwrap();
+        resolver.clear_cache();
+        assert!(!relative_import_missing(&src, &resolver, "./later"));
     }
 
     #[test]

@@ -71,6 +71,9 @@ jobs:
       - name: json import edit reaches the boundary (stamped import)
         if: matrix.mode == 'unbundled'
         run: node e2e/hmr-json-update.mjs
+      - name: unresolved relative import errors, creating the file recovers
+        if: matrix.mode == 'unbundled'
+        run: node e2e/hmr-unresolved-import.mjs
       - name: request paths (encoded filenames, traversal containment)
         if: matrix.mode == 'unbundled'
         run: node e2e/awkward-paths.mjs
