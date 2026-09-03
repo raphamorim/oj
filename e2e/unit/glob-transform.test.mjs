@@ -250,3 +250,80 @@ test("the rewrite adds no lines (source maps and stack traces stay aligned)", ()
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// Vite's `base` option (importMetaGlob.ts toAbsoluteGlob): patterns resolve
+// against the base, root-relative when it starts with `/`, and the map keys are
+// relative to that base; import specifiers stay relative to the importer.
+test("base option resolves patterns and keys against the base", () => {
+  const dir = fixture();
+  try {
+    mkdirSync(join(dir, "app", "deep"), { recursive: true });
+    const importer = join(dir, "app", "deep", "index.ts");
+    const rel = transformGlob('const m = import.meta.glob("./*.md", { base: "../../content" });', importer, dir);
+    assert.match(rel, /"\.\/a\.md":\s*\(\)\s*=>\s*import\("\.\.\/\.\.\/content\/a\.md"\)/);
+    assert.match(rel, /"\.\/b\.md":/);
+    const root = transformGlob('const m = import.meta.glob("./*.md", { base: "/content" });', importer, dir);
+    assert.match(root, /"\.\/a\.md":\s*\(\)\s*=>\s*import\("\.\.\/\.\.\/content\/a\.md"\)/);
+    assert.throws(
+      () => transformGlob('const m = import.meta.glob("./*.md", { base: "content" });', importer, dir),
+      /Option "base" must start with/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A `/`-prefixed pattern is project-root relative (not an absolute fs path),
+// and its keys are root-relative like Vite's `/src/...` keys.
+test("root-relative patterns resolve against the project root with /-keys", () => {
+  const dir = fixture();
+  try {
+    mkdirSync(join(dir, "app"), { recursive: true });
+    const out = transformGlob('const m = import.meta.glob("/pages/**/page.tsx");', join(dir, "app", "index.ts"), dir);
+    assert.match(out, /"\/pages\/home\/page\.tsx":\s*\(\)\s*=>\s*import\("\.\.\/pages\/home\/page\.tsx"\)/);
+    assert.match(out, /"\/pages\/about\/page\.tsx":/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The deprecated `as` option is `query` by another name; `as: 'raw' | 'url'`
+// forces the default import, and mixing `as` with `query` is rejected.
+test("as option maps to a query (raw/url force the default import)", () => {
+  const dir = fixture();
+  try {
+    const raw = transformGlob('const m = import.meta.glob("./content/*.md", { as: "raw", eager: true });', join(dir, "index.ts"), dir);
+    assert.match(raw, /^import __oj_glob0_0 from "\.\/content\/a\.md\?raw";/);
+    const url = transformGlob('const m = import.meta.glob("./content/*.md", { as: "url" });', join(dir, "index.ts"), dir);
+    assert.match(url, /import\("\.\/content\/a\.md\?url"\)\.then\(\(m\) => m\.default\)/);
+    const bare = transformGlob('const m = import.meta.glob("./content/*.md", { query: "raw" });', join(dir, "index.ts"), dir);
+    assert.match(bare, /import\("\.\/content\/a\.md\?raw"\)/);
+    assert.throws(
+      () => transformGlob('const m = import.meta.glob("./content/*.md", { as: "raw", query: "?x" });', join(dir, "index.ts"), dir),
+      /"as" and "query" cannot be used together/,
+    );
+    assert.throws(
+      () => transformGlob('const m = import.meta.glob("./content/*.md", { as: "raw", import: "named" });', join(dir, "index.ts"), dir),
+      /can only be "default" or "\*"/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("caseSensitive: false matches regardless of case; the importer itself is skipped", () => {
+  const dir = fixture();
+  try {
+    writeFileSync(join(dir, "content", "Upper.MD"), "# u");
+    const strict = transformGlob('const m = import.meta.glob("./content/*.md");', join(dir, "index.ts"), dir);
+    assert.doesNotMatch(strict, /Upper\.MD/);
+    const loose = transformGlob('const m = import.meta.glob("./content/*.md", { caseSensitive: false });', join(dir, "index.ts"), dir);
+    assert.match(loose, /"\.\/content\/Upper\.MD":/);
+    assert.match(loose, /"\.\/content\/a\.md":/);
+    writeFileSync(join(dir, "pages", "index.ts"), "");
+    const self = transformGlob('const m = import.meta.glob("./**/*.ts");', join(dir, "pages", "index.ts"), dir);
+    assert.doesNotMatch(self, /"\.\/index\.ts"/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 import { readdirSync, statSync } from "node:fs";
-import { resolve, dirname, relative, sep } from "node:path";
+import { resolve, dirname, join, relative, sep } from "node:path";
 
 const GLOB_HEAD = /import\.meta\.glob\b/g;
 
@@ -25,7 +25,7 @@ function callArgsStart(code, from) {
   return code[i] === "(" ? i + 1 : -1;
 }
 
-function globToRegExp(absGlob) {
+function globToRegExp(absGlob, flags = "") {
   let re = "";
   for (let i = 0; i < absGlob.length; i++) {
     const c = absGlob[i];
@@ -50,7 +50,7 @@ function globToRegExp(absGlob) {
       re += c;
     }
   }
-  return new RegExp("^" + re + "$");
+  return new RegExp("^" + re + "$", flags);
 }
 
 function walk(dir, out) {
@@ -63,14 +63,28 @@ function walk(dir, out) {
   }
 }
 
-function matchPattern(fileDir, pattern, exhaustive = false) {
-  const absGlob = (pattern.startsWith("/") ? pattern : resolve(fileDir, pattern)).split(sep).join("/");
+// Vite's toAbsoluteGlob: `/x` is project-root relative, `./x` and `../x`
+// resolve against the importer's directory or, with the `base` option,
+// against that base (itself root-relative when it starts with `/`); anything
+// else (an alias, a bare id) keeps resolving against the importer's directory.
+function absGlobOf(pattern, fileDir, root, base) {
+  const dir = base ? (base[0] === "/" ? join(root, base) : resolve(fileDir, base)) : fileDir;
+  if (pattern.startsWith("/")) return join(root, pattern.slice(1));
+  if (pattern.startsWith("./")) return join(dir, pattern.slice(2));
+  if (pattern.startsWith("../")) return join(dir, pattern);
+  return resolve(fileDir, pattern);
+}
+
+function matchPattern(absGlob, exhaustive = false, caseSensitive = true) {
+  absGlob = absGlob.split(sep).join("/");
   const starIdx = absGlob.search(/[*?{]/);
   const base = starIdx === -1 ? dirname(absGlob) : absGlob.slice(0, absGlob.lastIndexOf("/", starIdx));
-  const re = globToRegExp(absGlob);
+  // Vite: `caseSensitive: false` matches with nocase (an `Icon.svg` pattern
+  // finds `icon.svg`).
+  const re = globToRegExp(absGlob, caseSensitive ? "" : "i");
   const explicitHidden = absGlob.slice(base.length + 1).split("/")
     .filter((part) => part.startsWith("."))
-    .map(globToRegExp);
+    .map((part) => globToRegExp(part));
   const all = [];
   walk(base.split("/").join(sep), all);
   return all.filter((f) => {
@@ -91,7 +105,40 @@ const toRel = (fileDir, abs) => {
   return r;
 };
 
-export function transformGlob(code, filePath) {
+// The key of a matched file, as Vite writes it: relative to the importer for
+// relative patterns, relative to `base` when that option is set, and
+// root-relative (`/src/...`) for `/`-prefixed and other absolute patterns.
+function keyOf(file, { fileDir, root, base, isRelative }) {
+  if (base) return toRel(base[0] === "/" ? join(root, base) : resolve(fileDir, base), file);
+  if (isRelative) return toRel(fileDir, file);
+  const r = relative(root, file).split(sep).join("/");
+  return r.startsWith("./") || r.startsWith("../") ? r : "/" + r;
+}
+
+// Vite's deprecated `as` option: it is `query` under another name, and
+// `as: 'raw' | 'url'` forces `import: 'default'` (Vite rejects anything else).
+const FORCE_DEFAULT_AS = ["raw", "url"];
+function normalizeOptions(opts) {
+  const out = { ...opts };
+  if (typeof out.as === "string") {
+    if (typeof out.query === "string" || (out.query && typeof out.query === "object")) {
+      throw new Error('Options "as" and "query" cannot be used together');
+    }
+    if (FORCE_DEFAULT_AS.includes(out.as)) {
+      if (out.import && out.import !== "default" && out.import !== "*") {
+        throw new Error(`Option "import" can only be "default" or "*" when "as" is "${out.as}", but got "${out.import}"`);
+      }
+      out.import = "default";
+    }
+    out.query = out.as;
+  }
+  if (typeof out.base === "string" && out.base[0] !== "/" && !out.base.startsWith("./") && !out.base.startsWith("../")) {
+    throw new Error(`Option "base" must start with '/', './' or '../', but got "${out.base}"`);
+  }
+  return out;
+}
+
+export function transformGlob(code, filePath, root = process.env.OJ_APP_ROOT ?? process.cwd()) {
   if (!code.includes("import.meta.glob")) return code;
   const fileDir = dirname(filePath);
   const prelude = [];
@@ -113,25 +160,34 @@ export function transformGlob(code, filePath) {
     try { args = new Function("return [" + argsSrc + "]")(); } catch { continue; }
     GLOB_HEAD.lastIndex = i;
     const patterns = (Array.isArray(args[0]) ? args[0] : [args[0]]).filter((p) => typeof p === "string");
-    const opts = args[1] && typeof args[1] === "object" ? args[1] : {};
+    let opts;
+    try { opts = normalizeOptions(args[1] && typeof args[1] === "object" ? args[1] : {}); } catch (e) {
+      throw new Error(`${e.message} (import.meta.glob in ${filePath})`);
+    }
     const includes = patterns.filter((p) => !p.startsWith("!"));
     const excludes = patterns.filter((p) => p.startsWith("!")).map((p) => p.slice(1));
     const exhaustive = opts.exhaustive === true;
-    const exclude = new Set(excludes.flatMap((p) => matchPattern(fileDir, p, exhaustive)));
-    const files = [...new Set(includes.flatMap((p) => matchPattern(fileDir, p, exhaustive)))]
-      .filter((f) => !exclude.has(f))
+    const caseSensitive = opts.caseSensitive !== false;
+    const base = typeof opts.base === "string" ? opts.base : null;
+    const isRelative = patterns.every((p) => ".!".includes(p[0]));
+    const match = (p) => matchPattern(absGlobOf(p, fileDir, root, base), exhaustive, caseSensitive);
+    const exclude = new Set(excludes.flatMap(match));
+    const files = [...new Set(includes.flatMap(match))]
+      .filter((f) => !exclude.has(f) && f !== filePath)
       .sort();
-    const query = typeof opts.query === "string"
+    let query = typeof opts.query === "string"
       ? opts.query
       : opts.query && typeof opts.query === "object"
         ? `?${new URLSearchParams(opts.query)}`
         : "";
-    const importName = typeof opts.import === "string" ? opts.import : null;
+    if (query && query[0] !== "?") query = `?${query}`;
+    // `import: '*'` is the whole namespace, like no `import` at all.
+    const importName = typeof opts.import === "string" && opts.import !== "*" ? opts.import : null;
     const wantDefault = importName === "default";
     const entries = files.map((f, idx) => {
       const rel = toRel(fileDir, f);
       const spec = rel + query;
-      const key = JSON.stringify(rel);
+      const key = JSON.stringify(keyOf(f, { fileDir, root, base, isRelative }));
       if (opts.eager) {
         const id = `__oj_glob${g}_${idx}`;
         prelude.push(wantDefault
