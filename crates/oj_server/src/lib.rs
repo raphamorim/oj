@@ -2197,14 +2197,33 @@ async fn proxy_websocket(
     })
 }
 
-async fn serve_html(state: &ServerState, bytes: Vec<u8>) -> Response {
+/// `url`: the page's request path (Vite's ctx.path); `file`: the html on disk
+/// (ctx.filename). A throwing transformIndexHtml fails the request with the
+/// plugin error (Vite's indexHtml middleware lets it reach the error
+/// middleware) instead of serving the untransformed page.
+async fn serve_html(state: &ServerState, bytes: Vec<u8>, url: &str, file: &Path) -> Response {
     let mut raw = String::from_utf8_lossy(&bytes).into_owned();
     // %VITE_*% / import.meta.env substitution (Vite's htmlEnvHook), a pre-hook
     // before any plugin transformIndexHtml.
     raw = oj_env::replace_html_env(&raw, &state.html_env);
     if let Some(host) = &state.plugins {
-        if let Ok(out) = host.transform_index_html(&raw).await {
-            raw = out;
+        let ctx = serde_json::json!({
+            "path": url,
+            "filename": file.display().to_string(),
+            "originalUrl": url,
+        })
+        .to_string();
+        match host.transform_index_html(&raw, &ctx).await {
+            Ok(out) => raw = out,
+            Err(e) => {
+                eprintln!("oj: transformIndexHtml failed for {url}: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    format!("oj: transformIndexHtml failed for {url}\n{e}"),
+                )
+                    .into_response();
+            }
         }
     }
     let html = if state.bundle {
@@ -2217,7 +2236,7 @@ async fn serve_html(state: &ServerState, bytes: Vec<u8>) -> Response {
 
 async fn serve_index_html(state: &ServerState) -> Response {
     match tokio::fs::read(state.root.join("index.html")).await {
-        Ok(bytes) => serve_html(state, bytes).await,
+        Ok(bytes) => serve_html(state, bytes, "/index.html", &state.root.join("index.html")).await,
         Err(_) => (StatusCode::NOT_FOUND, "oj: index.html not found").into_response(),
     }
 }
@@ -2609,7 +2628,7 @@ async fn serve_path(
     }
 
     match tokio::fs::read(&file).await {
-        Ok(bytes) if ext == "html" => serve_html(&state, bytes).await,
+        Ok(bytes) if ext == "html" => serve_html(&state, bytes, &url_of(&state.root, &file), &file).await,
         Ok(bytes) if ext == "css" => {
             let source = String::from_utf8_lossy(&bytes).into_owned();
             if is_tailwind_css(&source) {

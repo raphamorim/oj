@@ -2460,6 +2460,11 @@ pub async fn build(
     // Page script entries across all documents: the only chunks that get the
     // modulepreload polyfill (a worker or plugin-emitted entry has no document).
     let mut page_entry_files: Vec<String> = Vec::new();
+    // Vite's build transformIndexHtml ctx (html.ts) carries the output bundle
+    // and the page's entry chunk; serialized once for every page.
+    let html_bundle: Option<serde_json::Value> = plugin_host
+        .as_ref()
+        .and_then(|_| serde_json::from_str(&serialize_bundle(&output.assets)).ok());
     for doc in &html_docs {
         let mut rewritten_html = oj_env::replace_html_env(&doc.src_html, &html_env);
         let page_base = page_base(&base, &doc.out_rel);
@@ -2593,9 +2598,29 @@ pub async fn build(
         }
 
         if let Some(host) = &plugin_host {
-            if let Ok(out) = host.transform_index_html(&rewritten_html).await {
-                rewritten_html = out;
-            }
+            // Vite (html.ts): `{ path: "/" + relative path, filename: <source
+            // html>, bundle, chunk }`, and a throwing hook fails the build.
+            let page_file = doc.dir.join(
+                Path::new(&doc.out_rel)
+                    .file_name()
+                    .unwrap_or_default(),
+            );
+            let chunk = html_bundle
+                .as_ref()
+                .zip(doc_entry_files.first())
+                .and_then(|(b, f)| b.get(f.as_str()).cloned())
+                .unwrap_or(serde_json::Value::Null);
+            let ctx = serde_json::json!({
+                "path": format!("/{}", doc.out_rel),
+                "filename": page_file.display().to_string(),
+                "bundle": html_bundle.clone().unwrap_or(serde_json::Value::Object(Default::default())),
+                "chunk": chunk,
+            })
+            .to_string();
+            rewritten_html = host
+                .transform_index_html(&rewritten_html, &ctx)
+                .await
+                .map_err(|e| anyhow::anyhow!("plugin transformIndexHtml failed for {}:\n{e}", doc.out_rel))?;
         }
         let dest = out_dir.join(&doc.out_rel);
         if let Some(parent) = dest.parent() {
