@@ -58,6 +58,8 @@ struct OjCssPlugin {
     /// `css.preprocessorOptions` (Sass additionalData/loadPaths, Less/Stylus
     /// options), applied the same way the dev server applies them.
     css: Option<oj_config::CssConfig>,
+    /// Inline `<script type="module">` bodies keyed by their html-proxy id.
+    html_inline: Arc<Mutex<std::collections::HashMap<String, String>>>,
 }
 
 fn assets_inline_limit_of(config: &oj_config::OjConfig) -> u64 {
@@ -468,10 +470,21 @@ impl Plugin for OjCssPlugin {
             .into_owned();
         let asset_query = split_asset_query(args.specifier);
         let importer = args.importer.map(str::to_string);
+        let html_proxy = args.specifier.contains("?html-proxy&index=").then(|| {
+            let spec = args.specifier.strip_prefix("./").unwrap_or(args.specifier);
+            if Path::new(spec).is_absolute() {
+                spec.to_string()
+            } else {
+                self.root.join(spec).to_string_lossy().into_owned()
+            }
+        });
         let ctx = ctx.clone();
         async move {
             if is_routes {
                 return Ok(Some(HookResolveIdOutput::from_id(routes_id)));
+            }
+            if let Some(id) = html_proxy {
+                return Ok(Some(HookResolveIdOutput::from_id(id)));
             }
             if let Some((base, query)) = asset_query {
                 if let Ok(Ok(resolved)) = ctx.resolve(&base, importer.as_deref(), None).await {
@@ -530,7 +543,17 @@ impl Plugin for OjCssPlugin {
         let css_transform_enabled = Arc::clone(&self.css_transform_enabled);
         let self_has_postcss = self.has_postcss;
         let css_cfg = self.css.clone();
+        let html_inline = Arc::clone(&self.html_inline);
         async move {
+            if id.contains("?html-proxy&index=") {
+                if let Some(body) = html_inline.lock().unwrap().get(&id).cloned() {
+                    return Ok(Some(rolldown_plugin::HookLoadOutput {
+                        code: arcstr::ArcStr::from(body),
+                        module_type: Some(rolldown_common::ModuleType::Js),
+                        ..Default::default()
+                    }));
+                }
+            }
             if let Some(file) = id.strip_suffix("?url") {
                 if is_stylesheet_path(file) {
                     // `import u from './a.scss?url'`: the URL of the COMPILED
@@ -1162,6 +1185,7 @@ fn forward_emitted_html(
         out_rel,
         src_html: content,
         scripts,
+        dir: emit.root.clone(),
     });
 }
 
@@ -1647,6 +1671,8 @@ pub async fn build(
     }
 
     let mut html_docs: Vec<HtmlDoc> = Vec::new();
+    let html_inline: Arc<Mutex<std::collections::HashMap<String, String>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
     let mut inputs: Vec<InputItem> = Vec::new();
     let mut seen_imports: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut had_html = false;
@@ -1682,10 +1708,17 @@ pub async fn build(
             };
             had_html = true;
             let html_dir = abs.parent().unwrap_or(&root).to_path_buf();
+            let (content, inline) = externalize_inline_scripts(&content, &abs);
+            for (_, id, body) in &inline {
+                html_inline.lock().unwrap().insert(id.clone(), body.clone());
+            }
             let scripts: Vec<HtmlScript> = module_script_srcs(&content)
                 .into_iter()
                 .map(|src| {
-                    let abs = resolve_html_ref(&src, &html_dir, &root);
+                    let abs = match inline.iter().find(|(p, _, _)| *p == src) {
+                        Some((_, id, _)) => PathBuf::from(id),
+                        None => resolve_html_ref(&src, &html_dir, &root),
+                    };
                     HtmlScript { src, abs }
                 })
                 .collect();
@@ -1711,6 +1744,7 @@ pub async fn build(
                 out_rel,
                 src_html: content,
                 scripts,
+                dir: html_dir,
             });
         } else {
             if !abs.exists() {
@@ -1755,6 +1789,7 @@ pub async fn build(
         host: plugin_host.clone(),
         css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
         css: config.css.clone(),
+        html_inline: Arc::clone(&html_inline),
     }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
@@ -1859,6 +1894,8 @@ pub async fn build(
         oj_env::html_env_map(&defines)
     };
     let mut emitted: Vec<(String, usize)> = Vec::new();
+    let has_postcss = oj_server::has_postcss_config(&root);
+    let link_css_transform_enabled: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::new();
     let asset_names_pattern = ro_output_str(ro_opts, "assetFileNames");
     let css_asset_opts = CssAssetOpts {
         inline_limit: assets_inline_limit_of(&config),
@@ -2005,22 +2042,52 @@ pub async fn build(
             rewritten_html = insert_before_head(&rewritten_html, &links);
         }
 
-        for href in link_hrefs(&doc.src_html) {
-            let src = root.join(href.trim_start_matches('/'));
-            if src.is_file() {
-                let dest = out_dir.join(href.trim_start_matches('/'));
+        // `<link rel="stylesheet" href>` to a local file (relative or root-absolute)
+        // goes through the same pipeline as an imported stylesheet (Sass/PostCSS/
+        // Tailwind, lightningcss, url() assets) and is emitted hashed, as in Vite.
+        {
+            let mut seen_link_assets: std::collections::HashMap<PathBuf, String> =
+                std::collections::HashMap::new();
+            for href in stylesheet_hrefs(&doc.src_html) {
+                let src = resolve_html_ref(&href, &doc.dir, &root);
+                if !src.is_file() {
+                    continue;
+                }
+                let src_str = src.to_string_lossy().into_owned();
+                let out = compile_stylesheet(
+                    &root,
+                    &plugin_host,
+                    &link_css_transform_enabled,
+                    has_postcss,
+                    &config.css,
+                    &src_str,
+                    &src_str,
+                )
+                .await
+                .with_context(|| format!("stylesheet {href} linked from {}", doc.out_rel))?;
+                let dir = src.parent().map(Path::to_path_buf).unwrap_or_else(|| root.clone());
+                let css = rebase_css_urls(
+                    &out.css,
+                    &dir,
+                    &out_dir,
+                    &base,
+                    css_asset_opts,
+                    &mut emitted,
+                    &mut seen_link_assets,
+                );
+                let hash = content_hash(css.as_bytes());
+                let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("style");
+                let name = render_asset_name(css_asset_opts.asset_names, &sanitize_asset_name(stem), &hash, "css");
+                let dest = out_dir.join(&name);
                 if let Some(parent) = dest.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                let source = fs::read_to_string(&src)?;
-                if oj_server::sidecar::is_tailwind_css(&source) {
-                    let css = expand_css_via_sidecar(&root, &src, &source)?;
-                    let minified = oj_css::compile_css(href.as_str(), &css, true)
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                    fs::write(&dest, minified.css)?;
-                    continue;
-                }
-                fs::copy(&src, &dest)?;
+                fs::write(&dest, &css)?;
+                emitted.push((name.clone(), css.len()));
+                rewritten_html = rewritten_html.replace(
+                    &format!("href=\"{href}\""),
+                    &format!("href=\"{}\"", with_base(&name, &base)),
+                );
             }
         }
 
@@ -2111,6 +2178,88 @@ struct HtmlDoc {
     out_rel: String,
     src_html: String,
     scripts: Vec<HtmlScript>,
+    /// Directory of the source page; relative `<link href>`s resolve against it.
+    dir: PathBuf,
+}
+
+/// Inline `<script type="module">…</script>` blocks (no `src`): the byte range
+/// of the whole element and its body.
+fn inline_module_scripts(html: &str) -> Vec<(usize, usize, String)> {
+    let mut out = Vec::new();
+    for (start, _) in html.match_indices("<script") {
+        let Some(tag_end) = html[start..].find('>') else {
+            continue;
+        };
+        let tag = &html[start..start + tag_end];
+        if !tag.contains("type=\"module\"") || tag.contains("src=") || tag.ends_with('/') {
+            continue;
+        }
+        let body_start = start + tag_end + 1;
+        let Some(close) = html[body_start..].find("</script>") else {
+            continue;
+        };
+        let body = html[body_start..body_start + close].to_string();
+        if body.trim().is_empty() {
+            continue;
+        }
+        out.push((start, body_start + close + "</script>".len(), body));
+    }
+    out
+}
+
+/// Vite's html-proxy: each inline module script becomes its own entry
+/// (`<page>?html-proxy&index=N.js`, whose relative imports resolve against the
+/// page's directory) and the tag is rewritten to a `src` placeholder that the
+/// post-bundle HTML rewrite replaces with the hashed chunk. Returns the rewritten
+/// html and `(placeholder src, virtual id, body)` per script.
+fn externalize_inline_scripts(html: &str, html_abs: &Path) -> (String, Vec<(String, String, String)>) {
+    let blocks = inline_module_scripts(html);
+    if blocks.is_empty() {
+        return (html.to_string(), Vec::new());
+    }
+    let mut out = html.to_string();
+    let mut entries = Vec::new();
+    for (n, (start, end, body)) in blocks.iter().enumerate().rev() {
+        let placeholder = format!("/@oj-inline/{n}.js");
+        let id = format!("{}?html-proxy&index={n}.js", html_abs.display());
+        out.replace_range(*start..*end, &format!("<script type=\"module\" src=\"{placeholder}\"></script>"));
+        entries.push((placeholder, id, body.clone()));
+    }
+    entries.reverse();
+    (out, entries)
+}
+
+/// `href`s of `<link rel="stylesheet">` tags that name a local file (relative or
+/// root-absolute), in document order.
+fn stylesheet_hrefs(html: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (start, _) in html.match_indices("<link") {
+        let Some(end) = html[start..].find('>') else {
+            continue;
+        };
+        let tag = &html[start..start + end];
+        if !(tag.contains("rel=\"stylesheet\"") || tag.contains("rel='stylesheet'")) {
+            continue;
+        }
+        let Some(at) = tag.find("href=\"") else {
+            continue;
+        };
+        let rest = &tag[at + 6..];
+        let Some(close) = rest.find('"') else {
+            continue;
+        };
+        let href = &rest[..close];
+        if href.is_empty()
+            || href.starts_with("http://")
+            || href.starts_with("https://")
+            || href.starts_with("//")
+            || href.starts_with("data:")
+        {
+            continue;
+        }
+        out.push(href.to_string());
+    }
+    out
 }
 
 fn normalize_input_entries(input: &serde_json::Value) -> Vec<(String, String)> {
@@ -2152,12 +2301,6 @@ fn insert_before_head(html: &str, snippet: &str) -> String {
     }
 }
 
-fn link_hrefs(html: &str) -> Vec<String> {
-    scan_attrs(html, "<link", "href=\"")
-        .into_iter()
-        .filter(|href| href.starts_with('/'))
-        .collect()
-}
 
 fn scan_attrs(html: &str, tag_prefix: &str, attr_prefix: &str) -> Vec<String> {
     let mut values = Vec::new();
@@ -2245,6 +2388,7 @@ pub(crate) async fn build_ssr(
         host: plugin_host.clone(),
         css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
         css: config.css.clone(),
+        html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
     }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
@@ -2386,6 +2530,7 @@ async fn build_server_fns(root: &Path, out_dir: &Path, mode: &str) -> anyhow::Re
                 host: None,
                 css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
                 css: config.css.clone(),
+                html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
             })])
             .with_options(BundlerOptions {
                 input: Some(vec![InputItem {
@@ -2752,6 +2897,7 @@ async fn build_client_entry(
         host: plugin_host.clone(),
         css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
         css: config.css.clone(),
+        html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
     }));
 
     let mut bundler = BundlerBuilder::default()
@@ -2897,6 +3043,7 @@ async fn build_library(
                 host: None,
                 css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
                 css: config.css.clone(),
+                html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
             })])
             .with_options(BundlerOptions {
                 input: Some(vec![InputItem {
@@ -3852,18 +3999,35 @@ mod tests {
     }
 
     #[test]
-    fn link_hrefs_collects_only_absolute_hrefs() {
+    fn stylesheet_hrefs_take_local_stylesheet_links_only() {
         let html = r#"<html><head>
-          <link rel="stylesheet" href="/assets/app.css">
+          <link rel="stylesheet" href="/src/base.css">
+          <link rel="stylesheet" href="./src/theme.scss">
+          <link rel="stylesheet" href="https://cdn.test/x.css">
           <link rel="icon" href="favicon.ico">
           <link rel="modulepreload" href="/assets/chunk.js">
         </head></html>"#;
-        let hrefs = link_hrefs(html);
-        assert!(hrefs.contains(&"/assets/app.css".to_string()), "{hrefs:?}");
-        assert!(hrefs.contains(&"/assets/chunk.js".to_string()), "{hrefs:?}");
-        assert!(
-            !hrefs.iter().any(|h| h.contains("favicon")),
-            "relative href filtered: {hrefs:?}"
-        );
+        assert_eq!(stylesheet_hrefs(html), vec!["/src/base.css".to_string(), "./src/theme.scss".to_string()]);
     }
+
+    #[test]
+    fn inline_module_scripts_become_html_proxy_entries() {
+        let html = "<html><body>\n<script type=\"module\">import { x } from \"./src/x.js\"; x();</script>\n<script type=\"module\" src=\"/src/main.js\"></script>\n<script>var legacy = 1;</script>\n<script type=\"module\">console.log(2)</script></body></html>";
+        let blocks = inline_module_scripts(html);
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].2.contains("import { x }"));
+        let (out, entries) = externalize_inline_scripts(html, Path::new("/app/index.html"));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "/@oj-inline/0.js");
+        assert_eq!(entries[0].1, "/app/index.html?html-proxy&index=0.js");
+        assert_eq!(entries[1].1, "/app/index.html?html-proxy&index=1.js");
+        assert!(out.contains("<script type=\"module\" src=\"/@oj-inline/0.js\"></script>"), "{out}");
+        assert!(out.contains("<script type=\"module\" src=\"/@oj-inline/1.js\"></script>"), "{out}");
+        assert!(!out.contains("console.log(2)"), "inline body removed: {out}");
+        assert!(out.contains("var legacy = 1;"), "classic scripts untouched: {out}");
+        assert!(out.contains("src=\"/src/main.js\""), "external module kept: {out}");
+        // The placeholder is picked up as a module entry src.
+        assert!(module_script_srcs(&out).contains(&"/@oj-inline/0.js".to_string()));
+    }
+
 }
