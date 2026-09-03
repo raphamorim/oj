@@ -494,8 +494,15 @@ const ctx = {
   error: (m) => {
     throw typeof m === "string" ? new Error(m) : m;
   },
-  async resolve(source, importer) {
+  async resolve(source, importer, options) {
     if (source === "/@react-refresh") return { id: "/@oj/refresh-runtime.js" };
+    // Vite (pluginContainer ctx.resolve): the container's resolveId chain runs
+    // first, skipping the calling plugin for this id unless `skipSelf: false`,
+    // and only then Vite's own resolver. A sibling plugin's virtual id resolves
+    // here instead of falling through to oj's disk resolver and coming back null.
+    const skip = options && options.skipSelf === false ? null : (this && this._plugin) || null;
+    const viaPlugin = await resolveId(source, importer, { skip });
+    if (viaPlugin != null) return { id: viaPlugin };
     const map = transformResolveStore.getStore();
     if (map && map.has(source)) {
       const id = map.get(source);
@@ -539,7 +546,19 @@ const ctx = {
   },
   async load(options) {
     const id = typeof options === "string" ? options : options.id;
-    const info = await ctxRpc("moduleInfo", [id]);
+    // Vite (pluginContainer ctx.load): container.load runs the plugins' load
+    // chain, then transform, and hands back the module info. Only when no plugin
+    // serves the id does the source come from disk (oj's native compile).
+    let info = null;
+    const fromPlugin = await load(id);
+    if (fromPlugin != null) {
+      const outerWatch = transformWatchStore.getStore();
+      const out = JSON.parse(await transform(fromPlugin, id, null));
+      if (outerWatch) for (const f of out.watchFiles) outerWatch.add(f);
+      info = { id, code: out.code, importedIds: [] };
+    } else {
+      info = await ctxRpc("moduleInfo", [id]);
+    }
     if (info) {
       moduleInfoCache.set(info.id, info);
       seenIds.add(info.id);
@@ -559,6 +578,20 @@ const ctx = {
     return seenIds.values();
   },
 };
+
+// Vite gives every plugin its own context object whose `_plugin` is the plugin
+// itself (that is how ctx.resolve knows whom to skip). Derive a per-plugin view
+// over the shared ctx so `this._plugin` is set inside the hooks.
+const pluginCtxs = new WeakMap();
+function ctxFor(p) {
+  if (!p || typeof p !== "object") return ctx;
+  let c = pluginCtxs.get(p);
+  if (!c) {
+    c = Object.create(ctx, { _plugin: { value: p } });
+    pluginCtxs.set(p, c);
+  }
+  return c;
+}
 
 function deepMerge(a, b) {
   if (Array.isArray(a) && Array.isArray(b)) return [...a, ...b];
@@ -897,7 +930,7 @@ async function setupConfigureServer() {
   for (const { p, fn } of pluginsWithHook("configureServer")) {
     let r;
     try {
-      r = await fn.call(ctx, server);
+      r = await fn.call(ctxFor(p), server);
     } catch (e) {
       if (!ojStartMode) throw e;
       process.stderr.write(`${OJ} plugin host: configureServer(${p.name ?? "?"}) skipped: ${(e && e.message) || e}\n`);
@@ -982,7 +1015,7 @@ async function transform(code, id, resolvedJson) {
       if (!handler || !hookTransformMatches(p.transform, id, current)) continue;
       let r;
       try {
-        r = await handler.call(ctx, current, id, transformOptions);
+        r = await handler.call(ctxFor(p), current, id, transformOptions);
       } catch (e) {
         throw decoratePluginError(e, p, id);
       }
@@ -997,7 +1030,7 @@ async function transform(code, id, resolvedJson) {
     const info = { id, code: current, importedIds: [] };
     moduleInfoCache.set(id, info);
     seenIds.add(id);
-    for (const { fn } of pluginsWithHook("moduleParsed")) await fn.call(ctx, info);
+    for (const { p, fn } of pluginsWithHook("moduleParsed")) await fn.call(ctxFor(p), info);
     return JSON.stringify({
       code: current,
       watchFiles: [...bucket],
@@ -1170,14 +1203,17 @@ function hookTransformMatches(hook, id, code) {
   return true;
 }
 
-async function resolveId(source, importer) {
+// `opts.skip`: the plugin whose own this.resolve is running (Vite's skipCalls).
+async function resolveId(source, importer, opts) {
   const options = { scan: false, isEntry: false, custom: {}, attributes: {} };
+  const skip = opts && opts.skip;
   for (const p of plugins) {
+    if (skip && p === skip) continue;
     const handler = hookHandler(p.resolveId);
     if (!handler || !hookIdMatches(p.resolveId, source)) continue;
     let r;
     try {
-      r = await handler.call(ctx, source, importer || undefined, options);
+      r = await handler.call(ctxFor(p), source, importer || undefined, options);
     } catch (e) {
       throw decoratePluginError(e, p, importer || source);
     }
@@ -1193,7 +1229,7 @@ async function load(id) {
     if (!handler || !hookIdMatches(p.load, id)) continue;
     let r;
     try {
-      r = await handler.call(ctx, id);
+      r = await handler.call(ctxFor(p), id);
     } catch (e) {
       throw decoratePluginError(e, p, id);
     }
@@ -1233,8 +1269,8 @@ async function handleHotUpdate(file, timestamp, type, modulesJson) {
     server: devServer,
   };
   let filtered = null;
-  for (const { fn } of hotUpdatePlugins()) {
-    const r = await fn.call(ctx, hmrContext);
+  for (const { p, fn } of hotUpdatePlugins()) {
+    const r = await fn.call(ctxFor(p), hmrContext);
     if (r === "full-reload") return "full-reload";
     if (Array.isArray(r)) {
       hmrContext.modules = r;
@@ -1323,7 +1359,7 @@ async function transformIndexHtml(html) {
 // as `[plugin:name] message` and let the caller fail instead of logging on.
 async function runHookOrThrow(p, fn, args) {
   try {
-    return await fn.apply(ctx, args);
+    return await fn.apply(ctxFor(p), args);
   } catch (e) {
     throw decoratePluginError(e, p);
   }
@@ -1366,8 +1402,8 @@ async function renderChunk(code, chunkJson) {
   const root = resolvedConfig?.root ?? initial.config?.root ?? process.cwd();
   const options = { dir: pathResolve(root, outDir), format: "es" };
   let current = code;
-  for (const { fn } of pluginsWithHook("renderChunk")) {
-    const r = await fn.call(ctx, current, chunk, options);
+  for (const { p, fn } of pluginsWithHook("renderChunk")) {
+    const r = await fn.call(ctxFor(p), current, chunk, options);
     if (r == null) continue;
     current = typeof r === "string" ? r : (r.code ?? current);
   }
