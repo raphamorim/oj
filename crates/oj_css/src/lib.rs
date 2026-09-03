@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
+pub mod directive;
+
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
