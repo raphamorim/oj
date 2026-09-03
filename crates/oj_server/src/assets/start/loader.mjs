@@ -10,7 +10,7 @@ import { loadPluginContainerSync } from "./container-bridge.mjs";
 import { transformGlob } from "./glob-transform.mjs";
 import {
   EXTS, isFile, JS_TO_TS, probe, RESERVED, nearestPkgType,
-  hasEsmSyntax, isCjsFile, cjsFacade, jsonToEsm, stripJsonc, readJsonc, rewriteServerFns, substituteAlias,
+  hasEsmSyntax, isCjsFile, cjsFacade, jsonToEsm, stripJsonc, readJsonc, rewriteServerFns, substituteAlias, pkgNameOfSpec,
   parseImportsField, mergeTsConfig,
   PACK_FMT, PACK_PREFIX, packHash, packLine, packIntegrityFail, scanPack,
 } from "./loader-util.mjs";
@@ -671,9 +671,29 @@ function withUserConditions(context) {
   return missing.length ? { ...context, conditions: [...context.conditions, ...missing] } : context;
 }
 
+// Vite parity for externalized deps: their resolution swaps to
+// `externalConditions` (default node + module-sync, plus import) and never
+// sees the environment's conditions (`externalize ? options.externalConditions
+// : options.conditions` in Vite's resolver). Node already applies
+// node/import/default natively, so only the rest of the list is appended;
+// OJ_EXTERNAL_CONDITIONS carries the config's `resolve.externalConditions`.
+const EXTERNAL_CONDITIONS = (() => {
+  try {
+    const list = JSON.parse(process.env.OJ_EXTERNAL_CONDITIONS || "null");
+    if (Array.isArray(list)) return list.filter((c) => typeof c === "string" && c);
+  } catch {}
+  return ["module-sync"];
+})();
+function withExternalConditions(context) {
+  if (!EXTERNAL_CONDITIONS.length || !Array.isArray(context.conditions)) return context;
+  const missing = EXTERNAL_CONDITIONS.filter((c) => !context.conditions.includes(c));
+  return missing.length ? { ...context, conditions: [...context.conditions, ...missing] } : context;
+}
+
 export function resolve(spec, context, next) {
   if (isRequire(context)) return next(spec, context);
-  context = withUserConditions(context);
+  const barePkg = pkgNameOfSpec(spec);
+  context = barePkg && !isNoExternalPkg(barePkg) ? withExternalConditions(context) : withUserConditions(context);
   if (context.parentURL) context = { ...context, parentURL: stripQ(context.parentURL) };
   const key = (context.parentURL ?? "") + "\0" + spec;
   const rc = EPOCH ? resolveCache.get(key) : undefined;
@@ -792,14 +812,15 @@ function globMatch(pattern, value) {
   const re = new RegExp("^" + pattern.split("*").map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$");
   return re.test(value);
 }
-function isNoExternalDep(path) {
-  if (!SSR_EXTERNALS) return false;
-  const pkg = pkgNameOfPath(path);
-  if (!pkg) return false;
+function isNoExternalPkg(pkg) {
+  if (!SSR_EXTERNALS || !pkg) return false;
   if ((SSR_EXTERNALS.external || []).includes(pkg) || SSR_EXTERNALS.externalAll) return false;
   if (SSR_EXTERNALS.noExternalAll) return true;
   if ((SSR_EXTERNALS.noExternal || []).some((p) => globMatch(p, pkg))) return true;
   return (SSR_EXTERNALS.noExternalRegex || []).some((src) => { try { return new RegExp(src).test(pkg); } catch { return false; } });
+}
+function isNoExternalDep(path) {
+  return isNoExternalPkg(pkgNameOfPath(path));
 }
 
 // oxc `lang` for a module url, or null for anything the transform does not own.

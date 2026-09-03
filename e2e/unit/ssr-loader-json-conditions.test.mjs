@@ -83,9 +83,23 @@ test("SSR loader: JSON named exports and resolve.conditions reach Node's resolve
     // Without a configured condition Node's own set applies: the default entry.
     assert.equal(plain.which, "plain");
 
-    const custom = run({ OJ_RESOLVE_CONDITIONS: JSON.stringify(["custom"]) });
+    // Vite parity: the environment's `resolve.conditions` never reach an
+    // externalized dep (`externalize ? options.externalConditions :
+    // options.conditions`) — condpkg is external, so `custom` must NOT apply.
+    const notExternal = run({ OJ_RESOLVE_CONDITIONS: JSON.stringify(["custom"]) });
+    assert.equal(notExternal.which, "plain");
+
+    // `resolve.externalConditions` is the knob that reaches externals.
+    const custom = run({ OJ_EXTERNAL_CONDITIONS: JSON.stringify(["custom"]) });
     assert.equal(custom.which, "custom");
     assert.equal(custom.title, "Alpha");
+
+    // A noExternal dep resolves with the environment's conditions again.
+    const noExt = run({
+      OJ_RESOLVE_CONDITIONS: JSON.stringify(["custom"]),
+      OJ_SSR_EXTERNALS: JSON.stringify({ noExternal: ["condpkg"] }),
+    });
+    assert.equal(noExt.which, "custom");
   } finally {
     rmSync(app, { recursive: true, force: true });
   }

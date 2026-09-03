@@ -655,6 +655,24 @@ pub fn user_resolve_conditions(config: &OjConfig, env_name: &str) -> Option<Vec<
         .or_else(|| config.resolve.as_ref().and_then(|r| r.conditions.clone()))
 }
 
+/// The user's `resolve.externalConditions` for an environment (Vite: the
+/// conditions externalized SSR deps resolve with, replacing — never merging —
+/// the environment's `resolve.conditions`).
+pub fn user_external_conditions(config: &OjConfig, env_name: &str) -> Option<Vec<String>> {
+    config
+        .environments
+        .as_ref()
+        .and_then(|e| e.get(env_name))
+        .and_then(|e| e.get("resolve"))
+        .and_then(|r| r.get("externalConditions"))
+        .and_then(|c| c.as_array())
+        .map(|c| {
+            c.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+}
+
 /// Export conditions for an environment, as Vite resolves them: the default set
 /// is `browser`/`node`, `module`, and `development` or `production` (per `dev`),
 /// plus `import` and `default`, which the resolver always matches. A user
