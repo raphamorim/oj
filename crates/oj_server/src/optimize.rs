@@ -12,6 +12,10 @@ const OPTIMIZE_JS: &str = include_str!("assets/optimize-deps.mjs");
 pub struct DepMeta {
     pub file: String,
     pub needs_interop: bool,
+    /// The URL an importer is rewritten to: `/@oj-deps/<file>?v=<version>`, the
+    /// version query being what lets the server mark the response immutable (Vite's
+    /// ensureVersionQuery + `Cache-Control: max-age=31536000,immutable`).
+    pub url: String,
 }
 
 pub type DepMap = HashMap<String, DepMeta>;
@@ -19,11 +23,28 @@ pub type DepMap = HashMap<String, DepMeta>;
 pub struct OptimizedDeps {
     rx: watch::Receiver<Option<Arc<DepMap>>>,
     dir: PathBuf,
+    /// Short prebundle hash (Vite's browserHash): changes whenever the lockfile
+    /// or the optimizer config does, so a stale immutable cache entry is never
+    /// re-used under the same URL. Empty when the optimizer is disabled.
+    version: String,
+}
+
+/// `/@oj-deps/<file>?v=<version>` (Vite: `<cacheDir>/deps/<file>?v=<browserHash>`).
+pub fn dep_url(file: &str, version: &str) -> String {
+    if version.is_empty() {
+        format!("/@oj-deps/{file}")
+    } else {
+        format!("/@oj-deps/{file}?v={version}")
+    }
 }
 
 impl OptimizedDeps {
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
     }
 
     pub async fn ready(&self) -> Arc<DepMap> {
@@ -43,19 +64,25 @@ impl OptimizedDeps {
         OptimizedDeps {
             rx,
             dir: PathBuf::new(),
+            version: String::new(),
         }
     }
 
     pub fn prepare(root: &Path, version: &str, input: OptimizeInput) -> Self {
         let dir = oj_cache::cache_root(&root).join("deps");
         let hash = lockfile_hash(root, version, &input);
+        let short = hash[..8].to_string();
         let (tx, rx) = watch::channel(None);
 
         // optimizeDeps.force: ignore any cached pre-bundle and always rebuild.
         if !input.force {
             if let Some(map) = load_manifest(&dir, &hash) {
                 let _ = tx.send(Some(Arc::new(map)));
-                return OptimizedDeps { rx, dir };
+                return OptimizedDeps {
+                    rx,
+                    dir,
+                    version: short,
+                };
             }
         }
 
@@ -67,7 +94,11 @@ impl OptimizedDeps {
                 .unwrap_or_default();
             let _ = tx.send(Some(Arc::new(map)));
         });
-        OptimizedDeps { rx, dir }
+        OptimizedDeps {
+            rx,
+            dir,
+            version: short,
+        }
     }
 }
 
@@ -196,8 +227,9 @@ fn lockfile_hash(root: &Path, version: &str, input: &OptimizeInput) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-fn parse_metadata(v: &serde_json::Value) -> Option<DepMap> {
+fn parse_metadata(v: &serde_json::Value, hash: &str) -> Option<DepMap> {
     let obj = v.as_object()?;
+    let version = hash.get(..8).unwrap_or(hash);
     let mut map = DepMap::new();
     for (dep, meta) in obj {
         let file = meta.get("file")?.as_str()?.to_string();
@@ -208,6 +240,7 @@ fn parse_metadata(v: &serde_json::Value) -> Option<DepMap> {
         map.insert(
             dep.clone(),
             DepMeta {
+                url: dep_url(&file, version),
                 file,
                 needs_interop,
             },
@@ -222,7 +255,7 @@ fn load_manifest(dir: &Path, hash: &str) -> Option<DepMap> {
     if v.get("hash")?.as_str()? != hash {
         return None;
     }
-    let map = parse_metadata(v.get("metadata")?)?;
+    let map = parse_metadata(v.get("metadata")?, hash)?;
     for m in map.values() {
         if !dir.join(&m.file).exists() {
             return None;
@@ -305,7 +338,7 @@ async fn run_optimizer(
         }
     };
     let metadata = v.get("metadata")?;
-    let map = parse_metadata(metadata)?;
+    let map = parse_metadata(metadata, hash)?;
     let manifest = serde_json::json!({ "hash": hash, "metadata": metadata });
     let _ = std::fs::write(dir.join("manifest.json"), manifest.to_string());
     Some(map)
@@ -466,6 +499,7 @@ mod tests {
 
         let map = load_manifest(&deps, "abc").expect("matching hash loads");
         assert_eq!(map["react"].file, "react.js");
+        assert_eq!(map["react"].url, "/@oj-deps/react.js?v=abc");
         assert!(!map["react"].needs_interop);
 
         assert!(load_manifest(&deps, "different").is_none(), "stale hash");
@@ -513,8 +547,23 @@ mod tests {
         // break `import x from "cjs-dep"` at runtime.
         let v: serde_json::Value =
             serde_json::from_str(r#"{"dep":{"file":"dep.js"}}"#).unwrap();
-        let map = parse_metadata(&v).unwrap();
+        let map = parse_metadata(&v, "0123456789abcdef").unwrap();
         assert!(map["dep"].needs_interop);
+    }
+
+    #[test]
+    fn dep_urls_carry_the_short_prebundle_version() {
+        // Vite stamps `?v=<browserHash>` (8 hex chars) on every optimized dep URL
+        // so the immutable response can never outlive the prebundle it came from.
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"react":{"file":"react.js","needsInterop":false}}"#).unwrap();
+        let map = parse_metadata(&v, "0123456789abcdef0123").unwrap();
+        assert_eq!(map["react"].url, "/@oj-deps/react.js?v=01234567");
+        assert_eq!(map["react"].file, "react.js");
+        assert_eq!(dep_url("x.js", ""), "/@oj-deps/x.js", "no version, no query");
+        // A different prebundle hash is a different URL.
+        let other = parse_metadata(&v, "fedcba9876543210").unwrap();
+        assert_ne!(other["react"].url, map["react"].url);
     }
 
     #[tokio::test]

@@ -155,6 +155,9 @@ jobs:
       - name: server.fs allow list, strict:false, workspace-root default
         if: matrix.mode == 'unbundled'
         run: node e2e/server-fs-allow.mjs
+      - name: optimized deps are versioned and served immutable with an ETag
+        if: matrix.mode == 'unbundled'
+        run: node e2e/dep-optimize.mjs
 
   # i need to fix this or automate
   build:
