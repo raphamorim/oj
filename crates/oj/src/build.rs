@@ -315,6 +315,20 @@ fn node_env_defines(node_env: &str) -> Vec<(String, String)> {
     .collect()
 }
 
+/// Vite's define plugin for a browser bundle (`keepProcessEnv: false`, the
+/// default for a client consumer and the SSR webworker target): `process.env`
+/// itself (and its `global.`/`globalThis.` spellings) is defined to `{}`, so
+/// `process.env.SOMETHING` evaluates to `undefined` instead of throwing a
+/// ReferenceError, and NODE_ENV to the resolved mode. A lib build gets neither.
+fn process_env_defines(node_env: &str) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = ["process.env", "global.process.env", "globalThis.process.env"]
+        .iter()
+        .map(|k| (k.to_string(), "{}".to_string()))
+        .collect();
+    pairs.extend(node_env_defines(node_env));
+    pairs
+}
+
 fn shell_node_env() -> Option<String> {
     std::env::var("NODE_ENV").ok().filter(|v| !v.is_empty())
 }
@@ -2102,7 +2116,7 @@ pub async fn build(
             sourcemap: env_sourcemap(&config, "client", sourcemap),
             define: Some({
                 let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &env_prefix_refs);
-                let mut pairs: Vec<(String, String)> = node_env_defines(&node_env);
+                let mut pairs: Vec<(String, String)> = process_env_defines(&node_env);
                 pairs.extend(oj_env::import_meta_env_defines(
                     &env, mode, !is_production, &base, &env_prefix_refs,
                 ));
@@ -2884,7 +2898,13 @@ pub(crate) async fn build_ssr(
             sourcemap: env_sourcemap(&config, "ssr", sourcemap),
             define: Some({
                 let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &env_prefix_refs);
-                let mut pairs = node_env_defines(&node_env);
+                // `keepProcessEnv` defaults to true for a server consumer, so only
+                // the webworker target gets Vite's `process.env` -> `{}` defines.
+                let mut pairs = if externals.webworker() {
+                    process_env_defines(&node_env)
+                } else {
+                    node_env_defines(&node_env)
+                };
                 pairs.extend(oj_env::import_meta_env_defines_with(
                     &env,
                     mode,
@@ -3397,7 +3417,7 @@ async fn build_client_entry(
             sourcemap: env_sourcemap(&config, "client", sourcemap),
             define: Some({
                 let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &env_prefix_refs);
-                let mut pairs = node_env_defines(&node_env);
+                let mut pairs = process_env_defines(&node_env);
                 pairs.extend(oj_env::import_meta_env_defines(
                     &env,
                     mode,
@@ -4493,6 +4513,47 @@ mod tests {
             assert!(root.join("dist/index.html").is_file());
             fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    /// Vite's define plugin: a browser bundle gets `process.env` -> `{}` (so an
+    /// arbitrary `process.env.X` is `undefined`, not a ReferenceError) and
+    /// NODE_ENV inlined; a server bundle keeps `process.env` (keepProcessEnv).
+    #[tokio::test]
+    async fn client_build_defines_process_env_to_an_empty_object_and_ssr_keeps_it() {
+        let root = scratch("process-env-define");
+        fs::write(root.join("package.json"), r#"{"type":"module"}"#).unwrap();
+        fs::write(
+            root.join("index.html"),
+            r#"<html><body><script type="module" src="/main.js"></script></body></html>"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("main.js"),
+            "export const probe = [process.env.SOME_FLAG, globalThis.process.env.OTHER, process.env.NODE_ENV];\n\
+             window.probe = probe;\n",
+        )
+        .unwrap();
+        fs::write(root.join("server.js"), "export const flag = process.env.SOME_FLAG;\n").unwrap();
+
+        build(root.clone(), None, None, Some("production"), false)
+            .await
+            .expect("client build");
+        let mut client = String::new();
+        for entry in fs::read_dir(root.join("dist/assets")).unwrap() {
+            let p = entry.unwrap().path();
+            if p.extension().is_some_and(|e| e == "js") {
+                client.push_str(&fs::read_to_string(p).unwrap());
+            }
+        }
+        assert!(!client.contains("process.env"), "client bundle still reads process.env:\n{client}");
+        assert!(client.contains("\"production\"") || client.contains("`production`"));
+
+        build_ssr(&root, &root.join("dist-ssr"), "server.js", "production", oj_config::Sourcemap::Off)
+            .await
+            .expect("ssr build");
+        let server = fs::read_to_string(root.join("dist-ssr/server.mjs")).unwrap();
+        assert!(server.contains("process.env.SOME_FLAG"), "ssr bundle must keep process.env:\n{server}");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
