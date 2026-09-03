@@ -37,6 +37,7 @@ pub fn module(code: &str) -> CachedModule {
         fs_allow: vec!["/node_modules/react".into()],
         watch_files: vec!["/tailwind.config.ts".into()],
         hot: None,
+        meta: Vec::new(),
     }
 }
 

@@ -1427,6 +1427,46 @@ mod jsx_settings_tests {
 }
 
 #[cfg(test)]
+mod config_section_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_top_level_keys_land_in_extra_and_known_ones_do_not() {
+        let cfg: OjConfig = serde_json::from_str(
+            r#"{"base":"/app/","marker":{"enabled":true,"tag":"x"},"react":{"compiler":true},"build":{"outDir":"out"}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.base.as_deref(), Some("/app/"));
+        assert_eq!(cfg.build.as_ref().unwrap().out_dir.as_deref(), Some("out"));
+        assert_eq!(cfg.config_section("marker").unwrap()["tag"], "x");
+        assert_eq!(cfg.config_section("react").unwrap()["compiler"], true);
+        assert!(cfg.config_section("base").is_none(), "modelled keys are not sections");
+        assert!(cfg.config_section("build").is_none());
+        assert!(cfg.config_section("missing").is_none());
+        assert_eq!(cfg.extra.len(), 2);
+    }
+
+    #[test]
+    fn a_config_without_extras_has_an_empty_catch_all() {
+        let cfg: OjConfig = serde_json::from_str(r#"{"base":"/"}"#).unwrap();
+        assert!(cfg.extra.is_empty());
+        assert!(OjConfig::default().config_section("marker").is_none());
+    }
+
+    #[test]
+    fn camel_case_keys_still_resolve_to_fields_beside_the_catch_all() {
+        let cfg: OjConfig = serde_json::from_str(
+            r#"{"publicDir":false,"appType":"mpa","envPrefix":"APP_","plugins":[1]}"#,
+        )
+        .unwrap();
+        assert!(matches!(cfg.public_dir, Some(BoolOrString::Bool(false))));
+        assert_eq!(cfg.app_type.as_deref(), Some("mpa"));
+        assert!(cfg.env_prefix.is_some());
+        assert!(cfg.config_section("plugins").is_some(), "unmodelled keys of any shape are kept");
+    }
+}
+
+#[cfg(test)]
 mod ssr_externals_tests {
     use super::*;
 

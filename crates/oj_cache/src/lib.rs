@@ -111,6 +111,18 @@ pub struct CachedModule {
     /// context, and these are the `accept` declarations for the module graph.
     #[serde(default)]
     pub hot: Option<HotMeta>,
+    /// Native plugin side channels, keyed by plugin name. Replayed to the
+    /// plugins as `module_seen` when the module is served from cache, so a
+    /// cross-module registry rebuilds on a warm start without retransforms.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub meta: Vec<(String, serde_json::Value)>,
+}
+
+impl CachedModule {
+    /// One plugin's side channel for this module.
+    pub fn meta_for(&self, plugin: &str) -> Option<&serde_json::Value> {
+        self.meta.iter().find(|(name, _)| name == plugin).map(|(_, value)| value)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -220,6 +232,7 @@ mod tests {
             fs_allow: Vec::new(),
             watch_files: Vec::new(),
             hot: None,
+            meta: Vec::new(),
         }
     }
 
@@ -230,6 +243,46 @@ mod tests {
         assert_eq!(cache.get(&key), None);
         cache.put(&key, &sample());
         assert_eq!(cache.get(&key), Some(sample()));
+    }
+
+    #[test]
+    fn plugin_meta_round_trips_and_is_absent_when_empty() {
+        let cache = temp_cache("meta");
+        let mut module = sample();
+        module.meta = vec![
+            ("marker".into(), serde_json::json!({ "hits": 2, "ids": ["a", "b"] })),
+            ("other".into(), serde_json::json!(null)),
+        ];
+        let key = cache.key(b"source", "/src/App.tsx", "dev");
+        cache.put(&key, &module);
+        let back = cache.get(&key).unwrap();
+        assert_eq!(back, module);
+        assert_eq!(back.meta_for("marker").unwrap()["hits"], 2);
+        assert_eq!(back.meta_for("other"), Some(&serde_json::Value::Null));
+        assert_eq!(back.meta_for("missing"), None);
+
+        // Entries written before the field existed, and entries with no plugin
+        // data, carry no `meta` key at all and still load.
+        let json = serde_json::to_string(&sample()).unwrap();
+        assert!(!json.contains("\"meta\""), "{json}");
+        let parsed: CachedModule = serde_json::from_str(&json).unwrap();
+        assert!(parsed.meta.is_empty());
+    }
+
+    #[test]
+    fn plugin_salt_changes_the_key() {
+        let base = PersistentCache::new(std::env::temp_dir(), "1.0.0").with_salt_extra("env");
+        let with_plugin = PersistentCache::new(std::env::temp_dir(), "1.0.0")
+            .with_salt_extra("env")
+            .with_salt_extra("marker=v1");
+        let other_options = PersistentCache::new(std::env::temp_dir(), "1.0.0")
+            .with_salt_extra("env")
+            .with_salt_extra("marker=v2");
+        let a = base.key(b"s", "/u", "dev");
+        let b = with_plugin.key(b"s", "/u", "dev");
+        let c = other_options.key(b"s", "/u", "dev");
+        assert_ne!(a, b, "a plugin appearing misses the cache");
+        assert_ne!(b, c, "a plugin option changing misses the cache");
     }
 
     #[test]

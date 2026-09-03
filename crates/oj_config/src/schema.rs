@@ -44,6 +44,20 @@ pub struct OjConfig {
     /// Vite's `html` block (`cspNonce`).
     pub html: Option<HtmlConfig>,
     pub legacy: Option<LegacyConfig>,
+    /// Every top-level key no field above claims, kept as JSON. Native plugins
+    /// read their options from here by the section name they declare; see
+    /// `config_section`.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl OjConfig {
+    /// A top-level section the schema does not model, as raw JSON: how a
+    /// native plugin finds its options (`config_section("marker")` for a
+    /// `marker: { ... }` key in `oj.config`). Known Vite keys are not here.
+    pub fn config_section(&self, name: &str) -> Option<&serde_json::Value> {
+        self.extra.get(name)
+    }
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
