@@ -16,3 +16,6 @@ mutants.out.old/
 
 # TanStack Start dev-time scratch
 .tanstack/
+
+# also a symlink named node_modules (the trailing-slash form only matches directories)
+node_modules
