@@ -1318,8 +1318,19 @@ async function transformIndexHtml(html) {
   return current;
 }
 
+// A throwing lifecycle hook (buildStart, buildEnd, renderStart, generateBundle,
+// writeBundle, closeBundle) rejects the whole build in rolldown/Vite; surface it
+// as `[plugin:name] message` and let the caller fail instead of logging on.
+async function runHookOrThrow(p, fn, args) {
+  try {
+    return await fn.apply(ctx, args);
+  } catch (e) {
+    throw decoratePluginError(e, p);
+  }
+}
+
 async function runLifecycle(hook) {
-  for (const { fn } of pluginsWithHook(hook)) await fn.call(ctx);
+  for (const { p, fn } of pluginsWithHook(hook)) await runHookOrThrow(p, fn, []);
   return null;
 }
 
@@ -1332,7 +1343,7 @@ async function runBuildStart() {
     input: resolvedConfig?.build?.rollupOptions?.input ?? "index.html",
   };
   await transformEmitStore.run(chunkBucket, async () => {
-    for (const { fn } of pluginsWithHook("buildStart")) await fn.call(ctx, options);
+    for (const { p, fn } of pluginsWithHook("buildStart")) await runHookOrThrow(p, fn, [options]);
   });
   return JSON.stringify({ emittedChunks: chunkBucket });
 }
@@ -1341,13 +1352,7 @@ async function generateBundle(bundleJson, isWrite) {
   const bundle = JSON.parse(bundleJson || "{}");
   const outputOptions = environment.config?.build ?? {};
   for (const { p, fn } of pluginsWithHook("generateBundle")) {
-    try {
-      await fn.call(ctx, outputOptions, bundle, isWrite);
-    } catch (e) {
-      process.stderr.write(
-        `${OJ} plugin host: generateBundle(${p.name ?? "?"}) failed: ${(e && (e.stack || e.message)) || e}\n`,
-      );
-    }
+    await runHookOrThrow(p, fn, [outputOptions, bundle, isWrite]);
   }
   return JSON.stringify(bundle);
 }
@@ -1372,8 +1377,8 @@ async function renderChunk(code, chunkJson) {
 async function writeBundle(bundleJson, isWrite) {
   const bundle = JSON.parse(bundleJson || "{}");
   const outputOptions = environment.config?.build ?? {};
-  for (const { fn } of pluginsWithHook("writeBundle")) {
-    await fn.call(ctx, outputOptions, bundle, isWrite);
+  for (const { p, fn } of pluginsWithHook("writeBundle")) {
+    await runHookOrThrow(p, fn, [outputOptions, bundle, isWrite]);
   }
   return null;
 }

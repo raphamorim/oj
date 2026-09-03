@@ -1524,9 +1524,10 @@ impl Plugin for OjUserPlugin {
         ctx: &PluginContext,
         _args: &rolldown_plugin::HookBuildStartArgs<'_>,
     ) -> rolldown_plugin::HookNoopReturn {
+        // Vite/rolldown: a rejecting buildStart fails the build.
         match self.host.build_start().await {
             Ok(chunks) => forward_emitted_chunks(ctx, &chunks, &self.emit),
-            Err(e) => eprintln!("oj build: plugin buildStart failed: {e}"),
+            Err(e) => return Err(anyhow::anyhow!("plugin buildStart failed:\n{e}")),
         }
         Ok(())
     }
@@ -1670,7 +1671,12 @@ impl Plugin for OjUserPlugin {
             return Ok(());
         }
         let bundle_json = serialize_bundle_with_vite_manifest(args.bundle, &self.emit.root);
-        if let Ok(Some(mutated)) = self.host.generate_bundle(&bundle_json, args.is_write).await {
+        let mutated = self
+            .host
+            .generate_bundle(&bundle_json, args.is_write)
+            .await
+            .map_err(|e| anyhow::anyhow!("plugin generateBundle failed:\n{e}"))?;
+        if let Some(mutated) = mutated {
             apply_bundle_mutations(args.bundle, &mutated);
         }
         Ok(())
@@ -1711,8 +1717,10 @@ impl Plugin for OjUserPlugin {
             return Ok(());
         }
         let bundle_json = serialize_bundle(args.bundle);
-        let _ = self.host.write_bundle(&bundle_json, true).await;
-        Ok(())
+        self.host
+            .write_bundle(&bundle_json, true)
+            .await
+            .map_err(|e| anyhow::anyhow!("plugin writeBundle failed:\n{e}"))
     }
 
     async fn render_start(
@@ -1720,8 +1728,10 @@ impl Plugin for OjUserPlugin {
         _ctx: &PluginContext,
         _args: &rolldown_plugin::HookRenderStartArgs<'_>,
     ) -> rolldown_plugin::HookNoopReturn {
-        let _ = self.host.render_start().await;
-        Ok(())
+        self.host
+            .render_start()
+            .await
+            .map_err(|e| anyhow::anyhow!("plugin renderStart failed:\n{e}"))
     }
 
     async fn close_bundle(
@@ -1729,8 +1739,10 @@ impl Plugin for OjUserPlugin {
         _ctx: &PluginContext,
         _args: Option<&rolldown_plugin::HookCloseBundleArgs<'_>>,
     ) -> rolldown_plugin::HookNoopReturn {
-        let _ = self.host.close_bundle().await;
-        Ok(())
+        self.host
+            .close_bundle()
+            .await
+            .map_err(|e| anyhow::anyhow!("plugin closeBundle failed:\n{e}"))
     }
 }
 
@@ -2220,7 +2232,7 @@ pub async fn build(
 
     if let Some(host) = &plugin_host {
         if let Err(e) = host.build_end().await {
-            eprintln!("oj build: plugin buildEnd failed: {e}");
+            bail!("plugin buildEnd failed:\n{e}");
         }
         // CSS a plugin routed through the vite:css-post shim (e.g. UnoCSS's
         // generated utilities) joins the build's stylesheet output.
@@ -3284,7 +3296,7 @@ pub(crate) async fn build_ssr(
 
     if let Some(host) = &plugin_host {
         if let Err(e) = host.build_end().await {
-            eprintln!("oj build (ssr): plugin buildEnd failed: {e}");
+            bail!("plugin buildEnd failed (ssr):\n{e}");
         }
     }
 
@@ -3798,7 +3810,7 @@ async fn build_client_entry(
 
     if let Some(host) = &plugin_host {
         if let Err(e) = host.build_end().await {
-            eprintln!("oj build (client): plugin buildEnd failed: {e}");
+            bail!("plugin buildEnd failed (client):\n{e}");
         }
     }
 
