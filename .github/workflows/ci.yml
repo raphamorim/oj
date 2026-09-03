@@ -89,6 +89,9 @@ jobs:
       - name: .js-suffixed aliased and tsconfig-paths imports remap to .ts (dev + build)
         if: matrix.mode == 'unbundled'
         run: node e2e/ts-output-remap.mjs
+      - name: require() in a served CJS dep resolves with the require condition
+        if: matrix.mode == 'unbundled'
+        run: node e2e/cjs-require-condition.mjs
 
   # i need to fix this or automate
   build:

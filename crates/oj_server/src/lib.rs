@@ -243,6 +243,10 @@ struct ServerState {
     reload_tx: broadcast::Sender<String>,
     graph: Mutex<ModuleGraph>,
     resolver: Arc<OjResolver>,
+    /// `resolver` with the `require` condition in place of `import`, for the
+    /// `require()` specifiers of a directly-served CommonJS dep (Vite parity:
+    /// getConditions pushes `require` when resolving for a requirer).
+    require_resolver: Arc<OjResolver>,
     ssr_resolver: Arc<OjResolver>,
     cache: PersistentCache,
     memory: Mutex<MemoryCache>,
@@ -673,6 +677,17 @@ impl DevServer {
             .as_ref()
             .map(|p| root.join(p))
             .unwrap_or_else(|| root.join("public"));
+        let client_resolver = Arc::new(OjResolver::with_settings(
+            &root,
+            oj_resolver::ResolveSettings {
+                conditions: oj_config::resolve_conditions(&config, "client"),
+                alias: oj_config::resolve_alias(&config, "client"),
+                dedupe: oj_config::resolve_dedupe(&config),
+                extensions: oj_config::resolve_extensions(&config),
+                main_fields: oj_config::resolve_main_fields(&config),
+                preserve_symlinks: oj_config::resolve_preserve_symlinks(&config),
+            },
+        ));
         let state = Arc::new(ServerState {
             persistent_cache,
             root: root.clone(),
@@ -680,17 +695,8 @@ impl DevServer {
             bundle,
             reload_tx: reload_tx.clone(),
             graph: Mutex::new(ModuleGraph::new()),
-            resolver: Arc::new(OjResolver::with_settings(
-                &root,
-                oj_resolver::ResolveSettings {
-                    conditions: oj_config::resolve_conditions(&config, "client"),
-                    alias: oj_config::resolve_alias(&config, "client"),
-                    dedupe: oj_config::resolve_dedupe(&config),
-                    extensions: oj_config::resolve_extensions(&config),
-                    main_fields: oj_config::resolve_main_fields(&config),
-                    preserve_symlinks: oj_config::resolve_preserve_symlinks(&config),
-                },
-            )),
+            require_resolver: Arc::new(client_resolver.require_variant()),
+            resolver: client_resolver,
             ssr_resolver: Arc::new(OjResolver::with_settings(
                 &root,
                 oj_resolver::ResolveSettings {
@@ -3064,6 +3070,7 @@ async fn ensure_module(
 
     let root = state.root.clone();
     let resolver = Arc::clone(&state.resolver);
+    let require_resolver = Arc::clone(&state.require_resolver);
     let fs_allow = Arc::clone(&state.fs_allow);
     let dir_cache = Arc::clone(&state.dir_cache);
     let virtual_ids: std::collections::BTreeSet<String> =
@@ -3154,7 +3161,7 @@ async fn ensure_module(
                 watch_files: Vec::new(),
             });
         }
-        let mut rewrite = |spec: &str| {
+        let rewrite_with = |spec: &str, resolver: &OjResolver| {
             if spec == "virtual:oj-routes" {
                 return Some("/@oj/routes.js".to_string());
             }
@@ -3170,7 +3177,7 @@ async fn ensure_module(
                 }
             }
             if let Some(url) =
-                rewrite_specifier(&root, &dir, &resolver, &fs_allow, &dir_cache, spec, !bundle)
+                rewrite_specifier(&root, &dir, resolver, &fs_allow, &dir_cache, spec, !bundle)
             {
                 // `.svg` resolves to `<url>?url` (asset). When a transform plugin is
                 // active (vite-plugin-svgr), leave the svg unmarked instead so it
@@ -3205,6 +3212,7 @@ async fn ensure_module(
             }
             None
         };
+        let mut rewrite = |spec: &str| rewrite_with(spec, &resolver);
         if bundle {
             let bundle_interop = interop_node_builtins(&source, &file_owned);
             let factory = oj_compiler::bundle::compile_factory(
@@ -3232,12 +3240,21 @@ async fn ensure_module(
         } else {
             let output = if is_dep {
                 let dep_interop = interop_node_builtins(&source, &file_owned);
-                oj_compiler::cjs::compile_dep(
-                    &file_owned,
-                    &url_owned,
-                    dep_interop.as_deref().unwrap_or(&source),
-                    &mut rewrite,
-                )
+                let dep_src = dep_interop.as_deref().unwrap_or(&source);
+                if oj_compiler::cjs::has_module_syntax_pub(&file_owned, dep_src) {
+                    oj_compiler::cjs::compile_dep(&file_owned, &url_owned, dep_src, &mut rewrite)
+                } else {
+                    // A CommonJS dep's `require()`s resolve with the `require`
+                    // condition (Vite's getConditions for a requirer), so a dual
+                    // package hands it its CJS build (`module.exports = fn`), not
+                    // the ESM one the interop would wrap as `{ default: fn }`.
+                    oj_compiler::cjs::compile_dep(
+                        &file_owned,
+                        &url_owned,
+                        dep_src,
+                        &mut |spec: &str| rewrite_with(spec, &require_resolver),
+                    )
+                }
             } else {
                 let interopped =
                     oj_compiler::interop::rewrite_cjs_interop(&source, &file_owned, &|spec| {
