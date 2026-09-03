@@ -105,14 +105,45 @@ pub struct ServerConfig {
     pub host: Option<String>,
     pub strict_port: Option<bool>,
     pub open: Option<bool>,
-    pub cors: Option<bool>,
+    pub cors: Option<CorsConfig>,
     pub hmr: Option<HmrConfig>,
     pub hmr_gate: Option<bool>,
-    pub allowed_hosts: Option<Vec<String>>,
+    pub allowed_hosts: Option<AllowedHosts>,
     pub headers: Option<BTreeMap<String, String>>,
     pub proxy: Option<BTreeMap<String, ProxyEntry>>,
     pub fs: Option<FsConfig>,
     pub warmup: Option<WarmupConfig>,
+}
+
+/// Vite's `server.cors`: `true` reflects any origin, `false` disables CORS, an
+/// object carries cors-package options; unset means Vite's default (localhost
+/// origins only).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum CorsConfig {
+    Toggle(bool),
+    Options(CorsOptions),
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CorsOptions {
+    /// `true` (any), a string, or a list of exact origins. A RegExp cannot cross
+    /// the config boundary; the extractor warns and this falls back to the default.
+    pub origin: Option<serde_json::Value>,
+    pub methods: Option<serde_json::Value>,
+    pub allowed_headers: Option<serde_json::Value>,
+    pub credentials: Option<bool>,
+    pub max_age: Option<u64>,
+}
+
+/// Vite's `server.allowedHosts`: `true` allows any Host header; a list adds
+/// hostnames (a leading `.` allows the domain and its subdomains).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum AllowedHosts {
+    All(bool),
+    List(Vec<String>),
 }
 
 #[derive(Debug, Clone, Deserialize)]

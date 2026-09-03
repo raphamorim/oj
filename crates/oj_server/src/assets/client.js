@@ -32,11 +32,18 @@ export function createHotContext(ownerId) {
   return {
     data,
     accept(first, second) {
-      const cb = typeof first === "function" ? first : second || (() => {});
-      mod.acceptCallbacks.push(cb);
+      // accept() / accept(cb): self-accepting. accept(dep, cb) / accept([deps], cb):
+      // this module is the boundary for updates of those dependencies and the
+      // callback receives the new dependency module(s), as in Vite.
+      if (first === undefined || typeof first === "function") {
+        mod.acceptCallbacks.push({ deps: [id], fn: first || (() => {}) });
+        return;
+      }
+      const deps = (Array.isArray(first) ? first : [first]).map((d) => String(d).split("?")[0]);
+      mod.acceptCallbacks.push({ deps, fn: second || (() => {}), single: typeof first === "string" });
     },
     acceptExports(_names, cb) {
-      mod.acceptCallbacks.push(cb || (() => {}));
+      mod.acceptCallbacks.push({ deps: [id], fn: cb || (() => {}) });
     },
     dispose(cb) {
       mod.disposeCallbacks.push(cb);
@@ -90,22 +97,37 @@ function queueUpdate(update) {
 
 async function applyUpdate(update) {
   const cleanPath = update.path.split("?")[0];
+  const acceptedUrl = update.acceptedPath || update.path;
+  const acceptedPath = acceptedUrl.split("?")[0];
   const mod = hotModules.get(cleanPath);
-  if (!mod || mod.acceptCallbacks.length === 0) {
-    console.log(`[oj] ${cleanPath} has no accept handler, reloading`);
+  if (!mod) {
+    // The module is in the server's graph but this page never loaded it (a
+    // lazy route, a component behind a condition). Nothing to swap; like Vite,
+    // ignore it instead of reloading a page that does not run that code.
+    console.debug(`[oj] ${cleanPath} is not loaded here, ignoring update`);
+    return;
+  }
+  const isSelf = acceptedPath === cleanPath;
+  const accepts = mod.acceptCallbacks.filter((cb) => cb.deps.includes(acceptedPath));
+  if (accepts.length === 0) {
+    console.log(`[oj] ${cleanPath} has no accept handler for ${acceptedPath}, reloading`);
     location.reload();
     return;
   }
-  const accepts = mod.acceptCallbacks.slice();
-  const disposes = mod.disposeCallbacks.slice();
-  emit("vite:beforeUpdate", { type: "js-update", path: cleanPath });
+  // Dispose callbacks belong to the module being replaced (the accepted one).
+  const disposed = hotModules.get(acceptedPath);
+  const disposes = disposed ? disposed.disposeCallbacks.slice() : [];
+  emit("vite:beforeUpdate", { type: "update", updates: [update] });
   try {
-    for (const dispose of disposes) await dispose(mod.data);
-    const sep = update.path.includes("?") ? "&" : "?";
-    const next = await import(update.path + sep + "t=" + update.timestamp);
-    for (const accept of accepts) await accept(next);
+    for (const dispose of disposes) await dispose(disposed.data);
+    const sep = acceptedUrl.includes("?") ? "&" : "?";
+    const next = await import(acceptedUrl + sep + "t=" + update.timestamp);
+    for (const cb of accepts) {
+      if (isSelf || cb.single) await cb.fn(next);
+      else await cb.fn(cb.deps.map((d) => (d === acceptedPath ? next : undefined)));
+    }
     clearOverlay();
-    emit("vite:afterUpdate", { type: "js-update", path: cleanPath });
+    emit("vite:afterUpdate", { type: "update", updates: [update] });
     console.log(`[oj] hot updated ${update.path}`);
   } catch (err) {
     emit("vite:error", { err: { message: String(err) } });
@@ -219,6 +241,7 @@ function swapCss(update) {
 }
 
 let socket = null;
+let hadConnection = false;
 
 (function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -231,8 +254,15 @@ let socket = null;
     } catch {
       return;
     }
-    if (msg.type === "update") {
-      (msg.updates || []).forEach(queueUpdate);
+    if (msg.type === "connected") {
+      // Vite-protocol greeting; nothing to do.
+    } else if (msg.type === "update") {
+      // Vite's UpdatePayload: css-update entries swap stylesheets, js-update
+      // entries re-import boundaries.
+      for (const u of msg.updates || []) {
+        if (u.type === "css-update") swapCss(u);
+        else queueUpdate(u);
+      }
     } else if (msg.type === "css-update") {
       swapCss(msg);
     } else if (msg.type === "full-reload") {
@@ -240,14 +270,30 @@ let socket = null;
       console.log("[oj] full reload:", msg.reason || "");
       location.reload();
     } else if (msg.type === "error") {
-      emit("vite:error", { err: { message: msg.message } });
-      showOverlay(msg.message || "unknown error");
+      // Vite's ErrorPayload carries `err`; older oj frames carried `message`.
+      const err = msg.err || { message: msg.message };
+      emit("vite:error", { err });
+      showOverlay(err.message || "unknown error");
     } else if (msg.type === "custom") {
       emit(msg.event, msg.data);
     }
   });
-  ws.addEventListener("open", () => console.log("[oj] dev server connected"));
+  ws.addEventListener("open", () => {
+    if (hadConnection) {
+      // The server went away and came back (config or .env change restarts
+      // it): its module graph, defines and caches are new, so the page's
+      // modules are stale. Vite reloads here too.
+      console.log("[oj] dev server restarted, reloading");
+      emit("vite:ws:connect", { webSocket: ws });
+      location.reload();
+      return;
+    }
+    hadConnection = true;
+    emit("vite:ws:connect", { webSocket: ws });
+    console.log("[oj] dev server connected");
+  });
   ws.addEventListener("close", () => {
+    emit("vite:ws:disconnect", { webSocket: ws });
     console.log("[oj] dev server disconnected, retrying in 1s…");
     setTimeout(connect, 1000);
   });

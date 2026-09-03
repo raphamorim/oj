@@ -205,12 +205,15 @@ pub struct ViteValues {
     pub mode: Option<String>,
     /// `resolve.{extensions,mainFields,conditions,preserveSymlinks}`.
     pub resolve: Option<serde_json::Value>,
-    /// `server.{strictPort,open,cors}` normalized to booleans.
+    /// `server.{strictPort,open}` normalized to booleans (`cors` is its own field).
     pub server_flags: Option<serde_json::Value>,
     /// `css.preprocessorOptions.<lang>.additionalData` (string form).
     pub css: Option<serde_json::Value>,
     pub env_prefix: Option<Vec<String>>,
     pub env_dir: Option<String>,
+    /// `server.cors` (bool or options object) and `server.allowedHosts` (true or list).
+    pub cors: Option<serde_json::Value>,
+    pub allowed_hosts: Option<serde_json::Value>,
 }
 
 /// Evaluate the app's `vite.config` for `command` ("serve" | "build") and `mode`.
@@ -351,6 +354,8 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
                 .collect()
         }),
         env_dir: json.get("envDir").and_then(|v| v.as_str()).map(str::to_string),
+        cors: json.get("cors").filter(|v| !v.is_null()).cloned(),
+        allowed_hosts: json.get("allowedHosts").filter(|v| !v.is_null()).cloned(),
     }
 }
 
@@ -520,6 +525,15 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
             build.ssr_manifest = bool_or_str("ssrManifest");
         }
     }
+    if v.cors.is_some() || v.allowed_hosts.is_some() {
+        let sc = config.server.get_or_insert_with(Default::default);
+        if sc.cors.is_none() {
+            sc.cors = v.cors.and_then(|c| serde_json::from_value(c).ok());
+        }
+        if sc.allowed_hosts.is_none() {
+            sc.allowed_hosts = v.allowed_hosts.and_then(|a| serde_json::from_value(a).ok());
+        }
+    }
     if config.oxc.is_none() {
         config.oxc = v.oxc;
     }
@@ -561,9 +575,6 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
         }
         if sc.open.is_none() {
             sc.open = sf.get("open").and_then(|b| b.as_bool());
-        }
-        if sc.cors.is_none() {
-            sc.cors = sf.get("cors").and_then(|b| b.as_bool());
         }
     }
     if let Some(po) = v
@@ -1243,6 +1254,8 @@ mod vite_values_tests {
             css: None,
             env_prefix: None,
             env_dir: None,
+            cors: None,
+            allowed_hosts: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/vite-base/"));
@@ -1280,6 +1293,8 @@ mod vite_values_tests {
             css: None,
             env_prefix: None,
             env_dir: None,
+            cors: None,
+            allowed_hosts: None,
         };
         merge_vite_values(&mut config, v);
         assert_eq!(config.base.as_deref(), Some("/oj-base/"));
@@ -1449,7 +1464,7 @@ mod vite_values_tests {
                 "extensions": [".ts", ".js"], "mainFields": ["module"],
                 "conditions": ["custom"], "preserveSymlinks": true
             })),
-            server_flags: Some(serde_json::json!({ "strictPort": true, "open": true, "cors": false })),
+            server_flags: Some(serde_json::json!({ "strictPort": true, "open": true })),
             css: Some(serde_json::json!({ "preprocessorOptions": { "scss": { "additionalData": "@use 'x';" } } })),
             env_prefix: Some(vec!["VITE_".into(), "APP_".into()]),
             env_dir: Some("env".into()),
@@ -1465,7 +1480,6 @@ mod vite_values_tests {
         let sc = config.server.as_ref().unwrap();
         assert_eq!(sc.strict_port, Some(true));
         assert_eq!(sc.open, Some(true));
-        assert_eq!(sc.cors, Some(false));
         let scss = &config.css.as_ref().unwrap().preprocessor_options.as_ref().unwrap()["scss"];
         assert_eq!(scss.additional_data.as_deref(), Some("@use 'x';"));
         assert_eq!(oj_config::env_prefixes(&config), vec!["VITE_".to_string(), "APP_".to_string()]);
@@ -1478,5 +1492,24 @@ mod vite_values_tests {
         merge_vite_values(&mut config, ViteValues { mode: Some("staging".into()), env_dir: Some("env".into()), ..Default::default() });
         assert_eq!(config.mode.as_deref(), Some("qa"));
         assert_eq!(config.env_dir.as_deref(), Some("cfg"));
+    }
+
+    #[test]
+    fn merge_adopts_cors_and_allowed_hosts() {
+        let mut config = oj_config::OjConfig::default();
+        let v = ViteValues {
+            cors: Some(serde_json::json!({ "origin": ["http://a.test"], "credentials": true })),
+            allowed_hosts: Some(serde_json::json!([".corp.example"])),
+            ..Default::default()
+        };
+        merge_vite_values(&mut config, v);
+        let sc = config.server.unwrap();
+        assert!(matches!(sc.cors, Some(oj_config::CorsConfig::Options(ref o)) if o.credentials == Some(true)));
+        assert!(matches!(sc.allowed_hosts, Some(oj_config::AllowedHosts::List(ref l)) if l == &vec![".corp.example".to_string()]));
+        let mut config = oj_config::OjConfig::default();
+        merge_vite_values(&mut config, ViteValues { cors: Some(serde_json::json!(false)), allowed_hosts: Some(serde_json::json!(true)), ..Default::default() });
+        let sc = config.server.unwrap();
+        assert!(matches!(sc.cors, Some(oj_config::CorsConfig::Toggle(false))));
+        assert!(matches!(sc.allowed_hosts, Some(oj_config::AllowedHosts::All(true))));
     }
 }

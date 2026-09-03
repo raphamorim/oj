@@ -1928,6 +1928,7 @@ dependencies = [
  "anyhow",
  "axum",
  "blake3",
+ "futures-util",
  "glob",
  "json-strip-comments",
  "libc",
@@ -1948,6 +1949,7 @@ dependencies = [
  "simdutf8",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

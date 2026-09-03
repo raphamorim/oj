@@ -103,7 +103,9 @@ impl Model {
             return Ok(());
         }
         if gray.contains(&module) {
-            return Err(Reload::Circular);
+            // A circular import on the current path is skipped, like Vite's
+            // propagateUpdate; other importer paths may still find a boundary.
+            return Ok(());
         }
         if self.accepting.contains(&module) {
             boundaries.insert(module);
@@ -144,7 +146,6 @@ impl Model {
 
 #[derive(Debug, PartialEq)]
 enum Reload {
-    Circular,
     Entry,
 }
 

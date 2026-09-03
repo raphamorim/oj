@@ -71,12 +71,9 @@ fn a_deep_cycle_is_reported_as_a_cycle_not_a_hang() {
         g.set_self_accepting(&p(50_000), false);
         g.propagate_update(&p(0))
     });
-    match decision {
-        HmrDecision::FullReload { reason } => {
-            assert!(reason.contains("circular"), "{reason}");
-        }
-        HmrDecision::Update { boundaries } => panic!("cycle accepted: {boundaries:?}"),
-    }
+    // A closed cycle with no entry has nothing loaded to update and nothing to
+    // reload; the point is that the walk terminates.
+    assert_eq!(decision, HmrDecision::Update { boundaries: vec![] });
 }
 
 #[test]
@@ -138,10 +135,7 @@ fn self_import_is_a_cycle() {
     let mut g = ModuleGraph::new();
     let a = p(0);
     g.add_import(&a, &a);
-    assert!(matches!(
-        g.propagate_update(&a),
-        HmrDecision::FullReload { .. }
-    ));
+    assert_eq!(g.propagate_update(&a), HmrDecision::Update { boundaries: vec![] });
 }
 
 #[test]
@@ -166,9 +160,10 @@ fn cycles_of_every_small_length_are_detected() {
             g.add_import(&p((i + 1) % len), &p(i));
         }
         let decision = g.propagate_update(&p(0));
-        assert!(
-            matches!(decision, HmrDecision::FullReload { .. }),
-            "cycle of {len} accepted: {decision:?}"
+        assert_eq!(
+            decision,
+            HmrDecision::Update { boundaries: vec![] },
+            "cycle of {len} must terminate with nothing to do: {decision:?}"
         );
     }
 }
@@ -183,12 +178,11 @@ fn a_cycle_below_an_accepting_boundary_still_updates() {
     g.add_import(&b, &a);
     g.add_import(&boundary, &a);
     g.set_self_accepting(&boundary, true);
-    // Whatever it decides, it must decide: the cycle is reachable from the
-    // change, so a full reload is the honest answer.
-    match g.propagate_update(&leaf) {
-        HmrDecision::FullReload { reason } => assert!(reason.contains("circular"), "{reason}"),
-        HmrDecision::Update { boundaries } => assert!(boundaries.contains(&boundary)),
-    }
+    // The cycle is skipped and the accepting importer above it is the boundary.
+    assert_eq!(
+        g.propagate_update(&leaf),
+        HmrDecision::Update { boundaries: vec![boundary] }
+    );
 }
 
 #[test]

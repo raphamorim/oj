@@ -227,6 +227,7 @@ fn an_entry_is_only_ever_published_whole() {
         css_exports: vec![("a\nb".into(), "c\"d".into())],
         fs_allow: vec!["/tmp/a b/c".into()],
         watch_files: vec!["\\\\?\\C:\\x".into()],
+        hot: None,
     };
     f.cache.put(&key, &written);
     assert_eq!(f.cache.get(&key), Some(written));

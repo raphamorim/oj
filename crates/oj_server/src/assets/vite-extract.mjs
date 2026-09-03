@@ -285,9 +285,6 @@ function extractServerFlags(s) {
   // Vite admits `open: true | string`; oj opens the served url in both cases.
   if (s.open === true || typeof s.open === "string") out.open = true;
   else if (s.open === false) out.open = false;
-  // `cors: object` means "enabled with these options"; oj applies its default policy.
-  if (typeof s.cors === "boolean") out.cors = s.cors;
-  else if (s.cors && typeof s.cors === "object") out.cors = true;
   return Object.keys(out).length ? out : null;
 }
 function extractCss(css) {
@@ -307,6 +304,25 @@ function extractEnvPrefix(p) {
   if (Array.isArray(p)) return p.filter((x) => typeof x === "string");
   return null;
 }
+function extractCors(cors) {
+  if (typeof cors === "boolean") return cors;
+  if (!cors || typeof cors !== "object") return null;
+  const out = {};
+  const strOrList = (v) =>
+    typeof v === "string" ? v : Array.isArray(v) ? v.filter((x) => typeof x === "string") : undefined;
+  if (cors.origin === true || cors.origin === false) out.origin = cors.origin;
+  else if (strOrList(cors.origin) !== undefined) out.origin = strOrList(cors.origin);
+  if (strOrList(cors.methods) !== undefined) out.methods = strOrList(cors.methods);
+  if (strOrList(cors.allowedHeaders) !== undefined) out.allowedHeaders = strOrList(cors.allowedHeaders);
+  if (typeof cors.credentials === "boolean") out.credentials = cors.credentials;
+  if (typeof cors.maxAge === "number") out.maxAge = cors.maxAge;
+  return out;
+}
+function extractAllowedHosts(v) {
+  if (v === true) return true;
+  if (Array.isArray(v)) return v.filter((x) => typeof x === "string");
+  return null;
+}
 
 function warnUnsupported(c) {
 
@@ -322,7 +338,9 @@ function warnUnsupported(c) {
   }
   if (c.worker) warn("worker config is not applied");
   if (c.ssr?.resolve) warn("ssr.resolve is not applied (noExternal/external/target are)");
-  if (c.server?.allowedHosts !== undefined) warn("server.allowedHosts is accepted but not applied");
+  if (c.server?.cors && typeof c.server.cors === "object" && c.server.cors.origin instanceof RegExp) {
+    warn("server.cors.origin RegExp is not applied; the localhost default is used");
+  }
 }
 
 const isMainRun = import.meta.url === pathToFileURL(process.argv[1] || "").href;
@@ -365,6 +383,8 @@ if (isMainRun) try {
       css: extractCss(c.css),
       envPrefix: extractEnvPrefix(c.envPrefix),
       envDir: typeof c.envDir === "string" ? c.envDir : null,
+      cors: extractCors(c.server?.cors),
+      allowedHosts: extractAllowedHosts(c.server?.allowedHosts),
     }),
   );
 } catch (e) {

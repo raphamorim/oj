@@ -24,6 +24,8 @@ simdutf8.workspace = true
 glob = "0.3.4"
 regex = "1.11"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+tokio-tungstenite = "0.29"
+futures-util = "0.3"
 rolldown = "1.2.5"
 rolldown_common = "1.2.5"
 rolldown_plugin = "1.2.5"
