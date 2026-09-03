@@ -2996,6 +2996,9 @@ pub async fn build(
                 .await
                 .map_err(|e| anyhow::anyhow!("plugin transformIndexHtml failed for {}:\n{e}", doc.out_rel))?;
         }
+        if let Some(nonce) = oj_config::html_csp_nonce(&config) {
+            rewritten_html = oj_server::inject_csp_nonce(&rewritten_html, &nonce);
+        }
         let dest = out_dir.join(&doc.out_rel);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
