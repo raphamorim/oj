@@ -96,7 +96,21 @@ try {
   assert.ok(!main.includes("DEAD_CODE_MARKER"), "dead code is dropped");
   assert.ok(!main.includes("usedFunction"), "the default build minifies (mangles) identifiers");
   assert.ok(!readCss(dist).includes("\n  color"), "CSS is minified by default");
-  console.log("ok: defaults (no manifest, minified js + css, import.meta.hot gone)");
+  const html0 = fs.readFileSync(path.join(dist, "index.html"), "utf8");
+  assert.match(html0, /<script type="module" src="\/assets\/main-[^"]+\.js" crossorigin>/, "entry script carries crossorigin (Vite)");
+  assert.match(html0, /<link rel="stylesheet" href="\/assets\/main-[^"]+\.css" crossorigin \/>/, "injected stylesheet link carries crossorigin");
+  console.log("ok: defaults (no manifest, minified js + css, import.meta.hot gone, crossorigin tags)");
+
+  // Reporter: every output file with a gzip column; a low chunkSizeWarningLimit
+  // triggers Vite's code-splitting hint, reportCompressedSize: false drops the column.
+  const rep = ok([], { build: { chunkSizeWarningLimit: 0.1 } });
+  assert.match(rep.stdout, /assets\/main-[^ ]+\.js\s+│ gzip: /, `gzip column: ${rep.stdout}`);
+  assert.match(rep.stdout, /index\.html/, "html pages are listed too");
+  assert.match(rep.stderr, /Some chunks are larger than 0.1 kB after minification/, "chunkSizeWarningLimit warning");
+  const quiet = ok([], { build: { chunkSizeWarningLimit: 0.1, minify: false, reportCompressedSize: false } });
+  assert.ok(!quiet.stdout.includes("gzip:"), "reportCompressedSize: false drops the gzip column");
+  assert.ok(!quiet.stderr.includes("Some chunks are larger"), "no chunk warning without minification (Vite)");
+  console.log("ok: reporter gzip column, chunkSizeWarningLimit, reportCompressedSize");
 
   // 2. Every build flag at once, with --outDir and --base.
   const out1 = path.join(base, "out1");

@@ -57,7 +57,7 @@ try {
   const themeCss = fs.readFileSync(path.join(dist, cssLinks.find((h) => h.includes("theme-"))), "utf8");
   assert.match(themeCss, /#010203|rgb\(1,\s*2,\s*3\)/, `scss compiled:\n${themeCss}`);
   assert.doesNotMatch(themeCss, /\$c/, "sass variable shipped");
-  const scripts = [...html.matchAll(/<script type="module" src="([^"]+)"><\/script>/g)].map((m) => m[1]);
+  const scripts = [...html.matchAll(/<script type="module" src="([^"]+)"(?: crossorigin)?><\/script>/g)].map((m) => m[1]);
   assert.equal(scripts.length, 2, `inline + main scripts externalized: ${scripts}`);
   assert.ok(scripts.every((s) => /^\/assets\/.+\.js$/.test(s)), `both point at hashed chunks: ${scripts}`);
   assert.doesNotMatch(html, /import \{ x \}|@oj-inline/, "inline body or placeholder left in html");

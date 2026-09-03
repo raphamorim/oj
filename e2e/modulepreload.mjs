@@ -45,6 +45,7 @@ try {
     if (!fs.existsSync(f)) throw new Error("preloaded chunk missing on disk: " + href);
   }
   if (!links.some((h) => /vendor-/.test(h))) throw new Error("vendor chunk not preloaded: " + links.join(", "));
+  if (!/<link rel="modulepreload" href="[^"]+" crossorigin/.test(html)) throw new Error("modulepreload links lack crossorigin (Vite sets it)\n" + html);
   console.log("chunks:             ", files.filter((f) => f.endsWith(".js")).join(", "));
   console.log("modulepreload links:", links.join(", "));
   console.log("\nMODULEPRELOAD VERIFIED: entry static-import chunks preloaded in HTML");

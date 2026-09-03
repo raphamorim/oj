@@ -2778,7 +2778,9 @@ pub async fn build(
         let mut doc_entry_files: Vec<String> = Vec::new();
         for s in &doc.scripts {
             if let Some(file) = facade_to_file.get(&s.abs) {
-                rewritten_html = rewritten_html.replace(&s.src, &with_base(file, &page_base));
+                let out_src = with_base(file, &page_base);
+                rewritten_html = rewritten_html.replace(&s.src, &out_src);
+                rewritten_html = add_script_crossorigin(&rewritten_html, &out_src);
                 doc_entry_files.push(file.clone());
             }
         }
@@ -2801,7 +2803,7 @@ pub async fn build(
                 .iter()
                 .map(|f| {
                     format!(
-                        "<link rel=\"modulepreload\" href=\"{}\" />",
+                        "<link rel=\"modulepreload\" href=\"{}\" crossorigin />",
                         with_base(f, &page_base)
                     )
                 })
@@ -2893,7 +2895,7 @@ pub async fn build(
 
         if let Some(css_name) = &combined_css_name {
             let link = format!(
-                "<link rel=\"stylesheet\" href=\"{}\" />",
+                "<link rel=\"stylesheet\" href=\"{}\" crossorigin />",
                 with_base(css_name, &page_base)
             );
             rewritten_html = insert_before_head(&rewritten_html, &link);
@@ -2933,6 +2935,7 @@ pub async fn build(
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
+        emitted.push((doc.out_rel.clone(), rewritten_html.len()));
         fs::write(&dest, rewritten_html)?;
     }
 
@@ -2977,14 +2980,62 @@ pub async fn build(
         out_dir.display(),
         started.elapsed()
     );
-    emitted.sort_by(|a, b| b.1.cmp(&a.1));
-    for (name, bytes) in emitted.iter().take(12) {
-        println!("  {:>9}  {}", human_bytes(*bytes), name);
-    }
-    if emitted.len() > 12 {
-        println!("  … and {} more files", emitted.len() - 12);
+    report_build_output(
+        &out_dir,
+        &mut emitted,
+        oj_config::build_report_compressed_size(&config),
+    );
+    // Vite's reporter: with minification on and no lib, a client chunk over
+    // `build.chunkSizeWarningLimit` kB gets the code-splitting hint.
+    if client_minify {
+        let limit = oj_config::build_chunk_size_warning_limit(&config);
+        let large = output.assets.iter().any(|a| match a {
+            rolldown_common::Output::Chunk(c) => (c.code.len() as f64) / 1000.0 > limit,
+            _ => false,
+        });
+        if large {
+            eprintln!("{}", chunk_size_warning(limit));
+        }
     }
     Ok(())
+}
+
+/// The per-file report, largest first, with Vite's gzip column
+/// (`build.reportCompressedSize`, default on). Source maps are listed by size
+/// only, as in Vite.
+fn report_build_output(out_dir: &Path, emitted: &mut Vec<(String, usize)>, report_gzip: bool) {
+    emitted.sort_by(|a, b| b.1.cmp(&a.1));
+    let width = emitted.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+    for (name, bytes) in emitted.iter() {
+        let gzip = if report_gzip && !name.ends_with(".map") {
+            fs::read(out_dir.join(name))
+                .ok()
+                .map(|data| format!("  │ gzip: {:>8}", human_bytes(gzip_size(&data))))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        println!("  {:>9}  {name:<width$}{gzip}", human_bytes(*bytes));
+    }
+}
+
+fn gzip_size(data: &[u8]) -> usize {
+    use std::io::Write;
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    if enc.write_all(data).is_err() {
+        return 0;
+    }
+    enc.finish().map(|v| v.len()).unwrap_or(0)
+}
+
+/// Vite's chunk size warning text (reporter.ts).
+fn chunk_size_warning(limit_kb: f64) -> String {
+    format!(
+        "\n(!) Some chunks are larger than {limit_kb} kB after minification. Consider:\n\
+         - Using dynamic import() to code-split the application\n\
+         - Use build.rollupOptions.output.manualChunks to improve chunking: https://rollupjs.org/configuration-options/#output-manualchunks\n\
+         - Adjust chunk size limit for this warning via build.chunkSizeWarningLimit."
+    )
 }
 
 fn human_bytes(bytes: usize) -> String {
@@ -3138,6 +3189,27 @@ fn resolve_html_ref(src: &str, html_dir: &Path, root: &Path) -> PathBuf {
             other => out.push(other),
         }
     }
+    out
+}
+
+/// Vite emits every entry `<script type="module">` with `crossorigin` (module
+/// scripts fetch in CORS mode anyway, and only a crossorigin tag can be
+/// preloaded with `<link rel="preload">`); add it to the tag whose `src` is
+/// `src` unless the page already set it.
+fn add_script_crossorigin(html: &str, src: &str) -> String {
+    let mut out = String::with_capacity(html.len() + 16);
+    let mut rest = html;
+    while let Some(start) = rest.find("<script") {
+        let Some(end) = rest[start..].find('>') else { break };
+        let tag = &rest[start..start + end];
+        let has_src = html_attr(tag, "src") == Some(src);
+        out.push_str(&rest[..start + end]);
+        if has_src && !has_bare_attr(tag, "crossorigin") && html_attr(tag, "crossorigin").is_none() {
+            out.push_str(" crossorigin");
+        }
+        rest = &rest[start + end..];
+    }
+    out.push_str(rest);
     out
 }
 
@@ -4822,7 +4894,7 @@ fn split_css_links(
                 links.push('\n');
             }
             links.push_str(&format!(
-                "<link rel=\"stylesheet\" href=\"{}\" />",
+                "<link rel=\"stylesheet\" href=\"{}\" crossorigin />",
                 with_base(css_name, page_base)
             ));
         }
@@ -5979,6 +6051,34 @@ mod tests {
         assert!(ro_output_overrides(Some(&cs)).inline_dynamic_imports);
         assert!(!ro_output_overrides(None).inline_dynamic_imports);
         assert!(matches!(ro_treeshake(None), rolldown_common::TreeshakeOptions::Option(_)));
+    }
+
+    #[test]
+    fn entry_scripts_get_crossorigin_once() {
+        let html = r#"<script type="module" src="/assets/main-1.js"></script><script src="/other.js"></script><script type="module" crossorigin src="/assets/main-1.js"></script>"#;
+        let out = add_script_crossorigin(html, "/assets/main-1.js");
+        assert_eq!(
+            out,
+            r#"<script type="module" src="/assets/main-1.js" crossorigin></script><script src="/other.js"></script><script type="module" crossorigin src="/assets/main-1.js"></script>"#
+        );
+        // Untouched when no tag has that src.
+        assert_eq!(add_script_crossorigin(html, "/nope.js"), html);
+    }
+
+    #[test]
+    fn reporter_gzip_and_chunk_warning_follow_vite() {
+        let out = scratch("reporter");
+        let big = "x".repeat(20_000);
+        fs::write(out.join("a.js"), &big).unwrap();
+        assert!(gzip_size(big.as_bytes()) < 200, "gzip of a repetitive file is small");
+        assert_eq!(gzip_size(b""), 20, "an empty gzip stream is the 20-byte header");
+        let mut emitted = vec![("a.js".to_string(), 20_000), ("b.js".to_string(), 30)];
+        report_build_output(&out, &mut emitted, true);
+        assert_eq!(emitted[0].0, "a.js", "largest first");
+        let w = chunk_size_warning(500.0);
+        assert!(w.contains("larger than 500 kB after minification"));
+        assert!(w.contains("build.chunkSizeWarningLimit"));
+        fs::remove_dir_all(&out).unwrap();
     }
 
     #[test]
