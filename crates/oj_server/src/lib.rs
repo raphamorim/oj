@@ -339,6 +339,10 @@ struct ServerState {
     /// filled in (Vite's clientInjections), rendered once at startup.
     client_js: String,
     bundle_runtime_js: String,
+    /// Per module url, the `import.meta.glob` patterns it expands (absolute):
+    /// a file created or deleted under one changes the expansion, so the module
+    /// is recompiled and hot updated (Vite's importMetaGlob hotUpdate).
+    glob_importers: Mutex<HashMap<String, Vec<glob::Pattern>>>,
     /// Vite's `appType` (`spa` | `mpa` | `custom`): whether an unmatched
     /// navigation falls back to `index.html`, and whether html is served at all.
     app_type: String,
@@ -894,6 +898,7 @@ impl DevServer {
             resolve_failed: Mutex::new(std::collections::HashSet::new()),
             client_js,
             bundle_runtime_js,
+            glob_importers: Mutex::new(HashMap::new()),
             app_type,
             ws_token,
             ws_token_check,
@@ -3416,6 +3421,19 @@ async fn ensure_module(
         )
         .map_err(|err| format!("read error for {url}: {err}"))?,
     };
+    if !state.bundle && source.contains("import.meta.glob") {
+        let patterns: Vec<glob::Pattern> = oj_compiler::glob::glob_patterns(&source, file)
+            .iter()
+            .filter_map(|p| glob::Pattern::new(p).ok())
+            .collect();
+        let clean = url.split('?').next().unwrap_or(url).to_string();
+        let mut globs = state.glob_importers.lock().unwrap();
+        if patterns.is_empty() {
+            globs.remove(&clean);
+        } else {
+            globs.insert(clean, patterns);
+        }
+    }
     if file.extension().and_then(|e| e.to_str()) == Some("css") && is_tailwind_css(&source) {
         let css = compile_tailwind(state, url, &source).await?;
         let module = Arc::new(CachedModule {
@@ -7299,6 +7317,47 @@ async fn decide(
         let failed: Vec<String> = state.resolve_failed.lock().unwrap().drain().collect();
         for url in failed {
             paths.push(state.root.join(url.trim_start_matches('/')));
+        }
+    }
+    // A file created or deleted under an `import.meta.glob` pattern changes
+    // what the importer expands to: recompile and update the importer as if it
+    // had been edited (Vite's importMetaGlob hotUpdate on create/delete).
+    let glob_importers: Vec<String> = {
+        let globs = state.glob_importers.lock().unwrap();
+        if globs.is_empty() {
+            Vec::new()
+        } else {
+            let graph = state.graph.lock().unwrap();
+            // `*` stops at `/`, as the directory walk expanding the glob does.
+            let opts = glob::MatchOptions {
+                require_literal_separator: true,
+                ..Default::default()
+            };
+            let mut hit: Vec<String> = Vec::new();
+            for p in &paths {
+                let known = graph.contains(Path::new(&url_of(&state.root, p)));
+                let added_or_removed = !p.exists() || !known;
+                if !added_or_removed {
+                    continue;
+                }
+                for (importer, patterns) in globs.iter() {
+                    if patterns.iter().any(|pat| pat.matches_path_with(p, opts))
+                        && !hit.contains(importer)
+                    {
+                        hit.push(importer.clone());
+                    }
+                }
+            }
+            hit
+        }
+    };
+    for importer in glob_importers {
+        println!("oj: glob importer {importer} re-expanded");
+        state.mtime_keys.lock().unwrap().remove(&importer);
+        state.memory.lock().unwrap().remove(&importer);
+        let file = state.root.join(importer.trim_start_matches('/'));
+        if !paths.contains(&file) {
+            paths.push(file);
         }
     }
 
