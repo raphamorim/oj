@@ -4,7 +4,7 @@
 import { createRequire } from "node:module";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
-import { writeFileSync, readFileSync, realpathSync } from "node:fs";
+import { writeFileSync, readFileSync, realpathSync, existsSync } from "node:fs";
 
 const configPath = process.argv[2];
 const appRoot = process.argv[3];
@@ -100,8 +100,31 @@ async function loadConfig() {
   const m = await import(pathToFileURL(configPath).href);
   return {
     config: typeof m.default === "function" ? await m.default({ command, mode }) : m.default,
-    deps: [],
+    deps: relativeImportDeps(configPath),
   };
+}
+
+// A plain JS config loaded straight by Node has no bundler metafile to name its
+// imports, so walk its relative `import` specifiers (Vite's
+// configFileDependencies for the same file): the dev server restarts when one
+// of those files changes, as it does for the config itself.
+function relativeImportDeps(entry) {
+  const seen = new Set();
+  const stack = [entry];
+  const spec = /(?:\bfrom\s*|\bimport\s*\(?\s*)["'](\.{1,2}\/[^"']+)["']/g;
+  while (stack.length) {
+    const file = stack.pop();
+    if (seen.has(file)) continue;
+    seen.add(file);
+    let src;
+    try { src = readFileSync(file, "utf8"); } catch { continue; }
+    for (const m of src.matchAll(spec)) {
+      const dep = resolve(dirname(file), m[1]);
+      if (!seen.has(dep) && existsSync(dep)) stack.push(dep);
+    }
+  }
+  seen.delete(entry);
+  return [...seen];
 }
 
 function aliasKeyFromRegex(source) {
@@ -342,6 +365,16 @@ function extractServerFlags(s, legacy, appType) {
       for (const k of ["port", "clientPort", "timeout"]) if (typeof s.hmr[k] === "number") h[k] = s.hmr[k];
       if (typeof s.hmr.overlay === "boolean") h.overlay = s.hmr.overlay;
       if (Object.keys(h).length) out.hmr = h;
+    }
+    if (s.fs && typeof s.fs === "object" && typeof s.fs.strict === "boolean") out.fsStrict = s.fs.strict;
+    // server.watch.ignored: string globs only (RegExp/functions cannot cross the bridge).
+    if (s.watch && typeof s.watch === "object" && s.watch.ignored != null) {
+      const raw = Array.isArray(s.watch.ignored) ? s.watch.ignored : [s.watch.ignored];
+      const ignored = raw.filter((x) => typeof x === "string");
+      if (ignored.length) out.watch = { ignored };
+      if (ignored.length !== raw.length) {
+        warn("server.watch.ignored RegExp or function entries are not applied (string globs are)");
+      }
     }
   }
   if (legacy?.skipWebSocketTokenCheck === true) out.skipWebSocketTokenCheck = true;

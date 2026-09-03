@@ -346,6 +346,10 @@ struct ServerState {
     /// Vite's `appType` (`spa` | `mpa` | `custom`): whether an unmatched
     /// navigation falls back to `index.html`, and whether html is served at all.
     app_type: String,
+    /// Vite's `server.watch.ignored` as compiled globs (each pattern both as
+    /// written and rooted at the project); a change matching one is dropped
+    /// before HMR or restart handling.
+    watch_ignored: Vec<glob::Pattern>,
     /// Per-process secret a browser page must present as `?token=` to open the
     /// HMR socket (Vite's `webSocketToken`): another origin's page cannot read
     /// update frames or push invalidations. Non-browser clients (no `Origin`)
@@ -368,6 +372,8 @@ pub struct BuiltApp {
     pub reload_tx: broadcast::Sender<String>,
     /// The client plugin host, for the shutdown hooks (buildEnd, closeBundle).
     pub plugin_host: Option<Arc<PluginHost>>,
+    /// `server.open`: launch the browser once bound.
+    pub open: bool,
 }
 
 pub async fn bind_dev_listener(
@@ -410,6 +416,9 @@ impl DevServer {
         println!("  ready in {:?}", built.started.elapsed());
         if built.plugin_host.is_some() {
             tokio::spawn(close_plugins_on_shutdown(built.plugin_host.clone()));
+        }
+        if built.open {
+            open_browser(&url);
         }
         axum::serve(listener, built.router).await?;
         Ok(())
@@ -765,6 +774,19 @@ impl DevServer {
         if app_type != "spa" {
             println!("  appType: {app_type}");
         }
+        let fs_strict = server_cfg.fs.as_ref().and_then(|f| f.strict) != Some(false);
+        if !fs_strict {
+            println!("  server.fs.strict: false (files outside the allow list are served)");
+        }
+        let watch_ignored = watch_ignored_patterns(
+            &root,
+            server_cfg
+                .watch
+                .as_ref()
+                .and_then(|w| w.ignored.as_deref())
+                .unwrap_or(&[]),
+        );
+        let open = server_cfg.open == Some(true);
 
         let started = Instant::now();
         let (reload_tx, _) = broadcast::channel::<String>(64);
@@ -900,6 +922,7 @@ impl DevServer {
             bundle_runtime_js,
             glob_importers: Mutex::new(HashMap::new()),
             app_type,
+            watch_ignored,
             ws_token,
             ws_token_check,
             optimized: Arc::new(if bundle {
@@ -1046,6 +1069,7 @@ impl DevServer {
             started,
             reload_tx,
             plugin_host,
+            open,
         })
     }
 }
@@ -1087,6 +1111,85 @@ async fn close_plugins_on_shutdown(host: Option<Arc<PluginHost>>) {
         .await;
     }
     std::process::exit(code);
+}
+
+/// Vite's `server.open`: launch the system browser at the served url once the
+/// listener is bound. `BROWSER=none` disables it and any other `BROWSER` value
+/// names the command to run (the `open` package's convention Vite follows).
+pub fn open_browser(url: &str) {
+    let browser = std::env::var("BROWSER").ok().filter(|b| !b.trim().is_empty());
+    if browser.as_deref() == Some("none") {
+        return;
+    }
+    let mut cmd = match browser {
+        Some(b) => std::process::Command::new(b),
+        None if cfg!(target_os = "macos") => std::process::Command::new("open"),
+        None if cfg!(target_os = "windows") => {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "start", ""]);
+            c
+        }
+        None => std::process::Command::new("xdg-open"),
+    };
+    cmd.arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Err(err) = cmd.spawn() {
+        eprintln!("oj: could not open the browser: {err}");
+    }
+}
+
+/// `server.watch.ignored` entries as globs. Vite hands them to chokidar, which
+/// matches absolute paths; a relative pattern is kept as written (for
+/// root-relative matching) and rooted at the project (for absolute paths).
+fn watch_ignored_patterns(root: &Path, ignored: &[String]) -> Vec<glob::Pattern> {
+    let mut out = Vec::new();
+    for raw in ignored {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        if let Ok(p) = glob::Pattern::new(raw) {
+            out.push(p);
+        }
+        if !raw.starts_with('/') && !raw.starts_with("**") {
+            let rooted = root.join(raw).to_string_lossy().replace('\\', "/");
+            if let Ok(p) = glob::Pattern::new(&rooted) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+fn is_watch_ignored(patterns: &[glob::Pattern], root: &Path, path: &Path) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+    let opts = glob::MatchOptions {
+        require_literal_separator: true,
+        ..Default::default()
+    };
+    let rel = path.strip_prefix(root).ok();
+    patterns.iter().any(|p| {
+        p.matches_path_with(path, opts) || rel.is_some_and(|r| p.matches_path_with(r, opts))
+    })
+}
+
+/// A file the config imported (the extractor reports them, like Vite's
+/// `configFileDependencies`): its change restarts the server too. Packages
+/// under node_modules are left out, as in Vite.
+fn is_config_dependency(path: &Path) -> bool {
+    let deps = plugins::config_dependencies();
+    if deps.is_empty() {
+        return false;
+    }
+    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    deps.iter().any(|d| {
+        !d.components().any(|c| c.as_os_str() == "node_modules")
+            && (d == path || std::fs::canonicalize(d).is_ok_and(|r| r == real))
+    })
 }
 
 fn js(body: impl IntoResponse) -> Response {
@@ -1460,24 +1563,6 @@ async fn preview_host_check(
     next.run(req).await
 }
 
-/// Open `url` in the default browser (Vite's `open` option), best effort.
-pub fn open_browser(url: &str) {
-    let mut cmd = if cfg!(target_os = "macos") {
-        std::process::Command::new("open")
-    } else if cfg!(target_os = "windows") {
-        let mut c = std::process::Command::new("cmd");
-        c.args(["/c", "start", ""]);
-        c
-    } else {
-        std::process::Command::new("xdg-open")
-    };
-    let _ = cmd
-        .arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-}
 
 pub async fn preview(opts: PreviewOptions) -> anyhow::Result<()> {
     let dir = opts.dir.canonicalize().with_context(|| {
@@ -2944,10 +3029,10 @@ async fn serve_path(
                 // of its own.
                 if state.app_type != "custom" && accepts_html_fallback(&headers) {
                     if let Some(page) = html_fallback_candidate(rel)
-                        .and_then(|c| locate(&state.root, &state.public_dir, &c))
+                        .and_then(|c| locate(&state.root, state.public_dir.as_deref(), &c))
                     {
                         return match tokio::fs::read(&page).await {
-                            Ok(bytes) => serve_html(&state, bytes).await,
+                            Ok(bytes) => serve_html(&state, bytes, &format!("/{rel}"), &page).await,
                             Err(_) => (StatusCode::NOT_FOUND, format!("oj: no such file: /{rel}"))
                                 .into_response(),
                         };
@@ -7203,12 +7288,18 @@ fn spawn_watcher(state: Arc<ServerState>) {
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
-            let paths: Vec<PathBuf> = paths.into_iter().collect();
+            let paths: Vec<PathBuf> = paths
+                .into_iter()
+                .filter(|p| !is_watch_ignored(&state.watch_ignored, &state.root, p))
+                .collect();
+            if paths.is_empty() {
+                continue;
+            }
             created.retain(|p| !seen_paths.contains(p));
             seen_paths.extend(paths.iter().cloned());
             // A config or .env change can't be hot-applied (config is read once at
             // startup), so restart the process to pick it up — matching Vite.
-            if paths.iter().any(|p| is_restart_trigger(p)) {
+            if paths.iter().any(|p| is_restart_trigger(p) || is_config_dependency(p)) {
                 restart_process();
             }
             if !state.hmr_enabled {
@@ -7362,9 +7453,11 @@ async fn decide(
     }
 
     for path in &paths {
+        // Vite's default watch ignores: `**/node_modules/**` and `**/.git/**`
+        // at any depth (a nested package's node_modules included).
         if path.components().any(|c| {
             let c = c.as_os_str();
-            c == "node_modules" || c == ".oj-cache" || c == "dist"
+            c == "node_modules" || c == ".oj-cache" || c == "dist" || c == ".git"
         }) {
             continue;
         }
@@ -8127,6 +8220,21 @@ mod tests {
         assert!(!wants_module_import(&h, None));
         h.insert("sec-fetch-dest", "script".parse().unwrap());
         assert!(wants_module_import(&h, None), "a module import of the url");
+    }
+
+    #[test]
+    fn watch_ignored_globs_match_relative_and_absolute_paths() {
+        let root = Path::new("/app");
+        let pats = watch_ignored_patterns(
+            root,
+            &["**/generated/**".to_string(), "docs/*.md".to_string(), "/tmp/out/**".to_string()],
+        );
+        assert!(is_watch_ignored(&pats, root, Path::new("/app/src/generated/x.ts")));
+        assert!(is_watch_ignored(&pats, root, Path::new("/app/docs/intro.md")), "root-relative pattern");
+        assert!(!is_watch_ignored(&pats, root, Path::new("/app/docs/deep/intro.md")), "* stops at /");
+        assert!(is_watch_ignored(&pats, root, Path::new("/tmp/out/a/b.js")), "absolute pattern");
+        assert!(!is_watch_ignored(&pats, root, Path::new("/app/src/main.ts")));
+        assert!(!is_watch_ignored(&[], root, Path::new("/app/src/generated/x.ts")));
     }
 
     #[test]

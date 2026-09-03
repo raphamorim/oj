@@ -44,10 +44,6 @@ pub struct OjConfig {
     /// Vite's `html` block (`cspNonce`).
     pub html: Option<HtmlConfig>,
     pub legacy: Option<LegacyConfig>,
-    /// Vite's `appType`: `spa` (default) falls back to `index.html` for
-    /// navigations, `mpa` only rewrites `/dir/` and `/page` to html files, and
-    /// `custom` leaves html to the app's own middleware.
-    pub app_type: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -175,6 +171,15 @@ pub struct ServerConfig {
     pub proxy: Option<BTreeMap<String, ProxyEntry>>,
     pub fs: Option<FsConfig>,
     pub warmup: Option<WarmupConfig>,
+    pub watch: Option<WatchConfig>,
+}
+
+/// Vite's `server.watch`: `ignored` globs (strings; RegExp and function forms
+/// cannot cross the config bridge) whose changes never reach HMR or restart.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WatchConfig {
+    pub ignored: Option<Vec<String>>,
 }
 
 /// Vite's `server.cors`: `true` reflects any origin, `false` disables CORS, an
