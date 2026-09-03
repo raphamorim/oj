@@ -8,7 +8,7 @@ use oxc_ast::ast::{
     Argument, ArrayExpressionElement, Expression, NewExpression, ObjectPropertyKind, Program,
     PropertyKey, Statement,
 };
-use oxc_ast_visit::{walk_mut, VisitMut};
+use oxc_ast_visit::{walk, walk_mut, Visit, VisitMut};
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 
@@ -26,6 +26,54 @@ pub fn expand_source(source: &str, path: &Path) -> String {
     let dir = path.parent().unwrap_or(path);
     expand(&allocator, dir, &mut program);
     oxc_codegen::Codegen::new().build(&program).code
+}
+
+/// The positive `import.meta.glob` patterns a module uses, resolved against its
+/// directory the way `expand` resolves them (`<dir>/pages/*.tsx`). The dev
+/// server's watcher keeps these per importer: a file created or deleted under
+/// one of them changes what the glob expands to, so the importer is updated as
+/// if it had been edited (Vite's importMetaGlob `hotUpdate`).
+pub fn glob_patterns(source: &str, path: &Path) -> Vec<String> {
+    if !source.contains("import.meta.glob") {
+        return Vec::new();
+    }
+    let allocator = Allocator::default();
+    let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::mjs());
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+    if parsed.panicked {
+        return Vec::new();
+    }
+    let dir = path.parent().unwrap_or(path);
+    let mut collector = PatternCollector {
+        dir,
+        out: Vec::new(),
+    };
+    collector.visit_program(&parsed.program);
+    collector.out
+}
+
+struct PatternCollector<'d> {
+    dir: &'d Path,
+    out: Vec<String>,
+}
+
+impl<'a> Visit<'a> for PatternCollector<'_> {
+    fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
+        if is_import_meta_glob(call) {
+            if let Some(patterns) = call.arguments.first().and_then(collect_patterns) {
+                for pattern in patterns {
+                    if !pattern.starts_with('!') {
+                        // `dir/./pages/*` would not match `dir/pages/x` as a
+                        // glob pattern: drop the current-dir segments.
+                        let rel = pattern.strip_prefix("./").unwrap_or(&pattern);
+                        let abs = self.dir.join(rel).to_string_lossy().replace('\\', "/");
+                        self.out.push(abs.replace("/./", "/"));
+                    }
+                }
+            }
+        }
+        walk::walk_call_expression(self, call);
+    }
 }
 
 pub fn expand<'a>(allocator: &'a Allocator, dir: &Path, program: &mut Program<'a>) {
@@ -631,6 +679,22 @@ mod tests {
         std::fs::write(d.join("img/b.png"), b"b").unwrap();
         std::fs::write(d.join("w.ts"), "self.onmessage = () => {};").unwrap();
         d
+    }
+
+    #[test]
+    fn glob_patterns_are_resolved_against_the_importer_dir() {
+        let src = "const a = import.meta.glob('./pages/*.tsx');\n\
+                   const b = import.meta.glob(['./img/**/*.png', '!./img/skip.png'], { eager: true });\n\
+                   const c = import.meta.glob(dynamic);\n";
+        let pats = glob_patterns(src, std::path::Path::new("/app/src/main.ts"));
+        assert_eq!(pats, vec!["/app/src/pages/*.tsx", "/app/src/img/**/*.png"]);
+        assert!(glob_patterns("export const x = 1;", std::path::Path::new("/app/x.ts")).is_empty());
+        // The resolved pattern matches the files `expand` would list (with `*`
+        // stopping at `/`, as the directory walk in glob_matches does).
+        let p = glob::Pattern::new(&pats[0]).unwrap();
+        let opts = glob::MatchOptions { require_literal_separator: true, ..Default::default() };
+        assert!(p.matches_path_with(std::path::Path::new("/app/src/pages/About.tsx"), opts));
+        assert!(!p.matches_path_with(std::path::Path::new("/app/src/pages/nested/Deep.tsx"), opts));
     }
 
     #[test]
