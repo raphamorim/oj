@@ -150,7 +150,9 @@ test("parseImportsField flattens string and conditional-object targets", () => {
   const map = Object.fromEntries(rules);
   assert.equal(map["#lib/*"], "./src/lib/*");
   assert.equal(map["#pick-import"], "./esm.js");
-  assert.equal(map["#env"], "./env.ts");
+  // Node takes the first supported condition in object order; the SSR loader
+  // runs in Node, so `node` listed first wins over `default`.
+  assert.equal(map["#env"], "./env.node.ts");
   assert.equal(map["#node-only"], "./env.node.ts");
   assert.ok(!("#no-string" in map));
 });
