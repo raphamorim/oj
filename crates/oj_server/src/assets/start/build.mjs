@@ -4,7 +4,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, cpSync, rmSync } fr
 import { createRequire } from "node:module";
 import { dirname, join, resolve, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { importPkg, viteEnvDefine } from "./resolve-pkg.mjs";
+import { importPkg, viteEnvDefine, jsxTransformOptions } from "./resolve-pkg.mjs";
 import {
   assetsPlugin, makeVitePlugins, nodeBuiltinShims, workspaceRoot, contentHashEmitter,
 } from "./rolldown-assets.mjs";
@@ -167,7 +167,7 @@ const client = await build({
   input: { client: join(HERE, "client-entry.tsx") },
   platform: "browser",
   transform: {
-    jsx: { runtime: "automatic" },
+    jsx: jsxTransformOptions(NODE_ENV !== "production"),
     define: {
       "process.env": PROCESS_ENV_JSON,
       global: "globalThis", ...viteEnvDefine({ ssr: false, mode: MODE }),
@@ -216,7 +216,7 @@ await build({
   input: { "server-bundle": join(HERE, "server-entry.tsx") },
   platform: "node",
   transform: {
-    jsx: { runtime: "automatic" },
+    jsx: jsxTransformOptions(NODE_ENV !== "production"),
     define: {
       "process.env.NODE_ENV": JSON.stringify(NODE_ENV), "process.env.TSS_SERVER_FN_BASE": '"/_serverFn/"',
       ...viteEnvDefine({ ssr: true, mode: MODE }),

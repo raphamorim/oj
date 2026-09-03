@@ -150,8 +150,12 @@ fn transform_options(
             .as_ref()
             .and_then(|b| b.target.clone())
             .map(rolldown_common::Either::Left),
+        // `runtime` stays None unless configured: rolldown only merges the
+        // tsconfig `compilerOptions.jsx`/`jsxFactory`/`jsxImportSource` into the
+        // transform when no runtime is set, and a project configured that way
+        // must keep building as before.
         jsx: Some(rolldown_common::Either::Right(rolldown_common::JsxOptions {
-            runtime: Some(if classic { "classic".into() } else { "automatic".into() }),
+            runtime: jsx.runtime.clone(),
             development: Some(!is_production),
             import_source: if classic { None } else { jsx.import_source },
             pragma: if classic { jsx.pragma } else { None },
@@ -1455,7 +1459,7 @@ pub async fn build(
     }
 
     if let Some(lib) = build_cfg.lib.clone() {
-        return build_library(&root, &out_dir, lib, mode, minify, sourcemap).await;
+        return build_library(&root, &out_dir, &config, lib, mode, minify, sourcemap).await;
     }
 
     let base = normalize_base(config.base.as_deref().unwrap_or("/"));
@@ -2031,8 +2035,8 @@ pub(crate) async fn build_ssr(
     let mut config =
         oj_config::load_with(root, "build", mode).map_err(|e| anyhow::anyhow!("{e}"))?;
     oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", mode);
-    let node_env =
-        oj_env::resolve_node_env(shell_node_env().as_deref(), &oj_env::load(root, mode), "production");
+    let loaded_env = oj_env::load(root, mode);
+    let node_env = oj_env::resolve_node_env(shell_node_env().as_deref(), &loaded_env, "production");
     let is_production = node_env == "production";
     let ssr_base = config.base.clone().unwrap_or_else(|| "/".into());
     let plugin_host = user_plugin_host(
@@ -2094,17 +2098,16 @@ pub(crate) async fn build_ssr(
                 .unwrap_or(sourcemap)
                 .then_some(SourceMapType::File),
             define: Some({
+                let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &["VITE_"]);
                 let mut pairs = node_env_defines(&node_env);
-                pairs.extend([
-                    ("import.meta.env.SSR".to_string(), "true".to_string()),
-                    ("import.meta.env.PROD".to_string(), is_production.to_string()),
-                    ("import.meta.env.DEV".to_string(), (!is_production).to_string()),
-                    (
-                        "import.meta.env.MODE".to_string(),
-                        serde_json::Value::String(mode.to_string()).to_string(),
-                    ),
-                    ("import.meta.env.BASE_URL".to_string(), "\"/\"".to_string()),
-                ]);
+                pairs.extend(oj_env::import_meta_env_defines_with(
+                    &env,
+                    mode,
+                    !is_production,
+                    &ssr_base,
+                    &["VITE_"],
+                    true,
+                ));
                 pairs.extend(oj_config::config_defines(&config));
                 pairs.extend(oj_config::environment_defines(&config, "ssr"));
                 pairs.into_iter().collect()
@@ -2184,8 +2187,14 @@ fn has_server_modules(root: &Path) -> bool {
     walk(&root.join("src"))
 }
 
-async fn build_server_fns(root: &Path, out_dir: &Path) -> anyhow::Result<()> {
+async fn build_server_fns(root: &Path, out_dir: &Path, mode: &str) -> anyhow::Result<()> {
     use rolldown::{IsExternal, Platform};
+    let mut config =
+        oj_config::load_with(root, "build", mode).map_err(|e| anyhow::anyhow!("{e}"))?;
+    oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", mode);
+    let node_env =
+        oj_env::resolve_node_env(shell_node_env().as_deref(), &oj_env::load(root, mode), "production");
+    let is_production = node_env == "production";
     let entry_path = root.join("_oj_server_fns_entry.tsx");
     fs::write(&entry_path, OJ_SERVER_FNS_JS)?;
     let collected: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2219,17 +2228,12 @@ async fn build_server_fns(root: &Path, out_dir: &Path) -> anyhow::Result<()> {
                 entry_filenames: Some("_oj_server_fns.mjs".to_string().into()),
                 chunk_filenames: Some("_oj_server_fns-[hash].mjs".to_string().into()),
                 minify: Some(RawMinifyOptions::Bool(false)),
-                define: Some(
-                    vec![
-                        (
-                            "process.env.NODE_ENV".to_string(),
-                            "'production'".to_string(),
-                        ),
-                        ("import.meta.env.SSR".to_string(), "true".to_string()),
-                    ]
-                    .into_iter()
-                    .collect(),
-                ),
+                transform: transform_options(&config, is_production),
+                define: Some({
+                    let mut pairs = node_env_defines(&node_env);
+                    pairs.push(("import.meta.env.SSR".to_string(), "true".to_string()));
+                    pairs.into_iter().collect()
+                }),
                 ..Default::default()
             })
             .build()
@@ -2473,7 +2477,7 @@ pub(crate) async fn build_ssr_app(
     };
     let (js, css) = build_client_entry(root, out_dir, &client_entry, mode, minify, sourcemap).await?;
 
-    build_server_fns(root, out_dir).await?;
+    build_server_fns(root, out_dir, mode).await?;
     if has_server_modules(root) {
         println!(
             "  {:>9}  _oj_server_fns.mjs",
@@ -2666,6 +2670,7 @@ async fn build_client_entry(
 async fn build_library(
     root: &Path,
     out_dir: &Path,
+    config: &oj_config::OjConfig,
     lib: oj_config::LibConfig,
     mode: &str,
     minify: bool,
@@ -2673,6 +2678,7 @@ async fn build_library(
 ) -> anyhow::Result<()> {
     let node_env =
         oj_env::resolve_node_env(shell_node_env().as_deref(), &oj_env::load(root, mode), "production");
+    let is_production = node_env == "production";
     let entry_import = if lib.entry.starts_with('.') {
         lib.entry.clone()
     } else {
@@ -2731,6 +2737,7 @@ async fn build_library(
                 chunk_filenames: Some(format!("{file_name}-[hash].{ext}").into()),
                 minify: Some(RawMinifyOptions::Bool(minify)),
                 sourcemap: sourcemap.then_some(SourceMapType::File),
+                transform: transform_options(config, is_production),
                 define: Some(node_env_defines(&node_env).into_iter().collect()),
                 ..Default::default()
             })

@@ -228,6 +228,9 @@ function extractEsbuild(es) {
 
 function warnUnsupported(c) {
   if (c.css?.preprocessorOptions) warn("css.preprocessorOptions is not applied yet");
+  if (c.esbuild?.jsx === "preserve" || c.oxc?.jsx === "preserve") {
+    warn("jsx: \"preserve\" is not supported; JSX is compiled with the automatic runtime");
+  }
   if (c.esbuild && typeof c.esbuild === "object") {
     const rest = Object.keys(c.esbuild).filter((k) => !JSX_ESBUILD_KEYS.includes(k));
     if (rest.length) warn(`esbuild options ${rest.join(", ")} are not applied (jsx* are)`);

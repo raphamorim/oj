@@ -5,7 +5,7 @@ import { readFileSync, unlinkSync, statSync, openSync, readSync, realpathSync } 
 import { writeFile, appendFile, rename, mkdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { resolve as pathResolve, dirname } from "node:path";
-import { importPkg, viteEnvDefine, emptyVirtualStub } from "./resolve-pkg.mjs";
+import { importPkg, viteEnvDefine, emptyVirtualStub, jsxTransformOptions } from "./resolve-pkg.mjs";
 import { loadPluginContainerSync } from "./container-bridge.mjs";
 import { transformGlob } from "./glob-transform.mjs";
 import {
@@ -807,7 +807,7 @@ export function load(url, context, next) {
     const src = transformServerFns(transformGlob(raw, path), path);
     const out = transformSync(path, src, {
       lang: clean.endsWith("tsx") ? "tsx" : clean.endsWith("jsx") ? "jsx" : "ts",
-      jsx: { runtime: "automatic" },
+      jsx: jsxTransformOptions(),
       define: DEFINE,
     });
     cachePut(raw.includes("import.meta.glob") ? null : key, out.code);
@@ -832,7 +832,7 @@ export function load(url, context, next) {
     const compiled = container.transform(raw, path);
     if (compiled != null) {
       const out = transformSync(path, compiled, {
-        lang: "jsx", jsx: { runtime: "automatic" },
+        lang: "jsx", jsx: jsxTransformOptions(),
         define: DEFINE,
       });
       cachePut(compiled.includes("import.meta.glob") ? null : key, out.code);

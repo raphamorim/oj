@@ -82,7 +82,8 @@ pub fn server_fs_deny(config: &OjConfig) -> Vec<String> {
 /// then the older `esbuild.jsx*` names (`jsx: "transform"` is the classic runtime,
 /// `jsxFactory`/`jsxFragment` its pragmas). Unset fields mean oxc's defaults
 /// (automatic runtime from `react`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JsxSettings {
     pub runtime: Option<String>,
     pub import_source: Option<String>,

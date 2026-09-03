@@ -302,6 +302,7 @@ fn refresh_instrumentation_only_happens_in_dev_and_only_for_components() {
             refresh: false,
             sourcemap: false,
             ssr: false,
+            ..CompileOptions::dev()
         },
     )
     .unwrap();
@@ -348,6 +349,7 @@ fn sourcemap_can_be_turned_off_entirely() {
             refresh: true,
             sourcemap: false,
             ssr: false,
+            ..CompileOptions::dev()
         },
     )
     .unwrap();

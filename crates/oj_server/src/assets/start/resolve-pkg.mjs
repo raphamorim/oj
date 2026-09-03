@@ -68,6 +68,21 @@ export async function importPkg(root, spec, preferred = []) {
   return m.default ?? m;
 }
 
+/// JSX transform options for rolldown / oxc-transform from `OJ_JSX` (the config's
+/// `oxc.jsx` / `esbuild.jsx*`, serialized by oj). Defaults to the automatic React
+/// runtime; a file's own `@jsx*` pragma comments still win inside oxc.
+export function jsxTransformOptions(development) {
+  let cfg = {};
+  try { cfg = JSON.parse(process.env.OJ_JSX || "{}") || {}; } catch {}
+  const classic = cfg.runtime === "classic";
+  const out = { runtime: classic ? "classic" : "automatic" };
+  if (development != null) out.development = development;
+  if (!classic && cfg.importSource) out.importSource = cfg.importSource;
+  if (classic && cfg.pragma) out.pragma = cfg.pragma;
+  if (classic && cfg.pragmaFrag) out.pragmaFrag = cfg.pragmaFrag;
+  return out;
+}
+
 export function viteEnvDefine({ ssr = false, mode = "development", env: envSource = process.env } = {}) {
   // Vite: DEV/PROD follow NODE_ENV (isProduction), MODE is the mode itself.
   const nodeEnv = envSource.NODE_ENV || (mode === "production" ? "production" : "development");

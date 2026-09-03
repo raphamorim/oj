@@ -668,7 +668,10 @@ impl DevServer {
                 },
             )),
             cache: PersistentCache::new(oj_cache::cache_root(&root), env!("CARGO_PKG_VERSION"))
-                .with_salt_extra(&env_defines_digest),
+                .with_salt_extra(&env_defines_digest)
+                // A cached compile embeds the JSX runtime import; a changed
+                // importSource/runtime must not serve the old module.
+                .with_salt_extra(&format!("jsx={jsx:?}")),
             memory: Mutex::new(MemoryCache::new(memory_cache_budget())),
             mtime_keys: Mutex::new(HashMap::new()),
             compile_locks: Mutex::new(HashMap::new()),
@@ -983,13 +986,13 @@ async fn ssr_module(
         return match oj_compiler::ssr::ssr_transform_module(
             &compile_path,
             &source,
-            &oj_compiler::CompileOptions::prod(),
+            &prod_compile_opts(&state),
         ) {
             Ok(code) => js(code),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
         };
     }
-    match oj_compiler::compile(&compile_path, &source, &oj_compiler::CompileOptions::prod()) {
+    match oj_compiler::compile(&compile_path, &source, &prod_compile_opts(&state)) {
         Ok(out) => js(out.code),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
@@ -3628,6 +3631,7 @@ async fn serve_oj_routes(State(state): State<Arc<ServerState>>) -> Response {
     let fs_allow = Arc::clone(&state.fs_allow);
     let dir_cache = Arc::clone(&state.dir_cache);
     let synthetic = root.join("oj-routes.tsx");
+    let compile_opts = dev_compile_opts(&state);
     let compiled = tokio::task::spawn_blocking(move || {
         let dir = root.clone();
         let mut rewrite =
@@ -3635,7 +3639,7 @@ async fn serve_oj_routes(State(state): State<Arc<ServerState>>) -> Response {
         oj_compiler::compile_module(
             &synthetic,
             OJ_ROUTES_JS,
-            &oj_compiler::CompileOptions::dev(),
+            &compile_opts,
             Some(&mut rewrite),
         )
         .map(|o| o.code_with_inline_map())
@@ -3662,6 +3666,18 @@ async fn serve_oj_routes(State(state): State<Arc<ServerState>>) -> Response {
         )
             .into_response(),
     }
+}
+
+fn dev_compile_opts(state: &ServerState) -> oj_compiler::CompileOptions {
+    let mut opts = oj_compiler::CompileOptions::dev();
+    opts.jsx = state.jsx.clone();
+    opts
+}
+
+fn prod_compile_opts(state: &ServerState) -> oj_compiler::CompileOptions {
+    let mut opts = oj_compiler::CompileOptions::prod();
+    opts.jsx = state.jsx.clone();
+    opts
 }
 
 /// The compiler's JSX settings for a config (`oxc.jsx` / `esbuild.jsx*`).
@@ -3742,6 +3758,7 @@ async fn serve_plugin_resolve(state: &Arc<ServerState>, id: &str) -> Response {
         state.virtual_modules.keys().cloned().collect();
     let plugin_fallback = state.plugins.is_some();
     let importer_abs = format!("\0{id}");
+    let compile_opts = dev_compile_opts(&state);
     let compiled = tokio::task::spawn_blocking(move || {
         let mut rewrite = |spec: &str| {
             if virtual_ids.contains(spec) {
@@ -3770,7 +3787,7 @@ async fn serve_plugin_resolve(state: &Arc<ServerState>, id: &str) -> Response {
         oj_compiler::compile_module(
             Path::new("plugin.tsx"),
             &source,
-            &oj_compiler::CompileOptions::dev(),
+            &compile_opts,
             Some(&mut rewrite),
         )
         .map(|o| o.code_with_inline_map())
@@ -3836,6 +3853,7 @@ async fn serve_plugin_id(state: &Arc<ServerState>, spec: &str, importer: &str) -
     let dir_cache = Arc::clone(&state.dir_cache);
     let plugin_fallback = !state.bundle;
     let importer_id = id.clone();
+    let compile_opts = dev_compile_opts(&state);
     let compiled = tokio::task::spawn_blocking(move || {
         let mut rewrite = |s: &str| {
             if let Some(u) =
@@ -3860,7 +3878,7 @@ async fn serve_plugin_id(state: &Arc<ServerState>, spec: &str, importer: &str) -
         oj_compiler::compile_module(
             Path::new("plugin.tsx"),
             &source,
-            &oj_compiler::CompileOptions::dev(),
+            &compile_opts,
             Some(&mut rewrite),
         )
         .map(|o| o.code_with_inline_map())
@@ -4013,6 +4031,7 @@ async fn serve_plugin_load_fallback(state: &Arc<ServerState>, uri: &Uri) -> Opti
     let dir_cache = Arc::clone(&state.dir_cache);
     let plugin_fallback = !state.bundle;
     let importer_id = id.clone();
+    let compile_opts = dev_compile_opts(&state);
     let compiled = tokio::task::spawn_blocking(move || {
         let mut rewrite = |s: &str| {
             if let Some(u) =
@@ -4037,7 +4056,7 @@ async fn serve_plugin_load_fallback(state: &Arc<ServerState>, uri: &Uri) -> Opti
         oj_compiler::compile_module(
             Path::new("plugin.tsx"),
             &source,
-            &oj_compiler::CompileOptions::dev(),
+            &compile_opts,
             Some(&mut rewrite),
         )
         .map(|o| o.code_with_inline_map())

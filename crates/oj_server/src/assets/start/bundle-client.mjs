@@ -3,7 +3,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import { importPkg, viteEnvDefine } from "./resolve-pkg.mjs";
+import { importPkg, viteEnvDefine, jsxTransformOptions } from "./resolve-pkg.mjs";
 import { assetsPlugin, makeVitePlugins, nodeBuiltinShims, workspaceRoot } from "./rolldown-assets.mjs";
 import { loadPluginContainer } from "./vite-plugin-bridge.mjs";
 import { transformGlob } from "./glob-transform.mjs";
@@ -83,7 +83,7 @@ const result = await build({
   input: join(HERE, "client-entry.tsx"),
   platform: "browser",
   transform: {
-    jsx: { runtime: "automatic" },
+    jsx: jsxTransformOptions(),
     define: {
       "process.env": JSON.stringify({ NODE_ENV: "development", TSS_SERVER_FN_BASE: SERVER_FN_BASE }),
       global: "globalThis",

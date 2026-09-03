@@ -143,9 +143,13 @@ pub fn resolve_node_env(shell: Option<&str>, loaded: &[(String, String)], defaul
         if v == "development" {
             return v.clone();
         }
-        eprintln!(
-            "oj: NODE_ENV={v} is not supported in the .env file. Only NODE_ENV=development is supported to create a development build of your project."
-        );
+        // The dev server recomputes its defines after the plugin host boots; warn once.
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "oj: NODE_ENV={v} is not supported in the .env file. Only NODE_ENV=development is supported to create a development build of your project."
+            );
+        }
     }
     default.to_string()
 }
@@ -157,12 +161,26 @@ pub fn import_meta_env_defines(
     base_url: &str,
     prefixes: &[&str],
 ) -> Vec<(String, String)> {
+    import_meta_env_defines_with(loaded, mode, dev, base_url, prefixes, false)
+}
+
+/// `import_meta_env_defines` for a chosen environment: `ssr` sets
+/// `import.meta.env.SSR` (Vite defines the same object for the ssr environment
+/// with `SSR: true`).
+pub fn import_meta_env_defines_with(
+    loaded: &[(String, String)],
+    mode: &str,
+    dev: bool,
+    base_url: &str,
+    prefixes: &[&str],
+    ssr: bool,
+) -> Vec<(String, String)> {
     let mut obj = serde_json::Map::new();
     obj.insert("MODE".into(), mode.into());
     obj.insert("BASE_URL".into(), base_url.into());
     obj.insert("DEV".into(), dev.into());
     obj.insert("PROD".into(), (!dev).into());
-    obj.insert("SSR".into(), false.into());
+    obj.insert("SSR".into(), ssr.into());
     for (k, v) in loaded {
         if prefixes.iter().any(|p| k.starts_with(p)) {
             obj.insert(k.clone(), serde_json::Value::String(v.clone()));
@@ -236,6 +254,21 @@ pub fn replace_html_env(html: &str, env: &BTreeMap<String, String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssr_variant_flips_only_the_ssr_flag() {
+        let loaded = vec![("VITE_X".to_string(), "1".to_string())];
+        let ssr = import_meta_env_defines_with(&loaded, "staging", false, "/app/", &["VITE_"], true);
+        let get = |k: &str| ssr.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap();
+        assert_eq!(get("import.meta.env.SSR"), "true");
+        assert_eq!(get("import.meta.env.PROD"), "true");
+        assert_eq!(get("import.meta.env.MODE"), "\"staging\"");
+        assert_eq!(get("import.meta.env.BASE_URL"), "\"/app/\"");
+        assert_eq!(get("import.meta.env.VITE_X"), "\"1\"");
+        assert!(get("import.meta.env").contains("\"SSR\":true"));
+        let client = import_meta_env_defines(&loaded, "staging", false, "/app/", &["VITE_"]);
+        assert!(client.iter().any(|(k, v)| k == "import.meta.env.SSR" && v == "false"));
+    }
 
     #[test]
     fn node_env_shell_wins_then_dotenv_development_then_default() {

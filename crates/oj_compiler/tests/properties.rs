@@ -95,8 +95,8 @@ proptest! {
         for opts in [
             CompileOptions::dev(),
             CompileOptions::prod(),
-            CompileOptions { dev: true, refresh: false, sourcemap: false, ssr: false },
-            CompileOptions { dev: false, refresh: true, sourcemap: false, ssr: false },
+            CompileOptions { dev: true, refresh: false, sourcemap: false, ssr: false, ..CompileOptions::dev() },
+            CompileOptions { dev: false, refresh: true, sourcemap: false, ssr: false, ..CompileOptions::dev() },
         ] {
             if let Ok(out) = compile(Path::new(&path), &source, &opts) {
                 prop_assert!(output_parses(&out.code), "{source}\n->\n{}", out.code);
