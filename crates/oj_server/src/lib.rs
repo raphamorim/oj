@@ -267,6 +267,9 @@ struct ServerState {
     scss_additional_data: Option<String>,
     sass_additional_data: Option<String>,
     css_config: Option<oj_config::CssConfig>,
+    /// `resolve.alias`, root and public dir as seen by `@import`/`@use`/`url()`
+    /// specifiers inside stylesheets (Vite's CSS resolvers).
+    css_resolve: oj_css::CssResolveConfig,
     preload_snapshot: Vec<String>,
     proxy: Vec<(String, oj_config::ProxyEntry)>,
     /// Per `proxy` entry: the compiled pattern of a `^` (regex) context, `None`
@@ -709,6 +712,11 @@ impl DevServer {
                 preserve_symlinks: oj_config::resolve_preserve_symlinks(&config),
             },
         ));
+        let css_resolve = oj_css::CssResolveConfig {
+            root: root.clone(),
+            public_dir: public_dir.clone(),
+            alias: oj_config::resolve_alias(&config, "client"),
+        };
         let state = Arc::new(ServerState {
             persistent_cache,
             root: root.clone(),
@@ -746,6 +754,7 @@ impl DevServer {
             scss_additional_data: oj_config::css_additional_data(&config, "scss"),
             sass_additional_data: oj_config::css_additional_data(&config, "sass"),
             css_config: config.css.clone(),
+            css_resolve,
             fs_allow: Arc::new(Mutex::new({
                 let mut set: std::collections::HashSet<PathBuf> = server_cfg
                     .fs
@@ -3088,6 +3097,7 @@ async fn ensure_module(
         let load_paths = sass_load_paths_for(state, url);
         let dir = file.parent().map(Path::to_path_buf);
         let src = source.clone();
+        let css_resolve = state.css_resolve.clone();
         let compiled = tokio::task::spawn_blocking(move || {
             oj_css::compile_sass_opts(
                 &src,
@@ -3095,6 +3105,7 @@ async fn ensure_module(
                     load_dir: dir.as_deref(),
                     additional_data: data.as_deref(),
                     load_paths: &load_paths,
+                    resolve: css_resolve.as_ref(),
                 },
             )
         })
@@ -3178,6 +3189,7 @@ async fn ensure_module(
     let url_owned = url.to_string();
     let sass_data = sass_additional_data_for(state, &url_owned);
     let sass_load_paths = sass_load_paths_for(state, &url_owned);
+    let css_resolve = state.css_resolve.clone();
     let css_dev_sourcemap = state
         .css_config
         .as_ref()
@@ -3218,6 +3230,7 @@ async fn ensure_module(
             });
         }
         if is_css {
+            let resolve = css_resolve.as_ref();
             let css_src = if oj_css::is_sass(&url_owned) && !sass_precompiled {
                 oj_css::compile_sass_opts(
                     &source,
@@ -3225,6 +3238,7 @@ async fn ensure_module(
                         load_dir: Some(&dir),
                         additional_data: sass_data.as_deref(),
                         load_paths: &sass_load_paths,
+                        resolve,
                     },
                 )?
             } else {
@@ -3232,12 +3246,8 @@ async fn ensure_module(
             };
             // Plain `@import`s are inlined (postcss-import parity) so the injected
             // stylesheet does not @import a bare specifier or a wrong-relative url.
-            let css_src = oj_css::inline_imports(&css_src, &file_owned)?;
-            let output = if css_dev_sourcemap {
-                oj_css::compile_css_rebased_with_map(&url_owned, &css_src, false)?
-            } else {
-                oj_css::compile_css_rebased(&url_owned, &css_src, false)?
-            };
+            let css_src = oj_css::inline_imports_with(&css_src, &file_owned, &resolve)?;
+            let output = oj_css::compile_css_dev(&url_owned, &css_src, css_dev_sourcemap, &resolve)?;
             return Ok(CachedModule {
                 is_boundary: true,
                 hot: None,

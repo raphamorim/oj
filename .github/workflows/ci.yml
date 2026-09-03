@@ -137,6 +137,9 @@ jobs:
       - name: ssr dev stack frames map back to the original .ts lines
         if: matrix.mode == 'unbundled'
         run: node e2e/ssr-stacktrace.mjs
+      - name: css specifiers resolve like Vite (alias, root-absolute, hacks)
+        if: matrix.mode == 'unbundled'
+        run: node e2e/css-vite-parity.mjs
 
   # i need to fix this or automate
   build:
