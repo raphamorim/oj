@@ -49,7 +49,8 @@ const get = async (route) => {
 let server;
 let failed = false;
 try {
-  server = spawn(oj, ["dev", app, "--port", String(port)], { stdio: "ignore" });
+  // Auto-discovery is opt-in (include-only pre-bundling is the default); this test covers the discovered path.
+  server = spawn(oj, ["dev", app, "--port", String(port)], { stdio: "ignore", env: { ...process.env, OJ_OPTIMIZE_SCAN: "1" } });
   for (let i = 0; i < 80; i++) {
     try { if ((await fetch(`http://localhost:${port}/`)).ok) break; } catch {}
     await new Promise((r) => setTimeout(r, 250));

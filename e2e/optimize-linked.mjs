@@ -55,7 +55,7 @@ try {
     'import { hi as h1 } from "norm-lib";\nimport { hi as h2 } from "link-lib";\nwindow.__R = h1() + h2();\n',
   );
 
-  server = spawn(oj, ["dev", app, "--port", String(port)], { stdio: "ignore" });
+  server = spawn(oj, ["dev", app, "--port", String(port)], { stdio: "ignore", env: { ...process.env, OJ_OPTIMIZE_SCAN: "1" } });
   for (let i = 0; i < 120; i++) {
     try { if ((await fetch(`http://localhost:${port}/`)).ok) break; } catch {}
     await new Promise((r) => setTimeout(r, 250));
@@ -63,7 +63,7 @@ try {
   // let the optimizer settle
   await new Promise((r) => setTimeout(r, 800));
 
-  const manifestPath = path.join(app, ".oj-cache", "deps", "manifest.json");
+  const manifestPath = path.join(app, ".oj-cache", "v1", "deps", "manifest.json");
   if (!fs.existsSync(manifestPath)) throw new Error("no deps manifest emitted");
   const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
   const meta = manifest.metadata || {};
