@@ -175,13 +175,16 @@ export function rewriteServerFns(code, rel) {
     changed = true;
     const id = JSON.stringify(Buffer.from(`${rel}#${name}`).toString("base64url"));
     const meta = `{ id: ${id}, name: ${JSON.stringify(name)}, filename: ${JSON.stringify(rel)} }`;
+    // Same line as the declaration, and the import shares the first line: the
+    // rewrite adds no lines, so the transform's source map (and stack traces)
+    // keep pointing at the right line of the original file.
     const rpc =
-      `${indent}export const ${name}_createServerFn_handler = createServerRpc(${meta}, ` +
-      `(opts) => ${name}.__executeServer(opts));\n`;
-    return `${pre}${rpc}${indent}${decl}${name}_createServerFn_handler, `;
+      `export const ${name}_createServerFn_handler = createServerRpc(${meta}, ` +
+      `(opts) => ${name}.__executeServer(opts)); `;
+    return `${pre}${indent}${rpc}${decl}${name}_createServerFn_handler, `;
   });
   if (!changed) return code;
-  return `import { createServerRpc } from "@tanstack/react-start/server-rpc";\n${out}`;
+  return `import { createServerRpc } from "@tanstack/react-start/server-rpc"; ${out}`;
 }
 
 export const PACK_FMT = 2;

@@ -301,8 +301,19 @@ pub fn ssr_transform_module(
     source: &str,
     opts: &crate::CompileOptions,
 ) -> Result<String, crate::CompileError> {
+    ssr_transform_module_with_map(path, source, opts).map(|(code, _)| code)
+}
+
+/// The transformed module plus the compile step's source map (a data URL). The
+/// SSR rewrite is line-preserving, so the map still locates every line of the
+/// result in the original source (Vite's ssrFixStacktrace input).
+pub fn ssr_transform_module_with_map(
+    path: &Path,
+    source: &str,
+    opts: &crate::CompileOptions,
+) -> Result<(String, Option<String>), crate::CompileError> {
     let compiled = crate::compile(path, source, opts)?;
-    Ok(ssr_transform(&compiled.code, path))
+    Ok((ssr_transform(&compiled.code, path), compiled.map_data_url))
 }
 
 fn resolve_local_symbol(scoping: &Scoping, s: &ExportSpecifier) -> Option<SymbolId> {
@@ -359,6 +370,11 @@ fn collect_pattern_names(pat: &BindingPattern, out: &mut Vec<String>) {
     }
 }
 
+// Line-preserving: the hoisted imports/exports share the first line with the
+// module's own code, and a removed span (an import statement, an `export`
+// keyword) keeps its line breaks, so every line keeps its number and the
+// compile step's source map still applies line for line (Vite gets the same
+// effect from magic-string; the runner's stack rewriting relies on it).
 fn apply(source: &str, mut edits: Vec<Edit>, hoisted: &[String]) -> String {
     edits.sort_by_key(|e| (e.start, e.end));
     let mut prefix_end = 0usize;
@@ -369,7 +385,7 @@ fn apply(source: &str, mut edits: Vec<Edit>, hoisted: &[String]) -> String {
     out.push_str(&source[..prefix_end]);
     for line in hoisted {
         out.push_str(line);
-        out.push('\n');
+        out.push(' ');
     }
     let mut pos = prefix_end as u32;
     for e in &edits {
@@ -378,6 +394,11 @@ fn apply(source: &str, mut edits: Vec<Edit>, hoisted: &[String]) -> String {
         }
         out.push_str(&source[pos as usize..e.start as usize]);
         out.push_str(&e.text);
+        let removed = source[e.start as usize..e.end as usize].matches('\n').count();
+        let kept = e.text.matches('\n').count();
+        for _ in kept..removed {
+            out.push('\n');
+        }
         pos = e.end;
     }
     out.push_str(&source[pos as usize..]);
@@ -568,6 +589,32 @@ mod tests {
         assert!(o.contains(r#"__vite_ssr_exportName__("x""#), "{o}");
         assert!(o.contains(r#"__vite_ssr_exportName__("default""#), "{o}");
         assert!(!o.contains(": number"), "TS type survived: {o}");
+    }
+
+    #[test]
+    fn rewrite_keeps_every_line_in_place() {
+        let src = "import {\n  a,\n  b,\n} from './u';\nimport d from './d';\nexport const x = a(b);\nexport default function f() {\n  return d + x;\n}\n";
+        let o = t(src);
+        assert_eq!(o.lines().count(), src.lines().count(), "{o}");
+        let out_lines: Vec<&str> = o.lines().collect();
+        let src_lines: Vec<&str> = src.lines().collect();
+        assert!(out_lines[0].contains("__vite_ssr_import__(\"./u\""), "hoisted on line 1: {o}");
+        assert!(out_lines[0].contains("__vite_ssr_exportName__(\"x\""), "{o}");
+        assert!(out_lines[5].contains("const x = "), "line 6 keeps `x`: {o}");
+        assert_eq!(src_lines[5], "export const x = a(b);");
+        assert!(out_lines[6].starts_with("function f() {"), "line 7 keeps `f`: {o}");
+        assert_eq!(out_lines[7], "  return (0, __vite_ssr_import_1__.default) + x;");
+    }
+
+    #[test]
+    fn module_with_map_returns_the_compile_map() {
+        use super::ssr_transform_module_with_map;
+        use crate::CompileOptions;
+        let src = "import { helper } from './u';\nexport const x: number = helper(1);";
+        let (code, map) = ssr_transform_module_with_map(Path::new("c.ts"), src, &CompileOptions::dev()).unwrap();
+        assert!(code.contains("__vite_ssr_import__"), "{code}");
+        let map = map.expect("dev compile carries a source map");
+        assert!(map.starts_with("data:application/json;charset=utf-8;base64,"), "{map}");
     }
 
     #[test]

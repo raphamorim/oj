@@ -148,10 +148,14 @@ export function transformGlob(code, filePath) {
           : `() => import(${JSON.stringify(spec)})`;
       return `${key}: ${imp}`;
     });
-    out += code.slice(last, m.index) + `{${entries.join(", ")}}`;
+    // Line-preserving: a call that spanned several lines keeps its line breaks
+    // (inside the braces), and the eager imports share the first line, so the
+    // transform's source map still points at the right lines of the original.
+    const spanned = code.slice(m.index, i).split("\n").length - 1;
+    out += code.slice(last, m.index) + `{${entries.join(", ")}${"\n".repeat(spanned)}}`;
     last = i;
     g++;
   }
   out += code.slice(last);
-  return prelude.length ? prelude.join("\n") + "\n" + out : out;
+  return prelude.length ? prelude.join(" ") + " " + out : out;
 }

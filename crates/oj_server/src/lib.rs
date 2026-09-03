@@ -952,6 +952,15 @@ fn js(body: impl IntoResponse) -> Response {
     ([(header::CONTENT_TYPE, "text/javascript")], body).into_response()
 }
 
+// An SSR module carries its source map inline: the runner maps stack frames
+// through it back to the original file (Vite's ssrFixStacktrace).
+fn with_inline_map(code: String, map_data_url: Option<String>) -> String {
+    match map_data_url {
+        Some(map) => format!("{code}\n//# sourceMappingURL={map}\n"),
+        None => code,
+    }
+}
+
 async fn ssr_resolve(
     State(state): State<Arc<ServerState>>,
     Query(q): Query<HashMap<String, String>>,
@@ -1091,13 +1100,13 @@ async fn ssr_module(
     opts.refresh = false;
     opts.ssr = true;
     if q.get("runner").map(|v| v == "1").unwrap_or(false) {
-        return match oj_compiler::ssr::ssr_transform_module(&compile_path, &source, &opts) {
-            Ok(code) => js(code),
+        return match oj_compiler::ssr::ssr_transform_module_with_map(&compile_path, &source, &opts) {
+            Ok((code, map)) => js(with_inline_map(code, map)),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
         };
     }
     match oj_compiler::compile(&compile_path, &source, &opts) {
-        Ok(out) => js(out.code),
+        Ok(out) => js(with_inline_map(out.code, out.map_data_url)),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
 }

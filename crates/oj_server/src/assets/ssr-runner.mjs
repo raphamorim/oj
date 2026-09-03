@@ -4,6 +4,8 @@
 import vm from "node:vm";
 import readline from "node:readline";
 import { fstatSync, statSync } from "node:fs";
+import { SourceMap } from "node:module";
+import path from "node:path";
 
 const [BASE, ENTRY] = process.argv.slice(2);
 
@@ -43,6 +45,39 @@ const context = vm.createContext(contextGlobals);
 
 const registry = new Map();
 const externals = new Map();
+// Source maps of the modules served by /@ssr-module, by module id. vm modules
+// get no source-map support from Node itself, so, like Vite's ssrFixStacktrace,
+// the runner rewrites stack frames through these before an error leaves it.
+const sourceMaps = new Map();
+const MAP_RE = /\n\/\/# sourceMappingURL=data:application\/json(?:;charset=[\w-]+)?;base64,([A-Za-z0-9+/=]+)\s*$/;
+function sourceMapOf(code) {
+  const m = MAP_RE.exec(code);
+  if (!m) return null;
+  try {
+    return new SourceMap(JSON.parse(Buffer.from(m[1], "base64").toString("utf8")));
+  } catch {
+    return null;
+  }
+}
+const FRAME_RE = /^ {4}at (?:(\S.*?)\s\()?(.+?):(\d+)(?::(\d+))?\)?/;
+function rewriteStack(stack) {
+  return String(stack)
+    .split("\n")
+    .map((line) =>
+      line.replace(FRAME_RE, (input, name, id, ln, col) => {
+        const map = sourceMaps.get(id);
+        if (!map) return input;
+        // Stack positions are 1-based, the map's are 0-based.
+        const pos = map.findEntry(Number(ln) - 1, Number(col ?? 1) - 1);
+        if (!pos || pos.originalSource == null || pos.originalLine == null) return input;
+        const file = path.resolve(path.dirname(id), pos.originalSource);
+        const where = `${file}:${pos.originalLine + 1}:${pos.originalColumn + 1}`;
+        const fn = name?.trim();
+        return !fn || fn === "eval" ? `    at ${where}` : `    at ${fn} (${where})`;
+      }),
+    )
+    .join("\n");
+}
 
 const enc = encodeURIComponent;
 
@@ -114,6 +149,9 @@ async function build(id) {
   if (inflight) return inflight;
   const p = (async () => {
     const code = await fetchText(`${BASE}/@ssr-module?id=${enc(id)}`);
+    const map = sourceMapOf(code);
+    if (map) sourceMaps.set(id, map);
+    else sourceMaps.delete(id);
     const mod = new vm.SourceTextModule(code, {
       context,
       identifier: id,
@@ -282,7 +320,7 @@ rl.on("line", (line) => {
   const emit = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
   const url = typeof msg.url === "string" ? msg.url : "/";
   const body = typeof msg.body === "string" ? msg.body : "";
-  const fail = (e) => emit({ error: String((e && e.stack) || e) });
+  const fail = (e) => emit({ error: e && e.stack ? rewriteStack(e.stack) : String(e) });
   if (msg.cmd === "render") withLock(() => handleRender(emit, url)).catch(fail);
   else if (msg.cmd === "load") withLock(() => handleLoad(emit, url)).catch(fail);
   else if (msg.cmd === "action") withLock(() => handleAction(emit, url, body)).catch(fail);
