@@ -100,9 +100,12 @@ test("runner serves requests over loopback http and commands over stdin", async 
     const after = await r.req({ url: "/hello", headers: { "x-forwarded-host": "h" } });
     assert.equal(after.status, 200);
 
+    // An exception escaping the handler is a 500 HTML page with message and
+    // stack, like Vite's errorMiddleware fallback body.
     const boom = await r.req({ url: "/boom", headers: { "x-forwarded-host": "h" } });
     assert.equal(boom.status, 500);
-    assert.match(boom.body, /kaboom/);
+    assert.match(boom.headers["content-type"], /text\/html/);
+    assert.match(boom.body, /<h1>Internal Server Error<\/h1><h2>kaboom<\/h2><pre>Error: kaboom/);
 
     const missing = await r.req({ url: "/missing", headers: { "x-forwarded-host": "h" } });
     assert.equal(missing.status, 404);
