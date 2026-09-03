@@ -237,7 +237,16 @@ pub struct DevServer {
     /// Vite's `--mode` for `serve` (default `development`): selects `.env.<mode>`,
     /// `import.meta.env.MODE`, and the mode plugin `config` hooks see.
     pub mode: Option<String>,
+    /// Builds the native plugin registry once the config is loaded; `None`
+    /// serves with no native plugins.
+    pub native_plugins: Option<NativePluginFactory>,
 }
+
+/// How the binary hands the server its compiled-in plugins: called with the
+/// canonical root and the loaded config, so a plugin can read its section
+/// (`OjConfig::config_section`) and decide whether it is active.
+pub type NativePluginFactory =
+    Arc<dyn Fn(&Path, &oj_config::OjConfig) -> oj_plugin::Registry + Send + Sync>;
 
 struct ServerState {
     root: PathBuf,
@@ -271,6 +280,12 @@ struct ServerState {
     preprocess: tokio::sync::OnceCell<std::sync::Arc<Sidecar>>,
     svelte: tokio::sync::OnceCell<std::sync::Arc<Sidecar>>,
     tailwind_urls: Mutex<std::collections::HashSet<String>>,
+    /// The compiled-in plugins active for this app (empty when none).
+    native: oj_plugin::SharedRegistry,
+    /// Served stylesheet urls in which a native plugin's CSS directive was
+    /// expanded: they are recompiled, never served from cache, when the
+    /// plugin's state changes.
+    directive_urls: Mutex<std::collections::HashSet<String>>,
     has_postcss: bool,
     scss_additional_data: Option<String>,
     sass_additional_data: Option<String>,
@@ -456,6 +471,13 @@ impl DevServer {
         plugins::adopt_vite_config_values(&mut config, &root, "serve", &dev_mode)
             .map_err(|e| anyhow::anyhow!(e))?;
         boot_phase("vite config values adopted");
+        let native: oj_plugin::SharedRegistry = Arc::new(match &self.native_plugins {
+            Some(factory) => factory(&root, &config),
+            None => oj_plugin::Registry::new(&root),
+        });
+        if !native.is_empty() {
+            println!("  native plugins: {}", native.names().join(", "));
+        }
 
         // Feed optimizeDeps.include/exclude/needsInterop into partial bundling so
         // the same vite.config field that drives Vite's dep pre-bundle drives oj's.
@@ -592,6 +614,12 @@ impl DevServer {
         });
         if let Some(dir) = &ssr_bridge_dir {
             plugin_cfg["ssrBridge"] = serde_json::json!({ "dir": dir.display().to_string() });
+        }
+        // JS plugins a native plugin declares it replaces: the host drops them
+        // the way it drops the React plugins oj always does natively.
+        let replaced = native.replaced_js_plugins();
+        if !replaced.is_empty() {
+            plugin_cfg["nativePluginNames"] = serde_json::json!(replaced);
         }
         let plugin_config = plugin_cfg.to_string();
         plugin_cfg["environment"]["name"] = serde_json::json!("ssr");
@@ -851,11 +879,21 @@ impl DevServer {
                     server: true,
                 },
             )),
-            cache: PersistentCache::new(oj_cache::cache_root(&root), env!("CARGO_PKG_VERSION"))
-                .with_salt_extra(&env_defines_digest)
-                // A cached compile embeds the JSX runtime import; a changed
-                // importSource/runtime must not serve the old module.
-                .with_salt_extra(&format!("jsx={jsx:?}")),
+            cache: {
+                let cache = PersistentCache::new(oj_cache::cache_root(&root), env!("CARGO_PKG_VERSION"))
+                    .with_salt_extra(&env_defines_digest)
+                    // A cached compile embeds the JSX runtime import; a changed
+                    // importSource/runtime must not serve the old module.
+                    .with_salt_extra(&format!("jsx={jsx:?}"));
+                // A native plugin's output is in the cached code and meta: the
+                // active set and each plugin's options key the cache too.
+                let plugin_salt = native.cache_salt();
+                if plugin_salt.is_empty() {
+                    cache
+                } else {
+                    cache.with_salt_extra(&format!("plugins={plugin_salt}"))
+                }
+            },
             memory: Mutex::new(MemoryCache::new(memory_cache_budget())),
             mtime_keys: Mutex::new(HashMap::new()),
             compile_locks: Mutex::new(HashMap::new()),
@@ -864,6 +902,8 @@ impl DevServer {
             preprocess: tokio::sync::OnceCell::new(),
             svelte: tokio::sync::OnceCell::new(),
             tailwind_urls: Mutex::new(std::collections::HashSet::new()),
+            native: Arc::clone(&native),
+            directive_urls: Mutex::new(std::collections::HashSet::new()),
             has_postcss: has_postcss_config(&root),
             scss_additional_data: oj_config::css_additional_data(&config, "scss"),
             sass_additional_data: oj_config::css_additional_data(&config, "sass"),
@@ -2983,6 +3023,21 @@ async fn serve_path(
         decoded.as_str()
     };
 
+    // A native plugin's virtual sheet: `/@oj/<name>.css`, built from the
+    // plugin's state on every request (a css-update names it on change).
+    if let Some(name) = oj_plugin::virtual_css_name(uri.path()) {
+        if let Some(sheet) = state.native.virtual_sheet(name) {
+            return (
+                [
+                    (header::CONTENT_TYPE, "text/css"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
+                sheet.css,
+            )
+                .into_response();
+        }
+    }
+
     if let Some(name) = uri.path().strip_prefix("/@oj-deps/") {
         if name.contains('/') || name.contains("..") {
             return (StatusCode::FORBIDDEN, "oj: bad optimized dep path").into_response();
@@ -3397,6 +3452,7 @@ async fn ensure_module(
                 let module = Arc::new(CachedModule {
                     is_boundary: false,
                     hot: None,
+                    meta: Vec::new(),
                     kind: match factory.kind {
                         oj_compiler::bundle::FactoryKind::Esm => "esm".into(),
                         oj_compiler::bundle::FactoryKind::Cjs => "cjs".into(),
@@ -3431,6 +3487,7 @@ async fn ensure_module(
                 let module = Arc::new(CachedModule {
                     is_boundary: false,
                     hot: None,
+                    meta: Vec::new(),
                     kind: match factory.kind {
                         oj_compiler::bundle::FactoryKind::Esm => "esm".into(),
                         oj_compiler::bundle::FactoryKind::Cjs => "cjs".into(),
@@ -3462,6 +3519,7 @@ async fn ensure_module(
             Arc::new(CachedModule {
                 is_boundary: false,
                 hot: None,
+                meta: Vec::new(),
                 kind: match factory.kind {
                     oj_compiler::bundle::FactoryKind::Esm => "esm".into(),
                     oj_compiler::bundle::FactoryKind::Cjs => "cjs".into(),
@@ -3478,6 +3536,7 @@ async fn ensure_module(
             Arc::new(CachedModule {
                 is_boundary: false,
                 hot: None,
+                meta: Vec::new(),
                 kind: String::new(),
                 code: default,
                 map_data_url: None,
@@ -3504,9 +3563,10 @@ async fn ensure_module(
             .get(url)
             .filter(|(t, s, _)| *t == mtime && *s == size)
             .map(|(_, _, k)| k.clone());
-        if let Some(key) = cached_key {
+        if let Some(key) = cached_key.filter(|_| state.native.mtime_cacheable(file)) {
             if let Some(module) = memory_get(state, url, &key) {
                 register_in_graph(state, url, &module);
+                native_module_seen(state, file, &module);
                 return Ok((key, module));
             }
         }
@@ -3559,6 +3619,25 @@ async fn ensure_module(
         )
         .map_err(|err| format!("read error for {url}: {err}"))?,
     };
+    // A native plugin's CSS directive is masked before any sidecar sees the
+    // sheet and expanded after Lightning CSS, so the plugin's CSS never goes
+    // through a pipeline stage that might reject or rewrite it.
+    let mut masked_directives: Vec<&'static str> = Vec::new();
+    let source = if file.extension().and_then(|e| e.to_str()).is_some_and(is_style_ext) {
+        let mut source = source;
+        for (directive, _) in state.native.css_directives() {
+            if let Some(masked) = oj_css::directive::mask(&source, directive) {
+                source = masked;
+                masked_directives.push(directive);
+            }
+        }
+        if !masked_directives.is_empty() {
+            state.directive_urls.lock().unwrap().insert(url.to_string());
+        }
+        source
+    } else {
+        source
+    };
     if !state.bundle && source.contains("import.meta.glob") {
         let patterns: Vec<glob::Pattern> = oj_compiler::glob::glob_patterns(&source, file)
             .iter()
@@ -3574,9 +3653,11 @@ async fn ensure_module(
     }
     if file.extension().and_then(|e| e.to_str()) == Some("css") && is_tailwind_css(&source) {
         let css = compile_tailwind(state, url, &source).await?;
+        let css = unmask_directives(state, &masked_directives, css);
         let module = Arc::new(CachedModule {
             is_boundary: true,
             hot: None,
+            meta: Vec::new(),
             kind: "css".into(),
             code: css,
             map_data_url: None,
@@ -3623,6 +3704,7 @@ async fn ensure_module(
 
     if let Some(module) = memory_get(state, url, &key) {
         register_in_graph(state, url, &module);
+        native_module_seen(state, file, &module);
         return Ok((key, module));
     }
 
@@ -3634,6 +3716,7 @@ async fn ensure_module(
 
     if let Some(module) = memory_get(state, url, &key) {
         register_in_graph(state, url, &module);
+        native_module_seen(state, file, &module);
         return Ok((key, module));
     }
     // The persistent (cross-restart) cache holds post-plugin-transform code. A
@@ -3655,6 +3738,9 @@ async fn ensure_module(
         if !needs_retransform {
             memory_put(state, url, &key, &module);
             register_in_graph(state, url, &module);
+            // Warm start: the plugins learn about the module from its cached
+            // side channel instead of a retransform.
+            native_module_seen(state, file, &module);
             replay_module_parsed(state, file, &key, is_dep_early, is_server).await;
             return Ok((key, module));
         }
@@ -3665,6 +3751,7 @@ async fn ensure_module(
         let module = Arc::new(CachedModule {
             is_boundary: false,
             hot: None,
+            meta: Vec::new(),
             kind: String::new(),
             code,
             map_data_url: None,
@@ -3806,6 +3893,7 @@ async fn ensure_module(
         let module = Arc::new(CachedModule {
             is_boundary: false,
             hot: None,
+            meta: Vec::new(),
             kind: String::new(),
             code: format!(
                 "export default {};\n",
@@ -3857,6 +3945,8 @@ async fn ensure_module(
         .unwrap_or(false);
     let bundle = state.bundle;
     let hmr_state = Arc::clone(state);
+    let native = Arc::clone(&state.native);
+    let masked_directives_owned = masked_directives.clone();
     let plugin_fallback = state.plugins.is_some() && !bundle;
     let svgr_active = state.plugins_have_transform && !bundle;
     let resolve_id_res = if plugin_fallback { state.resolve_id_res.clone() } else { Vec::new() };
@@ -3880,6 +3970,7 @@ async fn ensure_module(
             return Ok(CachedModule {
                 is_boundary: false,
                 hot: None,
+                meta: Vec::new(),
                 kind: if bundle { "esm".into() } else { String::new() },
                 code,
                 map_data_url: None,
@@ -3913,6 +4004,7 @@ async fn ensure_module(
                 oj_css::inline_imports_with(&css_src, &file_owned, &resolve)?
             };
             let output = oj_css::compile_css_dev(&url_owned, &css_src, css_dev_sourcemap, &resolve)?;
+            let css = unmask_directives_with(&native, &masked_directives_owned, output.css);
             // A CSS module exports its class map, which changes on edit, so it
             // cannot self-accept (Vite's css-analysis): the update climbs to the
             // importing component, whose re-import fetches the new exports.
@@ -3920,8 +4012,9 @@ async fn ensure_module(
             return Ok(CachedModule {
                 is_boundary: !is_css_module,
                 hot: None,
+                meta: Vec::new(),
                 kind: "css".into(),
-                code: output.css,
+                code: css,
                 map_data_url: None,
                 imports: Vec::new(),
                 require_map: Vec::new(),
@@ -4024,6 +4117,7 @@ async fn ensure_module(
             Ok(CachedModule {
                 is_boundary: factory.is_boundary(),
                 hot: None,
+                meta: Vec::new(),
                 kind: match factory.kind {
                     oj_compiler::bundle::FactoryKind::Esm => "esm".into(),
                     oj_compiler::bundle::FactoryKind::Cjs => "cjs".into(),
@@ -4111,12 +4205,24 @@ async fn ensure_module(
                     oj_compiler::CompileOptions::dev()
                 };
                 opts.jsx = jsx_config;
-                oj_compiler::compile_module_with_maps(
+                let src = interopped.as_deref().unwrap_or(&source);
+                // The native plugin pass, gated by the plugins' filters before
+                // the parse; absent, the compile is exactly what it was.
+                let mut pre = |cx: &mut oj_compiler::AstCx<'_, '_>| native.run_pre_transform(cx);
+                let module_type = oj_compiler::module_type_of(&file_owned);
+                let pre_slot: Option<&mut oj_compiler::PreTransformer> =
+                    if native.wants_pre_transform(&file_owned, Some(src), module_type) {
+                        Some(&mut pre)
+                    } else {
+                        None
+                    };
+                oj_compiler::compile_module_full(
                     &file_owned,
-                    interopped.as_deref().unwrap_or(&source),
+                    src,
                     &opts,
                     Some(&mut rewrite),
                     &plugin_maps,
+                    pre_slot,
                 )
             }
             .map_err(|err| format!("compile error:\n{err}"))?;
@@ -4141,6 +4247,7 @@ async fn ensure_module(
                 },
                 require_map: Vec::new(),
                 css_exports: Vec::new(),
+                meta: output.meta,
             })
         }
     })
@@ -4168,13 +4275,16 @@ async fn ensure_module(
         }
         Err(join_err) => return Err(format!("compiler task failed: {join_err}")),
     };
-    if state.persistent_cache {
+    // A sheet with an expanded plugin directive holds plugin state, not a
+    // function of its source: it never survives a restart.
+    if state.persistent_cache && masked_directives.is_empty() {
         let _ = state
             .cache_writes
             .try_send((key.clone(), Arc::clone(&module)));
     }
     memory_put(state, url, &key, &module);
     register_in_graph(state, url, &module);
+    native_module_seen(state, file, &module);
     state
         .resolve_failed
         .lock()
@@ -4184,6 +4294,32 @@ async fn ensure_module(
         state.parsed_fired.lock().unwrap().insert(key.clone());
     }
     Ok((key, module))
+}
+
+/// Hand a served module to the native plugins, with the side channel the
+/// compile (or the cache) carries for it. A no-op with no plugins.
+fn native_module_seen(state: &ServerState, file: &Path, module: &CachedModule) {
+    if !state.native.is_empty() {
+        state.native.module_seen(file, &module.meta);
+    }
+}
+
+fn unmask_directives(state: &ServerState, masked: &[&'static str], css: String) -> String {
+    unmask_directives_with(&state.native, masked, css)
+}
+
+/// Expand the directives masked before the pipeline with what their plugins
+/// say they are now.
+fn unmask_directives_with(native: &oj_plugin::Registry, masked: &[&'static str], mut css: String) -> String {
+    if masked.is_empty() {
+        return css;
+    }
+    for (directive, plugin) in native.css_directives() {
+        if masked.contains(&directive) {
+            css = oj_css::directive::unmask(&css, directive, &plugin.css_for_directive());
+        }
+    }
+    css
 }
 
 async fn replay_module_parsed(
@@ -7155,8 +7291,7 @@ impl HmrGate {
                 );
             } else {
                 let paths: Vec<PathBuf> = entries.into_iter().map(|(p, _)| p).collect();
-                let sref: &ServerState = state;
-                for message in decide(sref, &paths, &Default::default()).await {
+                for message in decide(&state, &paths, &Default::default()).await {
                     let _ = state.reload_tx.send(message);
                 }
             }
@@ -7492,7 +7627,7 @@ fn parse_hmr_filter(raw: &str) -> Option<Vec<PathBuf>> {
 /// `created`: the paths the watcher reported as newly created among `paths`
 /// (the rest are edits, or removals when the file is gone).
 async fn decide(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     paths: &[PathBuf],
     created: &std::collections::HashSet<PathBuf>,
 ) -> Vec<String> {
@@ -7602,6 +7737,27 @@ async fn decide(
         }
     }
 
+    // Native plugins: a change may invalidate other modules (`Module`); those
+    // join the changed set so the loop below treats them as edited too.
+    if !state.native.is_empty() {
+        let mut extra: Vec<PathBuf> = Vec::new();
+        for path in &paths {
+            for inv in state.native.invalidates(path) {
+                if let oj_plugin::Invalidation::Module(p) = inv {
+                    if !paths.contains(&p) && !extra.contains(&p) {
+                        extra.push(p);
+                    }
+                }
+            }
+        }
+        for p in &extra {
+            let url = url_of(&state.root, p);
+            state.mtime_keys.lock().unwrap().remove(&url);
+            state.memory.lock().unwrap().remove(&url);
+        }
+        paths.extend(extra);
+    }
+
     for path in &paths {
         // Vite's default watch ignores: `**/node_modules/**` and `**/.git/**`
         // at any depth (a nested package's node_modules included).
@@ -7610,6 +7766,13 @@ async fn decide(
             c == "node_modules" || c == ".oj-cache" || c == "dist" || c == ".git"
         }) {
             continue;
+        }
+
+        if !state.native.is_empty() {
+            if let Some(frame) = native_invalidations(state, path, &mut updates).await {
+                messages.push(frame);
+                return messages;
+            }
         }
 
         if let Some(host) = &state.plugins {
@@ -7858,6 +8021,58 @@ async fn decide(
         messages.push(serde_json::json!({ "type": "update", "updates": updates }).to_string());
     }
     messages
+}
+
+/// What the native plugins say a changed file invalidates, as HMR frames:
+/// `CssUrl` becomes a css-update (and drops that sheet's cache so it is
+/// rebuilt), `FullReload` returns the full-reload frame to send instead, and
+/// a plugin that reported anything gets its directive sheets repushed. A
+/// deleted file is reported to the plugins first; a changed module the
+/// plugins care about is recompiled here so the registry the sheets read is
+/// current before the client fetches them.
+async fn native_invalidations(
+    state: &Arc<ServerState>,
+    path: &Path,
+    updates: &mut Vec<serde_json::Value>,
+) -> Option<String> {
+    if !path.exists() {
+        state.native.module_removed(path);
+    }
+    let invalidations = state.native.invalidates(path);
+    if invalidations.is_empty() {
+        return None;
+    }
+    let url = url_of(&state.root, path);
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if path.is_file() && COMPILABLE.contains(&ext) && state.graph.lock().unwrap().contains(Path::new(&url)) {
+        state.mtime_keys.lock().unwrap().remove(&url);
+        state.memory.lock().unwrap().remove(&url);
+        if let Err(e) = ensure_module(state, path, &url).await {
+            eprintln!("oj: recompile for native plugins failed for {url}: {e}");
+        }
+    }
+    let timestamp = now_millis() as u64;
+    let mut css_urls: Vec<String> = Vec::new();
+    for inv in invalidations {
+        match inv {
+            oj_plugin::Invalidation::FullReload(reason) => {
+                println!("oj: change {} -> full-reload (native plugin: {reason})", path.display());
+                return Some(full_reload_frame(&reason, None, Some(path)));
+            }
+            oj_plugin::Invalidation::CssUrl(css_url) => css_urls.push(css_url),
+            oj_plugin::Invalidation::Module(_) => {}
+        }
+    }
+    css_urls.extend(state.directive_urls.lock().unwrap().iter().cloned());
+    css_urls.sort();
+    css_urls.dedup();
+    for css_url in css_urls {
+        state.mtime_keys.lock().unwrap().remove(&css_url);
+        state.memory.lock().unwrap().remove(&css_url);
+        println!("oj: change {} -> css-update {css_url} (native plugin)", path.display());
+        updates.push(update_entry("css-update", &css_url, timestamp));
+    }
+    None
 }
 
 #[cfg(test)]

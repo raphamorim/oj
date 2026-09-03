@@ -21,6 +21,12 @@ fn report_css_warnings(name: &str, warnings: &RwLock<Vec<CssError<ParserError<'_
         return;
     };
     const SHOWN: usize = 5;
+    // The plugin-directive sentinel is an unknown at-rule on purpose; the
+    // parser keeping it (and saying so) is the mechanism working, not a warning.
+    let list: Vec<&CssError<ParserError<'_>>> = list
+        .iter()
+        .filter(|w| !w.to_string().contains(directive::SENTINEL_AT_RULE))
+        .collect();
     for w in list.iter().take(SHOWN) {
         eprintln!("oj: css warning in {name}: {w}");
     }

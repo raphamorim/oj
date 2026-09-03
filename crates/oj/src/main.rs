@@ -175,6 +175,7 @@ async fn run() -> anyhow::Result<()> {
                     no_cache,
                     lazy,
                     mode,
+                    native_plugins: None,
                 }
                 .run()
                 .await

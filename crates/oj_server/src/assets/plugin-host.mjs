@@ -359,11 +359,14 @@ async function loadViteConfig(configPath) {
   return typeof mod.default === "function" ? await mod.default(env) : mod.default;
 }
 
+// The React-family plugins oj always reimplements natively, plus whatever the
+// active native plugins declare they replace (`nativePluginNames` from oj).
 const OJ_NATIVE_PLUGIN_NAMES = new Set([
   "vite:react-babel",
   "vite:react-refresh",
   "vite:react-swc",
   "vite:react-swc:resolve-runtime",
+  ...(Array.isArray(initial.nativePluginNames) ? initial.nativePluginNames : []),
 ]);
 
 // Dev-tooling plugins oj cannot host: they drive a full Vite dev server (ws
