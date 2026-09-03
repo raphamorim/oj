@@ -13,6 +13,13 @@ const APP = process.env.OJ_APP_ROOT ?? process.cwd();
 const { build } = await importPkg(APP, "rolldown", ["vite", "@tanstack/react-start"]);
 const WORKSPACE = workspaceRoot(APP);
 const SERVER_FN_BASE = process.env.TSS_SERVER_FN_BASE ?? "/_serverFn/";
+// The config's `define` map (OJ_DEFINE from oj). Vite's define plugin applies
+// it to the client environment exactly as to SSR, so a define a component
+// references must not render on the server and then throw on hydration.
+// Config defines win over Vite's env defines, as in the SSR loader.
+const USER_DEFINE = (() => {
+  try { return JSON.parse(process.env.OJ_DEFINE || "{}") || {}; } catch { return {}; }
+})();
 
 function rewriteServerFns(code, id) {
   if (!code.includes("createServerFn")) return null;
@@ -105,6 +112,8 @@ const result = await build({
       "process.env": JSON.stringify({ NODE_ENV: "development", TSS_SERVER_FN_BASE: SERVER_FN_BASE }),
       global: "globalThis",
       ...viteEnvDefine({ ssr: false }),
+      ...USER_DEFINE,
+      ...(container?.defines?.() ?? {}),
     },
   },
   resolve: {
