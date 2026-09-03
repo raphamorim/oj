@@ -116,6 +116,9 @@ jobs:
       - name: this.resolve / this.load consult sibling plugins first
         if: matrix.mode == 'unbundled'
         run: node e2e/plugin-ctx-chain.mjs
+      - name: plugin config() define reaches dev and build compiles
+        if: matrix.mode == 'unbundled'
+        run: node e2e/plugin-config-define.mjs
 
   # i need to fix this or automate
   build:

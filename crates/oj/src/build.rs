@@ -1927,6 +1927,15 @@ async fn user_plugin_host(
     }
 }
 
+// `define` entries the plugins' config() hooks returned; Vite merges them into
+// config.define, so they join the build's define map (plugin value wins).
+async fn plugin_config_defines(host: &Option<Arc<PluginHost>>) -> Vec<(String, String)> {
+    match host {
+        Some(h) => h.config_defines().await,
+        None => Vec::new(),
+    }
+}
+
 pub async fn build(
     root: PathBuf,
     out: Option<PathBuf>,
@@ -2122,6 +2131,7 @@ pub async fn build(
         mode,
     )
     .await;
+    let plugin_defines = plugin_config_defines(&plugin_host).await;
     let emit = Arc::new(EmitState::new(root.to_path_buf()));
     let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
     if let Some(host) = &plugin_host {
@@ -2139,6 +2149,7 @@ pub async fn build(
         ));
         pairs.extend(oj_config::config_defines(&config));
         pairs.extend(oj_config::environment_defines(&config, "client"));
+        pairs.extend(plugin_defines);
         pairs
     };
     oj_plugins.push(Arc::new(OjCssPlugin {
@@ -3184,6 +3195,7 @@ pub(crate) async fn build_ssr(
         mode,
     )
     .await;
+    let plugin_defines = plugin_config_defines(&plugin_host).await;
 
     // Vite's SSR externalization: dependencies stay external unless
     // `ssr.noExternal` (or a webworker target) bundles them; `ssr.external` wins.
@@ -3278,6 +3290,7 @@ pub(crate) async fn build_ssr(
                 ));
                 pairs.extend(oj_config::config_defines(&config));
                 pairs.extend(oj_config::environment_defines(&config, "ssr"));
+                pairs.extend(plugin_defines);
                 pairs.into_iter().collect()
             }),
             ..Default::default()
@@ -3740,6 +3753,7 @@ async fn build_client_entry(
         mode,
     )
     .await;
+    let plugin_defines = plugin_config_defines(&plugin_host).await;
     let emit = Arc::new(EmitState::new(root.to_path_buf()));
     let mut oj_plugins: Vec<SharedPluginable> = Vec::new();
     if let Some(host) = &plugin_host {
@@ -3792,6 +3806,7 @@ async fn build_client_entry(
                 ));
                 pairs.extend(oj_config::config_defines(&config));
                 pairs.extend(oj_config::environment_defines(&config, "client"));
+                pairs.extend(plugin_defines);
                 pairs.into_iter().collect()
             }),
             ..Default::default()

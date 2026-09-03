@@ -603,6 +603,7 @@ function deepMerge(a, b) {
   return b === undefined ? a : b;
 }
 
+let pluginConfigDelta = {};
 async function runConfigHooks() {
   userResolvedViteConfig = await loadUserResolvedViteConfig();
   let config = initial.config ?? {};
@@ -628,8 +629,14 @@ async function runConfigHooks() {
   config.plugins = configPlugins;
   for (const { p, fn } of pluginsWithHook("config")) {
     try {
-      const partial = await fn.call(ctx, config, env);
-      if (partial) config = deepMerge(config, partial);
+      const partial = await fn.call(ctxFor(p), config, env);
+      if (partial) {
+        config = deepMerge(config, partial);
+        // What the plugins themselves contributed (Vite merges it into the
+        // resolved config); Rust asks for it via getPluginConfig so values oj
+        // applies natively (define) reach the compile too.
+        pluginConfigDelta = deepMerge(pluginConfigDelta, partial);
+      }
     } catch (e) {
       if (!ojStartMode) throw e;
       process.stderr.write(`${OJ} plugin host: config(${p.name ?? "?"}) skipped: ${(e && e.message) || e}\n`);
@@ -1577,6 +1584,14 @@ async function run(hook, args) {
   }
   if (hook === "writeBundle") return writeBundle(args[0], args[1] === "true");
   if (hook === "getPluginCount") return String(plugins.length);
+  if (hook === "getPluginConfig") {
+    // JSON-safe subset of what config() hooks returned (functions/RegExps drop).
+    let define = null;
+    try {
+      define = pluginConfigDelta.define ? JSON.parse(JSON.stringify(pluginConfigDelta.define)) : null;
+    } catch {}
+    return JSON.stringify({ define });
+  }
   if (hook === "getEnvDelta") {
     // config() hooks ran at module init (top-level await), so the diff vs the
     // process-start snapshot is final by the time any stdio hook is answered.
