@@ -128,6 +128,9 @@ jobs:
       - name: start prod build honors ssr.external (bare imports, server still renders)
         if: matrix.mode == 'unbundled'
         run: node e2e/start-ssr-external.mjs
+      - name: ssr dev stack frames map back to the original .ts lines
+        if: matrix.mode == 'unbundled'
+        run: node e2e/ssr-stacktrace.mjs
 
   # i need to fix this or automate
   build:

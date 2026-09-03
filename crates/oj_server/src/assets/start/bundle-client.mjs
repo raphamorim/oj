@@ -45,7 +45,8 @@ function rewriteServerFns(code, id) {
     const id2 = Buffer.from(`${rel}#${e.name}`).toString("base64url");
     out = out.slice(0, e.open) + `createClientRpc(${JSON.stringify(id2)})` + out.slice(e.close);
   }
-  return `import { createClientRpc } from "@tanstack/react-start/client-rpc";\n${out}`;
+  // On the first line, not above it: the rewrite must not shift source lines.
+  return `import { createClientRpc } from "@tanstack/react-start/client-rpc"; ${out}`;
 }
 
 // The app's package.json "imports" wins over the src/router convention, the

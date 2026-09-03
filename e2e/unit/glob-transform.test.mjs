@@ -148,7 +148,7 @@ test("eager + query + import:default produces static imports of the ?query", () 
       join(dir, "index.ts"),
     );
     assert.match(out, /^import\s+\w+\s+from\s+"\.\/content\/a\.md\?raw";/m);
-    assert.match(out, /^import\s+\w+\s+from\s+"\.\/content\/b\.md\?raw";/m);
+    assert.match(out, /(?:^|; )import\s+\w+\s+from\s+"\.\/content\/b\.md\?raw";/m);
     assert.doesNotMatch(out, /\(\)\s*=>\s*import/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -221,6 +221,31 @@ test("an empty glob yields an empty map, not a crash", () => {
   try {
     const out = transformGlob('const m = import.meta.glob("./nope/*.md");', join(dir, "index.ts"));
     assert.match(out, /const m = \{\}/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the rewrite adds no lines (source maps and stack traces stay aligned)", () => {
+  const dir = fixture();
+  try {
+    const code = [
+      "// header",
+      "const eager = import.meta.glob(",
+      '  "./content/*.md",',
+      "  { eager: true },",
+      ") as Record<string, unknown>;",
+      'const lazy = import.meta.glob("./pages/**/*.tsx");',
+      "export const marker = 1;",
+    ].join("\n");
+    const out = transformGlob(code, join(dir, "index.ts"));
+    const lines = out.split("\n");
+    assert.equal(lines.length, code.split("\n").length, out);
+    assert.match(lines[0], /^import \* as __oj_glob0_0 from "\.\/content\/a\.md"; import \* as __oj_glob0_1 from "\.\/content\/b\.md"; \/\/ header$/);
+    assert.match(lines[1], /^const eager = \{"\.\/content\/a\.md": __oj_glob0_0, "\.\/content\/b\.md": __oj_glob0_1$/);
+    assert.match(lines[4], /^\} as Record<string, unknown>;$/);
+    assert.match(lines[5], /^const lazy = \{.*\};$/);
+    assert.equal(lines[6], "export const marker = 1;");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

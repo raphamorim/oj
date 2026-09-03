@@ -290,6 +290,24 @@ test("rewriteServerFns handles an exported const and multiple functions", () => 
   assert.equal(out.match(/from "@tanstack\/react-start\/server-rpc"/g).length, 1);
 });
 
+test("rewriteServerFns adds no lines (source maps and stack traces stay aligned)", () => {
+  const code = [
+    'import { createServerFn } from "@tanstack/react-start";',
+    "",
+    "export const a = createServerFn({",
+    '  method: "GET",',
+    "}).handler(async () => {",
+    '  throw new Error("boom");',
+    "});",
+  ].join("\n");
+  const out = rewriteServerFns(code, "src/fns.ts");
+  const lines = out.split("\n");
+  assert.equal(lines.length, code.split("\n").length, out);
+  assert.match(lines[0], /^import \{ createServerRpc \} from "@tanstack\/react-start\/server-rpc"; import \{ createServerFn \}/);
+  assert.match(lines[2], /^export const a_createServerFn_handler = createServerRpc\(.*\); export const a = createServerFn\(\{$/);
+  assert.equal(lines[5], '  throw new Error("boom");');
+});
+
 test("stripJsonc + readJsonc tolerate comments and trailing commas", () => {
   const dir = mk("jsonc");
   try {
