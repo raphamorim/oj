@@ -155,6 +155,26 @@ impl OjResolver {
         }
     }
 
+    /// The resolver for `require()` specifiers: Vite's `getConditions` pushes
+    /// `require` instead of `import` when resolving for a requirer (`isRequire`),
+    /// so a dual package's `exports` map hands its CommonJS build to a CJS dep
+    /// that requires it and its ESM build to an importer. Everything else
+    /// (aliases, extensions, dedupe, tsconfig paths) is the same, and the fs
+    /// cache is shared.
+    pub fn require_variant(&self) -> Self {
+        let mut options = self.inner.options().clone();
+        for c in options.condition_names.iter_mut() {
+            if c == "import" {
+                *c = "require".to_string();
+            }
+        }
+        Self {
+            inner: self.inner.clone_with_options(options),
+            root: self.root.clone(),
+            dedupe: self.dedupe.clone(),
+        }
+    }
+
     /// A bare import of a `resolve.dedupe` package resolves from the project
     /// root so nested / monorepo copies collapse to one instance (Vite parity).
     fn should_dedupe(&self, specifier: &str) -> bool {
@@ -305,6 +325,31 @@ mod tests {
             .unwrap()
             .ends_with("browser.js"));
         assert!(node.resolve(&dir, "dual-pkg").unwrap().ends_with("node.js"));
+    }
+
+    #[test]
+    fn require_variant_swaps_the_import_condition_for_require() {
+        // Vite getConditions: a require() resolves with `require`, not `import`,
+        // so a dual package's exports map picks its CJS build for a requirer.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/dual");
+        let importer = OjResolver::with_conditions(
+            &dir,
+            &["browser", "import", "development", "default"].map(String::from),
+        );
+        let requirer = importer.require_variant();
+        assert!(importer
+            .resolve(&dir, "esm-cjs")
+            .unwrap()
+            .ends_with("esm.mjs"));
+        assert!(requirer
+            .resolve(&dir, "esm-cjs")
+            .unwrap()
+            .ends_with("cjs.cjs"));
+        // Conditions other than import are untouched (browser still wins).
+        assert!(requirer
+            .resolve(&dir, "dual-pkg")
+            .unwrap()
+            .ends_with("browser.js"));
     }
 
     #[test]
