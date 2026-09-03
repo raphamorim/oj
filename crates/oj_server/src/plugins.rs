@@ -1038,9 +1038,14 @@ impl PluginHost {
         Ok(chunks)
     }
 
+    /// `buildEnd(error?)`: Rollup passes the error that failed the build, so
+    /// plugins see a failed build too (`None` for a successful one).
     #[inline]
-    pub async fn build_end(&self) -> Result<(), String> {
-        self.call("buildEnd", &[]).await.map(|_| ())
+    pub async fn build_end(&self, error: Option<&str>) -> Result<(), String> {
+        match error {
+            Some(e) => self.call("buildEnd", &[e]).await.map(|_| ()),
+            None => self.call("buildEnd", &[]).await.map(|_| ()),
+        }
     }
 
     #[inline]
