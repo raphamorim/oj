@@ -2380,10 +2380,8 @@ pub async fn build(
                 }
                 fs::write(&dest, &css)?;
                 emitted.push((name.clone(), css.len()));
-                rewritten_html = rewritten_html.replace(
-                    &format!("href=\"{href}\""),
-                    &format!("href=\"{}\"", with_base(&name, &base)),
-                );
+                rewritten_html =
+                    rewrite_link_hrefs(&rewritten_html, &href, &with_base(&name, &base));
             }
         }
 
@@ -2617,6 +2615,35 @@ fn insert_before_head(html: &str, snippet: &str) -> String {
     }
 }
 
+
+/// Rewrite the `href` of every `<link>` whose value is `from`, keeping the tag's
+/// own quoting (single, double or none), so a bundled stylesheet link is updated
+/// however the page spelled it.
+fn rewrite_link_hrefs(html: &str, from: &str, to: &str) -> String {
+    let mut out = String::with_capacity(html.len() + to.len());
+    let mut last = 0;
+    for (start, _) in html.match_indices("<link") {
+        if start < last {
+            continue;
+        }
+        let Some(end) = html[start..].find('>') else {
+            continue;
+        };
+        let tag = &html[start..start + end];
+        let Some(value) = html_attr(tag, "href") else {
+            continue;
+        };
+        if value != from {
+            continue;
+        }
+        let offset = value.as_ptr() as usize - tag.as_ptr() as usize;
+        out.push_str(&html[last..start + offset]);
+        out.push_str(to);
+        last = start + offset + value.len();
+    }
+    out.push_str(&html[last..]);
+    out
+}
 
 fn html_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
     let bytes = tag.as_bytes();
@@ -4644,6 +4671,17 @@ mod tests {
         assert_eq!(human_bytes(1_048_575), "1024.0kB");
         assert_eq!(human_bytes(1_048_576), "1.0MB");
         assert_eq!(human_bytes(3_145_728), "3.0MB");
+    }
+
+    #[test]
+    fn rewrite_link_hrefs_keeps_the_pages_quoting() {
+        let html = "<link rel='stylesheet' href='/site.css'><link rel=stylesheet href=/site.css><link rel=\"stylesheet\" href = \"/site.css\"><link href=\"/other.css\">";
+        let out = rewrite_link_hrefs(html, "/site.css", "/assets/site-abc.css");
+        assert_eq!(
+            out,
+            "<link rel='stylesheet' href='/assets/site-abc.css'><link rel=stylesheet href=/assets/site-abc.css><link rel=\"stylesheet\" href = \"/assets/site-abc.css\"><link href=\"/other.css\">"
+        );
+        assert_eq!(rewrite_link_hrefs("<p>no links</p>", "/a", "/b"), "<p>no links</p>");
     }
 
     #[test]
