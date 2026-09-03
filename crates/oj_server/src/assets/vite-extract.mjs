@@ -222,6 +222,24 @@ function extractBuild(b) {
   if (typeof b.ssr === "string" || typeof b.ssr === "boolean") out.ssr = b.ssr;
   if (typeof b.ssrManifest === "string" || typeof b.ssrManifest === "boolean") out.ssrManifest = b.ssrManifest;
   if (typeof b.copyPublicDir === "boolean") out.copyPublicDir = b.copyPublicDir;
+  if (typeof b.manifest === "string" || typeof b.manifest === "boolean") out.manifest = b.manifest;
+  if (typeof b.cssMinify === "boolean" || typeof b.cssMinify === "string") out.cssMinify = b.cssMinify;
+  if (typeof b.assetsDir === "string") out.assetsDir = b.assetsDir;
+  if (typeof b.reportCompressedSize === "boolean") out.reportCompressedSize = b.reportCompressedSize;
+  if (typeof b.chunkSizeWarningLimit === "number") out.chunkSizeWarningLimit = b.chunkSizeWarningLimit;
+  if (b.write === false) out.write = false;
+  if (b.watch && typeof b.watch === "object") out.watch = {};
+  if (b.license && b.license !== false) out.license = true;
+  // Resolved defaults (cssTarget = target, commonjsOptions = { include:
+  // [/node_modules/], extensions: [".js", ".cjs"] }) are not user choices.
+  if (b.cssTarget !== undefined && JSON.stringify(b.cssTarget) !== JSON.stringify(b.target)) out.cssTarget = b.cssTarget;
+  const cjs = b.commonjsOptions;
+  if (cjs && typeof cjs === "object") {
+    const extra = Object.keys(cjs).filter((k) => k !== "include" && k !== "extensions");
+    const defaultInclude = Array.isArray(cjs.include) && cjs.include.length === 1 && String(cjs.include[0]) === "/node_modules/";
+    const defaultExt = JSON.stringify(cjs.extensions) === JSON.stringify([".js", ".cjs"]);
+    if (extra.length || !defaultInclude || !defaultExt) out.commonjsOptions = {};
+  }
   if (b.lib && typeof b.lib === "object") {
     const lib = {};
     const e = b.lib.entry;

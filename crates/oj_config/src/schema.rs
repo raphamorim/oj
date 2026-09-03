@@ -289,6 +289,28 @@ pub struct BuildConfig {
     pub assets_inline_limit: Option<u64>,
     pub css_code_split: Option<bool>,
     pub copy_public_dir: Option<bool>,
+    /// Vite's `build.assetsDir` (default `assets`): where hashed chunks and
+    /// assets go under outDir.
+    pub assets_dir: Option<String>,
+    /// Vite's `build.cssMinify`: unset follows `build.minify`; a minifier name
+    /// (`"lightningcss"`, `"esbuild"`) means on.
+    pub css_minify: Option<BoolOrString>,
+    /// Vite's `build.manifest`: `true` for `.vite/manifest.json`, or a file name.
+    pub manifest: Option<BoolOrString>,
+    /// Vite's `build.reportCompressedSize` (default true): gzip column in the report.
+    pub report_compressed_size: Option<bool>,
+    /// Vite's `build.chunkSizeWarningLimit` in kB (default 500).
+    pub chunk_size_warning_limit: Option<f64>,
+    /// Vite's `build.write`; only `true` is supported (oj writes the bundle to disk).
+    pub write: Option<bool>,
+    /// Vite's `build.watch`; not supported by oj (warned about, ignored).
+    pub watch: Option<serde_json::Value>,
+    /// Vite's `build.license`; not supported by oj (warned about, ignored).
+    pub license: Option<serde_json::Value>,
+    /// Vite's `build.commonjsOptions`; rolldown handles CJS natively (warned about, ignored).
+    pub commonjs_options: Option<serde_json::Value>,
+    /// Vite's `build.cssTarget`; accepted, oj lowers CSS with lightningcss defaults (warned about).
+    pub css_target: Option<StringOrList>,
 }
 
 /// Vite's `build.lib.entry`: one path, a list (each named by its file stem), or

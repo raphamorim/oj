@@ -626,6 +626,42 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
         if build.ssr_manifest.is_none() {
             build.ssr_manifest = bool_or_str("ssrManifest");
         }
+        if build.manifest.is_none() {
+            build.manifest = bool_or_str("manifest");
+        }
+        if build.css_minify.is_none() {
+            build.css_minify = bool_or_str("cssMinify");
+        }
+        if build.assets_dir.is_none() {
+            build.assets_dir = str_of("assetsDir");
+        }
+        if build.report_compressed_size.is_none() {
+            build.report_compressed_size = bool_of("reportCompressedSize");
+        }
+        if build.chunk_size_warning_limit.is_none() {
+            build.chunk_size_warning_limit = vb.get("chunkSizeWarningLimit").and_then(|v| v.as_f64());
+        }
+        if build.write.is_none() {
+            build.write = bool_of("write");
+        }
+        for (key, slot) in [
+            ("watch", &mut build.watch),
+            ("license", &mut build.license),
+            ("commonjsOptions", &mut build.commonjs_options),
+        ] {
+            if slot.is_none() {
+                *slot = vb.get(key).filter(|v| !v.is_null()).cloned();
+            }
+        }
+        if build.css_target.is_none() {
+            build.css_target = match vb.get("cssTarget") {
+                Some(serde_json::Value::String(s)) => Some(oj_config::StringOrList::One(s.clone())),
+                Some(serde_json::Value::Array(a)) => Some(oj_config::StringOrList::Many(
+                    a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+                )),
+                _ => None,
+            };
+        }
         if build.lib.is_none() {
             build.lib = vb
                 .get("lib")

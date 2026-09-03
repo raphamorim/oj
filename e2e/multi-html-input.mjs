@@ -24,6 +24,7 @@ fs.writeFileSync(
   path.join(app, "oj.config.json"),
   JSON.stringify({
     build: {
+      manifest: true,
       rolldownOptions: {
         input: {
           admin: "pages/admin/index.html",

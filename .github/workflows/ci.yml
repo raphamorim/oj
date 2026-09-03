@@ -271,3 +271,5 @@ jobs:
           curl -sf -D - -o /dev/null "http://localhost:4173$asset" | grep -qi 'cache-control: public, max-age=31536000, immutable'
           curl -sf -D - -o /dev/null http://localhost:4173/ | grep -qi 'cache-control: no-cache'
           lsof -ti:4173 -sTCP:LISTEN | xargs -r kill || true
+      - name: build CLI flags (--base, --outDir, --assetsDir, --minify, --sourcemap, --manifest, -m, -c, --watch)
+        run: node e2e/build-cli-flags.mjs

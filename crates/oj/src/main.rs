@@ -59,18 +59,52 @@ enum Command {
     },
     Build {
         root: Option<PathBuf>,
-        #[arg(long)]
+        /// Output directory (default: dist). `--out` is accepted as an alias.
+        #[arg(long = "outDir", alias = "out")]
         out: Option<PathBuf>,
+        /// Build the given entry for server-side rendering.
         #[arg(long)]
         ssr: Option<String>,
-        #[arg(long)]
+        /// Set env mode (Vite's -m/--mode).
+        #[arg(short = 'm', long)]
         mode: Option<String>,
         /// Use this vite.config instead of the one found in the root.
-        #[arg(long)]
+        #[arg(short = 'c', long)]
         config: Option<PathBuf>,
         /// Empty outDir even when it is outside the project root (Vite's --emptyOutDir).
         #[arg(long = "emptyOutDir")]
         empty_out_dir: bool,
+        /// Public base path (default: /).
+        #[arg(long)]
+        base: Option<String>,
+        /// Directory under outDir to place assets in (default: assets).
+        #[arg(long = "assetsDir")]
+        assets_dir: Option<String>,
+        /// Static asset base64 inline threshold in bytes (default: 4096).
+        #[arg(long = "assetsInlineLimit")]
+        assets_inline_limit: Option<u64>,
+        /// Transpile target (default: baseline-widely-available).
+        #[arg(long)]
+        target: Option<String>,
+        /// Output source maps: true | false | inline | hidden (default: false).
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        sourcemap: Option<String>,
+        /// Enable/disable minification, or name the minifier (default: oxc).
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        minify: Option<String>,
+        /// Emit the build manifest json (optionally under this file name).
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        manifest: Option<String>,
+        /// Emit the ssr manifest json (optionally under this file name).
+        #[arg(long = "ssrManifest", num_args = 0..=1, default_missing_value = "true")]
+        ssr_manifest: Option<String>,
+        /// Rebuild on changes (Vite's -w); not supported by oj yet.
+        #[arg(short = 'w', long)]
+        watch: bool,
+        /// Vite's `--app` (builder mode). oj's build already covers every
+        /// configured environment, so this is accepted as a no-op.
+        #[arg(long)]
+        app: bool,
     },
     Preview {
         root: Option<PathBuf>,
@@ -155,6 +189,16 @@ async fn run() -> anyhow::Result<()> {
             mode,
             config,
             empty_out_dir,
+            base,
+            assets_dir,
+            assets_inline_limit,
+            target,
+            sourcemap,
+            minify,
+            manifest,
+            ssr_manifest,
+            watch,
+            app: _,
         } => {
             let root = root.unwrap_or_else(|| {
                 let playground = PathBuf::from("playground");
@@ -169,7 +213,25 @@ async fn run() -> anyhow::Result<()> {
                 let mode = mode.unwrap_or_else(|| "production".to_string());
                 start_dev::start_build(root, &mode, out).await
             } else {
-                build::build(root, out, ssr, mode.as_deref(), empty_out_dir).await
+                build::build(
+                    root,
+                    mode.as_deref(),
+                    build::CliOptions {
+                        out,
+                        ssr,
+                        empty_out_dir,
+                        base,
+                        assets_dir,
+                        assets_inline_limit,
+                        target,
+                        sourcemap,
+                        minify,
+                        manifest,
+                        ssr_manifest,
+                        watch,
+                    },
+                )
+                .await
             }
         }
         Command::Preview {
