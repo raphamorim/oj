@@ -65,12 +65,19 @@ impl StringOrList {
 #[serde(default, rename_all = "camelCase")]
 pub struct CssConfig {
     pub preprocessor_options: Option<BTreeMap<String, PreprocessorEntry>>,
+    /// Vite's `css.devSourcemap`: inline source maps on dev-served CSS.
+    pub dev_sourcemap: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct PreprocessorEntry {
     pub additional_data: Option<String>,
+    /// Every other option, forwarded verbatim: Sass `loadPaths`/`includePaths`,
+    /// Less `paths`/`javascriptEnabled`/`globalVars`/`modifyVars`, Stylus
+    /// `paths`/`define`, ... (Vite passes preprocessorOptions straight through).
+    #[serde(flatten)]
+    pub rest: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]

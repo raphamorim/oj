@@ -115,18 +115,64 @@ fn index_target(p: &Path) -> Option<PathBuf> {
 #[derive(Debug)]
 struct DottedFs;
 
+// grass resolves a directory import `@use "pkg"` by probing `pkg/index.scss` and
+// `pkg/_index.scss` (or `.sass`). When `pkg` is an npm package reached through
+// a node_modules load path, its package.json names the stylesheet instead:
+// Vite's sass importer resolves with mainFields `["sass", "style"]` (then
+// `main`). Map the probe to that file. Syntax follows the probed extension
+// (grass parses by it), so an `index.sass` probe only accepts a `.sass` entry
+// and an `index.scss` probe accepts `.scss` or plain `.css`.
+fn package_entry(probe: &Path) -> Option<PathBuf> {
+    let name = probe.file_name()?.to_str()?;
+    let want_sass = match name {
+        "index.scss" | "_index.scss" => false,
+        "index.sass" | "_index.sass" => true,
+        _ => return None,
+    };
+    let dir = probe.parent()?;
+    let pkg = std::fs::read_to_string(dir.join("package.json")).ok()?;
+    let pkg: serde_json::Value = serde_json::from_str(&pkg).ok()?;
+    let accepts = |p: &Path| {
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+        p.is_file() && if want_sass { ext == "sass" } else { ext == "scss" || ext == "css" }
+    };
+    for field in ["sass", "style", "main"] {
+        let Some(rel) = pkg.get(field).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let p = dir.join(rel);
+        if accepts(&p) {
+            return Some(p);
+        }
+        let exts: &[&str] = if want_sass { &["sass"] } else { &["scss", "css"] };
+        for ext in exts {
+            let c = with_ext(&p, ext);
+            if c.is_file() {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+// The real file behind a grass probe that is not itself a file: a dotted-basename
+// stylesheet's phantom index, or an npm package's `sass`/`style`/`main` entry.
+fn probe_target(p: &Path) -> Option<PathBuf> {
+    index_target(p).or_else(|| package_entry(p))
+}
+
 impl grass::Fs for DottedFs {
     fn is_dir(&self, p: &Path) -> bool {
         p.is_dir() || dotted_stylesheet(p).is_some()
     }
     fn is_file(&self, p: &Path) -> bool {
-        p.is_file() || index_target(p).is_some()
+        p.is_file() || probe_target(p).is_some()
     }
     fn read(&self, p: &Path) -> io::Result<Vec<u8>> {
         let bytes = if p.is_file() {
             std::fs::read(p)?
         } else {
-            match index_target(p) {
+            match probe_target(p) {
                 Some(real) => std::fs::read(real)?,
                 None => std::fs::read(p)?,
             }
@@ -154,12 +200,16 @@ fn strip_sass_import_ext(source: &str) -> String {
         let t = line.trim_start();
         let is_import = t.starts_with("@use") || t.starts_with("@forward") || t.starts_with("@import");
         if is_import && !line.contains("url(") {
+            // `~pkg/...` is the webpack-era spelling of a node_modules import that
+            // Vite's sass importer still accepts; the load paths cover it bare.
             out.push_str(
                 &line
                     .replace(".scss\"", "\"")
                     .replace(".scss'", "'")
                     .replace(".sass\"", "\"")
-                    .replace(".sass'", "'"),
+                    .replace(".sass'", "'")
+                    .replace("\"~", "\"")
+                    .replace("'~", "'"),
             );
         } else {
             out.push_str(line);
@@ -177,11 +227,61 @@ pub fn compile_sass_with(
     load_dir: Option<&Path>,
     additional_data: Option<&str>,
 ) -> Result<String, String> {
+    compile_sass_opts(
+        source,
+        &SassOptions {
+            load_dir,
+            additional_data,
+            load_paths: &[],
+        },
+    )
+}
+
+/// How a Sass stylesheet is compiled: the importing file's directory, the
+/// configured `css.preprocessorOptions.scss.loadPaths`/`includePaths`, and the
+/// `node_modules` directories above it (so `@use "bootstrap/scss/bootstrap"` and
+/// `@use "pkg"` resolve as in Vite), plus `additionalData` prepended.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SassOptions<'a> {
+    pub load_dir: Option<&'a Path>,
+    pub additional_data: Option<&'a str>,
+    pub load_paths: &'a [PathBuf],
+}
+
+/// Every `node_modules` directory from `dir` up to the filesystem root, nearest
+/// first: Sass' node resolution for bare `@use`/`@import` specifiers.
+pub fn node_modules_load_paths(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        if d.file_name().is_some_and(|n| n == "node_modules") {
+            cur = d.parent();
+            continue;
+        }
+        let nm = d.join("node_modules");
+        if nm.is_dir() {
+            out.push(nm);
+        }
+        cur = d.parent();
+    }
+    out
+}
+
+pub fn compile_sass_opts(source: &str, opts: &SassOptions<'_>) -> Result<String, String> {
     let fs = DottedFs;
     let mut options = grass::Options::default().fs(&fs);
-    if let Some(dir) = load_dir {
+    if let Some(dir) = opts.load_dir {
         options = options.load_path(dir);
     }
+    for p in opts.load_paths {
+        options = options.load_path(p);
+    }
+    if let Some(dir) = opts.load_dir {
+        for nm in node_modules_load_paths(dir) {
+            options = options.load_path(nm);
+        }
+    }
+    let additional_data = opts.additional_data;
     let stripped = strip_sass_import_ext(source);
     let source = match additional_data {
         Some(data) if !data.is_empty() => format!("{data}\n{stripped}"),
@@ -202,11 +302,19 @@ fn default_targets() -> Targets {
 }
 
 pub fn compile_css(url: &str, source: &str, minify: bool) -> Result<CssOutput, String> {
-    compile_css_impl(url, source, minify, false)
+    compile_css_impl(url, source, minify, false, false)
 }
 
 pub fn compile_css_rebased(url: &str, source: &str, minify: bool) -> Result<CssOutput, String> {
-    compile_css_impl(url, source, minify, true)
+    compile_css_impl(url, source, minify, true, false)
+}
+
+/// `compile_css_rebased` plus an inline source map (`css.devSourcemap`): the
+/// served CSS ends with a `sourceMappingURL` data URL mapping back to `url`,
+/// with the (preprocessed) source embedded, so devtools show the stylesheet's
+/// rules at their source lines.
+pub fn compile_css_rebased_with_map(url: &str, source: &str, minify: bool) -> Result<CssOutput, String> {
+    compile_css_impl(url, source, minify, true, true)
 }
 
 fn compile_css_impl(
@@ -214,6 +322,7 @@ fn compile_css_impl(
     source: &str,
     minify: bool,
     rebase: bool,
+    source_map: bool,
 ) -> Result<CssOutput, String> {
     let is_module = is_css_module(url);
     let options = ParserOptions {
@@ -237,16 +346,32 @@ fn compile_css_impl(
         .map_err(|err| format!("css transform error in {url}: {err}"))?;
 
     let base = if rebase { css_base_dir(url) } else { None };
+    let mut sm = parcel_sourcemap::SourceMap::new("");
+    if source_map {
+        let idx = sm.add_source(url);
+        let _ = sm.set_source_content(idx as usize, source);
+    }
     let result = stylesheet
         .to_css(PrinterOptions {
             minify,
             targets,
             analyze_dependencies: base.as_ref().map(|_| DependencyOptions::default()),
+            source_map: source_map.then_some(&mut sm),
             ..PrinterOptions::default()
         })
         .map_err(|err| format!("css print error in {url}: {err}"))?;
 
     let mut css = result.code;
+    if source_map {
+        // Sources are stored root-relative (`src/app.css`); `sourceRoot: "/"`
+        // makes devtools resolve them to the served url (`/src/app.css`).
+        let json = sm
+            .to_json(Some("/"))
+            .map_err(|err| format!("css sourcemap error in {url}: {err}"))?;
+        css.push_str("\n/*# sourceMappingURL=data:application/json;base64,");
+        css.push_str(&base64(json.as_bytes()));
+        css.push_str(" */\n");
+    }
     if let (Some(base), Some(deps)) = (base, result.dependencies) {
         for dep in deps {
             let (placeholder, orig) = match dep {
@@ -268,6 +393,324 @@ fn compile_css_impl(
     });
 
     Ok(CssOutput { css, exports })
+}
+
+/// Inline plain `@import` rules the way Vite's postcss-import step does, so a
+/// stylesheet served in dev or concatenated into a build chunk carries its
+/// imported rules instead of an `@import` the browser would resolve against the
+/// wrong URL (or a bare specifier it cannot resolve at all). Relative imports
+/// resolve against the importing file; bare ones (`normalize.css`, `~pkg/x`)
+/// through the `node_modules` directories above it via the package's `style`
+/// or `main` entry. Imports with a media query, `layer(...)` or `supports(...)`
+/// and external urls are left as written. Every inlined file's relative `url()`
+/// and remaining `@import` paths are rebased to `file`'s directory.
+pub fn inline_imports(source: &str, file: &Path) -> Result<String, String> {
+    let mut stack = vec![file.to_path_buf()];
+    let out = inline_imports_depth(source, file, &mut stack)?;
+    Ok(if out.contains("@import") { hoist_imports(&out) } else { out })
+}
+
+/// Move every statement-level `@import ...;` that survived inlining (external
+/// urls, media-query imports, unresolvable specifiers) to the top, after a
+/// leading `@charset`, since CSS requires imports to precede all other rules and
+/// an inlined file's rules may now sit above them.
+fn hoist_imports(css: &str) -> String {
+    let mut imports: Vec<&str> = Vec::new();
+    let mut body = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some(pos) = rest.find("@import") {
+        let (before, at) = rest.split_at(pos);
+        let statement_start = before
+            .trim_end()
+            .chars()
+            .next_back()
+            .is_none_or(|c| matches!(c, ';' | '}' | '{'));
+        let end = if statement_start { at.find(';') } else { None };
+        let Some(end) = end else {
+            body.push_str(before);
+            body.push_str("@import");
+            rest = &at[7..];
+            continue;
+        };
+        body.push_str(before);
+        imports.push(&at[..=end]);
+        rest = &at[end + 1..];
+    }
+    body.push_str(rest);
+    if imports.is_empty() {
+        return body;
+    }
+    let mut out = String::with_capacity(css.len());
+    let mut body_rest = body.as_str();
+    if let Some(after) = body_rest.trim_start().strip_prefix("@charset") {
+        if let Some(end) = after.find(';') {
+            let stmt_end = body_rest.len() - after.len() + end + 1;
+            out.push_str(&body_rest[..stmt_end]);
+            out.push('\n');
+            body_rest = &body_rest[stmt_end..];
+        }
+    }
+    for imp in imports {
+        out.push_str(imp.trim_start());
+        out.push('\n');
+    }
+    out.push_str(body_rest);
+    out
+}
+
+fn inline_imports_depth(source: &str, file: &Path, stack: &mut Vec<PathBuf>) -> Result<String, String> {
+    if !source.contains("@import") || stack.len() > 32 {
+        return Ok(source.to_string());
+    }
+    let dir = file.parent().unwrap_or(Path::new("."));
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(pos) = rest.find("@import") {
+        let (before, at) = rest.split_at(pos);
+        // Only a statement-level `@import` (preceded by nothing, `;`, `}` or `{`
+        // modulo whitespace) counts; anything else is inside a string or comment.
+        let statement_start = before
+            .trim_end()
+            .chars()
+            .next_back()
+            .is_none_or(|c| matches!(c, ';' | '}' | '{' | '/'));
+        let parsed = if statement_start { parse_plain_import(&at[7..]) } else { None };
+        let Some((spec, consumed, media)) = parsed else {
+            out.push_str(before);
+            out.push_str("@import");
+            rest = &at[7..];
+            continue;
+        };
+        let stmt_len = 7 + consumed;
+        let resolved = resolve_css_import(&spec, dir);
+        let Some(target) = resolved.filter(|t| !stack.iter().any(|s| s == t)) else {
+            out.push_str(before);
+            out.push_str(&at[..stmt_len]);
+            rest = &at[stmt_len..];
+            continue;
+        };
+        let child = std::fs::read_to_string(&target)
+            .map_err(|e| format!("cannot read @import {spec} ({}): {e}", target.display()))?;
+        stack.push(target.clone());
+        let child = inline_imports_depth(&child, &target, stack)?;
+        stack.pop();
+        let child_dir = target.parent().unwrap_or(Path::new("."));
+        let rebased = rebase_to_dir(&child, &target, child_dir, dir)?;
+        out.push_str(before);
+        match media {
+            // `@import "x" print;` becomes `@media print { ... }` (postcss-import).
+            Some(media) => {
+                out.push_str("@media ");
+                out.push_str(&media);
+                out.push_str(" {\n");
+                out.push_str(&rebased);
+                out.push_str("\n}\n");
+            }
+            None => {
+                out.push_str(&rebased);
+                out.push('\n');
+            }
+        }
+        rest = &at[stmt_len..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// `"x"`, `'x'`, `url(x)`, `url("x")`, optionally followed by a media query,
+/// then `;`. Returns the specifier, how many bytes of `after` the statement
+/// (through `;`) spans, and the media query if any. `layer(...)`/`supports(...)`
+/// imports are not inlined (None).
+fn parse_plain_import(after: &str) -> Option<(String, usize, Option<String>)> {
+    let trimmed = after.trim_start();
+    let ws = after.len() - trimmed.len();
+    let (spec, used) = if let Some(inner) = trimmed.strip_prefix("url(") {
+        let close = inner.find(')')?;
+        let raw = inner[..close].trim().trim_matches(|c| c == '"' || c == '\'');
+        (raw.to_string(), 4 + close + 1)
+    } else {
+        let quote = trimmed.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let close = trimmed[1..].find(quote)?;
+        (trimmed[1..1 + close].to_string(), 1 + close + 1)
+    };
+    let tail = &trimmed[used..];
+    let semi = tail.find(';')?;
+    if tail[..semi].contains(['{', '}']) {
+        return None;
+    }
+    let cond = tail[..semi].trim();
+    // `layer(...)` / `supports(...)` imports keep their rule for the browser.
+    if cond.contains("layer(") || cond.contains("supports(") || cond.starts_with("layer") {
+        return None;
+    }
+    if spec.is_empty()
+        || spec.starts_with("data:")
+        || spec.starts_with("//")
+        || spec.contains("://")
+        || spec.starts_with('/')
+    {
+        return None;
+    }
+    let media = (!cond.is_empty()).then(|| cond.to_string());
+    Some((spec, ws + used + semi + 1, media))
+}
+
+fn css_file_candidates(base: &Path) -> Vec<PathBuf> {
+    let mut v = vec![base.to_path_buf()];
+    if base.extension().is_none() {
+        v.push(with_ext(base, "css"));
+    }
+    v.push(base.join("index.css"));
+    v
+}
+
+/// postcss-import's resolution order: relative to the importer, then a
+/// node_modules package (`style`/`main` entry for a bare package, a file inside
+/// it otherwise), `~` prefix accepted.
+pub fn resolve_css_import(spec: &str, dir: &Path) -> Option<PathBuf> {
+    let spec = spec.strip_prefix('~').unwrap_or(spec);
+    let spec = spec.split(['?', '#']).next().unwrap_or(spec);
+    if spec.is_empty() {
+        return None;
+    }
+    for c in css_file_candidates(&dir.join(spec)) {
+        if c.is_file() {
+            return Some(c);
+        }
+    }
+    if spec.starts_with("./") || spec.starts_with("../") {
+        return None;
+    }
+    let (pkg, rest) = split_package_specifier(spec)?;
+    for nm in node_modules_load_paths(dir) {
+        let pkg_dir = nm.join(pkg);
+        if !pkg_dir.is_dir() {
+            continue;
+        }
+        if rest.is_empty() {
+            if let Ok(text) = std::fs::read_to_string(pkg_dir.join("package.json")) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                    for field in ["style", "main"] {
+                        if let Some(entry) = json.get(field).and_then(|v| v.as_str()) {
+                            for c in css_file_candidates(&pkg_dir.join(entry)) {
+                                if c.is_file() && c.extension().is_some_and(|e| e == "css") {
+                                    return Some(c);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let idx = pkg_dir.join("index.css");
+            return idx.is_file().then_some(idx);
+        }
+        for c in css_file_candidates(&pkg_dir.join(rest)) {
+            if c.is_file() {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+fn split_package_specifier(spec: &str) -> Option<(&str, &str)> {
+    let mut parts = spec.splitn(if spec.starts_with('@') { 3 } else { 2 }, '/');
+    let pkg = if spec.starts_with('@') {
+        let scope = parts.next()?;
+        let name = parts.next()?;
+        &spec[..scope.len() + 1 + name.len()]
+    } else {
+        parts.next()?
+    };
+    let rest = spec.get(pkg.len() + 1..).unwrap_or("");
+    Some((pkg, rest))
+}
+
+/// Rewrite the relative `url()` / `@import` paths of a stylesheet that lives in
+/// `from_dir` so they are correct from `to_dir` (where it is being inlined).
+fn rebase_to_dir(css: &str, file: &Path, from_dir: &Path, to_dir: &Path) -> Result<String, String> {
+    if !(css.contains("url(") || css.contains("@import")) || from_dir == to_dir {
+        return Ok(css.to_string());
+    }
+    let name = file.to_string_lossy().into_owned();
+    let stylesheet = StyleSheet::parse(
+        css,
+        ParserOptions {
+            filename: name.clone(),
+            ..ParserOptions::default()
+        },
+    )
+    .map_err(|err| format!("css parse error in {name}: {err}"))?;
+    let result = stylesheet
+        .to_css(PrinterOptions {
+            analyze_dependencies: Some(DependencyOptions::default()),
+            ..PrinterOptions::default()
+        })
+        .map_err(|err| format!("css print error in {name}: {err}"))?;
+    let mut out = result.code;
+    for dep in result.dependencies.unwrap_or_default() {
+        let (placeholder, orig) = match dep {
+            Dependency::Url(u) => (u.placeholder, u.url),
+            Dependency::Import(i) => (i.placeholder, i.url),
+        };
+        let replacement = if rebase_relative(&orig, "/x").is_none() {
+            orig
+        } else {
+            let (path, suffix) = match orig.find(['?', '#']) {
+                Some(i) => (&orig[..i], &orig[i..]),
+                None => (orig.as_str(), ""),
+            };
+            format!("{}{}", relative_path(to_dir, &from_dir.join(path)), suffix)
+        };
+        out = out.replace(&placeholder, &replacement);
+    }
+    Ok(out)
+}
+
+/// `target` expressed relative to `from_dir`, with `/` separators and a leading
+/// `./` when it does not start with `..`.
+fn relative_path(from_dir: &Path, target: &Path) -> String {
+    let norm = |p: &Path| -> Vec<String> {
+        let mut segs: Vec<String> = Vec::new();
+        for c in p.components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    segs.pop();
+                }
+                std::path::Component::CurDir | std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
+                std::path::Component::Normal(s) => segs.push(s.to_string_lossy().into_owned()),
+            }
+        }
+        segs
+    };
+    let from = norm(from_dir);
+    let to = norm(target);
+    let common = from.iter().zip(to.iter()).take_while(|(a, b)| a == b).count();
+    let mut parts: Vec<String> = std::iter::repeat_n("..".to_string(), from.len() - common).collect();
+    parts.extend(to[common..].iter().cloned());
+    let joined = parts.join("/");
+    if joined.starts_with("..") {
+        joined
+    } else {
+        format!("./{joined}")
+    }
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
 }
 
 fn css_base_dir(url: &str) -> Option<String> {
@@ -497,6 +940,135 @@ mod tests {
             .unwrap_or_else(|e| panic!("nested dotted @use should resolve: {e}"));
         assert!(css.contains("color: #0f0") || css.contains("color: green"), "{css}");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sass_resolves_node_modules_packages_like_vite() {
+        // `@use "pkg"` -> package.json `sass` (then `style`) entry; `@use
+        // "pkg/path"` -> a file inside the package; `~pkg` is accepted; the
+        // node_modules directory is found above the importing file.
+        let base = std::env::temp_dir().join(format!("oj-css-nm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pkg = base.join("node_modules/@acme/tokens");
+        std::fs::create_dir_all(pkg.join("src")).unwrap();
+        std::fs::create_dir_all(base.join("src/deep")).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"@acme/tokens","main":"index.js","sass":"src/index.scss"}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("src/index.scss"), "$brand: #123456;\n").unwrap();
+        std::fs::write(pkg.join("src/_mixins.scss"), "@mixin pad { padding: 4px; }\n").unwrap();
+        let styled = base.join("node_modules/plain-css");
+        std::fs::create_dir_all(&styled).unwrap();
+        std::fs::write(styled.join("package.json"), r#"{"name":"plain-css","style":"dist/x.css"}"#).unwrap();
+        std::fs::create_dir_all(styled.join("dist")).unwrap();
+        std::fs::write(styled.join("dist/x.css"), ".plain { color: green; }\n").unwrap();
+
+        let dir = base.join("src/deep");
+        let scss = "@use \"@acme/tokens\" as t;\n@use \"~@acme/tokens/src/mixins\";\n@import \"plain-css\";\n.a { color: t.$brand; @include mixins.pad; }";
+        let css = compile_sass(scss, Some(&dir)).unwrap();
+        assert!(css.contains("#123456"), "package sass entry resolved: {css}");
+        assert!(css.contains("padding: 4px"), "~pkg/path resolved: {css}");
+        assert!(css.contains(".plain"), "style entry resolved: {css}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sass_load_paths_from_config_resolve_bare_imports() {
+        let base = std::env::temp_dir().join(format!("oj-css-lp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("styles")).unwrap();
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::write(base.join("styles/_theme.scss"), "$accent: #abc;\n").unwrap();
+        let opts = SassOptions {
+            load_dir: Some(&base.join("src")),
+            additional_data: Some("$pad: 2px;"),
+            load_paths: &[base.join("styles")],
+        };
+        let css = compile_sass_opts("@use \"theme\";\n.a { color: theme.$accent; padding: $pad; }", &opts).unwrap();
+        assert!(css.contains("#abc") && css.contains("2px"), "{css}");
+        assert!(compile_sass("@use \"theme\";", Some(&base.join("src"))).is_err(), "not on the load path without config");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn inlines_relative_and_package_imports_and_rebases_urls() {
+        let base = std::env::temp_dir().join(format!("oj-css-imp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("src/base")).unwrap();
+        std::fs::create_dir_all(base.join("node_modules/normalize-fake")).unwrap();
+        std::fs::write(base.join("src/vars.css"), ":root { --x: 1; }\n").unwrap();
+        std::fs::write(
+            base.join("src/base/reset.css"),
+            "@import \"../vars.css\";\n.reset { background: url(./dot.png); }\n",
+        )
+        .unwrap();
+        std::fs::write(base.join("node_modules/normalize-fake/package.json"), r#"{"name":"normalize-fake","style":"n.css"}"#).unwrap();
+        std::fs::write(base.join("node_modules/normalize-fake/n.css"), ".norm { margin: 0; }\n").unwrap();
+        std::fs::write(base.join("src/print.css"), ".print { display: none; }\n").unwrap();
+        let app = base.join("src/app.css");
+        let src = "@import \"./base/reset.css\";\n@import 'normalize-fake';\n@import url(https://cdn.test/x.css);\n@import \"./print.css\" print;\n@import \"./missing.css\" screen;\n.app { color: red; }\n";
+        let out = inline_imports(src, &app).unwrap();
+        assert!(out.contains("--x: 1"), "nested import inlined: {out}");
+        assert!(out.contains(".reset"), "relative import inlined: {out}");
+        assert!(out.contains("url(\"./base/dot.png\")") || out.contains("url(./base/dot.png)"), "url rebased to the entry dir: {out}");
+        assert!(out.contains(".norm"), "package style entry inlined: {out}");
+        assert!(out.contains("@import url(https://cdn.test/x.css);"), "external import kept: {out}");
+        assert!(out.contains("@media print {\n.print { display: none; }"), "media import inlined as @media: {out}");
+        assert!(out.contains("@import \"./missing.css\" screen;"), "unresolvable media import kept: {out}");
+        // Kept imports are hoisted above the inlined rules (CSS requires it).
+        let first_rule = out.find('{').unwrap();
+        assert!(out.rfind("@import").unwrap() < first_rule, "imports hoisted first: {out}");
+        assert!(!out.contains("@import \"./base/reset.css\""), "inlined import removed: {out}");
+        assert!(out.contains(".app { color: red; }"), "own rules kept verbatim: {out}");
+        // Compiles and, in dev, rebases against the served url of the entry.
+        let compiled = compile_css_rebased("/src/app.css", &out, true).unwrap();
+        assert!(compiled.css.contains("/src/base/dot.png"), "{}", compiled.css);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn import_inlining_survives_cycles_and_missing_files() {
+        let base = std::env::temp_dir().join(format!("oj-css-cyc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("a.css"), "@import \"./b.css\";\n.a{}").unwrap();
+        std::fs::write(base.join("b.css"), "@import \"./a.css\";\n.b{}").unwrap();
+        let out = inline_imports("@import \"./b.css\";\n.a{}", &base.join("a.css")).unwrap();
+        assert!(out.contains(".b{}") && out.contains(".a{}"), "{out}");
+        assert!(out.contains("@import \"./a.css\";"), "the cycle edge stays as written: {out}");
+        let missing = inline_imports("@import \"./nope.css\";\n.a{}", &base.join("a.css")).unwrap();
+        assert!(missing.contains("@import \"./nope.css\";"), "unresolvable import left alone: {missing}");
+        assert_eq!(relative_path(Path::new("/p/src"), Path::new("/p/src/base/dot.png")), "./base/dot.png");
+        assert_eq!(relative_path(Path::new("/p/src/base"), Path::new("/p/vars.css")), "../../vars.css");
+        assert_eq!(split_package_specifier("@acme/tokens/src/x.css"), Some(("@acme/tokens", "src/x.css")));
+        assert_eq!(split_package_specifier("normalize.css"), Some(("normalize.css", "")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn dev_sourcemap_is_appended_inline_and_names_the_source() {
+        let out = compile_css_rebased_with_map("/src/app.css", ".a {\n  color: red;\n}\n.b { color: blue; }\n", false).unwrap();
+        let marker = "/*# sourceMappingURL=data:application/json;base64,";
+        let at = out.css.find(marker).expect("sourceMappingURL comment");
+        let b64_json = out.css[at + marker.len()..].trim_end().trim_end_matches("*/").trim();
+        // Decode the base64 back and check the map shape.
+        let decoded = {
+            let t = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut bits = 0u32; let mut n = 0; let mut bytes = Vec::new();
+            for c in b64_json.bytes().filter(|c| *c != b'=') {
+                let v = t.iter().position(|x| *x == c).unwrap() as u32;
+                bits = bits << 6 | v; n += 6;
+                if n >= 8 { n -= 8; bytes.push((bits >> n) as u8); bits &= (1 << n) - 1; }
+            }
+            String::from_utf8(bytes).unwrap()
+        };
+        assert!(decoded.contains("\"sources\":[\"src/app.css\"]") && decoded.contains("\"sourceRoot\":\"/\""), "{decoded}");
+        assert!(decoded.contains("sourcesContent"), "source embedded: {decoded}");
+        assert!(decoded.contains("\"mappings\":\"") && !decoded.contains("\"mappings\":\"\""), "non-empty mappings: {decoded}");
+        // Without the flag nothing is appended.
+        assert!(!compile_css_rebased("/src/app.css", ".a { color: red; }", false).unwrap().css.contains("sourceMappingURL"));
     }
 
     #[test]

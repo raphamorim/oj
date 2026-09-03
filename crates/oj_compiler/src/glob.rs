@@ -149,10 +149,22 @@ pub fn expand_dynamic_import_vars<'a>(
 
 /// Rewrites `new URL("./asset", import.meta.url)` into a hoisted `?url` asset
 /// import referenced in place, so the asset flows through oj's normal asset
-/// pipeline (Vite's asset-import-meta-url). Returns whether anything changed.
-pub fn expand_new_url_asset<'a>(allocator: &'a Allocator, program: &mut Program<'a>) -> bool {
+/// pipeline (Vite's asset-import-meta-url). A template literal
+/// (`new URL(\`./img/${name}.png\`, import.meta.url)`) becomes a lookup over
+/// the files matching its glob, falling back to the original url; and
+/// `new Worker(new URL("./w.ts", import.meta.url), ...)` becomes a
+/// `?worker&url` import so the worker is bundled as its own chunk (Vite's
+/// worker-import-meta-url). Returns whether anything changed.
+pub fn expand_new_url_asset<'a>(
+    allocator: &'a Allocator,
+    dir: &Path,
+    program: &mut Program<'a>,
+    source: &str,
+) -> bool {
     let mut v = NewUrlAsset {
         allocator,
+        dir,
+        source,
         hoisted: Vec::new(),
         uid: 0,
     };
@@ -170,55 +182,151 @@ pub fn expand_new_url_asset<'a>(allocator: &'a Allocator, program: &mut Program<
     true
 }
 
-struct NewUrlAsset<'a> {
+struct NewUrlAsset<'a, 'd, 's> {
     allocator: &'a Allocator,
+    dir: &'d Path,
+    source: &'s str,
     hoisted: Vec<String>,
     uid: usize,
 }
 
-impl<'a> NewUrlAsset<'a> {
-    fn asset_spec(&self, n: &NewExpression<'a>) -> Option<String> {
+enum UrlSpec {
+    /// `new URL("./a.png", import.meta.url)`
+    Literal(String),
+    /// `new URL(\`./img/${n}.png\`, import.meta.url)`: the glob it implies and
+    /// the template's source text.
+    Template { pattern: String, arg: String },
+}
+
+impl<'a> NewUrlAsset<'a, '_, '_> {
+    fn is_import_meta_url(arg: &Argument<'a>) -> bool {
+        match arg.as_expression() {
+            Some(Expression::StaticMemberExpression(m)) => {
+                m.property.name == "url" && matches!(&m.object, Expression::ImportMeta(_))
+            }
+            _ => false,
+        }
+    }
+
+    fn asset_spec(&self, n: &NewExpression<'a>) -> Option<UrlSpec> {
         let Expression::Identifier(id) = &n.callee else {
             return None;
         };
-        if id.name != "URL" || n.arguments.len() != 2 {
+        if id.name != "URL" || n.arguments.len() != 2 || !Self::is_import_meta_url(&n.arguments[1]) {
             return None;
         }
-        let Expression::StringLiteral(spec) = n.arguments[0].as_expression()? else {
+        match n.arguments[0].as_expression()? {
+            Expression::StringLiteral(spec) => {
+                let spec = spec.value.as_str();
+                (spec.starts_with("./") || spec.starts_with("../")).then(|| UrlSpec::Literal(spec.to_string()))
+            }
+            Expression::TemplateLiteral(tpl) if !tpl.expressions.is_empty() => {
+                let mut pattern = String::new();
+                for (i, q) in tpl.quasis.iter().enumerate() {
+                    let piece = q.value.cooked.as_ref().map(|c| c.as_str()).unwrap_or(q.value.raw.as_str());
+                    pattern.push_str(piece);
+                    if i < tpl.expressions.len() {
+                        pattern.push('*');
+                    }
+                }
+                if !(pattern.starts_with("./") || pattern.starts_with("../")) {
+                    return None;
+                }
+                let arg = self.source.get(tpl.span.start as usize..tpl.span.end as usize)?.to_string();
+                Some(UrlSpec::Template { pattern, arg })
+            }
+            _ => None,
+        }
+    }
+
+    /// `new Worker(new URL("./w.ts", import.meta.url), opts)` (or SharedWorker):
+    /// the worker entry, to import as `?worker&url`.
+    fn worker_url_spec(&self, n: &NewExpression<'a>) -> Option<(String, &'static str)> {
+        let Expression::Identifier(id) = &n.callee else {
             return None;
         };
-        let spec = spec.value.as_str();
-        if !(spec.starts_with("./") || spec.starts_with("../")) {
-            return None;
-        }
-        // second arg must be `import.meta.url`
-        let Expression::StaticMemberExpression(m) = n.arguments[1].as_expression()? else {
+        let kind = match id.name.as_str() {
+            "Worker" => "worker",
+            "SharedWorker" => "sharedworker",
+            _ => return None,
+        };
+        let Expression::NewExpression(url) = n.arguments.first()?.as_expression()? else {
             return None;
         };
-        if m.property.name != "url" || !matches!(&m.object, Expression::ImportMeta(_)) {
-            return None;
+        match self.asset_spec(url)? {
+            UrlSpec::Literal(spec) => Some((spec, kind)),
+            UrlSpec::Template { .. } => None,
         }
-        Some(spec.to_string())
+    }
+
+    fn parse_expr(&self, rep: &str) -> Option<Expression<'a>> {
+        let src: &'a str = self.allocator.alloc_str(rep);
+        let parsed = Parser::new(self.allocator, src, SourceType::mjs()).parse();
+        match parsed.program.body.into_iter().next() {
+            Some(Statement::ExpressionStatement(es)) => Some(es.unbox().expression),
+            _ => None,
+        }
     }
 }
 
-impl<'a> VisitMut<'a> for NewUrlAsset<'a> {
+impl<'a> VisitMut<'a> for NewUrlAsset<'a, '_, '_> {
     fn visit_expression(&mut self, expr: &mut Expression<'a>) {
-        if let Expression::NewExpression(n) = &*expr {
-            if let Some(spec) = self.asset_spec(n) {
-                let ident = format!("__oj_url_{}", self.uid);
+        if let Expression::NewExpression(n) = &mut *expr {
+            if let Some((spec, kind)) = self.worker_url_spec(n) {
+                let ident = format!("__oj_worker_{}", self.uid);
                 self.uid += 1;
                 self.hoisted
-                    .push(format!("import {ident} from {:?};", format!("{spec}?url")));
-                let rep = format!("new URL({ident}, import.meta.url)");
-                let src: &'a str = self.allocator.alloc_str(&rep);
-                let parsed = Parser::new(self.allocator, src, SourceType::mjs()).parse();
-                if let Some(Statement::ExpressionStatement(es)) =
-                    parsed.program.body.into_iter().next()
-                {
-                    *expr = es.unbox().expression;
+                    .push(format!("import {ident} from {:?};", format!("{spec}?{kind}&url")));
+                if let Some(url_expr) = self.parse_expr(&ident) {
+                    if let Some(first) = n.arguments.first_mut() {
+                        *first = Argument::from(url_expr);
+                    }
+                }
+                // The remaining arguments (worker options) are visited as usual.
+                for arg in n.arguments.iter_mut().skip(1) {
+                    if let Some(e) = arg.as_expression_mut() {
+                        walk_mut::walk_expression(self, e);
+                    }
                 }
                 return;
+            }
+        }
+        if let Expression::NewExpression(n) = &*expr {
+            match self.asset_spec(n) {
+                Some(UrlSpec::Literal(spec)) => {
+                    let ident = format!("__oj_url_{}", self.uid);
+                    self.uid += 1;
+                    self.hoisted
+                        .push(format!("import {ident} from {:?};", format!("{spec}?url")));
+                    if let Some(e) = self.parse_expr(&format!("new URL({ident}, import.meta.url)")) {
+                        *expr = e;
+                    }
+                    return;
+                }
+                Some(UrlSpec::Template { pattern, arg }) => {
+                    let mut matches = glob_matches(self.dir, &[pattern]);
+                    matches.sort();
+                    if !matches.is_empty() {
+                        let mut entries = Vec::new();
+                        for key in &matches {
+                            let ident = format!("__oj_url_{}", self.uid);
+                            self.uid += 1;
+                            self.hoisted
+                                .push(format!("import {ident} from {:?};", format!("{key}?url")));
+                            entries.push(format!("{key:?}: {ident}"));
+                        }
+                        // Unmatched at runtime: keep the original url, as Vite does.
+                        let rep = format!(
+                            "new URL((function (p) {{ var m = {{{}}}; return m[p] ?? p; }})({arg}), import.meta.url)",
+                            entries.join(", ")
+                        );
+                        if let Some(e) = self.parse_expr(&rep) {
+                            *expr = e;
+                        }
+                        return;
+                    }
+                }
+                None => {}
             }
         }
         walk_mut::walk_expression(self, expr);
@@ -236,7 +344,8 @@ pub fn expand_new_url_asset_source(source: &str, path: &Path) -> String {
         return source.to_string();
     }
     let mut program = parsed.program;
-    if expand_new_url_asset(&allocator, &mut program) {
+    let dir = path.parent().unwrap_or(path);
+    if expand_new_url_asset(&allocator, dir, &mut program, source) {
         oxc_codegen::Codegen::new().build(&program).code
     } else {
         source.to_string()
@@ -443,6 +552,44 @@ fn glob_matches(dir: &Path, patterns: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("oj-glob-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("img")).unwrap();
+        std::fs::write(d.join("img/a.png"), b"a").unwrap();
+        std::fs::write(d.join("img/b.png"), b"b").unwrap();
+        std::fs::write(d.join("w.ts"), "self.onmessage = () => {};").unwrap();
+        d
+    }
+
+    #[test]
+    fn template_literal_new_url_expands_to_a_glob_lookup() {
+        let d = tmp("tpl");
+        let src = "const n = 'a';\nexport const u = new URL(`./img/${n}.png`, import.meta.url);\n";
+        let out = expand_new_url_asset_source(src, &d.join("main.js"));
+        assert!(out.contains("import __oj_url_0 from \"./img/a.png?url\""), "{out}");
+        assert!(out.contains("import __oj_url_1 from \"./img/b.png?url\""), "{out}");
+        assert!(out.contains("\"./img/a.png\": __oj_url_0"), "{out}");
+        assert!(out.contains("m[p] ?? p"), "unmatched keys fall back to the literal url: {out}");
+        assert!(out.contains("`./img/${n}.png`"), "the original template is the lookup key: {out}");
+        // A template that matches nothing is left alone.
+        let none = expand_new_url_asset_source("new URL(`./nope/${x}.png`, import.meta.url);", &d.join("main.js"));
+        assert!(none.contains("new URL(`./nope/${x}.png`, import.meta.url)"), "{none}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn new_worker_with_import_meta_url_becomes_a_worker_url_import() {
+        let d = tmp("worker");
+        let src = "const w = new Worker(new URL(\"./w.ts\", import.meta.url), { type: \"module\" });\nconst s = new SharedWorker(new URL(\"./w.ts\", import.meta.url));\n";
+        let out = expand_new_url_asset_source(src, &d.join("main.js"));
+        assert!(out.contains("import __oj_worker_0 from \"./w.ts?worker&url\""), "{out}");
+        assert!(out.contains("import __oj_worker_1 from \"./w.ts?sharedworker&url\""), "{out}");
+        assert!(out.contains("new Worker(__oj_worker_0, { type: \"module\" })"), "{out}");
+        assert!(out.contains("new SharedWorker(__oj_worker_1)"), "{out}");
+        assert!(!out.contains("w.ts?url"), "the worker entry is not a plain asset: {out}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
     use super::*;
     use oxc_codegen::Codegen;
 

@@ -171,6 +171,36 @@ pub fn css_additional_data(config: &OjConfig, lang: &str) -> Option<String> {
         .and_then(|e| e.additional_data.clone())
 }
 
+/// `css.preprocessorOptions.<lang>` minus `additionalData`, as JSON for the
+/// preprocessor (Less/Stylus run in a node sidecar and take the object as-is).
+pub fn css_preprocessor_json(config: &OjConfig, lang: &str) -> serde_json::Value {
+    config
+        .css
+        .as_ref()
+        .and_then(|c| c.preprocessor_options.as_ref())
+        .and_then(|m| m.get(lang))
+        .map(|e| serde_json::Value::Object(e.rest.iter().map(|(k, v)| (k.clone(), v.clone())).collect()))
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// Sass `loadPaths` (Vite 5+) and the legacy `includePaths`, in order.
+pub fn css_load_paths(config: &OjConfig, lang: &str) -> Vec<String> {
+    let entry = config
+        .css
+        .as_ref()
+        .and_then(|c| c.preprocessor_options.as_ref())
+        .and_then(|m| m.get(lang));
+    let mut out = Vec::new();
+    if let Some(e) = entry {
+        for key in ["loadPaths", "includePaths"] {
+            if let Some(arr) = e.rest.get(key).and_then(|v| v.as_array()) {
+                out.extend(arr.iter().filter_map(|v| v.as_str()).map(str::to_string));
+            }
+        }
+    }
+    out
+}
+
 pub fn server_fs_deny(config: &OjConfig) -> Vec<String> {
     config
         .server
@@ -1388,5 +1418,28 @@ mod ssr_option_tests {
         assert_eq!(ssr_manifest_name(&cfg("{}")), None);
         assert_eq!(ssr_manifest_name(&cfg(r#"{"build":{"ssrManifest":true}}"#)), Some(".vite/ssr-manifest.json".into()));
         assert_eq!(ssr_manifest_name(&cfg(r#"{"build":{"ssrManifest":"m.json"}}"#)), Some("m.json".into()));
+    }
+}
+
+#[cfg(test)]
+mod preprocessor_options_tests {
+    use super::*;
+
+    #[test]
+    fn preprocessor_options_keep_every_key_for_the_preprocessor() {
+        let cfg: OjConfig = serde_json::from_str(
+            r##"{"css":{"preprocessorOptions":{
+                "scss":{"additionalData":"$x: 1;","loadPaths":["styles"],"includePaths":["legacy"]},
+                "less":{"javascriptEnabled":true,"globalVars":{"brand":"#f00"},"paths":["less"]}}}}"##,
+        )
+        .unwrap();
+        assert_eq!(css_additional_data(&cfg, "scss").as_deref(), Some("$x: 1;"));
+        assert_eq!(css_load_paths(&cfg, "scss"), vec!["styles".to_string(), "legacy".to_string()]);
+        let less = css_preprocessor_json(&cfg, "less");
+        assert_eq!(less["javascriptEnabled"], true);
+        assert_eq!(less["globalVars"]["brand"], "#f00");
+        assert!(less.get("additionalData").is_none());
+        assert!(css_preprocessor_json(&cfg, "stylus").is_null());
+        assert!(css_load_paths(&cfg, "sass").is_empty());
     }
 }

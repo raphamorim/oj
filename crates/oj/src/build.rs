@@ -84,6 +84,11 @@ struct OjCssPlugin {
     // preprocesses/compiles them, matching Vite where CSS is a real module.
     host: Option<Arc<PluginHost>>,
     css_transform_enabled: Arc<tokio::sync::OnceCell<bool>>,
+    /// `css.preprocessorOptions` (Sass additionalData/loadPaths, Less/Stylus
+    /// options), applied the same way the dev server applies them.
+    css: Option<oj_config::CssConfig>,
+    /// Inline `<script type="module">` bodies keyed by their html-proxy id.
+    html_inline: Arc<Mutex<std::collections::HashMap<String, String>>>,
 }
 
 fn assets_inline_limit_of(config: &oj_config::OjConfig) -> u64 {
@@ -391,58 +396,11 @@ fn prepare_out_dir(root: &Path, out_dir: &Path, empty: Option<bool>) -> anyhow::
 }
 
 fn is_build_asset(id: &str) -> bool {
-    matches!(
-        std::path::Path::new(id.split('?').next().unwrap_or(id))
-            .extension()
-            .and_then(|e| e.to_str()),
-        Some(
-            "png"
-                | "jpg"
-                | "jpeg"
-                | "gif"
-                | "webp"
-                | "avif"
-                | "ico"
-                | "bmp"
-                | "svg"
-                | "woff"
-                | "woff2"
-                | "ttf"
-                | "otf"
-                | "eot"
-                | "mp4"
-                | "webm"
-                | "mov"
-                | "mp3"
-                | "wav"
-                | "ogg"
-        )
-    )
+    oj_compiler::assets::is_asset_url(id)
 }
 
 fn asset_mime(ext: &str) -> &'static str {
-    match ext {
-        "svg" => "image/svg+xml",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "avif" => "image/avif",
-        "ico" => "image/x-icon",
-        "woff" => "font/woff",
-        "woff2" => "font/woff2",
-        "ttf" => "font/ttf",
-        "otf" => "font/otf",
-        "eot" => "application/vnd.ms-fontobject",
-        "bmp" => "image/bmp",
-        "mp4" => "video/mp4",
-        "webm" => "video/webm",
-        "mov" => "video/quicktime",
-        "mp3" => "audio/mpeg",
-        "wav" => "audio/wav",
-        "ogg" => "audio/ogg",
-        _ => "application/octet-stream",
-    }
+    oj_compiler::assets::asset_mime(ext)
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -535,6 +493,166 @@ fn emit_or_inline(
     ))
 }
 
+fn is_stylesheet_path(path: &str) -> bool {
+    path.ends_with(".css")
+        || oj_css::is_sass(path)
+        || oj_server::sidecar::is_less(path)
+        || oj_server::sidecar::is_stylus(path)
+}
+
+/// The build's stylesheet pipeline for one file: plugin transforms on the raw
+/// source, Sass/Less/Stylus, Tailwind/PostCSS, then lightningcss (minified).
+/// Shared by plain CSS imports, `?url` (emitted as a compiled `.css` asset) and
+/// `?inline` (the compiled text), so every form of importing a stylesheet ships
+/// the same CSS, as in Vite.
+async fn compile_stylesheet(
+    root: &Path,
+    host: &Option<Arc<oj_server::plugins::PluginHost>>,
+    css_transform_enabled: &tokio::sync::OnceCell<bool>,
+    has_postcss: bool,
+    css: &Option<oj_config::CssConfig>,
+    path: &str,
+    id: &str,
+) -> anyhow::Result<oj_css::CssOutput> {
+    let cfg = oj_config::OjConfig {
+        css: css.clone(),
+        ..Default::default()
+    };
+    let is_less = oj_server::sidecar::is_less(path);
+    let is_stylus = oj_server::sidecar::is_stylus(path);
+    let mut source =
+        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+    // Run the plugin transform chain on the raw CSS source first, so directive
+    // transformers (UnoCSS `@apply`/`@unocss-include`, etc.) resolve before oj
+    // preprocesses and compiles it.
+    if let Some(host) = host {
+        let on = *css_transform_enabled
+            .get_or_init(|| async { host.has_transform().await })
+            .await;
+        if on {
+            if let Ok((out, _, _, _)) = host.transform(&source, id, "{}").await {
+                source = out;
+            }
+        }
+    }
+    if oj_css::is_sass(path) {
+        let lang = if path.ends_with(".sass") { "sass" } else { "scss" };
+        let data = oj_config::css_additional_data(&cfg, lang);
+        let load_paths: Vec<PathBuf> = oj_config::css_load_paths(&cfg, lang)
+            .into_iter()
+            .map(|p| root.join(p))
+            .collect();
+        let dir = std::path::Path::new(path).parent();
+        source = oj_css::compile_sass_opts(
+            &source,
+            &oj_css::SassOptions {
+                load_dir: dir,
+                additional_data: data.as_deref(),
+                load_paths: &load_paths,
+            },
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+    } else if is_less || is_stylus {
+        let lang = if is_less { "less" } else { "stylus" };
+        if let Some(data) = oj_config::css_additional_data(&cfg, lang).filter(|d| !d.is_empty()) {
+            source = format!("{data}\n{source}");
+        }
+        let opts = oj_config::css_preprocessor_json(&cfg, lang);
+        source = preprocess_via_sidecar(root, std::path::Path::new(path), &source, opts)?;
+    }
+    // PostCSS/Tailwind run on the preprocessor OUTPUT (Vite orders them the same
+    // way), on the source as transformed so far rather than re-read from disk.
+    if oj_server::sidecar::is_tailwind_css(&source) || has_postcss {
+        source = expand_css_via_sidecar(root, std::path::Path::new(path), &source)?;
+    }
+    // Plain `@import`s are inlined (postcss-import parity) so the concatenated
+    // chunk stylesheet does not carry imports that 404 from `assets/`.
+    source = oj_css::inline_imports(&source, std::path::Path::new(path)).map_err(|e| anyhow::anyhow!(e))?;
+    let css_id = match std::path::Path::new(path).strip_prefix(root) {
+        Ok(rel) => format!("/{}", rel.display()),
+        Err(_) => path.to_string(),
+    };
+    oj_css::compile_css(&css_id, &source, true).map_err(|e| anyhow::anyhow!(e))
+}
+
+/// Split `spec?query` into the file and a normalized oj asset query, for Vite's
+/// import queries in any combination/order: `?worker`, `?worker&inline`,
+/// `?worker&url`, `?sharedworker...`, and the single `?url`/`?raw`/`?inline`/
+/// `?init`/`?react`. Other queries (`?v=1`, `?tsr-split=x`) are not oj's.
+fn split_asset_query(spec: &str) -> Option<(String, String)> {
+    let (base, query) = spec.split_once('?')?;
+    let params: Vec<&str> = query.split('&').filter(|p| !p.is_empty()).collect();
+    let has = |k: &str| params.iter().any(|p| *p == k);
+    let worker_kind = if has("worker") {
+        Some("worker")
+    } else if has("sharedworker") {
+        Some("sharedworker")
+    } else {
+        None
+    };
+    if let Some(kind) = worker_kind {
+        let mut q = kind.to_string();
+        if has("inline") {
+            q.push_str("&inline");
+        } else if has("url") {
+            q.push_str("&url");
+        }
+        return Some((base.to_string(), q));
+    }
+    for kind in ["url", "init", "raw", "inline", "react"] {
+        if params.len() == 1 && has(kind) {
+            return Some((base.to_string(), kind.to_string()));
+        }
+    }
+    None
+}
+
+/// `(file, ctor, inline, url)` for a resolved worker id (`x.ts?worker&inline`).
+fn worker_id_parts(id: &str) -> Option<(&str, &'static str, bool, bool)> {
+    let (file, query) = id.split_once('?')?;
+    let params: Vec<&str> = query.split('&').collect();
+    let ctor = if params.contains(&"worker") {
+        "Worker"
+    } else if params.contains(&"sharedworker") {
+        "SharedWorker"
+    } else {
+        return None;
+    };
+    Some((file, ctor, params.contains(&"inline"), params.contains(&"url")))
+}
+
+/// Bundle a worker entry to a single ESM string (dynamic imports inlined) for
+/// `?worker&inline`, so the worker ships inside the importing chunk as in Vite.
+async fn bundle_worker_inline(root: &Path, file: &str) -> anyhow::Result<String> {
+    let mut bundler = BundlerBuilder::default()
+        .with_options(BundlerOptions {
+            input: Some(vec![InputItem {
+                name: Some("worker".to_string()),
+                import: file.to_string(),
+                ..Default::default()
+            }]),
+            cwd: Some(root.to_path_buf()),
+            format: Some(OutputFormat::Esm),
+            platform: Some(rolldown::Platform::Browser),
+            code_splitting: Some(rolldown_common::CodeSplittingMode::Bool(false)),
+            minify: Some(RawMinifyOptions::Bool(true)),
+            ..Default::default()
+        })
+        .build()
+        .map_err(|errs| anyhow::anyhow!("inline worker init failed: {errs:?}"))?;
+    let out = bundler
+        .generate()
+        .await
+        .map_err(|errs| anyhow::anyhow!("inline worker build failed for {file}:\n{errs:?}"))?;
+    let mut code = String::new();
+    for asset in &out.assets {
+        if let rolldown_common::Output::Chunk(chunk) = asset {
+            code.push_str(&chunk.code);
+        }
+    }
+    Ok(code)
+}
+
 impl Plugin for OjCssPlugin {
     fn name(&self) -> Cow<'static, str> {
         Cow::Borrowed("oj:build")
@@ -557,36 +675,28 @@ impl Plugin for OjCssPlugin {
             .join("oj-routes.tsx")
             .to_string_lossy()
             .into_owned();
-        let url_base = args.specifier.strip_suffix("?url").map(str::to_string);
-        let init_base = args.specifier.strip_suffix("?init").map(str::to_string);
-        let raw_base = args.specifier.strip_suffix("?raw").map(str::to_string);
-        let inline_base = args.specifier.strip_suffix("?inline").map(str::to_string);
-        let react_base = args.specifier.strip_suffix("?react").map(str::to_string);
-        let worker_base = args.specifier.strip_suffix("?worker").map(str::to_string);
-        let shared_base = args
-            .specifier
-            .strip_suffix("?sharedworker")
-            .map(str::to_string);
+        let asset_query = split_asset_query(args.specifier);
         let importer = args.importer.map(str::to_string);
+        let html_proxy = args.specifier.contains("?html-proxy&index=").then(|| {
+            let spec = args.specifier.strip_prefix("./").unwrap_or(args.specifier);
+            if Path::new(spec).is_absolute() {
+                spec.to_string()
+            } else {
+                self.root.join(spec).to_string_lossy().into_owned()
+            }
+        });
         let ctx = ctx.clone();
         async move {
             if is_routes {
                 return Ok(Some(HookResolveIdOutput::from_id(routes_id)));
             }
-            for (base, query) in [
-                (url_base, "url"),
-                (init_base, "init"),
-                (raw_base, "raw"),
-                (inline_base, "inline"),
-                (react_base, "react"),
-                (worker_base, "worker"),
-                (shared_base, "sharedworker"),
-            ] {
-                if let Some(base) = base {
-                    if let Ok(Ok(resolved)) = ctx.resolve(&base, importer.as_deref(), None).await {
-                        let id = format!("{}?{query}", resolved.id.as_str());
-                        return Ok(Some(HookResolveIdOutput::from_id(id)));
-                    }
+            if let Some(id) = html_proxy {
+                return Ok(Some(HookResolveIdOutput::from_id(id)));
+            }
+            if let Some((base, query)) = asset_query {
+                if let Ok(Ok(resolved)) = ctx.resolve(&base, importer.as_deref(), None).await {
+                    let id = format!("{}?{query}", resolved.id.as_str());
+                    return Ok(Some(HookResolveIdOutput::from_id(id)));
                 }
             }
             Ok(None)
@@ -638,8 +748,57 @@ impl Plugin for OjCssPlugin {
         let inline_limit = self.inline_limit;
         let host = self.host.clone();
         let css_transform_enabled = Arc::clone(&self.css_transform_enabled);
+        let self_has_postcss = self.has_postcss;
+        let css_cfg = self.css.clone();
+        let html_inline = Arc::clone(&self.html_inline);
         async move {
+            if id.contains("?html-proxy&index=") {
+                if let Some(body) = html_inline.lock().unwrap().get(&id).cloned() {
+                    return Ok(Some(rolldown_plugin::HookLoadOutput {
+                        code: arcstr::ArcStr::from(body),
+                        module_type: Some(rolldown_common::ModuleType::Js),
+                        ..Default::default()
+                    }));
+                }
+            }
             if let Some(file) = id.strip_suffix("?url") {
+                if is_stylesheet_path(file) {
+                    // `import u from './a.scss?url'`: the URL of the COMPILED
+                    // stylesheet, emitted as a `.css` asset (Vite css.ts), not the
+                    // raw preprocessor source.
+                    let out = compile_stylesheet(
+                        &root,
+                        &host,
+                        &css_transform_enabled,
+                        self_has_postcss,
+                        &css_cfg,
+                        file,
+                        &id,
+                    )
+                    .await?;
+                    let stem = std::path::Path::new(file)
+                        .file_stem()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("style");
+                    let reference = ctx
+                        .emit_file(
+                            rolldown_common::EmittedAsset {
+                                name: Some(format!("{stem}.css")),
+                                source: rolldown_common::StrOrBytes::Str(out.css),
+                                ..Default::default()
+                            },
+                            None,
+                            None,
+                        )
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    return Ok(Some(rolldown_plugin::HookLoadOutput {
+                        code: arcstr::ArcStr::from(format!(
+                            "export default import.meta.ROLLUP_FILE_URL_{reference};"
+                        )),
+                        module_type: Some(rolldown_common::ModuleType::Js),
+                        ..Default::default()
+                    }));
+                }
                 let bytes =
                     std::fs::read(file).map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
                 let code = emit_or_inline(&ctx, file, bytes, inline_limit)?;
@@ -721,6 +880,28 @@ impl Plugin for OjCssPlugin {
                 }));
             }
             if let Some(file) = id.strip_suffix("?inline") {
+                if is_stylesheet_path(file) {
+                    // `import css from './a.css?inline'` is the compiled CSS text,
+                    // as in dev and Vite, not a base64 data URI of the source.
+                    let out = compile_stylesheet(
+                        &root,
+                        &host,
+                        &css_transform_enabled,
+                        self_has_postcss,
+                        &css_cfg,
+                        file,
+                        &id,
+                    )
+                    .await?;
+                    return Ok(Some(rolldown_plugin::HookLoadOutput {
+                        code: arcstr::ArcStr::from(format!(
+                            "export default {};",
+                            serde_json::Value::String(out.css)
+                        )),
+                        module_type: Some(rolldown_common::ModuleType::Js),
+                        ..Default::default()
+                    }));
+                }
                 let bytes =
                     std::fs::read(file).map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
                 let ext = std::path::Path::new(file)
@@ -754,14 +935,20 @@ impl Plugin for OjCssPlugin {
                     ..Default::default()
                 }));
             }
-            let worker = id
-                .strip_suffix("?worker")
-                .map(|f| (f, "Worker"))
-                .or_else(|| {
-                    id.strip_suffix("?sharedworker")
-                        .map(|f| (f, "SharedWorker"))
-                });
-            if let Some((file, ctor)) = worker {
+            if let Some((file, ctor, inline, url)) = worker_id_parts(&id) {
+                if inline {
+                    // `?worker&inline`: the worker's bundled code travels inside
+                    // this chunk and starts from a Blob URL (data: URL fallback).
+                    let code = bundle_worker_inline(&root, file).await?;
+                    let literal = serde_json::Value::String(code).to_string();
+                    return Ok(Some(rolldown_plugin::HookLoadOutput {
+                        code: arcstr::ArcStr::from(format!(
+                            "const __oj_worker_code = {literal};\nexport default function (options) {{ const opts = Object.assign({{ type: \"module\" }}, options); const blob = typeof Blob !== \"undefined\" && new Blob([__oj_worker_code], {{ type: \"text/javascript;charset=utf-8\" }}); const url = blob ? URL.createObjectURL(blob) : \"data:text/javascript;charset=utf-8,\" + encodeURIComponent(__oj_worker_code); try {{ return new {ctor}(url, opts); }} finally {{ if (blob) setTimeout(() => URL.revokeObjectURL(url), 0); }} }};"
+                        )),
+                        module_type: Some(rolldown_common::ModuleType::Js),
+                        ..Default::default()
+                    }));
+                }
                 let stem = std::path::Path::new(file)
                     .file_stem()
                     .and_then(|n| n.to_str())
@@ -777,10 +964,17 @@ impl Plugin for OjCssPlugin {
                         ..Default::default()
                     })
                     .map_err(|e| anyhow::anyhow!(e))?;
+                let code = if url {
+                    // `?worker&url` (also what `new Worker(new URL(...))` becomes):
+                    // the chunk's URL as a string.
+                    format!("export default import.meta.ROLLUP_FILE_URL_{reference};")
+                } else {
+                    format!(
+                        "export default function (options) {{ return new {ctor}(import.meta.ROLLUP_FILE_URL_{reference}, Object.assign({{ type: \"module\" }}, options)); }};"
+                    )
+                };
                 return Ok(Some(rolldown_plugin::HookLoadOutput {
-                    code: arcstr::ArcStr::from(format!(
-                        "export default function () {{ return new {ctor}(import.meta.ROLLUP_FILE_URL_{reference}, {{ type: \"module\" }}); }};"
-                    )),
+                    code: arcstr::ArcStr::from(code),
                     module_type: Some(rolldown_common::ModuleType::Js),
                     ..Default::default()
                 }));
@@ -810,43 +1004,19 @@ impl Plugin for OjCssPlugin {
                     ..Default::default()
                 }));
             }
-            let is_less = oj_server::sidecar::is_less(path);
-            let is_stylus = oj_server::sidecar::is_stylus(path);
-            if !(path.ends_with(".css") || oj_css::is_sass(path) || is_less || is_stylus) {
+            if !is_stylesheet_path(path) {
                 return Ok(None);
             }
-            let mut source = std::fs::read_to_string(path)
-                .map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
-            // Run the plugin transform chain on the raw CSS source first, so
-            // directive transformers (UnoCSS `@apply`/`@unocss-include`, etc.)
-            // resolve before oj preprocesses and compiles it.
-            if let Some(host) = &host {
-                let on = *css_transform_enabled
-                    .get_or_init(|| async { host.has_transform().await })
-                    .await;
-                if on {
-                    if let Ok((out, _, _, _)) = host.transform(&source, &id, "{}").await {
-                        source = out;
-                    }
-                }
-            }
-            if oj_css::is_sass(path) {
-                let dir = std::path::Path::new(path).parent();
-                source = oj_css::compile_sass(&source, dir).map_err(|e| anyhow::anyhow!(e))?;
-            } else if is_less || is_stylus {
-                source = preprocess_via_sidecar(&root, std::path::Path::new(path))?;
-            }
-            if oj_server::sidecar::is_tailwind_css(&source)
-                || (self.has_postcss && path.ends_with(".css"))
-            {
-                source = expand_css_via_sidecar(&root, std::path::Path::new(path))?;
-            }
-            let css_id = match std::path::Path::new(path).strip_prefix(&root) {
-                Ok(rel) => format!("/{}", rel.display()),
-                Err(_) => path.to_string(),
-            };
-            let output =
-                oj_css::compile_css(&css_id, &source, true).map_err(|e| anyhow::anyhow!(e))?;
+            let output = compile_stylesheet(
+                &root,
+                &host,
+                &css_transform_enabled,
+                self_has_postcss,
+                &css_cfg,
+                path,
+                &id,
+            )
+            .await?;
             let js = match &output.exports {
                 Some(exports) => {
                     let map: serde_json::Map<String, serde_json::Value> = exports
@@ -877,31 +1047,75 @@ impl Plugin for OjCssPlugin {
     }
 }
 
-fn expand_css_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String> {
-    let script = oj_cache::cache_root(&root).join("css-sidecar.mjs");
+/// Tailwind / PostCSS over `css` (the file's content as processed so far, not
+/// re-read from disk), via the sidecar's line protocol.
+fn expand_css_via_sidecar(root: &Path, css_file: &Path, css: &str) -> anyhow::Result<String> {
+    run_sidecar_once(
+        root,
+        "css-sidecar.mjs",
+        oj_server::sidecar::SIDECAR_JS,
+        css_file,
+        css,
+        serde_json::Value::Null,
+        "tailwind/postcss",
+    )
+}
+
+fn run_sidecar_once(
+    root: &Path,
+    script_name: &str,
+    script_src: &str,
+    css_file: &Path,
+    css: &str,
+    options: serde_json::Value,
+    what: &str,
+) -> anyhow::Result<String> {
+    use std::io::Write;
+    let script = oj_cache::cache_root(root).join(script_name);
     if let Some(parent) = script.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&script, oj_server::sidecar::SIDECAR_JS)?;
-    let out = std::process::Command::new("node")
-        .args([
-            script.to_str().unwrap(),
-            "--once",
-            css_file.to_str().unwrap(),
-            root.to_str().unwrap(),
-        ])
+    fs::write(&script, script_src)?;
+    let req = serde_json::json!({
+        "id": 1,
+        "base": root.to_string_lossy(),
+        "css": css,
+        "from": css_file.to_string_lossy(),
+        "options": options,
+    })
+    .to_string();
+    let postcss_config = oj_server::find_postcss_config(root)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut child = std::process::Command::new("node")
+        .arg(&script)
         .env("NODE_COMPILE_CACHE", oj_server::node_compile_cache(root))
+        .env("OJ_POSTCSS_CONFIG", postcss_config)
         .current_dir(root)
-        .output()
-        .context("node not found for tailwind/postcss build")?;
-    if !out.status.success() {
-        bail!(
-            "css build failed for {}: {}",
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("node not found for {what} build"))?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{req}\n").as_bytes())?;
+    let out = child.wait_with_output()?;
+    let line = String::from_utf8_lossy(&out.stdout);
+    let line = line.trim().lines().next().unwrap_or("{}");
+    let v: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+    match v.get("css").and_then(|c| c.as_str()) {
+        Some(css) => Ok(css.to_string()),
+        None => bail!(
+            "{what} failed for {}: {}",
             css_file.display(),
-            String::from_utf8_lossy(&out.stderr)
-        );
+            v.get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("sidecar produced no output")
+        ),
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn svelte_via_sidecar(root: &Path, file: &Path) -> anyhow::Result<String> {
@@ -950,49 +1164,22 @@ fn svelte_via_sidecar(root: &Path, file: &Path) -> anyhow::Result<String> {
     }
 }
 
-fn preprocess_via_sidecar(root: &Path, css_file: &Path) -> anyhow::Result<String> {
-    use std::io::Write;
-    let script = oj_cache::cache_root(&root).join("css-preprocess.mjs");
-    if let Some(parent) = script.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&script, oj_server::sidecar::PREPROCESS_JS)?;
-    let css = fs::read_to_string(css_file)?;
-    let req = serde_json::json!({
-        "id": 1,
-        "base": root.to_string_lossy(),
-        "css": css,
-        "from": css_file.to_string_lossy(),
-    })
-    .to_string();
-    let mut child = std::process::Command::new("node")
-        .arg(&script)
-        .env("NODE_COMPILE_CACHE", oj_server::node_compile_cache(root))
-        .current_dir(root)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .context("node not found for css preprocess build")?;
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(format!("{req}\n").as_bytes())?;
-    let out = child.wait_with_output()?;
-    let line = String::from_utf8_lossy(&out.stdout);
-    let line = line.trim().lines().next().unwrap_or("{}");
-    let v: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
-    match v.get("css").and_then(|c| c.as_str()) {
-        Some(css) => Ok(css.to_string()),
-        None => bail!(
-            "css preprocess failed for {}: {}",
-            css_file.display(),
-            v.get("error")
-                .and_then(|e| e.as_str())
-                .unwrap_or("is `less`/`stylus` installed?")
-        ),
-    }
+fn preprocess_via_sidecar(
+    root: &Path,
+    css_file: &Path,
+    css: &str,
+    options: serde_json::Value,
+) -> anyhow::Result<String> {
+    run_sidecar_once(
+        root,
+        "css-preprocess.mjs",
+        oj_server::sidecar::PREPROCESS_JS,
+        css_file,
+        css,
+        options,
+        "css preprocess",
+    )
+    .map_err(|e| anyhow::anyhow!("{e} (is `less`/`stylus` installed?)"))
 }
 
 fn rolldown_resolve(
@@ -1222,6 +1409,7 @@ fn forward_emitted_html(
         out_rel,
         src_html: content,
         scripts,
+        dir: emit.root.clone(),
     });
 }
 
@@ -1730,6 +1918,8 @@ pub async fn build(
     }
 
     let mut html_docs: Vec<HtmlDoc> = Vec::new();
+    let html_inline: Arc<Mutex<std::collections::HashMap<String, String>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
     let mut inputs: Vec<InputItem> = Vec::new();
     let mut seen_imports: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut had_html = false;
@@ -1765,10 +1955,17 @@ pub async fn build(
             };
             had_html = true;
             let html_dir = abs.parent().unwrap_or(&root).to_path_buf();
+            let (content, inline) = externalize_inline_scripts(&content, &abs);
+            for (_, id, body) in &inline {
+                html_inline.lock().unwrap().insert(id.clone(), body.clone());
+            }
             let scripts: Vec<HtmlScript> = module_script_srcs(&content)
                 .into_iter()
                 .map(|src| {
-                    let abs = resolve_html_ref(&src, &html_dir, &root);
+                    let abs = match inline.iter().find(|(p, _, _)| *p == src) {
+                        Some((_, id, _)) => PathBuf::from(id),
+                        None => resolve_html_ref(&src, &html_dir, &root),
+                    };
                     HtmlScript { src, abs }
                 })
                 .collect();
@@ -1794,6 +1991,7 @@ pub async fn build(
                 out_rel,
                 src_html: content,
                 scripts,
+                dir: html_dir,
             });
         } else {
             if !abs.exists() {
@@ -1837,6 +2035,8 @@ pub async fn build(
         css_code_split: css_split,
         host: plugin_host.clone(),
         css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
+        css: config.css.clone(),
+        html_inline: Arc::clone(&html_inline),
     }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
@@ -1939,6 +2139,13 @@ pub async fn build(
         oj_env::html_env_map(&defines)
     };
     let mut emitted: Vec<(String, usize)> = Vec::new();
+    let has_postcss = oj_server::has_postcss_config(&root);
+    let link_css_transform_enabled: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::new();
+    let asset_names_pattern = ro_output_str(ro_opts, "assetFileNames");
+    let css_asset_opts = CssAssetOpts {
+        inline_limit: assets_inline_limit_of(&config),
+        asset_names: asset_names_pattern.as_deref(),
+    };
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
     let mut imports_map: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
@@ -2017,12 +2224,12 @@ pub async fn build(
                         .parent()
                         .map(Path::to_path_buf)
                         .unwrap_or_else(|| root.to_path_buf());
-                    rebase_css_urls(&css, &dir, &out_dir, &base, &mut emitted, &mut seen_assets)
+                    rebase_css_urls(&css, &dir, &out_dir, &base, css_asset_opts, &mut emitted, &mut seen_assets)
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
             let hash = content_hash(combined.as_bytes());
-            let css_name = format!("assets/style-{}.css", &hash[..8]);
+            let css_name = render_asset_name(css_asset_opts.asset_names, "style", &hash, "css");
             fs::write(out_dir.join(&css_name), &combined)?;
             emitted.push((css_name.clone(), combined.len()));
             for entry in &mut manifest_entries {
@@ -2045,6 +2252,7 @@ pub async fn build(
             &out_dir,
             &root,
             &base,
+            css_asset_opts,
             &mut emitted,
             &mut manifest_entries,
         )?
@@ -2107,22 +2315,52 @@ pub async fn build(
             rewritten_html = insert_before_head(&rewritten_html, &links);
         }
 
-        for href in link_hrefs(&doc.src_html) {
-            let src = root.join(href.trim_start_matches('/'));
-            if src.is_file() {
-                let dest = out_dir.join(href.trim_start_matches('/'));
+        // `<link rel="stylesheet" href>` to a local file (relative or root-absolute)
+        // goes through the same pipeline as an imported stylesheet (Sass/PostCSS/
+        // Tailwind, lightningcss, url() assets) and is emitted hashed, as in Vite.
+        {
+            let mut seen_link_assets: std::collections::HashMap<PathBuf, String> =
+                std::collections::HashMap::new();
+            for href in stylesheet_hrefs(&doc.src_html) {
+                let src = resolve_html_ref(&href, &doc.dir, &root);
+                if !src.is_file() {
+                    continue;
+                }
+                let src_str = src.to_string_lossy().into_owned();
+                let out = compile_stylesheet(
+                    &root,
+                    &plugin_host,
+                    &link_css_transform_enabled,
+                    has_postcss,
+                    &config.css,
+                    &src_str,
+                    &src_str,
+                )
+                .await
+                .with_context(|| format!("stylesheet {href} linked from {}", doc.out_rel))?;
+                let dir = src.parent().map(Path::to_path_buf).unwrap_or_else(|| root.clone());
+                let css = rebase_css_urls(
+                    &out.css,
+                    &dir,
+                    &out_dir,
+                    &base,
+                    css_asset_opts,
+                    &mut emitted,
+                    &mut seen_link_assets,
+                );
+                let hash = content_hash(css.as_bytes());
+                let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("style");
+                let name = render_asset_name(css_asset_opts.asset_names, &sanitize_asset_name(stem), &hash, "css");
+                let dest = out_dir.join(&name);
                 if let Some(parent) = dest.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                let source = fs::read_to_string(&src)?;
-                if oj_server::sidecar::is_tailwind_css(&source) {
-                    let css = expand_css_via_sidecar(&root, &src)?;
-                    let minified = oj_css::compile_css(href.as_str(), &css, true)
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                    fs::write(&dest, minified.css)?;
-                    continue;
-                }
-                fs::copy(&src, &dest)?;
+                fs::write(&dest, &css)?;
+                emitted.push((name.clone(), css.len()));
+                rewritten_html = rewritten_html.replace(
+                    &format!("href=\"{href}\""),
+                    &format!("href=\"{}\"", with_base(&name, &base)),
+                );
             }
         }
 
@@ -2223,6 +2461,88 @@ struct HtmlDoc {
     out_rel: String,
     src_html: String,
     scripts: Vec<HtmlScript>,
+    /// Directory of the source page; relative `<link href>`s resolve against it.
+    dir: PathBuf,
+}
+
+/// Inline `<script type="module">…</script>` blocks (no `src`): the byte range
+/// of the whole element and its body.
+fn inline_module_scripts(html: &str) -> Vec<(usize, usize, String)> {
+    let mut out = Vec::new();
+    for (start, _) in html.match_indices("<script") {
+        let Some(tag_end) = html[start..].find('>') else {
+            continue;
+        };
+        let tag = &html[start..start + tag_end];
+        if !tag.contains("type=\"module\"") || tag.contains("src=") || tag.ends_with('/') {
+            continue;
+        }
+        let body_start = start + tag_end + 1;
+        let Some(close) = html[body_start..].find("</script>") else {
+            continue;
+        };
+        let body = html[body_start..body_start + close].to_string();
+        if body.trim().is_empty() {
+            continue;
+        }
+        out.push((start, body_start + close + "</script>".len(), body));
+    }
+    out
+}
+
+/// Vite's html-proxy: each inline module script becomes its own entry
+/// (`<page>?html-proxy&index=N.js`, whose relative imports resolve against the
+/// page's directory) and the tag is rewritten to a `src` placeholder that the
+/// post-bundle HTML rewrite replaces with the hashed chunk. Returns the rewritten
+/// html and `(placeholder src, virtual id, body)` per script.
+fn externalize_inline_scripts(html: &str, html_abs: &Path) -> (String, Vec<(String, String, String)>) {
+    let blocks = inline_module_scripts(html);
+    if blocks.is_empty() {
+        return (html.to_string(), Vec::new());
+    }
+    let mut out = html.to_string();
+    let mut entries = Vec::new();
+    for (n, (start, end, body)) in blocks.iter().enumerate().rev() {
+        let placeholder = format!("/@oj-inline/{n}.js");
+        let id = format!("{}?html-proxy&index={n}.js", html_abs.display());
+        out.replace_range(*start..*end, &format!("<script type=\"module\" src=\"{placeholder}\"></script>"));
+        entries.push((placeholder, id, body.clone()));
+    }
+    entries.reverse();
+    (out, entries)
+}
+
+/// `href`s of `<link rel="stylesheet">` tags that name a local file (relative or
+/// root-absolute), in document order.
+fn stylesheet_hrefs(html: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (start, _) in html.match_indices("<link") {
+        let Some(end) = html[start..].find('>') else {
+            continue;
+        };
+        let tag = &html[start..start + end];
+        if !(tag.contains("rel=\"stylesheet\"") || tag.contains("rel='stylesheet'")) {
+            continue;
+        }
+        let Some(at) = tag.find("href=\"") else {
+            continue;
+        };
+        let rest = &tag[at + 6..];
+        let Some(close) = rest.find('"') else {
+            continue;
+        };
+        let href = &rest[..close];
+        if href.is_empty()
+            || href.starts_with("http://")
+            || href.starts_with("https://")
+            || href.starts_with("//")
+            || href.starts_with("data:")
+        {
+            continue;
+        }
+        out.push(href.to_string());
+    }
+    out
 }
 
 fn normalize_input_entries(input: &serde_json::Value) -> Vec<(String, String)> {
@@ -2278,12 +2598,6 @@ fn insert_before_head(html: &str, snippet: &str) -> String {
     }
 }
 
-fn link_hrefs(html: &str) -> Vec<String> {
-    scan_attrs(html, "<link", "href=\"")
-        .into_iter()
-        .filter(|href| href.starts_with('/'))
-        .collect()
-}
 
 fn scan_attrs(html: &str, tag_prefix: &str, attr_prefix: &str) -> Vec<String> {
     let mut values = Vec::new();
@@ -2397,6 +2711,8 @@ pub(crate) async fn build_ssr(
         css_code_split: false,
         host: plugin_host.clone(),
         css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
+        css: config.css.clone(),
+        html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
     }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
@@ -2539,6 +2855,8 @@ async fn build_server_fns(root: &Path, out_dir: &Path, mode: &str) -> anyhow::Re
                 css_code_split: false,
                 host: None,
                 css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
+                css: config.css.clone(),
+                html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
             })])
             .with_options(BundlerOptions {
                 input: Some(vec![InputItem {
@@ -2906,6 +3224,8 @@ async fn build_client_entry(
         css_code_split: false,
         host: plugin_host.clone(),
         css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
+        css: config.css.clone(),
+        html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
     }));
 
     let mut bundler = BundlerBuilder::default()
@@ -3047,6 +3367,8 @@ async fn build_library(
                 css_code_split: false,
                 host: None,
                 css_transform_enabled: Arc::new(tokio::sync::OnceCell::new()),
+                css: config.css.clone(),
+                html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
             })])
             .with_options(BundlerOptions {
                 input: Some(vec![InputItem {
@@ -3222,11 +3544,37 @@ fn content_hash(bytes: &[u8]) -> String {
 
 /// Emit a CSS-referenced asset (font/image) under a content hash and return its
 /// base-prefixed URL, or None to leave the `url()` untouched (data:/absolute/external).
+/// How files oj writes itself (CSS url() assets, chunk stylesheets) are named
+/// and when they are inlined: `build.assetsInlineLimit` and
+/// `build.rollupOptions.output.assetFileNames`.
+#[derive(Debug, Clone, Copy)]
+struct CssAssetOpts<'a> {
+    inline_limit: u64,
+    asset_names: Option<&'a str>,
+}
+
+/// Render Vite/rolldown `assetFileNames` placeholders (`[name]`, `[hash]`,
+/// `[ext]`, `[extname]`); the default is Vite's `assets/[name]-[hash][extname]`.
+fn render_asset_name(pattern: Option<&str>, name: &str, hash: &str, ext: &str) -> String {
+    let pattern = pattern.unwrap_or("assets/[name]-[hash][extname]");
+    let extname = if ext.is_empty() {
+        String::new()
+    } else {
+        format!(".{ext}")
+    };
+    pattern
+        .replace("[name]", name)
+        .replace("[hash]", &hash[..hash.len().min(8)])
+        .replace("[extname]", &extname)
+        .replace("[ext]", ext)
+}
+
 fn emit_css_url(
     inner: &str,
     css_dir: &Path,
     out_dir: &Path,
     base: &str,
+    opts: CssAssetOpts<'_>,
     emitted: &mut Vec<(String, usize)>,
     seen: &mut std::collections::HashMap<PathBuf, String>,
 ) -> Option<String> {
@@ -3247,14 +3595,18 @@ fn emit_css_url(
         return Some(format!("{url}{suffix}"));
     }
     let data = std::fs::read(&abs).ok()?;
+    let ext = abs.extension().and_then(|s| s.to_str()).unwrap_or("");
+    // Small assets referenced from CSS are inlined as in Vite (assetsInlineLimit),
+    // except an svg with a fragment, which must stay a file to keep its `#id`.
+    if (data.len() as u64) <= opts.inline_limit && !suffix.starts_with('#') {
+        if ext.eq_ignore_ascii_case("svg") {
+            return Some(svg_data_url(&String::from_utf8_lossy(&data)));
+        }
+        return Some(format!("data:{};base64,{}", asset_mime(ext), b64(&data)));
+    }
     let hash = content_hash(&data);
     let stem = abs.file_stem().and_then(|s| s.to_str()).unwrap_or("asset");
-    let ext = abs
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(|e| format!(".{e}"))
-        .unwrap_or_default();
-    let name = format!("assets/{}-{}{}", sanitize_asset_name(stem), &hash[..8], ext);
+    let name = render_asset_name(opts.asset_names, &sanitize_asset_name(stem), &hash, ext);
     let dest = out_dir.join(&name);
     if let Some(p) = dest.parent() {
         let _ = std::fs::create_dir_all(p);
@@ -3274,6 +3626,7 @@ fn rebase_css_urls(
     css_dir: &Path,
     out_dir: &Path,
     base: &str,
+    opts: CssAssetOpts<'_>,
     emitted: &mut Vec<(String, usize)>,
     seen: &mut std::collections::HashMap<PathBuf, String>,
 ) -> String {
@@ -3292,7 +3645,7 @@ fn rebase_css_urls(
             .trim()
             .trim_matches(|c| c == '"' || c == '\'')
             .trim();
-        match emit_css_url(inner, css_dir, out_dir, base, emitted, seen) {
+        match emit_css_url(inner, css_dir, out_dir, base, opts, emitted, seen) {
             Some(url) => {
                 out.push_str("url(\"");
                 out.push_str(&url);
@@ -3321,6 +3674,7 @@ fn emit_split_css_files(
     out_dir: &Path,
     root: &Path,
     base: &str,
+    opts: CssAssetOpts<'_>,
     emitted: &mut Vec<(String, usize)>,
     manifest_entries: &mut [ManifestEntry],
 ) -> anyhow::Result<Vec<(String, String)>> {
@@ -3353,6 +3707,7 @@ fn emit_split_css_files(
                     &dir,
                     out_dir,
                     base,
+                    opts,
                     emitted,
                     &mut seen_assets,
                 ));
@@ -3362,11 +3717,10 @@ fn emit_split_css_files(
             continue;
         }
         let hash = content_hash(css.as_bytes());
-        let css_name = format!(
-            "assets/{}-{}.css",
-            sanitize_asset_name(&chunk.name),
-            &hash[..8]
-        );
+        let css_name = render_asset_name(opts.asset_names, &sanitize_asset_name(&chunk.name), &hash, "css");
+        if let Some(parent) = out_dir.join(&css_name).parent() {
+            fs::create_dir_all(parent)?;
+        }
         fs::write(out_dir.join(&css_name), &css)?;
         emitted.push((css_name.clone(), css.len()));
         for entry in manifest_entries.iter_mut() {
@@ -4101,6 +4455,11 @@ mod tests {
         }
         // A query does not change the classification.
         assert!(is_build_asset("/src/a.png?url"));
+        // Same list as the dev server, case-insensitive like Vite.
+        assert!(is_build_asset("/src/photo.JPG"));
+        assert!(is_build_asset("/src/doc.pdf"));
+        assert!(is_build_asset("/src/site.webmanifest"));
+        assert_eq!(asset_mime("PNG"), "image/png");
         assert!(!is_build_asset("/src/a.tsx"));
         assert!(!is_build_asset("/src/a.png.tsx"));
         assert!(!is_build_asset(""));
@@ -4127,6 +4486,29 @@ mod tests {
             let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
             assert_eq!(b64(&bytes).len() % 4, 0, "len {len}");
         }
+    }
+
+    #[test]
+    fn asset_queries_split_in_any_combination() {
+        assert_eq!(split_asset_query("./w.ts?worker"), Some(("./w.ts".into(), "worker".into())));
+        assert_eq!(split_asset_query("./w.ts?worker&inline"), Some(("./w.ts".into(), "worker&inline".into())));
+        assert_eq!(split_asset_query("./w.ts?inline&worker"), Some(("./w.ts".into(), "worker&inline".into())));
+        assert_eq!(split_asset_query("./w.ts?url&sharedworker"), Some(("./w.ts".into(), "sharedworker&url".into())));
+        assert_eq!(split_asset_query("./a.png?url"), Some(("./a.png".into(), "url".into())));
+        assert_eq!(split_asset_query("./a.png?url&v=1"), None, "foreign params are not oj queries");
+        assert_eq!(split_asset_query("./a.png?v=1"), None);
+        assert_eq!(split_asset_query("./a.png"), None);
+        assert_eq!(worker_id_parts("/x/w.ts?worker&inline"), Some(("/x/w.ts", "Worker", true, false)));
+        assert_eq!(worker_id_parts("/x/w.ts?sharedworker&url"), Some(("/x/w.ts", "SharedWorker", false, true)));
+        assert_eq!(worker_id_parts("/x/w.ts?url"), None);
+    }
+
+    #[test]
+    fn asset_file_names_render_vite_placeholders() {
+        assert_eq!(render_asset_name(None, "bg", "0123456789abcdef", "png"), "assets/bg-01234567.png");
+        assert_eq!(render_asset_name(Some("static/[name].[hash][extname]"), "bg", "0123456789abcdef", "png"), "static/bg.01234567.png");
+        assert_eq!(render_asset_name(Some("[ext]/[name]-[hash].[ext]"), "app", "abcdef0123456789", "css"), "css/app-abcdef01.css");
+        assert_eq!(render_asset_name(None, "x", "abcd", ""), "assets/x-abcd");
     }
 
     #[test]
@@ -4188,18 +4570,35 @@ mod tests {
     }
 
     #[test]
-    fn link_hrefs_collects_only_absolute_hrefs() {
+    fn stylesheet_hrefs_take_local_stylesheet_links_only() {
         let html = r#"<html><head>
-          <link rel="stylesheet" href="/assets/app.css">
+          <link rel="stylesheet" href="/src/base.css">
+          <link rel="stylesheet" href="./src/theme.scss">
+          <link rel="stylesheet" href="https://cdn.test/x.css">
           <link rel="icon" href="favicon.ico">
           <link rel="modulepreload" href="/assets/chunk.js">
         </head></html>"#;
-        let hrefs = link_hrefs(html);
-        assert!(hrefs.contains(&"/assets/app.css".to_string()), "{hrefs:?}");
-        assert!(hrefs.contains(&"/assets/chunk.js".to_string()), "{hrefs:?}");
-        assert!(
-            !hrefs.iter().any(|h| h.contains("favicon")),
-            "relative href filtered: {hrefs:?}"
-        );
+        assert_eq!(stylesheet_hrefs(html), vec!["/src/base.css".to_string(), "./src/theme.scss".to_string()]);
     }
+
+    #[test]
+    fn inline_module_scripts_become_html_proxy_entries() {
+        let html = "<html><body>\n<script type=\"module\">import { x } from \"./src/x.js\"; x();</script>\n<script type=\"module\" src=\"/src/main.js\"></script>\n<script>var legacy = 1;</script>\n<script type=\"module\">console.log(2)</script></body></html>";
+        let blocks = inline_module_scripts(html);
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].2.contains("import { x }"));
+        let (out, entries) = externalize_inline_scripts(html, Path::new("/app/index.html"));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "/@oj-inline/0.js");
+        assert_eq!(entries[0].1, "/app/index.html?html-proxy&index=0.js");
+        assert_eq!(entries[1].1, "/app/index.html?html-proxy&index=1.js");
+        assert!(out.contains("<script type=\"module\" src=\"/@oj-inline/0.js\"></script>"), "{out}");
+        assert!(out.contains("<script type=\"module\" src=\"/@oj-inline/1.js\"></script>"), "{out}");
+        assert!(!out.contains("console.log(2)"), "inline body removed: {out}");
+        assert!(out.contains("var legacy = 1;"), "classic scripts untouched: {out}");
+        assert!(out.contains("src=\"/src/main.js\""), "external module kept: {out}");
+        // The placeholder is picked up as a module entry src.
+        assert!(module_script_srcs(&out).contains(&"/@oj-inline/0.js".to_string()));
+    }
+
 }

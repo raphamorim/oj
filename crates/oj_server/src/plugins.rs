@@ -577,21 +577,21 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
             sc.open = sf.get("open").and_then(|b| b.as_bool());
         }
     }
-    if let Some(po) = v
-        .css
-        .as_ref()
-        .and_then(|c| c.get("preprocessorOptions"))
-        .and_then(|p| p.as_object())
-    {
-        let css = config.css.get_or_insert_with(Default::default);
-        let map = css.preprocessor_options.get_or_insert_with(Default::default);
-        for (lang, opts) in po {
-            let Some(data) = opts.get("additionalData").and_then(|d| d.as_str()) else {
-                continue;
-            };
-            let entry = map.entry(lang.clone()).or_default();
-            if entry.additional_data.is_none() {
-                entry.additional_data = Some(data.to_string());
+    if let Some(css) = v.css.as_ref() {
+        if config.css.is_none() {
+            // The whole block (preprocessorOptions, devSourcemap, modules).
+            config.css = serde_json::from_value::<oj_config::CssConfig>(css.clone()).ok();
+        } else if let Some(po) = css.get("preprocessorOptions").and_then(|p| p.as_object()) {
+            let cfg = config.css.as_mut().unwrap();
+            let map = cfg.preprocessor_options.get_or_insert_with(Default::default);
+            for (lang, opts) in po {
+                let Some(data) = opts.get("additionalData").and_then(|d| d.as_str()) else {
+                    continue;
+                };
+                let entry = map.entry(lang.clone()).or_default();
+                if entry.additional_data.is_none() {
+                    entry.additional_data = Some(data.to_string());
+                }
             }
         }
     }
@@ -1511,5 +1511,17 @@ mod vite_values_tests {
         let sc = config.server.unwrap();
         assert!(matches!(sc.cors, Some(oj_config::CorsConfig::Toggle(false))));
         assert!(matches!(sc.allowed_hosts, Some(oj_config::AllowedHosts::All(true))));
+    }
+
+    #[test]
+    fn merge_adopts_css_preprocessor_options() {
+        let mut config = oj_config::OjConfig::default();
+        let v = ViteValues {
+            css: Some(serde_json::json!({ "preprocessorOptions": { "scss": { "additionalData": "$b: red;", "loadPaths": ["styles"] } } })),
+            ..Default::default()
+        };
+        merge_vite_values(&mut config, v);
+        assert_eq!(oj_config::css_additional_data(&config, "scss").as_deref(), Some("$b: red;"));
+        assert_eq!(oj_config::css_load_paths(&config, "scss"), vec!["styles".to_string()]);
     }
 }

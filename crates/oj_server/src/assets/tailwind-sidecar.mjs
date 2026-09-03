@@ -4,35 +4,73 @@
 import { createRequire } from "node:module";
 import { existsSync, fstatSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
+import { basename, dirname } from "node:path";
 import readline from "node:readline";
 
 const processors = new Map();
 
+// The config file oj found the way postcss-load-config does (OJ_POSTCSS_CONFIG:
+// postcss.config.*, .postcssrc*, or a package.json with a `postcss` key, possibly
+// in a parent directory up to the workspace root), read by its kind.
+async function readPostcssConfig(base) {
+  const cfgPath =
+    process.env.OJ_POSTCSS_CONFIG ||
+    ["postcss.config.js", "postcss.config.cjs", "postcss.config.mjs"].map((n) => `${base}/${n}`).find((p) => existsSync(p));
+  if (!cfgPath) return null;
+  const name = basename(cfgPath);
+  let config;
+  if (name === "package.json") {
+    config = JSON.parse(readFileSync(cfgPath, "utf8")).postcss;
+  } else if (name === ".postcssrc" || name.endsWith(".json")) {
+    config = JSON.parse(readFileSync(cfgPath, "utf8"));
+  } else {
+    const mod = await import(pathToFileURL(cfgPath).href);
+    config = mod.default ?? mod;
+  }
+  if (typeof config === "function") {
+    config = config({ env: process.env.NODE_ENV || "development", cwd: base, options: {} });
+  }
+  return config ? { config, dir: dirname(cfgPath) } : null;
+}
+
+// Resolve `postcss` and plugin packages from the config's own directory first
+// (a workspace-root config installs them there), then from the app.
+function resolver(dirs) {
+  const reqs = dirs.map((d) => createRequire(d + "/package.json"));
+  return (spec) => {
+    let err;
+    for (const req of reqs) {
+      try {
+        return req.resolve(spec);
+      } catch (e) {
+        err = e;
+      }
+    }
+    throw err;
+  };
+}
+
 async function loadPostcss(base) {
   if (processors.has(base)) return processors.get(base);
-  const req = createRequire(base + "/package.json");
-  const cfgPath = ["postcss.config.js", "postcss.config.cjs", "postcss.config.mjs"]
-    .map((n) => `${base}/${n}`)
-    .find((p) => existsSync(p));
   let processor = null;
-  if (cfgPath) {
+  const found = await readPostcssConfig(base);
+  if (found) {
+    const resolve = resolver(found.dir === base ? [base] : [found.dir, base]);
     let postcss;
     try {
-      postcss = (await import(req.resolve("postcss"))).default;
+      postcss = (await import(resolve("postcss"))).default;
     } catch {
       postcss = null;
     }
     if (postcss) {
-      const mod = await import(pathToFileURL(cfgPath).href);
-      const config = mod.default ?? mod;
-      const raw = config.plugins ?? {};
+      const raw = found.config.plugins ?? {};
       const plugins = [];
       if (Array.isArray(raw)) {
         for (const p of raw) if (p) plugins.push(p);
       } else {
         for (const [name, opts] of Object.entries(raw)) {
           if (opts === false) continue;
-          const imported = await import(req.resolve(name));
+          const imported = await import(pathToFileURL(resolve(name)).href);
           const factory = imported.default ?? imported;
           plugins.push(typeof factory === "function" ? factory(opts ?? {}) : factory);
         }

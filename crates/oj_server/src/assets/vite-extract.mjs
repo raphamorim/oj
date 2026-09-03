@@ -287,18 +287,6 @@ function extractServerFlags(s) {
   else if (s.open === false) out.open = false;
   return Object.keys(out).length ? out : null;
 }
-function extractCss(css) {
-  const po = css && typeof css === "object" ? css.preprocessorOptions : null;
-  if (!po || typeof po !== "object") return null;
-  const out = {};
-  for (const [lang, opts] of Object.entries(po)) {
-    if (opts && typeof opts.additionalData === "string") out[lang] = { additionalData: opts.additionalData };
-    else if (opts && typeof opts.additionalData === "function") {
-      warn(`css.preprocessorOptions.${lang}.additionalData function form is not applied`);
-    }
-  }
-  return Object.keys(out).length ? { preprocessorOptions: out } : null;
-}
 function extractEnvPrefix(p) {
   if (typeof p === "string") return [p];
   if (Array.isArray(p)) return p.filter((x) => typeof x === "string");
@@ -324,8 +312,28 @@ function extractAllowedHosts(v) {
   return null;
 }
 
-function warnUnsupported(c) {
+// The `css` block as JSON: preprocessorOptions (additionalData, loadPaths, Less
+// and Stylus options), devSourcemap, modules. Function-valued options (an
+// `additionalData` callback) cannot cross to Rust and are dropped with a warning.
+function extractCss(css) {
+  if (!css || typeof css !== "object") return null;
+  const po = css.preprocessorOptions;
+  if (po && typeof po === "object") {
+    for (const [lang, opts] of Object.entries(po)) {
+      if (opts && typeof opts.additionalData === "function") {
+        warn(`css.preprocessorOptions.${lang}.additionalData is a function; only the string form is applied`);
+      }
+    }
+  }
+  try {
+    const out = JSON.parse(JSON.stringify(css));
+    return out && Object.keys(out).length ? out : null;
+  } catch {
+    return null;
+  }
+}
 
+function warnUnsupported(c) {
   if (c.esbuild?.jsx === "preserve" || c.oxc?.jsx === "preserve") {
     warn("jsx: \"preserve\" is not supported; JSX is compiled with the automatic runtime");
   }

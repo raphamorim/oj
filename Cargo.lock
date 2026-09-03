@@ -1892,7 +1892,9 @@ version = "0.1.11"
 dependencies = [
  "grass",
  "lightningcss",
+ "parcel_sourcemap",
  "proptest",
+ "serde_json",
  "tempfile",
 ]
 

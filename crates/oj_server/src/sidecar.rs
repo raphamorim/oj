@@ -135,9 +135,13 @@ impl Sidecar {
         }
         std::fs::write(&script, js)?;
 
+        let postcss_config = crate::find_postcss_config(root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let mut child = tokio::process::Command::new("node")
             .arg(&script)
             .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
+            .env("OJ_POSTCSS_CONFIG", postcss_config)
             .env("NODE_COMPILE_CACHE", crate::node_compile_cache(root))
             .current_dir(root)
             .stdin(Stdio::piped())
@@ -181,11 +185,22 @@ impl Sidecar {
     }
 
     pub async fn compile(&self, css: &str, from: &str) -> Result<String, String> {
+        self.compile_with(css, from, serde_json::Value::Null).await
+    }
+
+    /// `options` is the user's `css.preprocessorOptions.<lang>` object (Less/Stylus
+    /// options), handed to the preprocessor as-is.
+    pub async fn compile_with(
+        &self,
+        css: &str,
+        from: &str,
+        options: serde_json::Value,
+    ) -> Result<String, String> {
         let id = self.counter.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
         let from = absolute_from(&self.base, from);
-        let request = serde_json::json!({ "id": id, "base": self.base, "css": css, "from": from });
+        let request = serde_json::json!({ "id": id, "base": self.base, "css": css, "from": from, "options": options });
         {
             let mut stdin = self.stdin.lock().await;
             if stdin

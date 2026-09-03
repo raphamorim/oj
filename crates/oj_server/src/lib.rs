@@ -258,6 +258,7 @@ struct ServerState {
     has_postcss: bool,
     scss_additional_data: Option<String>,
     sass_additional_data: Option<String>,
+    css_config: Option<oj_config::CssConfig>,
     preload_snapshot: Vec<String>,
     proxy: Vec<(String, oj_config::ProxyEntry)>,
     http: reqwest::Client,
@@ -705,6 +706,7 @@ impl DevServer {
             has_postcss: has_postcss_config(&root),
             scss_additional_data: oj_config::css_additional_data(&config, "scss"),
             sass_additional_data: oj_config::css_additional_data(&config, "sass"),
+            css_config: config.css.clone(),
             fs_allow: Arc::new(Mutex::new({
                 let mut set: std::collections::HashSet<PathBuf> = server_cfg
                     .fs
@@ -998,7 +1000,7 @@ async fn ssr_module(
     let ext = path.extension().and_then(|e| e.to_str());
     if !from_plugin && ext.is_some_and(is_style_ext) {
         let source = if is_preprocessor(id) {
-            match run_preprocess_sidecar(&state, id, &source).await {
+            match run_preprocess_sidecar(&state, id, &source, serde_json::Value::Null).await {
                 Ok(css) => css,
                 Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
             }
@@ -1088,6 +1090,26 @@ fn sass_additional_data_for(state: &ServerState, url: &str) -> Option<String> {
     } else {
         state.scss_additional_data.clone()
     }
+}
+
+/// `css.preprocessorOptions.<scss|sass>.loadPaths` / `includePaths`, resolved
+/// against the app root.
+fn sass_load_paths_for(state: &ServerState, url: &str) -> Vec<PathBuf> {
+    if !oj_css::is_sass(url) {
+        return Vec::new();
+    }
+    let Some(css) = &state.css_config else {
+        return Vec::new();
+    };
+    let cfg = oj_config::OjConfig {
+        css: Some(css.clone()),
+        ..Default::default()
+    };
+    let lang = if url.split('?').next().unwrap_or(url).ends_with(".sass") { "sass" } else { "scss" };
+    oj_config::css_load_paths(&cfg, lang)
+        .into_iter()
+        .map(|p| state.root.join(p))
+        .collect()
 }
 
 fn ssr_css_module(root: &Path, path: &Path, source: &str) -> Result<String, String> {
@@ -2257,12 +2279,18 @@ async fn serve_path(
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {e}")).into_response(),
         };
     }
-    if is_style_ext(ext) {
-        let import_query = uri.query().is_some_and(|q| q.contains("import"));
-        if import_query || !wants_raw_resource(&headers) {
-            let url = url_of(&state.root, &file);
-            return serve_css_wrapper(&state, &file, &url).await;
+    if is_style_ext(ext) && !file.starts_with(&state.public_dir) {
+        let url = url_of(&state.root, &file);
+        let q = uri.query();
+        let direct = q.is_some_and(|q| q.split('&').any(|kv| kv == "direct"));
+        let import_query = q.is_some_and(|q| q.split('&').any(|kv| kv == "import"));
+        if direct || (wants_raw_resource(&headers) && !import_query) {
+            // `<link href>`, `fetch()` of a `?url` stylesheet, or `?direct`: the
+            // compiled CSS text (Sass/Less/PostCSS/Tailwind applied), not the
+            // preprocessor source and not the JS wrapper.
+            return serve_css_direct(&state, &file, &url).await;
         }
+        return serve_css_wrapper(&state, &file, &url).await;
     }
     if COMPILABLE.contains(&ext) {
         let url = url_of(&state.root, &file);
@@ -2282,13 +2310,27 @@ async fn serve_path(
     // is imported as `import Icon from "./x.svg"`). serve_compiled runs the svgr
     // transform; svgs the plugin does not match fall back to a URL asset there. A raw
     // browser request (the Accept header wants the image) still serves the file.
-    if ext == "svg"
-        && state.plugins_have_transform
+    if ext.eq_ignore_ascii_case("svg")
         && query_asset_kind(uri.query()).is_none()
         && !wants_raw_resource(&headers)
     {
         let url = url_of(&state.root, &file);
-        return serve_compiled(&state, &file, &url, uri.query(), &headers).await;
+        if state.plugins_have_transform {
+            return serve_compiled(&state, &file, &url, uri.query(), &headers).await;
+        }
+        // No plugin can componentize it: a module import of an svg (relative,
+        // aliased or root-absolute) is its URL, like any other asset in Vite.
+        return match asset_module(&file, &url, "url").await {
+            Ok(js) => (
+                [
+                    (header::CONTENT_TYPE, "text/javascript"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
+                js,
+            )
+                .into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {e}")).into_response(),
+        };
     }
     if ext == "json" && !file.starts_with(&state.public_dir) {
         let url = url_of(&state.root, &file);
@@ -2777,16 +2819,68 @@ async fn ensure_module(
     };
 
     let source = if is_preprocessor(url) {
-        run_preprocess_sidecar(state, url, &source)
+        // css.preprocessorOptions.<less|stylus>: `additionalData` is prepended,
+        // everything else goes to the preprocessor as its options (Vite parity).
+        let lang = if sidecar::is_less(url) { "less" } else { "stylus" };
+        let cfg = state.css_config.clone().map(|c| oj_config::OjConfig {
+            css: Some(c),
+            ..Default::default()
+        });
+        let (data, opts) = match &cfg {
+            Some(c) => (
+                oj_config::css_additional_data(c, lang),
+                oj_config::css_preprocessor_json(c, lang),
+            ),
+            None => (None, serde_json::Value::Null),
+        };
+        let with_data = match data {
+            Some(d) if !d.is_empty() => format!("{d}\n{source}"),
+            _ => source,
+        };
+        run_preprocess_sidecar(state, url, &with_data, opts)
             .await
             .map_err(|e| format!("css preprocess error for {url}: {e}"))?
     } else {
         source
     };
 
-    let css_like = is_preprocessor(url) || file.extension().and_then(|e| e.to_str()) == Some("css");
+    // PostCSS runs on the preprocessor OUTPUT (Vite orders Sass before PostCSS),
+    // so a Sass file is compiled here first when a PostCSS config applies; the
+    // compile step below then skips Sass for it.
+    let mut sass_precompiled = false;
+    let source = if state.has_postcss && oj_css::is_sass(url) {
+        let data = sass_additional_data_for(state, url);
+        let load_paths = sass_load_paths_for(state, url);
+        let dir = file.parent().map(Path::to_path_buf);
+        let src = source.clone();
+        let compiled = tokio::task::spawn_blocking(move || {
+            oj_css::compile_sass_opts(
+                &src,
+                &oj_css::SassOptions {
+                    load_dir: dir.as_deref(),
+                    additional_data: data.as_deref(),
+                    load_paths: &load_paths,
+                },
+            )
+        })
+        .await
+        .map_err(|e| format!("sass compile task failed for {url}: {e}"))??;
+        sass_precompiled = true;
+        compiled
+    } else {
+        source
+    };
+    let css_like = sass_precompiled
+        || is_preprocessor(url)
+        || file.extension().and_then(|e| e.to_str()) == Some("css");
     let source = if state.has_postcss && css_like {
-        run_css_sidecar(state, url, &source).await.unwrap_or(source)
+        match run_css_sidecar(state, url, &source).await {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!("oj: postcss failed for {url}: {e}");
+                source
+            }
+        }
     } else {
         source
     };
@@ -2847,6 +2941,12 @@ async fn ensure_module(
     };
     let url_owned = url.to_string();
     let sass_data = sass_additional_data_for(state, &url_owned);
+    let sass_load_paths = sass_load_paths_for(state, &url_owned);
+    let css_dev_sourcemap = state
+        .css_config
+        .as_ref()
+        .and_then(|c| c.dev_sourcemap)
+        .unwrap_or(false);
     let bundle = state.bundle;
     let hmr_state = Arc::clone(state);
     let plugin_fallback = state.plugins.is_some() && !bundle;
@@ -2882,12 +2982,26 @@ async fn ensure_module(
             });
         }
         if is_css {
-            let css_src = if oj_css::is_sass(&url_owned) {
-                oj_css::compile_sass_with(&source, Some(&dir), sass_data.as_deref())?
+            let css_src = if oj_css::is_sass(&url_owned) && !sass_precompiled {
+                oj_css::compile_sass_opts(
+                    &source,
+                    &oj_css::SassOptions {
+                        load_dir: Some(&dir),
+                        additional_data: sass_data.as_deref(),
+                        load_paths: &sass_load_paths,
+                    },
+                )?
             } else {
                 source.clone()
             };
-            let output = oj_css::compile_css_rebased(&url_owned, &css_src, false)?;
+            // Plain `@import`s are inlined (postcss-import parity) so the injected
+            // stylesheet does not @import a bare specifier or a wrong-relative url.
+            let css_src = oj_css::inline_imports(&css_src, &file_owned)?;
+            let output = if css_dev_sourcemap {
+                oj_css::compile_css_rebased_with_map(&url_owned, &css_src, false)?
+            } else {
+                oj_css::compile_css_rebased(&url_owned, &css_src, false)?
+            };
             return Ok(CachedModule {
                 is_boundary: true,
                 hot: None,
@@ -3330,6 +3444,26 @@ fn register_in_graph(state: &ServerState, url: &str, module: &CachedModule) {
     graph.set_accepted_deps(Path::new(url), &accepted);
 }
 
+/// The compiled stylesheet as `text/css` (Vite's `?direct` / raw `<link>` request).
+async fn serve_css_direct(state: &Arc<ServerState>, file: &Path, url: &str) -> Response {
+    match ensure_module(state, file, url).await {
+        Ok((_, module)) => (
+            [
+                (header::CONTENT_TYPE, "text/css"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            module.code.clone(),
+        )
+            .into_response(),
+        Err(err) => {
+            let _ = state
+                .reload_tx
+                .send(serde_json::json!({ "type": "error", "message": err.clone() }).to_string());
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("oj: {err}")).into_response()
+        }
+    }
+}
+
 async fn serve_css_wrapper(state: &Arc<ServerState>, file: &Path, url: &str) -> Response {
     let (_, module) = match ensure_module(state, file, url).await {
         Ok(pair) => pair,
@@ -3369,13 +3503,55 @@ async fn serve_css_wrapper(state: &Arc<ServerState>, file: &Path, url: &str) -> 
 }
 
 pub fn has_postcss_config(root: &Path) -> bool {
-    [
+    find_postcss_config(root).is_some()
+}
+
+/// The PostCSS config that applies to `root`, found the way postcss-load-config
+/// does (what Vite uses): `postcss.config.{js,mjs,cjs,ts,mts,cts}`, `.postcssrc`,
+/// `.postcssrc.{json,js,mjs,cjs,ts,mts,cts}` or a `package.json` with a
+/// `postcss` key, searched from `root` up to the workspace root (nearest wins).
+/// The sidecar receives the path as `OJ_POSTCSS_CONFIG`.
+pub fn find_postcss_config(root: &Path) -> Option<PathBuf> {
+    const NAMES: &[&str] = &[
         "postcss.config.js",
-        "postcss.config.cjs",
         "postcss.config.mjs",
-    ]
-    .iter()
-    .any(|f| root.join(f).is_file())
+        "postcss.config.cjs",
+        "postcss.config.ts",
+        "postcss.config.mts",
+        "postcss.config.cts",
+        ".postcssrc",
+        ".postcssrc.json",
+        ".postcssrc.js",
+        ".postcssrc.mjs",
+        ".postcssrc.cjs",
+        ".postcssrc.ts",
+        ".postcssrc.mts",
+        ".postcssrc.cts",
+    ];
+    let stop = workspace_root(root);
+    let mut dir = Some(root);
+    while let Some(d) = dir {
+        for name in NAMES {
+            let p = d.join(name);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        let pkg = d.join("package.json");
+        if let Ok(text) = std::fs::read_to_string(&pkg) {
+            if serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .is_some_and(|v| v.get("postcss").is_some_and(|p| !p.is_null()))
+            {
+                return Some(pkg);
+            }
+        }
+        if d == stop {
+            break;
+        }
+        dir = d.parent();
+    }
+    None
 }
 
 async fn run_css_sidecar(
@@ -3478,15 +3654,11 @@ fn wants_raw_resource(headers: &HeaderMap) -> bool {
 }
 
 // Assets that, when imported from JS, resolve to a URL-exporting module (Vite's
-// default asset handling). svg is excluded: it is routed to vite-plugin-svgr.
+// default asset handling, case-insensitive). svg is excluded here: it is routed
+// through the compile path so vite-plugin-svgr can componentize it, falling back
+// to a URL module there.
 fn is_importable_asset_ext(ext: &str) -> bool {
-    matches!(
-        ext,
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "ico" | "bmp"
-            | "woff" | "woff2" | "ttf" | "otf" | "eot"
-            | "mp4" | "webm" | "ogg" | "mp3" | "wav" | "flac" | "m4a" | "aac" | "mov"
-            | "pdf" | "webmanifest"
-    )
+    oj_compiler::assets::is_asset_ext(ext) && !ext.eq_ignore_ascii_case("svg")
 }
 
 // Node core modules. When one reaches the browser graph (usually via config-time
@@ -3598,13 +3770,14 @@ async fn run_preprocess_sidecar(
     state: &Arc<ServerState>,
     url: &str,
     source: &str,
+    options: serde_json::Value,
 ) -> Result<String, String> {
     let sidecar = state
         .preprocess
         .get_or_try_init(|| Sidecar::spawn_preprocess(&state.root))
         .await
         .map_err(|e| e.to_string())?;
-    sidecar.compile(source, url).await
+    sidecar.compile_with(source, url, options).await
 }
 
 async fn run_svelte_sidecar(
@@ -4073,7 +4246,18 @@ fn rewrite_specifier(
             fs_allow.lock().unwrap().insert(package_root(&resolved));
             Some(dep_serve_url(&resolved, root))
         }
-        Ok(resolved) if resolved.starts_with(root) => Some(url_of(root, &resolved)),
+        Ok(resolved) if resolved.starts_with(root) => {
+            // An alias (`@/assets/logo.svg`) or root-absolute import of a style
+            // or asset gets the same `?import` / `?url` marks a relative one does.
+            let url = url_of(root, &resolved);
+            if css_import_marker && is_style_url(&url) {
+                return Some(format!("{url}?import"));
+            }
+            if css_import_marker && is_asset_path(&resolved) {
+                return Some(format!("{url}?url"));
+            }
+            Some(url)
+        }
         Ok(resolved) => {
             fs_allow.lock().unwrap().insert(package_root(&resolved));
             Some(dep_serve_url(&resolved, root))
@@ -4191,7 +4375,15 @@ fn worker_query_is_inline(url: &str) -> bool {
 async fn asset_module(file: &Path, url: &str, kind: &str) -> Result<String, String> {
     let clean_url = url.split('?').next().unwrap_or(url);
     match kind {
-        "url" => Ok(format!("export default {clean_url:?};\n")),
+        "url" => {
+            // A stylesheet's URL must serve its COMPILED css (Sass, PostCSS, ...)
+            // as text; `?direct` is the plain-CSS request, as in Vite.
+            let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if is_style_ext(ext) {
+                return Ok(format!("export default {:?};\n", format!("{clean_url}?direct")));
+            }
+            Ok(format!("export default {clean_url:?};\n"))
+        }
         "raw" => {
             let text = tokio::fs::read_to_string(file)
                 .await
@@ -4831,30 +5023,8 @@ fn decode_at_id(seg: &str) -> String {
 }
 
 fn is_asset_ext(ext: &str) -> bool {
-    matches!(
-        ext,
-        "png"
-            | "jpg"
-            | "jpeg"
-            | "gif"
-            | "webp"
-            | "avif"
-            | "ico"
-            | "bmp"
-            | "svg"
-            | "woff"
-            | "woff2"
-            | "ttf"
-            | "otf"
-            | "eot"
-            | "mp4"
-            | "webm"
-            | "mov"
-            | "mp3"
-            | "wav"
-            | "ogg"
-            | "wasm"
-    )
+    // A plain `.wasm` import is served as a URL module (Vite asks for `?init`).
+    oj_compiler::assets::is_asset_ext(ext) || ext.eq_ignore_ascii_case("wasm")
 }
 
 fn is_asset_path(file: &Path) -> bool {
@@ -4883,7 +5053,8 @@ fn content_type(ext: &str) -> &'static str {
         "webp" => "image/webp",
         "gif" => "image/gif",
         "txt" | "map2" => "text/plain; charset=utf-8",
-        _ => "application/octet-stream",
+        // Any other known asset type (case-insensitive), else octet-stream.
+        other => oj_compiler::assets::asset_mime(other),
     }
 }
 
@@ -5921,9 +6092,19 @@ async fn decide(state: &ServerState, paths: &[PathBuf]) -> Vec<String> {
         }
 
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if ext == "css" {
+        if is_style_ext(ext) {
             let url = url_of(&state.root, path);
-            if !state.graph.lock().unwrap().contains(Path::new(&url)) {
+            // A stylesheet nothing imports is loaded by a `<link>` (serving it
+            // compiled registers it in the graph, with no importers): swap the
+            // link rather than dispatching a JS update it has no handler for.
+            let link_loaded = {
+                let g = state.graph.lock().unwrap();
+                match g.node(Path::new(&url)) {
+                    None => true,
+                    Some(n) => n.importers.is_empty(),
+                }
+            };
+            if link_loaded {
                 println!("oj: change {url} -> css-update");
                 updates.push(update_entry("css-update", &url, now_millis() as u64));
                 continue;
@@ -6151,6 +6332,33 @@ mod tests {
     }
 
     #[test]
+    fn postcss_config_is_found_like_postcss_load_config() {
+        let base = std::env::temp_dir().join(format!("oj-postcss-find-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let app = base.join("packages/web");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(base.join(".git")).unwrap(); // workspace root marker
+        assert!(find_postcss_config(&app).is_none());
+        // A config at the workspace root applies to the package.
+        std::fs::write(base.join(".postcssrc.json"), r#"{"plugins":{}}"#).unwrap();
+        assert_eq!(find_postcss_config(&app), Some(base.join(".postcssrc.json")));
+        // package.json#postcss in the package itself wins (nearest first).
+        std::fs::write(app.join("package.json"), r#"{"name":"web","postcss":{"plugins":{}}}"#).unwrap();
+        assert_eq!(find_postcss_config(&app), Some(app.join("package.json")));
+        // ...and a config file in the package beats its package.json key.
+        std::fs::write(app.join("postcss.config.ts"), "export default {}").unwrap();
+        assert_eq!(find_postcss_config(&app), Some(app.join("postcss.config.ts")));
+        // A package.json without the key does not count.
+        std::fs::remove_file(app.join("postcss.config.ts")).unwrap();
+        std::fs::write(app.join("package.json"), r#"{"name":"web"}"#).unwrap();
+        assert_eq!(find_postcss_config(&app), Some(base.join(".postcssrc.json")));
+        // Nothing above the workspace root is consulted.
+        std::fs::remove_file(base.join(".postcssrc.json")).unwrap();
+        assert!(find_postcss_config(&app).is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn fs_deny_blocks_dotenv_and_git_by_default() {
         // No user config: Vite's default deny set still protects secrets.
         let root = Path::new("/proj");
@@ -6287,8 +6495,15 @@ mod tests {
         assert!(is_importable_asset_ext("webp"));
         assert!(is_importable_asset_ext("png"));
         assert!(is_importable_asset_ext("woff2"));
+        // Vite's list is case-insensitive and includes documents and more media.
+        assert!(is_importable_asset_ext("PNG"));
+        assert!(is_importable_asset_ext("pdf"));
+        assert!(is_importable_asset_ext("flac"));
+        assert!(is_asset_ext("Jpg"));
+        assert_eq!(content_type("JPG"), "image/jpeg");
         // svg is routed to vite-plugin-svgr, not URL-exported here.
         assert!(!is_importable_asset_ext("svg"));
+        assert!(!is_importable_asset_ext("SVG"));
         assert!(!is_importable_asset_ext("css"));
         assert!(!is_importable_asset_ext("js"));
     }
