@@ -378,13 +378,14 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
 /// Environment handed to the Start node scripts: the mode's `.env` `VITE_*` vars
 /// (shell wins, as in Vite's loadEnv) and the JSX settings from the config
 /// (`OJ_JSX`, consumed by `jsxTransformOptions` in resolve-pkg.mjs).
-fn start_script_env(root: &Path, command: &str, mode: &str) -> Vec<(String, String)> {
+fn start_script_env(root: &Path, command: &str, mode: &str) -> anyhow::Result<Vec<(String, String)>> {
     let mut vars: Vec<(String, String)> = oj_env::load(root, mode)
         .into_iter()
         .filter(|(k, _)| k.starts_with("VITE_") && std::env::var_os(k).is_none())
         .collect();
     let mut config = oj_config::load(root).unwrap_or_default();
-    oj_server::plugins::adopt_vite_config_values(&mut config, root, command, mode);
+    oj_server::plugins::adopt_vite_config_values(&mut config, root, command, mode)
+        .map_err(|e| anyhow::anyhow!(e))?;
     let jsx = oj_config::jsx_settings(&config);
     if jsx != oj_config::JsxSettings::default() {
         vars.push(("OJ_JSX".into(), serde_json::to_string(&jsx).unwrap_or_default()));
@@ -407,7 +408,7 @@ fn start_script_env(root: &Path, command: &str, mode: &str) -> Vec<(String, Stri
             serde_json::to_string(&externals).unwrap_or_default(),
         ));
     }
-    vars
+    Ok(vars)
 }
 
 pub async fn start_build(root: PathBuf, mode: &str) -> anyhow::Result<()> {
@@ -439,7 +440,7 @@ pub async fn start_build(root: PathBuf, mode: &str) -> anyhow::Result<()> {
         .env("OJ_CACHE_ROOT", oj_cache::cache_root(&root))
         .env("NODE_ENV", &node_env)
         .env("OJ_MODE", mode)
-        .envs(start_script_env(&root, "build", mode))
+        .envs(start_script_env(&root, "build", mode)?)
         .env("OJ_PRERENDER", &prerender)
         .env("NODE_COMPILE_CACHE", oj_server::node_compile_cache(&root))
         .current_dir(&root)
@@ -626,7 +627,7 @@ fn run_node(root: &Path, script: &Path, what: &str) -> anyhow::Result<()> {
         .env("OJ_APP_ROOT", root)
         .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
         .env("NODE_ENV", "development")
-        .envs(start_script_env(root, "serve", "development"))
+        .envs(start_script_env(root, "serve", "development")?)
         .env("NODE_COMPILE_CACHE", oj_server::node_compile_cache(root))
         .current_dir(root)
         .status()
@@ -662,7 +663,7 @@ async fn spawn_node_service(root: &Path, script: &Path) -> anyhow::Result<Runner
         .env("OJ_APP_ROOT", root)
         .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
         .env("NODE_ENV", "development")
-        .envs(start_script_env(root, "serve", "development"))
+        .envs(start_script_env(root, "serve", "development")?)
         .env(
             "OJ_SSR_BRIDGE_DIR",
             oj_server::plugins::ssr_bridge_dir(root),

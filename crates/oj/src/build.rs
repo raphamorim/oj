@@ -1844,15 +1844,18 @@ pub async fn build(
     let mut config = oj_config::load_with(&root, "build", &mode_owned)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if cli_mode.is_none() {
-        oj_server::plugins::adopt_vite_config_values_default_mode(&mut config, &root, "build", &mode_owned);
+        oj_server::plugins::adopt_vite_config_values_default_mode(&mut config, &root, "build", &mode_owned)
+            .map_err(|e| anyhow::anyhow!(e))?;
         if let Some(m) = config.mode.clone().filter(|m| *m != mode_owned) {
             mode_owned = m;
             config = oj_config::load_with(&root, "build", &mode_owned)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            oj_server::plugins::adopt_vite_config_values(&mut config, &root, "build", &mode_owned);
+            oj_server::plugins::adopt_vite_config_values(&mut config, &root, "build", &mode_owned)
+            .map_err(|e| anyhow::anyhow!(e))?;
         }
     } else {
-        oj_server::plugins::adopt_vite_config_values(&mut config, &root, "build", &mode_owned);
+        oj_server::plugins::adopt_vite_config_values(&mut config, &root, "build", &mode_owned)
+            .map_err(|e| anyhow::anyhow!(e))?;
     }
     let mode: &str = &mode_owned;
     let build_cfg = config.build.clone().unwrap_or_default();
@@ -2749,7 +2752,8 @@ pub(crate) async fn build_ssr(
 
     let mut config =
         oj_config::load_with(root, "build", mode).map_err(|e| anyhow::anyhow!("{e}"))?;
-    oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", mode);
+    oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", mode)
+        .map_err(|e| anyhow::anyhow!(e))?;
     let loaded_env = oj_env::load(&env_dir_of(root, &config), mode);
     let env_prefixes = env_prefixes_of(&config);
     let env_prefix_refs: Vec<&str> = env_prefixes.iter().map(String::as_str).collect();
@@ -2933,7 +2937,8 @@ async fn build_server_fns(root: &Path, out_dir: &Path, mode: &str) -> anyhow::Re
     use rolldown::{IsExternal, Platform};
     let mut config =
         oj_config::load_with(root, "build", mode).map_err(|e| anyhow::anyhow!("{e}"))?;
-    oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", mode);
+    oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", mode)
+        .map_err(|e| anyhow::anyhow!(e))?;
     let node_env =
         oj_env::resolve_node_env(shell_node_env().as_deref(), &oj_env::load(root, mode), "production");
     let is_production = node_env == "production";
@@ -3295,7 +3300,8 @@ async fn build_client_entry(
 
     let mut config =
         oj_config::load_with(root, "build", mode).map_err(|e| anyhow::anyhow!("{e}"))?;
-    oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", mode);
+    oj_server::plugins::adopt_vite_config_values(&mut config, root, "build", mode)
+        .map_err(|e| anyhow::anyhow!(e))?;
     let loaded_env = oj_env::load(&env_dir_of(root, &config), mode);
     let env_prefixes = env_prefixes_of(&config);
     let env_prefix_refs: Vec<&str> = env_prefixes.iter().map(String::as_str).collect();

@@ -371,7 +371,8 @@ impl DevServer {
             .unwrap_or_else(|| "development".to_string());
         let mut config =
             oj_config::load_with(&root, "serve", &dev_mode).map_err(|e| anyhow::anyhow!("{e}"))?;
-        plugins::adopt_vite_config_values(&mut config, &root, "serve", &dev_mode);
+        plugins::adopt_vite_config_values(&mut config, &root, "serve", &dev_mode)
+            .map_err(|e| anyhow::anyhow!(e))?;
         boot_phase("vite config values adopted");
 
         // Feed optimizeDeps.include/exclude/needsInterop into partial bundling so
