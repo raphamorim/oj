@@ -209,11 +209,10 @@ test("a source edit sends a targeted update to the accept boundary; dead ends st
   });
 
   try {
-    const portRes = await host.send({ id: 1, hook: "getMiddlewarePort" });
-    const port = Number(portRes.result);
+    const info = JSON.parse((await host.send({ id: 1, hook: "getServeInfo" })).result);
+    const port = Number(info.middlewarePort);
     assert.ok(port > 0, "middleware server is up");
-    const cf = await host.send({ id: 2, hook: "getCfEnvironments" });
-    assert.equal(cf.result, "true", "the host reports built cloudflare environments");
+    assert.equal(info.runnerEnvironments, true, "the host reports built runner environments");
 
     const invalidate = async (rel) => {
       const res = await fetch(`http://127.0.0.1:${port}/__oj_invalidate`, {
@@ -314,8 +313,8 @@ test("a user-set preTransformRequests is not overridden", async () => {
     cwd: fx.root,
   });
   try {
-    const portRes = await host.send({ id: 1, hook: "getMiddlewarePort" });
-    const port = Number(portRes.result);
+    const info = JSON.parse((await host.send({ id: 1, hook: "getServeInfo" })).result);
+    const port = Number(info.middlewarePort);
     assert.ok(port > 0, "middleware server is up");
     const seen = await (await fetch(`http://127.0.0.1:${port}/__probe`)).json();
     assert.equal(seen.worker, null, "the resolved value stands; the host does not force preTransformRequests");

@@ -54,7 +54,7 @@ struct StartState {
 }
 
 // Static hint that the app uses @cloudflare/vite-plugin, readable before the
-// plugin host boots (the definitive flag is BuiltApp::cf_environments). A plain
+// plugin host boots (the definitive flag is BuiltApp::runner_environments). A plain
 // text search of the config file: false for every non-Cloudflare app, so their
 // boot path is untouched.
 fn config_mentions_cloudflare_plugin(root: &Path, config: &Option<PathBuf>) -> bool {
@@ -138,7 +138,7 @@ pub async fn start_dev(
     oj_server::boot_phase("runner spawned");
     let (reload_tx, _) = broadcast::channel::<()>(16);
     // Whether the plugin's worker environments serve the documents is known only
-    // once the plugin host is up (BuiltApp::cf_environments); the cf_hint keeps
+    // once the plugin host is up (BuiltApp::runner_environments); the cf_hint keeps
     // the non-Cloudflare prewarm overlapping the build exactly as before, while
     // a Cloudflare config holds the prewarm until the flag arrives (and skips
     // it: warming the runner is wasted CPU when the worker renders).
@@ -162,7 +162,7 @@ pub async fn start_dev(
     let (bundle_res, built_res) = tokio::join!(bundle, built_task);
     let pinned = bundle_res??;
     let built = built_res??;
-    let _ = cf_tx.send(built.cf_environments);
+    let _ = cf_tx.send(built.runner_environments);
     oj_server::boot_phase("bundle+build joined");
     let css_host = if app_uses_tailwind(&root) {
         spawn_node_service(&root, &cache.join("css-host.mjs"), &mode)
@@ -185,7 +185,7 @@ pub async fn start_dev(
         gate: built.hmr_gate.clone(),
         css_host,
         mode: mode.clone(),
-        lazy_runner: built.cf_environments,
+        lazy_runner: built.runner_environments,
         runner_dirty: std::sync::atomic::AtomicBool::new(false),
     });
 
