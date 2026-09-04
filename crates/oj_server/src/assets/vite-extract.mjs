@@ -227,6 +227,10 @@ function extractOptimizeDeps(od) {
   if (ent) out.entries = ent;
   if (interop) out.needsInterop = interop;
   if (typeof od.force === "boolean") out.force = od.force;
+  if (typeof od.noDiscovery === "boolean") out.noDiscovery = od.noDiscovery;
+  for (const key of ["esbuildOptions", "rolldownOptions"]) {
+    if (od[key] && typeof od[key] === "object") out[key] = markFunctions(od[key]);
+  }
   return Object.keys(out).length ? out : null;
 }
 
@@ -378,7 +382,16 @@ function extractServerFlags(s, legacy, appType) {
       if (typeof s.hmr.overlay === "boolean") h.overlay = s.hmr.overlay;
       if (Object.keys(h).length) out.hmr = h;
     }
-    if (s.fs && typeof s.fs === "object" && typeof s.fs.strict === "boolean") out.fsStrict = s.fs.strict;
+    if (s.fs && typeof s.fs === "object") {
+      if (typeof s.fs.strict === "boolean") out.fsStrict = s.fs.strict;
+      if (Array.isArray(s.fs.deny)) out.fsDeny = s.fs.deny.filter((x) => typeof x === "string");
+    }
+    if (s.warmup && typeof s.warmup === "object") {
+      out.warmup = {};
+      for (const key of ["clientFiles", "ssrFiles"]) {
+        if (Array.isArray(s.warmup[key])) out.warmup[key] = s.warmup[key].filter((x) => typeof x === "string");
+      }
+    }
     // server.watch.ignored: string globs only (RegExp/functions cannot cross the bridge).
     if (s.watch && typeof s.watch === "object" && s.watch.ignored != null) {
       const raw = Array.isArray(s.watch.ignored) ? s.watch.ignored : [s.watch.ignored];
@@ -479,9 +492,6 @@ function warnUnsupported(c) {
   if (c.esbuild && typeof c.esbuild === "object") {
     const rest = Object.keys(c.esbuild).filter((k) => !JSX_ESBUILD_KEYS.includes(k));
     if (rest.length) warn(`esbuild options ${rest.join(", ")} are not applied (jsx* are)`);
-  }
-  if (c.optimizeDeps?.esbuildOptions || c.optimizeDeps?.rollupOptions) {
-    warn("optimizeDeps.esbuildOptions/rollupOptions are not applied; include/exclude/entries are");
   }
   if (c.worker) warn("worker config is not applied");
   if (typeof c.build?.assetsInlineLimit === "function") {
