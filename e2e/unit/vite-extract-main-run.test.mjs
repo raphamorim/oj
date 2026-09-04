@@ -16,7 +16,7 @@ import { execFileSync } from "node:child_process";
 import { copyFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { asset } from "./harness.mjs";
+import { asset, tmpProject } from "./harness.mjs";
 
 // argv[2] names a config that does not exist, so the run fails immediately --
 // what is under test is whether it runs at all, not what it extracts.
@@ -43,4 +43,27 @@ test("the extractor runs when its path reaches it through a symlink", () => {
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
+});
+
+
+test("Vite server and optimizer settings survive actual config loading", () => {
+  const fx = tmpProject();
+  try {
+    fx.write("vite.config.mjs", `export default {
+      server: { fs: { allow: ["../shared"], deny: ["**/*.private"] },
+        warmup: { clientFiles: ["./src/*.tsx"], ssrFiles: ["./server.ts"] } },
+      optimizeDeps: { noDiscovery: true, rolldownOptions: {
+        transform: { define: { __FEATURE__: '"enabled"' }, target: "es2015" },
+        resolve: { conditionNames: ["custom"] }
+      } }
+    }`);
+    const config = JSON.parse(execFileSync(process.execPath,
+      [asset("vite-extract.mjs"), join(fx.root, "vite.config.mjs"), fx.root], { encoding: "utf8" }));
+    assert.equal(config.__ok, true);
+    assert.deepEqual(config.serverFlags.fsDeny, ["**/*.private"]);
+    assert.deepEqual(config.serverFlags.warmup, { clientFiles: ["./src/*.tsx"], ssrFiles: ["./server.ts"] });
+    assert.equal(config.optimizeDeps.noDiscovery, true);
+    assert.equal(config.optimizeDeps.rolldownOptions.transform.target, "es2015");
+    assert.deepEqual(config.optimizeDeps.rolldownOptions.resolve.conditionNames, ["custom"]);
+  } finally { fx.cleanup(); }
 });

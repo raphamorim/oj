@@ -106,6 +106,7 @@ impl OptimizedDeps {
 /// (`optimizeDeps.include/exclude/entries`, `resolve.dedupe`, `resolve.alias`).
 #[derive(Default, Clone)]
 pub struct OptimizeInput {
+    pub no_discovery: Option<bool>,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
     pub entries: Vec<String>,
@@ -213,6 +214,7 @@ fn lockfile_hash(root: &Path, version: &str, input: &OptimizeInput) -> String {
         hasher.update(b"=");
         hasher.update(replacement.as_bytes());
     }
+    hasher.update(format!("\0discovery:{:?}", input.no_discovery).as_bytes());
     if let Some(opts) = &input.bundler_options {
         hasher.update(b"\0o");
         hasher.update(opts.to_string().as_bytes());
@@ -295,8 +297,12 @@ async fn run_optimizer(
     // it) is opt-in via OJ_OPTIMIZE_SCAN=1: it can break apps with UMD/CommonJS
     // interop quirks, so by default oj pre-bundles only the explicit
     // optimizeDeps.include list and serves the rest through wrap_cjs.
-    let auto_discover = std::env::var("OJ_OPTIMIZE_SCAN")
-        .is_ok_and(|v| !v.is_empty() && v != "0");
+    let auto_discover = input
+        .no_discovery
+        .map(|disabled| !disabled)
+        .unwrap_or_else(|| {
+            std::env::var("OJ_OPTIMIZE_SCAN").is_ok_and(|v| !v.is_empty() && v != "0")
+        });
     let cfg = serde_json::json!({
         "root": root,
         "outDir": dir,

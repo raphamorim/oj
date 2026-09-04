@@ -951,6 +951,7 @@ impl DevServer {
                     &root,
                     env!("CARGO_PKG_VERSION"),
                     optimize::OptimizeInput {
+                        no_discovery: config.optimize_deps.as_ref().and_then(|o| o.no_discovery),
                         include,
                         exclude,
                         entries,
@@ -991,6 +992,31 @@ impl DevServer {
             });
         }
         spawn_watcher(Arc::clone(&state));
+        let (client_files, ssr_files) = oj_config::server_warmup_files(&config);
+        if !client_files.is_empty() || !ssr_files.is_empty() {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                for file in warmup_paths(&state.root, &client_files) {
+                    let url = url_of(&state.root, &file);
+                    if let Err(error) = ensure_module(&state, &file, &url).await {
+                        eprintln!("oj: warmup {url}: {error}");
+                    }
+                }
+                for file in warmup_paths(&state.root, &ssr_files) {
+                    let response = ssr_module(
+                        State(Arc::clone(&state)),
+                        Query(HashMap::from([(
+                            "id".into(),
+                            file.to_string_lossy().into_owned(),
+                        )])),
+                    )
+                    .await;
+                    if !response.status().is_success() {
+                        eprintln!("oj: SSR warmup {}: {}", file.display(), response.status());
+                    }
+                }
+            });
+        }
         if self.lazy {
             // Lazy mode (Vite's default): no eager graph crawl. Modules are
             // compiled on demand as the browser requests them, so the first
@@ -1092,6 +1118,29 @@ impl DevServer {
             hmr_gate,
         })
     }
+}
+
+fn warmup_paths(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
+    let mut files = std::collections::BTreeSet::new();
+    let mut excluded = Vec::new();
+    for pattern in patterns {
+        let (negative, pattern) = pattern
+            .strip_prefix('!')
+            .map(|p| (true, p))
+            .unwrap_or((false, pattern.as_str()));
+        let pattern = root.join(pattern).to_string_lossy().into_owned();
+        if negative {
+            if let Ok(pattern) = glob::Pattern::new(&pattern) {
+                excluded.push(pattern);
+            }
+        } else if let Ok(matches) = glob::glob(&pattern) {
+            files.extend(matches.flatten().filter(|file| file.is_file()));
+        }
+    }
+    files
+        .into_iter()
+        .filter(|file| !excluded.iter().any(|p| p.matches_path(file)))
+        .collect()
 }
 
 /// Vite's dev server close runs the plugin container's `buildEnd` then
