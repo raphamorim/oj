@@ -2859,7 +2859,15 @@ async fn forward_to_plugin_middleware(
 // watcher event type: "update" | "create" | "delete". Fire-and-forget.
 pub async fn notify_plugin_mw_invalidate(port: u16, changes: &[(String, &'static str)]) {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    let client = CLIENT.get_or_init(reqwest::Client::new);
+    // The endpoint answers only after the plugin hotUpdate hooks ran, and the
+    // settled-batch call blocks the watcher thread: a hung hook must not
+    // freeze rebuilds for the session, so the request is bounded.
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default()
+    });
     let changes: Vec<serde_json::Value> = changes
         .iter()
         .map(|(path, kind)| serde_json::json!({ "path": path, "type": kind }))

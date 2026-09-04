@@ -1099,24 +1099,45 @@ function userSetPreTransformRequests(name) {
 // (Vite's watcher drives all of this itself; oj drives it since it owns the
 // file watcher. Runner-sent vite:invalidate is handled by the DevEnvironment.)
 const WATCHER_EVENT = { update: "change", create: "add", delete: "unlink" };
+const unmatchedChangeLogged = new Set();
+let invalidateQueue = Promise.resolve();
 async function invalidateEnvironments(environments, watcher, changes) {
-  for (const { path: file, type } of changes) {
-    try { watcher.emit(WATCHER_EVENT[type] || "change", file); } catch {}
+  // Re-classify at handling time: the early (pre-settle) send classifies from
+  // a raw event, and an atomic-save editor's momentary delete may have been
+  // recreated by the time this runs; a stale "delete" would prune a live
+  // module from the graph.
+  const normalized = changes.map(({ path: file, type }) => {
+    let t = type || "update";
+    if (t === "delete" && existsSync(file)) t = "update";
+    return { file: String(file).replace(/\\/g, "/"), type: t };
+  });
+  for (const { file, type } of normalized) {
+    try { watcher.emit(WATCHER_EVENT[type], file); } catch {}
   }
   if (!environments) return;
   const timestamp = Date.now();
+  const matched = new Set();
   for (const env of Object.values(environments)) {
     // oj's own HMR already covers the stub environments; only runner-backed
     // (real Vite) environments need their graph invalidated and updates sent.
     if (!env || env.__ojStub) continue;
-    for (const { path: file, type } of changes) {
+    for (const { file, type } of normalized) {
       try {
-        await hotUpdateEnvironment(env, String(file).replace(/\\/g, "/"), timestamp, type || "update");
+        if (await hotUpdateEnvironment(env, file, timestamp, type)) matched.add(file);
       } catch (e) {
         process.stderr.write(`${OJ} plugin host: hot update failed (${env.name}): ${(e && e.stack) || e}\n`);
         hotSend(env, { type: "error", err: prepareErrorPayload(e) });
       }
     }
+  }
+  // A changed file no runner-backed graph knows is Vite's "no modules matched"
+  // (nothing is sent), but here it can also mean the watcher path spells the
+  // file differently than the graph keys (a symlink, casing) — make the
+  // staleness visible once per file instead of silently serving old modules.
+  for (const { file, type } of normalized) {
+    if (type === "delete" || matched.has(file) || unmatchedChangeLogged.has(file)) continue;
+    unmatchedChangeLogged.add(file);
+    process.stderr.write(`${OJ} plugin host: change to ${file} matched no module in any runner environment\n`);
   }
 }
 
@@ -1163,11 +1184,13 @@ function sortedHotUpdatePlugins(env) {
   return sorted;
 }
 
+// Returns whether the change matched this environment (a module, or a reload
+// was sent), so the caller can surface changes no environment knows about.
 async function hotUpdateEnvironment(env, file, timestamp, type) {
   const mg = env.moduleGraph;
   if (!mg || typeof mg.getModulesByFile !== "function") {
     hotSend(env, { type: "full-reload" });
-    return;
+    return true;
   }
   // Vite's watcher wiring: watchChange on every event; onFileChange for
   // updates, onFileDelete for deletes.
@@ -1219,10 +1242,14 @@ async function hotUpdateEnvironment(env, file, timestamp, type) {
   // No module of this environment is affected: nothing to send, as in Vite
   // ("no modules matched"), except a client html edit which reloads the page.
   if (!options.modules.length) {
-    if (file.endsWith(".html") && env.name === "client") hotSend(env, { type: "full-reload", triggeredBy: file, path: "*" });
-    return;
+    if (file.endsWith(".html") && env.name === "client") {
+      hotSend(env, { type: "full-reload", triggeredBy: file, path: "*" });
+      return true;
+    }
+    return mods.size > 0;
   }
   updateModules(env, file, options.modules, timestamp);
+  return true;
 }
 
 // Vite's updateModules: invalidate each changed module, propagate to accept
@@ -1494,8 +1521,15 @@ async function setupConfigureServer() {
   };
   if (plugins.some((p) => p && p.name === "vite-plugin-cloudflare:dev")) {
     try {
-      server.environments = await buildEnvironments(server);
-      runnerEnvironmentsBuilt = !!server.environments;
+      const built = await buildEnvironments(server);
+      // Every createEnvironment/init can fail individually (workerd refused to
+      // boot, a port clash): an empty result must not count as runner-backed,
+      // or Rust would idle its SSR runner with nothing serving documents. The
+      // stub fallback below then still applies.
+      if (built && Object.keys(built).length > 0) {
+        server.environments = built;
+        runnerEnvironmentsBuilt = true;
+      }
     } catch (e) {
       process.stderr.write(`${OJ} plugin host: buildEnvironments failed: ${(e && e.message) || e}\n`);
     }
@@ -1557,7 +1591,12 @@ async function setupConfigureServer() {
         } catch {}
         // Answer only once the invalidation is done, so the Rust side's POST
         // completing means a next request cannot be served from stale modules.
-        try { await invalidateEnvironments(server.environments, fileWatcher, changes); } catch {}
+        // Serialized: the early (pre-settle) and settled sends for one edit
+        // batch must not interleave their module-graph walks.
+        invalidateQueue = invalidateQueue
+          .then(() => invalidateEnvironments(server.environments, fileWatcher, changes))
+          .catch(() => {});
+        await invalidateQueue;
         res.statusCode = 204;
         res.end();
       });
