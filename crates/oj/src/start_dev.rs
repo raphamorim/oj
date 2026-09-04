@@ -57,6 +57,15 @@ struct StartState {
 // plugin host boots (the definitive flag is BuiltApp::runner_environments). A plain
 // text search of the config file: false for every non-Cloudflare app, so their
 // boot path is untouched.
+// What the watcher forwards and rebuilds on: not the generated route tree (its
+// writes would loop the generator) and not bare directory events (Linux inotify
+// emits a parent-dir event alongside the file write; Vite never hands
+// directories to hotUpdate hooks either).
+fn watch_relevant(p: &Path) -> bool {
+    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    !name.contains("routeTree.gen") && !p.is_dir()
+}
+
 // Vite's watcher distinguishes add/change/unlink; notify's batched events are
 // classified at send time: gone from disk is a delete, seen as a Create in this
 // batch is a create, anything else an update.
@@ -413,10 +422,7 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             if let Some(port) = state.plugin_mw_port {
                 let early: Vec<(String, &'static str)> = paths
                     .iter()
-                    .filter(|p| {
-                        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        !name.contains("routeTree.gen") && !p.is_dir()
-                    })
+                    .filter(|p| watch_relevant(p))
                     .map(|p| (p.to_string_lossy().into_owned(), change_type(p, &created)))
                     .collect();
                 if !early.is_empty() {
@@ -446,10 +452,7 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             // events (Linux inotify emits a parent-dir event alongside the file
             // write, which would otherwise slip past a filename-only filter and
             // retrigger the generator on every reload).
-            let relevant = paths.iter().any(|p| {
-                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                !name.contains("routeTree.gen") && !p.is_dir()
-            });
+            let relevant = paths.iter().any(|p| watch_relevant(p));
             if !relevant {
                 continue;
             }
@@ -476,6 +479,7 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             ));
             let changed_paths: Vec<(String, &'static str)> = paths
                 .iter()
+                .filter(|p| watch_relevant(p))
                 .map(|p| (p.to_string_lossy().into_owned(), change_type(p, &created)))
                 .collect();
             rt.block_on(async {
@@ -1159,8 +1163,16 @@ async fn forward_document(
 
 async fn forward_with_body(state: &Arc<StartState>, req: Request) -> Response {
     // The middleware may pipe an unclaimed request on to the runner
-    // (x-oj-forward-to), so the runner must be fresh before the proxy call too.
-    ensure_runner_fresh(state).await;
+    // (x-oj-forward-to), so start refreshing it — without blocking this
+    // request, which the worker middleware typically serves itself.
+    if state.lazy_runner
+        && state
+            .runner_dirty
+            .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        let st = Arc::clone(state);
+        tokio::spawn(async move { ensure_runner_fresh(&st).await });
+    }
     let method = req.method().to_string();
     let url = req
         .uri()
