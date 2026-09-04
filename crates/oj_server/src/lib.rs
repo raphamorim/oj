@@ -2854,12 +2854,17 @@ async fn forward_to_plugin_middleware(
 // SSR. Used by the TanStack start path, where GET requests are otherwise
 // SSR'd and would never reach editor endpoints (the dev-server bridge).
 // Tell a plugin's configureServer middleware server that source files changed,
-// so it can invalidate the DevEnvironments' module graphs and reload the worker
-// runner (the Cloudflare-plugin HMR path). Fire-and-forget.
-pub async fn notify_plugin_mw_invalidate(port: u16, paths: &[String]) {
+// so it can invalidate the DevEnvironments' module graphs and send targeted
+// HMR updates (the Cloudflare-plugin HMR path). Each change carries Vite's
+// watcher event type: "update" | "create" | "delete". Fire-and-forget.
+pub async fn notify_plugin_mw_invalidate(port: u16, changes: &[(String, &'static str)]) {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     let client = CLIENT.get_or_init(reqwest::Client::new);
-    let body = serde_json::json!({ "paths": paths }).to_string();
+    let changes: Vec<serde_json::Value> = changes
+        .iter()
+        .map(|(path, kind)| serde_json::json!({ "path": path, "type": kind }))
+        .collect();
+    let body = serde_json::json!({ "changes": changes }).to_string();
     let _ = client
         .post(format!("http://127.0.0.1:{port}/__oj_invalidate"))
         .header(header::CONTENT_TYPE, "application/json")

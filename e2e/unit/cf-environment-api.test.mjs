@@ -368,3 +368,151 @@ test("a non-cloudflare plugin set gets oj-backed client/ssr stand-ins, not Vite-
     fx.cleanup();
   }
 });
+
+test("create retries failed resolutions, delete prunes, legacy hooks and hook errors follow Vite", async () => {
+  const fx = tmpProject({ prefix: "oj-cf-hmr2-" });
+
+  // Stub vite whose worker graph has a self-accepting entry importing:
+  //   broken.ts  - not in the graph by file, but in _hasResolveFailedErrorModules
+  //   gone.ts    - deleted (onFileDelete, then the entry boundary updates)
+  //   errfile.ts - a hotUpdate hook throws (the env gets {type:"error"})
+  // The client env carries a legacy handleHotUpdate-only plugin.
+  fx.pkg("vite", "index.mjs", {
+    "index.mjs": `
+      function node(id, url, file, extra) {
+        return { id, url, file, type: "js", importers: new Set(), acceptedHmrDeps: new Set(),
+                 acceptedHmrExports: null, isSelfAccepting: false, importedBindings: null,
+                 invalidations: [], ...extra };
+      }
+      export function resolveConfig(inline) {
+        const root = inline.root;
+        const entry = node("\\0virtual:worker-entry", "virtual:worker-entry", null, { isSelfAccepting: true });
+        const broken = node(root + "/src/broken.ts", "/src/broken.ts", root + "/src/broken.ts");
+        const gone = node(root + "/src/gone.ts", "/src/gone.ts", root + "/src/gone.ts");
+        const errf = node(root + "/src/errfile.ts", "/src/errfile.ts", root + "/src/errfile.ts");
+        for (const n of [broken, gone, errf]) n.importers.add(entry);
+        const byFile = new Map([[gone.file, new Set([gone])], [errf.file, new Set([errf])]]);
+        const mkWorker = (name) => {
+          const env = {
+            name, __sends: [], __watchChanges: [], __deletes: [], __nodes: { broken, gone },
+            pluginContainer: { watchChange(f, m) { env.__watchChanges.push(m.event + ":" + f.split("/").pop()); } },
+            moduleGraph: {
+              _hasResolveFailedErrorModules: new Set([broken]),
+              getModulesByFile(f) { return byFile.get(f); },
+              onFileChange() {},
+              onFileDelete(f) { env.__deletes.push(f); },
+              invalidateModule(mod, seen, ts, isHmr) { mod.invalidations.push({ ts, isHmr }); },
+            },
+            plugins: [{ name: "boom", hotUpdate(o) { if (o.file.endsWith("errfile.ts")) throw new Error("hook exploded"); } }],
+            hot: { send: (p) => env.__sends.push(p), on() {}, handleInvoke() {} },
+            init() {},
+          };
+          return env;
+        };
+        const mkClient = (name) => {
+          const env = {
+            name, __sends: [], __legacy: [],
+            plugins: [{ name: "old", handleHotUpdate(ctx) { env.__legacy.push(ctx.file); } }],
+            moduleGraph: { getModulesByFile() { return undefined; }, onFileChange() {}, invalidateModule() {} },
+            hot: { send: (p) => env.__sends.push(p), on() {} },
+            init() {},
+          };
+          return env;
+        };
+        return {
+          root,
+          logger: { info() {}, warn() {}, warnOnce() {}, error() {} },
+          environments: {
+            client: { consumer: "client", dev: { createEnvironment: mkClient } },
+            worker: { dev: { createEnvironment: mkWorker } },
+          },
+        };
+      }
+      export class DevEnvironment {}
+    `,
+  });
+
+  fx.write(
+    "oj.plugins.mjs",
+    `export default [{
+       name: "vite-plugin-cloudflare:dev",
+       configureServer(server) {
+         server.middlewares.use("/__probe", (req, res) => {
+           const w = server.environments.worker;
+           const c = server.environments.client;
+           res.setHeader("content-type", "application/json");
+           res.end(JSON.stringify({
+             workerSends: w.__sends,
+             watchChanges: w.__watchChanges,
+             deletes: w.__deletes,
+             brokenInvalidations: w.__nodes.broken.invalidations,
+             legacy: c.__legacy,
+           }));
+         });
+       },
+     }];\n`,
+  );
+
+  const host = rpcSidecar("plugin-host.mjs", {
+    args: [
+      path.join(fx.root, "oj.plugins.mjs"),
+      JSON.stringify({
+        config: { root: fx.root },
+        env: { command: "serve", mode: "development" },
+        environment: { name: "client" },
+      }),
+    ],
+    env: { OJ_CACHE_ROOT: fx.root },
+    cwd: fx.root,
+  });
+
+  try {
+    const info = JSON.parse((await host.send({ id: 1, hook: "getServeInfo" })).result);
+    const port = Number(info.middlewarePort);
+    assert.ok(port > 0, "middleware server is up");
+
+    const invalidate = async (rel, type) => {
+      const res = await fetch(`http://127.0.0.1:${port}/__oj_invalidate`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ changes: [{ path: path.join(fx.root, rel), type }] }),
+      });
+      assert.equal(res.status, 204);
+    };
+    const probe = async () => (await fetch(`http://127.0.0.1:${port}/__probe`)).json();
+
+    // A created file retries the modules whose resolution previously failed:
+    // new.ts is not in the graph, but broken.ts is retried and its update
+    // reaches the self-accepting entry boundary.
+    await invalidate("src/new.ts", "create");
+    let seen = await probe();
+    assert.equal(seen.workerSends.length, 1, `one payload, got ${JSON.stringify(seen.workerSends)}`);
+    assert.equal(seen.workerSends[0].type, "update");
+    assert.equal(seen.workerSends[0].updates[0].path, "/@id/virtual:worker-entry");
+    assert.equal(seen.brokenInvalidations.length, 1, "the failed-resolution module was invalidated");
+    assert.ok(seen.watchChanges.includes("create:new.ts"), "watchChange saw the create event");
+
+    // A deleted file goes through onFileDelete and still updates its boundary.
+    await invalidate("src/gone.ts", "delete");
+    seen = await probe();
+    assert.ok(seen.deletes.some((f) => f.endsWith("gone.ts")), "moduleGraph.onFileDelete ran");
+    assert.equal(seen.workerSends.length, 2);
+    assert.equal(seen.workerSends[1].type, "update");
+
+    // A throwing hotUpdate hook: the environment gets {type:"error"}, as Vite's
+    // hmr() sends, not a blind full-reload.
+    await invalidate("src/errfile.ts", "update");
+    seen = await probe();
+    assert.equal(seen.workerSends.length, 3);
+    assert.equal(seen.workerSends[2].type, "error");
+    assert.ok(seen.workerSends[2].err.message.includes("hook exploded"), "the error payload carries the message");
+
+    // Legacy handleHotUpdate: dispatched for the client environment on updates
+    // only, as in Vite.
+    assert.ok(seen.legacy.some((f) => f.endsWith("errfile.ts")), "legacy hook ran for the update");
+    assert.ok(!seen.legacy.some((f) => f.endsWith("new.ts")), "legacy hook is not called for create events");
+  } finally {
+    host.close();
+    fx.cleanup();
+  }
+});
