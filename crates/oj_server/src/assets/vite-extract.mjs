@@ -4,7 +4,7 @@
 import { createRequire } from "node:module";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
-import { writeFileSync, readFileSync, realpathSync, existsSync } from "node:fs";
+import { writeFileSync, readFileSync, realpathSync, existsSync, unlinkSync } from "node:fs";
 
 const configPath = process.argv[2];
 const appRoot = process.argv[3];
@@ -13,6 +13,10 @@ const mode = process.argv[5] || "development";
 // "default": the mode is the command's default, not a CLI `--mode`, so a `mode`
 // named by the config file may win (Vite: inlineConfig.mode || config.mode).
 const modeExplicit = process.argv[6] !== "default";
+// Where the extracted JSON goes. A file, not stdout: evaluating the config runs
+// plugin code (a route generator, a banner) that may print to stdout, which
+// used to corrupt the JSON the caller parses.
+const resultPath = process.argv[7] || null;
 
 process.env.VITE_CONFIG_NATIVE_IGNORE_WARNING ??= "true";
 
@@ -97,9 +101,20 @@ async function loadConfig() {
         __filename: JSON.stringify(configPath),
       },
     });
-    const out = resolve(dirname(fileURLToPath(import.meta.url)), "oj-vite-config.mjs");
+    // A unique path per process: the plugin host bundles the same config into
+    // this directory concurrently at boot, and two writers on one filename made
+    // either importer see a truncated bundle.
+    const out = resolve(
+      dirname(fileURLToPath(import.meta.url)),
+      `oj-vite-config-${process.pid}-${Math.random().toString(36).slice(2)}.tmp.mjs`,
+    );
     writeFileSync(out, r.outputFiles[0].text);
-    const m = await import(pathToFileURL(out).href);
+    let m;
+    try {
+      m = await import(pathToFileURL(out).href);
+    } finally {
+      try { unlinkSync(out); } catch {}
+    }
     return {
       config: typeof m.default === "function" ? await m.default({ command, mode }) : m.default,
       deps: absDeps(Object.keys(r.metafile?.inputs ?? {})),
@@ -514,11 +529,16 @@ const isMainRun = (() => {
 })();
 export { extractAlias, extractOptimizeDeps, extractProxy, warnUnsupported };
 
+const emitResult = (json) => {
+  if (resultPath) writeFileSync(resultPath, json);
+  else process.stdout.write(json);
+};
+
 if (isMainRun) try {
   const { config, raw, deps } = (await loadConfig()) ?? {};
   const c = config ?? {};
   warnUnsupported(raw ?? c);
-  process.stdout.write(
+  emitResult(
     JSON.stringify({
       __ok: true,
       __deps: deps ?? [],
@@ -561,5 +581,5 @@ if (isMainRun) try {
   );
 } catch (e) {
   process.stderr.write(`oj: could not extract vite.config values: ${(e && e.stack) || e}\n`);
-  process.stdout.write("{}");
+  emitResult("{}");
 }
