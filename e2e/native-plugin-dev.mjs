@@ -40,7 +40,10 @@ write(
 <link rel="stylesheet" href="/@oj/marker.css" />
 </head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>`,
 );
-write("src/main.tsx", `import { hello } from "./hello";\ndocument.getElementById("root").textContent = hello();\n`);
+write("src/main.tsx", `import { hello } from "./hello";\nimport { plain } from "./plain";\ndocument.getElementById("root").textContent = hello() + plain;\n`);
+// Starts without a marker: the edit below gives it one, and the sheet must
+// learn about it from the recompile, not from a plugin reading the disk.
+write("src/plain.tsx", `export const plain = 1;\nif (import.meta.hot) import.meta.hot.accept();\n`);
 write(
   "src/hello.tsx",
   `export function hello(): string {
@@ -154,6 +157,25 @@ try {
   assert.equal(sheet2.trim(), ".mk-hello{--marker-count:3}", `sheet reflects the edit: ${sheet2}`);
   const styles2 = await text(`http://localhost:${port}/src/styles.css`, { accept: "text/css" });
   assert.ok(styles2.includes("--marker-count:3"), `directive sheet was not served from cache:\n${styles2}`);
+
+  // A module the plugin never saw gains a marker: the host recompiles it
+  // before asking the plugins, so the sheet gets the new module in the same
+  // css-update.
+  const before2 = frames.length;
+  fs.appendFileSync(path.join(app, "src", "plain.tsx"), "export const p2 = __MARKER__;\n");
+  await waitFor(
+    () =>
+      frames
+        .slice(before2)
+        .some((f) => f.type === "update" && f.updates.some((u) => u.type === "css-update" && u.path === "/@oj/marker.css")),
+    "css-update for /@oj/marker.css after a plain module gains a marker",
+  );
+  const sheet3 = await text(`http://localhost:${port}/@oj/marker.css`);
+  assert.equal(
+    sheet3.trim(),
+    ".mk-hello{--marker-count:3}\n.mk-plain{--marker-count:1}",
+    `sheet has the newly marked module: ${sheet3}`,
+  );
   ws.close();
 
   // Warm restart: the cached entry carries the side channel; edit it on disk so
@@ -195,7 +217,11 @@ try {
   const helloWarm = await text(`http://localhost:${port}/src/hello.tsx`);
   assert.ok(helloWarm.includes('"mk-hello"'), "warm output is the cached transform");
   const sheetWarm = await text(`http://localhost:${port}/@oj/marker.css`);
-  assert.equal(sheetWarm.trim(), ".mk-hello{--marker-count:42}", `registry rebuilt from cache meta, no retransform: ${sheetWarm}`);
+  assert.equal(
+    sheetWarm.trim(),
+    ".mk-hello{--marker-count:42}\n.mk-plain{--marker-count:42}",
+    `registry rebuilt from cache meta, no retransform: ${sheetWarm}`,
+  );
 
   console.log("native-plugin-dev: ok");
 } catch (e) {

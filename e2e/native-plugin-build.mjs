@@ -36,7 +36,17 @@ write(
 <link rel="stylesheet" href="/@oj/marker.css" />
 </head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>`,
 );
-write("src/main.tsx", `import { hello } from "./hello";\ndocument.getElementById("root").textContent = hello();\n`);
+// `imported.css` is loaded by rolldown while other modules are still being
+// transformed; its directive must still see every marked module.
+let mainSrc = `import "./imported.css";\nimport { hello } from "./hello";\n`;
+const MANY = 24;
+for (let i = 0; i < MANY; i++) {
+  write(`src/m${i}.tsx`, `export const c${i} = __MARKER__;\nexport const el${i} = <b className={__MARKER__}>x</b>;\n`);
+  mainSrc += `import { c${i} } from "./m${i}";\n`;
+}
+mainSrc += `document.getElementById("root").textContent = hello() + [${Array.from({ length: MANY }, (_, i) => `c${i}`).join(",")}].join();\n`;
+write("src/main.tsx", mainSrc);
+write("src/imported.css", `.c { color: green }\n@marker;\n.d { color: black }\n`);
 write(
   "src/hello.tsx",
   `export function hello(): string {
@@ -77,7 +87,9 @@ try {
   // The emitted virtual sheet, hashed and in the manifest.
   const marker = assets.find((f) => /^marker-[0-9a-f]{8}\.css$/.test(f));
   assert.ok(marker, `virtual sheet emitted as assets/marker-<hash>.css: ${assets}`);
-  assert.equal(fs.readFileSync(path.join(dist, "assets", marker), "utf8").trim(), ".mk-hello{--marker-count:2}");
+  const markerCss = fs.readFileSync(path.join(dist, "assets", marker), "utf8");
+  assert.ok(markerCss.includes(".mk-hello{--marker-count:2}"), `virtual sheet has hello: ${markerCss}`);
+  assert.equal((markerCss.match(/--marker-count/g) || []).length, MANY + 1, `virtual sheet has every marked module: ${markerCss}`);
   const manifest = JSON.parse(fs.readFileSync(path.join(dist, ".vite", "manifest.json"), "utf8"));
   assert.equal(manifest["@oj/marker.css"]?.file, `assets/${marker}`, `manifest row: ${JSON.stringify(manifest, null, 1)}`);
   assert.ok(manifest["src/main.tsx"].css.includes(`assets/${marker}`), "the entry lists the sheet");
@@ -98,6 +110,19 @@ try {
   assert.ok(a >= 0 && m > a && b > m, `directive expanded between .a and .b:\n${css}`);
   assert.ok(!css.includes("@oj-directive") && !css.includes("@marker"), "no sentinel leaks");
   assert.ok(!out.includes("Unknown at rule: @oj-directive"), `the sentinel is not reported as a warning:\n${out}`);
+
+  // The JS-imported stylesheet: expanded after the bundle, so the directive
+  // sees all MANY + 1 marked modules, not whatever had been transformed when
+  // rolldown happened to load the sheet.
+  const imported = assets.find((f) => /^main-[0-9a-f]{8}\.css$/.test(f));
+  assert.ok(imported, `JS-imported sheet emitted with its chunk: ${assets}`);
+  const icss = fs.readFileSync(path.join(dist, "assets", imported), "utf8");
+  assert.equal((icss.match(/--marker-count/g) || []).length, MANY + 1, `directive in a JS-imported sheet saw every module:\n${icss}`);
+  const c = icss.indexOf(".c{");
+  const first = icss.indexOf("--marker-count");
+  const d = icss.indexOf(".d{");
+  assert.ok(c >= 0 && first > c && d > first, `expanded in place between .c and .d:\n${icss}`);
+  assert.ok(!icss.includes("@oj-directive") && !icss.includes("@marker"), "no sentinel leaks in the imported sheet");
 
   console.log("native-plugin-build: ok");
 } catch (e) {

@@ -168,13 +168,10 @@ impl OjPlugin for MarkerPlugin {
     }
 
     fn invalidates(&self, changed: &Path) -> Vec<Invalidation> {
-        let key = changed.to_string_lossy();
-        let known = self.registry.lock().unwrap().contains_key(&*key);
-        // A module that is (or just became) marked changes the sheet.
-        let marked_now = !known
-            && changed.extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e, "js" | "jsx" | "ts" | "tsx"))
-            && std::fs::read_to_string(changed).is_ok_and(|s| s.contains(MARKER));
-        if known || marked_now {
+        // The host recompiles a changed module the pass wants before asking,
+        // so a module that just gained a marker is already in the registry.
+        let known = self.registry.lock().unwrap().contains_key(&*changed.to_string_lossy());
+        if known {
             vec![Invalidation::CssUrl(oj_plugin::virtual_css_url(SHEET))]
         } else {
             Vec::new()

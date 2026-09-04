@@ -795,13 +795,16 @@ async fn compile_stylesheet(
         }
     }
     // A native plugin's directive is masked before any preprocessor or sidecar
-    // sees the sheet and expanded after Lightning CSS (see oj_css::directive).
-    let native = native_plugins();
-    let mut masked_directives: Vec<&'static str> = Vec::new();
-    for (directive, _) in native.css_directives() {
+    // sees the sheet (see oj_css::directive). The sentinel stays in the output:
+    // a sheet loaded while rolldown is still transforming modules must not be
+    // expanded yet, since the plugins have not seen every module that feeds
+    // them. Collected sheets are expanded after the bundle
+    // (`unmask_collected_css`); the callers that leave the pipeline early
+    // (`?url`, `?inline`, html-linked sheets) expand with
+    // `unmask_native_directives` themselves.
+    for (directive, _) in native_plugins().css_directives() {
         if let Some(masked) = oj_css::directive::mask(&source, directive) {
             source = masked;
-            masked_directives.push(directive);
         }
     }
     if oj_css::is_sass(path) {
@@ -849,14 +852,7 @@ async fn compile_stylesheet(
         Ok(rel) => format!("/{}", rel.display()),
         Err(_) => path.to_string(),
     };
-    let mut output =
-        oj_css::compile_css_with(&css_id, &source, &resolve.as_ref()).map_err(|e| anyhow::anyhow!(e))?;
-    for (directive, plugin) in native.css_directives() {
-        if masked_directives.contains(&directive) {
-            output.css = oj_css::directive::unmask(&output.css, directive, &plugin.css_for_directive());
-        }
-    }
-    Ok(output)
+    oj_css::compile_css_with(&css_id, &source, &resolve.as_ref()).map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Split `spec?query` into the file and a normalized oj asset query, for Vite's
@@ -1069,7 +1065,7 @@ impl Plugin for OjCssPlugin {
                     // `import u from './a.scss?url'`: the URL of the COMPILED
                     // stylesheet, emitted as a `.css` asset (Vite css.ts), not the
                     // raw preprocessor source.
-                    let out = compile_stylesheet(
+                    let mut out = compile_stylesheet(
                         &root,
                         &host,
                         &css_transform_enabled,
@@ -1080,6 +1076,7 @@ impl Plugin for OjCssPlugin {
                         &id,
                     )
                     .await?;
+                    out.css = unmask_native_directives(std::mem::take(&mut out.css));
                     let stem = std::path::Path::new(file)
                         .file_stem()
                         .and_then(|n| n.to_str())
@@ -1198,7 +1195,7 @@ impl Plugin for OjCssPlugin {
                 if is_stylesheet_path(file) {
                     // `import css from './a.css?inline'` is the compiled CSS text,
                     // as in dev and Vite, not a base64 data URI of the source.
-                    let out = compile_stylesheet(
+                    let mut out = compile_stylesheet(
                         &root,
                         &host,
                         &css_transform_enabled,
@@ -1209,6 +1206,7 @@ impl Plugin for OjCssPlugin {
                         &id,
                     )
                     .await?;
+                    out.css = unmask_native_directives(std::mem::take(&mut out.css));
                     return Ok(Some(rolldown_plugin::HookLoadOutput {
                         code: arcstr::ArcStr::from(format!(
                             "export default {};",
@@ -2322,6 +2320,32 @@ fn native_plugins() -> oj_plugin::SharedRegistry {
         .unwrap_or_else(|| Arc::new(oj_plugin::Registry::new(Path::new("."))))
 }
 
+/// Expand every native plugin directive sentinel in `css` with the plugin's
+/// CSS as of now. For a sheet that depends on the module graph this is only
+/// right once the bundle has run every module through the plugins.
+fn unmask_native_directives(css: String) -> String {
+    if !oj_css::directive::has_sentinel(&css) {
+        return css;
+    }
+    let mut css = css;
+    for (directive, plugin) in native_plugins().css_directives() {
+        css = oj_css::directive::unmask(&css, directive, &plugin.css_for_directive());
+    }
+    css
+}
+
+/// The collected stylesheets with their plugin directives expanded, called
+/// right after `bundler.write()` so no sheet is expanded against a registry
+/// that is still being fed by concurrent module transforms.
+fn unmask_collected_css(collected: &Arc<Mutex<Vec<(String, String)>>>) {
+    let mut entries = collected.lock().unwrap();
+    for (_, css) in entries.iter_mut() {
+        if oj_css::directive::has_sentinel(css) {
+            *css = unmask_native_directives(std::mem::take(css));
+        }
+    }
+}
+
 /// The native plugins as rolldown plugins: each plugin's own hooks, plus the
 /// one adapter that runs every `pre_transform_ast` when any has an AST pass.
 fn native_rolldown_plugins(native: &oj_plugin::SharedRegistry, ssr: bool, sourcemap: bool) -> Vec<SharedPluginable> {
@@ -2663,6 +2687,7 @@ pub async fn build(
             return Err(fail_with_plugin_hooks(anyhow::anyhow!("build failed:\n{detail}"), &plugin_host).await);
         }
     };
+    unmask_collected_css(&collected_css);
     bundler
         .close()
         .await
@@ -2973,7 +2998,7 @@ pub async fn build(
                     continue;
                 }
                 let src_str = src.to_string_lossy().into_owned();
-                let out = compile_stylesheet(
+                let mut out = compile_stylesheet(
                     &root,
                     &plugin_host,
                     &link_css_transform_enabled,
@@ -2985,6 +3010,7 @@ pub async fn build(
                 )
                 .await
                 .with_context(|| format!("stylesheet {href} linked from {}", doc.out_rel))?;
+                out.css = unmask_native_directives(std::mem::take(&mut out.css));
                 let dir = src.parent().map(Path::to_path_buf).unwrap_or_else(|| root.clone());
                 let css = rebase_css_urls(
                     &out.css,
@@ -3927,6 +3953,7 @@ pub(crate) async fn build_ssr(
         Ok(output) => output,
         Err(err) => return Err(fail_with_plugin_hooks(err, &plugin_host).await),
     };
+    unmask_collected_css(&collected_css);
     bundler
         .close()
         .await
@@ -4455,6 +4482,7 @@ async fn build_client_entry(
         Ok(output) => output,
         Err(err) => return Err(fail_with_plugin_hooks(err, &plugin_host).await),
     };
+    unmask_collected_css(&collected_css);
     bundler
         .close()
         .await
@@ -4689,6 +4717,7 @@ async fn build_library(
             .write()
             .await
             .map_err(rolldown_failure!("lib build ({fmt}) failed"))?;
+        unmask_collected_css(&collected_css);
         for asset in &output.assets {
             if let rolldown_common::Output::Chunk(c) = asset {
                 emitted.push((c.filename.to_string(), c.code.len()));

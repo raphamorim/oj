@@ -8027,9 +8027,12 @@ async fn decide(
 /// `CssUrl` becomes a css-update (and drops that sheet's cache so it is
 /// rebuilt), `FullReload` returns the full-reload frame to send instead, and
 /// a plugin that reported anything gets its directive sheets repushed. A
-/// deleted file is reported to the plugins first; a changed module the
-/// plugins care about is recompiled here so the registry the sheets read is
-/// current before the client fetches them.
+/// deleted file is reported to the plugins first. A changed module in the
+/// graph that a plugin's pass wants, or that a plugin already tracks, is
+/// recompiled BEFORE the plugins are asked: the recompile is what feeds
+/// `module_seen`, so a module that just gained (or lost) the plugin's syntax
+/// is in the registry by the time `invalidates` runs, and the sheets the
+/// client fetches next are current.
 async fn native_invalidations(
     state: &Arc<ServerState>,
     path: &Path,
@@ -8038,18 +8041,27 @@ async fn native_invalidations(
     if !path.exists() {
         state.native.module_removed(path);
     }
-    let invalidations = state.native.invalidates(path);
-    if invalidations.is_empty() {
-        return None;
-    }
     let url = url_of(&state.root, path);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if path.is_file() && COMPILABLE.contains(&ext) && state.graph.lock().unwrap().contains(Path::new(&url)) {
-        state.mtime_keys.lock().unwrap().remove(&url);
-        state.memory.lock().unwrap().remove(&url);
-        if let Err(e) = ensure_module(state, path, &url).await {
-            eprintln!("oj: recompile for native plugins failed for {url}: {e}");
+        let wanted = state.native.has_ast_passes()
+            && std::fs::read_to_string(path).is_ok_and(|src| {
+                state
+                    .native
+                    .wants_pre_transform(path, Some(&src), oj_compiler::module_type_of(path))
+            });
+        let tracked = !state.native.invalidates(path).is_empty();
+        if wanted || tracked {
+            state.mtime_keys.lock().unwrap().remove(&url);
+            state.memory.lock().unwrap().remove(&url);
+            if let Err(e) = ensure_module(state, path, &url).await {
+                eprintln!("oj: recompile for native plugins failed for {url}: {e}");
+            }
         }
+    }
+    let invalidations = state.native.invalidates(path);
+    if invalidations.is_empty() {
+        return None;
     }
     let timestamp = now_millis() as u64;
     let mut css_urls: Vec<String> = Vec::new();
