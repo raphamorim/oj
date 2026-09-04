@@ -332,6 +332,9 @@ pub struct ResolveConfig {
     pub extensions: Option<Vec<String>>,
     pub main_fields: Option<Vec<String>>,
     pub conditions: Option<Vec<String>>,
+    /// Vite's `resolve.externalConditions`: what externalized SSR deps resolve
+    /// with instead of the environment's conditions.
+    pub external_conditions: Option<Vec<String>>,
     pub preserve_symlinks: Option<bool>,
 }
 

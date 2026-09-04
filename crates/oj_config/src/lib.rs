@@ -659,18 +659,34 @@ pub fn user_resolve_conditions(config: &OjConfig, env_name: &str) -> Option<Vec<
 /// conditions externalized SSR deps resolve with, replacing — never merging —
 /// the environment's `resolve.conditions`).
 pub fn user_external_conditions(config: &OjConfig, env_name: &str) -> Option<Vec<String>> {
+    let str_list = |c: &serde_json::Value| {
+        c.as_array().map(|c| {
+            c.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+    };
+    // Most specific wins, as in Vite: the environment's list, then (for the ssr
+    // environment) the `ssr.resolve` sugar, then the top-level `resolve` list.
     config
         .environments
         .as_ref()
         .and_then(|e| e.get(env_name))
         .and_then(|e| e.get("resolve"))
         .and_then(|r| r.get("externalConditions"))
-        .and_then(|c| c.as_array())
-        .map(|c| {
-            c.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect::<Vec<_>>()
+        .and_then(&str_list)
+        .or_else(|| {
+            if env_name != "ssr" {
+                return None;
+            }
+            config
+                .ssr
+                .as_ref()
+                .and_then(|s| s.get("resolve"))
+                .and_then(|r| r.get("externalConditions"))
+                .and_then(&str_list)
         })
+        .or_else(|| config.resolve.as_ref().and_then(|r| r.external_conditions.clone()))
 }
 
 /// Export conditions for an environment, as Vite resolves them: the default set
@@ -1001,6 +1017,27 @@ fn to_script(js: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn external_conditions_fall_back_from_environment_to_ssr_sugar_to_top_level() {
+        let from = |json: &str| -> OjConfig { serde_json::from_str(json).unwrap() };
+        let env = from(
+            r#"{ "environments": { "ssr": { "resolve": { "externalConditions": ["env"] } } },
+                 "ssr": { "resolve": { "externalConditions": ["sugar"] } },
+                 "resolve": { "externalConditions": ["top"] } }"#,
+        );
+        assert_eq!(super::user_external_conditions(&env, "ssr"), Some(vec!["env".to_string()]));
+        let sugar = from(
+            r#"{ "ssr": { "resolve": { "externalConditions": ["sugar"] } },
+                 "resolve": { "externalConditions": ["top"] } }"#,
+        );
+        assert_eq!(super::user_external_conditions(&sugar, "ssr"), Some(vec!["sugar".to_string()]));
+        // The ssr sugar names the ssr environment only.
+        assert_eq!(super::user_external_conditions(&sugar, "worker"), Some(vec!["top".to_string()]));
+        let top = from(r#"{ "resolve": { "externalConditions": ["top"] } }"#);
+        assert_eq!(super::user_external_conditions(&top, "ssr"), Some(vec!["top".to_string()]));
+        assert_eq!(super::user_external_conditions(&OjConfig::default(), "ssr"), None);
+    }
+
     /// A config may declare a TypeScript `enum`, and lowering one needs scoping
     /// built with `with_enum_eval`: without it the transform aborts the process
     /// instead of loading the config.

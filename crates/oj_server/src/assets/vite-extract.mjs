@@ -331,8 +331,14 @@ function extractEsbuild(es) {
 
 // `ssr.noExternal`/`external` entries: strings and globs pass through, RegExps
 // become `{ regex }`, `true` stays `true`.
-function extractSsr(ssr) {
-  if (!ssr || typeof ssr !== "object") return null;
+function extractSsr(ssr, ssrEnvironment) {
+  // Vite treats `ssr.*` as sugar for `environments.ssr.*`; the environment
+  // spelling wins where both name the same option.
+  const envResolve = ssrEnvironment && typeof ssrEnvironment === "object" ? ssrEnvironment.resolve : null;
+  const merged = { ...(ssr && typeof ssr === "object" ? ssr : {}) };
+  if (envResolve || merged.resolve) merged.resolve = { ...(merged.resolve ?? {}), ...(envResolve ?? {}) };
+  ssr = Object.keys(merged).length ? merged : null;
+  if (!ssr) return null;
   const list = (v) => {
     if (v === true) return true;
     const arr = Array.isArray(v) ? v : v == null ? [] : [v];
@@ -349,13 +355,15 @@ function extractSsr(ssr) {
   if (ne === true || (Array.isArray(ne) && ne.length)) out.noExternal = ne;
   if (ex === true || (Array.isArray(ex) && ex.length)) out.external = ex;
   if (typeof ssr.target === "string") out.target = ssr.target;
+  const res = extractResolve(ssr.resolve);
+  if (res) out.resolve = res;
   return Object.keys(out).length ? out : null;
 }
 function extractResolve(r) {
   if (!r || typeof r !== "object") return null;
   const out = {};
   const strArr = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === "string") : null);
-  for (const k of ["extensions", "mainFields", "conditions"]) {
+  for (const k of ["extensions", "mainFields", "conditions", "externalConditions"]) {
     const v = strArr(r[k]);
     if (v && v.length) out[k] = v;
   }
@@ -512,7 +520,7 @@ const isMainRun = (() => {
   };
   return real(self) === real(entry);
 })();
-export { extractAlias, extractOptimizeDeps, extractProxy, warnUnsupported };
+export { extractAlias, extractOptimizeDeps, extractProxy, extractResolve, extractSsr, warnUnsupported };
 
 if (isMainRun) try {
   const { config, raw, deps } = (await loadConfig()) ?? {};
@@ -545,7 +553,7 @@ if (isMainRun) try {
       build: extractBuild(c.build),
       oxc: extractOxc(c.oxc),
       esbuild: extractEsbuild(c.esbuild),
-      ssr: extractSsr(c.ssr),
+      ssr: extractSsr(c.ssr, c.environments?.ssr),
       mode: typeof c.mode === "string" ? c.mode : null,
       resolve: extractResolve(c.resolve),
       serverFlags: extractServerFlags(c.server, c.legacy, c.appType),

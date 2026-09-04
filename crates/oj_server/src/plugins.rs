@@ -770,6 +770,9 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
         if rc.conditions.is_none() {
             rc.conditions = list("conditions");
         }
+        if rc.external_conditions.is_none() {
+            rc.external_conditions = list("externalConditions");
+        }
         if rc.preserve_symlinks.is_none() {
             rc.preserve_symlinks = vr.get("preserveSymlinks").and_then(|b| b.as_bool());
         }
@@ -1910,7 +1913,8 @@ mod vite_values_tests {
             mode: Some("staging".into()),
             resolve: Some(serde_json::json!({
                 "extensions": [".ts", ".js"], "mainFields": ["module"],
-                "conditions": ["custom"], "preserveSymlinks": true
+                "conditions": ["custom"], "externalConditions": ["custom-ext"],
+                "preserveSymlinks": true
             })),
             server_flags: Some(serde_json::json!({ "strictPort": true, "open": true })),
             css: Some(serde_json::json!({ "preprocessorOptions": { "scss": { "additionalData": "@use 'x';" } } })),
@@ -1924,6 +1928,7 @@ mod vite_values_tests {
         assert_eq!(rc.extensions.as_deref(), Some(&[".ts".to_string(), ".js".to_string()][..]));
         assert_eq!(rc.main_fields.as_deref(), Some(&["module".to_string()][..]));
         assert_eq!(rc.conditions.as_deref(), Some(&["custom".to_string()][..]));
+        assert_eq!(rc.external_conditions.as_deref(), Some(&["custom-ext".to_string()][..]));
         assert_eq!(rc.preserve_symlinks, Some(true));
         let sc = config.server.as_ref().unwrap();
         assert_eq!(sc.strict_port, Some(true));
