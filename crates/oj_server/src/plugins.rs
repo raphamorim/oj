@@ -1257,6 +1257,15 @@ impl PluginHost {
             .and_then(|s| s.parse().ok())
     }
 
+    /// Whether the host built real Vite DevEnvironments for the app's
+    /// `@cloudflare/vite-plugin` (documents are then served by the plugin's
+    /// worker, not the Node SSR runner). False on RPC failure, so an uncertain
+    /// host keeps the runner eagerly warm.
+    #[inline]
+    pub async fn cf_environments(&self) -> bool {
+        matches!(self.call("getCfEnvironments", &[]).await, Ok(Some(s)) if s == "true")
+    }
+
     /// Number of plugins still active after oj filters out the ones it
     /// reimplements natively (the React family). Defaults to 1 on RPC failure so
     /// an uncertain host is kept, never dropped by mistake.
