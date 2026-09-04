@@ -239,6 +239,7 @@ pub fn convert_style_to_class_name(
         let (shared_key, rule) = match shared {
             Some(hit) => hit,
             None => {
+                let _t = crate::timings::start(crate::timings::Stage::CreateMiss);
                 let pseudos: Vec<&str> = pseudos_of(key_path).collect();
                 let at_rules: Vec<&str> = at_rules_of(key_path).collect();
                 let const_rules: Vec<&str> = const_rules_of(key_path).collect();
@@ -282,54 +283,65 @@ fn convert_style_to_class_name_uncached(
     // arguments, so a collation error precedes any value-normalization error.
     let sorted_pseudos = sort_pseudos(pseudos)?;
     let sorted_at_rules = sort_at_rules(at_rules);
-    let mut at_and_const = sorted_at_rules.clone();
-    at_and_const.extend(const_rules.iter().copied());
-    let sorted_at_and_const = sort_at_rules(&at_and_const);
+    // A stable sort of an already sorted list is that list: the const-free
+    // case reads the at-rule order as is.
+    let sorted_at_and_const: Cow<[&str]> = if const_rules.is_empty() {
+        Cow::Borrowed(&sorted_at_rules)
+    } else {
+        let mut at_and_const = sorted_at_rules.clone();
+        at_and_const.extend(const_rules.iter().copied());
+        Cow::Owned(sort_at_rules(&at_and_const))
+    };
 
     let dashed = dashed_key(property);
 
     let px_to_rem = options.enable_font_size_px_to_rem;
-    let (values, is_array) = match value {
+    let single;
+    let multi;
+    let mut values: &[String] = match value {
         PreRuleValue::Single(scalar) => {
-            (vec![transform_scalar(property, scalar, px_to_rem)?], false)
+            single = transform_scalar(property, scalar, px_to_rem)?;
+            std::slice::from_ref(&single)
         }
-        PreRuleValue::Multi(scalars) => (
-            scalars
+        PreRuleValue::Multi(scalars) => {
+            multi = scalars
                 .iter()
                 .map(|s| transform_scalar(property, s, px_to_rem))
-                .collect::<Result<Vec<_>, _>>()?,
-            true,
-        ),
+                .collect::<Result<Vec<_>, _>>()?;
+            &multi
+        }
     };
-    let values = if is_array && has_var_fallback(&values) {
-        variable_fallbacks(&values)?
-    } else {
-        values
-    };
+    let fallbacks;
+    if matches!(value, PreRuleValue::Multi(_)) && has_var_fallback(values) {
+        fallbacks = variable_fallbacks(values)?;
+        values = &fallbacks;
+    }
 
     // The hash concatenates with `+` (so a JS `undefined` stringifies) while
     // the declaration is built with `Array.join`, which renders it empty.
-    let hash_values: Vec<&str> = match value {
-        PreRuleValue::Single(StyleScalar::Undefined) => vec!["undefined"],
-        _ => values.iter().map(String::as_str).collect(),
+    let undefined_single = matches!(value, PreRuleValue::Single(StyleScalar::Undefined));
+    let values_len: usize = if undefined_single {
+        "undefined".len()
+    } else {
+        values.iter().map(|v| v.len() + 2).sum()
     };
 
     // parity: the '<>' prefix and 'null' modifier keep upstream hashes stable;
     // built in place, byte-for-byte `<>{dashed}{values.join(", ")}{modifier}`.
     let modifier_len: usize = sorted_pseudos.iter().map(|s| s.len()).sum::<usize>()
         + sorted_at_and_const.iter().map(|s| s.len()).sum::<usize>();
-    let mut hash_input = String::with_capacity(
-        2 + dashed.len()
-            + hash_values.iter().map(|v| v.len() + 2).sum::<usize>()
-            + modifier_len.max(4),
-    );
+    let mut hash_input = String::with_capacity(2 + dashed.len() + values_len + modifier_len.max(4));
     hash_input.push_str("<>");
     hash_input.push_str(&dashed);
-    for (i, v) in hash_values.iter().enumerate() {
-        if i > 0 {
-            hash_input.push_str(", ");
+    if undefined_single {
+        hash_input.push_str("undefined");
+    } else {
+        for (i, v) in values.iter().enumerate() {
+            if i > 0 {
+                hash_input.push_str(", ");
+            }
+            hash_input.push_str(v);
         }
-        hash_input.push_str(v);
     }
     if modifier_len == 0 {
         hash_input.push_str("null");
@@ -337,21 +349,28 @@ fn convert_style_to_class_name_uncached(
         for p in &sorted_pseudos {
             hash_input.push_str(p);
         }
-        for a in &sorted_at_and_const {
+        for a in sorted_at_and_const.iter() {
             hash_input.push_str(a);
         }
     }
     let hashed = hash(&hash_input);
-    let class_name: std::sync::Arc<str> = if options.debug && options.enable_debug_class_names {
-        format!("{property}-{}{hashed}", options.class_name_prefix).into()
-    } else {
-        format!("{}{hashed}", options.class_name_prefix).into()
-    };
+    let debug_name = options.debug && options.enable_debug_class_names;
+    let mut class_name = String::with_capacity(
+        options.class_name_prefix.len()
+            + hashed.len()
+            + if debug_name { property.len() + 1 } else { 0 },
+    );
+    if debug_name {
+        class_name.push_str(property);
+        class_name.push('-');
+    }
+    class_name.push_str(&options.class_name_prefix);
+    class_name.push_str(&hashed);
 
     let rule = generate_css_rule(
         &class_name,
         &dashed,
-        &values,
+        values,
         &sorted_pseudos,
         &sorted_at_rules,
         const_rules,

@@ -22,6 +22,7 @@ use crate::eval::value::EvalValue;
 use crate::imports::{ImportTable, scan_imports};
 use crate::options::ResolvedOptions;
 use crate::rules::StylexRule;
+use crate::scopes::{ScopeBackend, ScopeModel};
 
 /// A style variable the bail path must keep alive (namespace `None` = all).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,13 +69,56 @@ pub struct BindingInfo<'a> {
     pub span: Span,
 }
 
+/// A reference's parent after climbing parens, as far as the site indexes
+/// look: a member expression naming `property`, or anything else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefParent<'a> {
+    Other,
+    Member { property: Option<&'a str> },
+}
+
+/// One reference handed to a `reference_starts_where` filter; the parent is
+/// computed only when asked for (the oxc path climbs the node table).
+#[derive(Clone, Copy)]
+pub struct RefSite<'n, 'a> {
+    inner: RefSiteInner<'n, 'a>,
+}
+
+#[derive(Clone, Copy)]
+enum RefSiteInner<'n, 'a> {
+    Oxc(&'n AstNodes<'a>, NodeId),
+    Native(RefParent<'a>),
+}
+
+impl<'a> RefSite<'_, 'a> {
+    pub(crate) fn native(parent: RefParent<'a>) -> Self {
+        RefSite {
+            inner: RefSiteInner::Native(parent),
+        }
+    }
+
+    pub fn parent(&self) -> RefParent<'a> {
+        match self.inner {
+            RefSiteInner::Oxc(nodes, node) => ref_parent_of(nodes, node),
+            RefSiteInner::Native(parent) => parent,
+        }
+    }
+}
+
+// One per compile; boxing the oxc side would only add an allocation.
+#[allow(clippy::large_enum_variant)]
+enum Scoping<'a> {
+    Oxc(Semantic<'a>),
+    Native(ScopeModel<'a>),
+}
+
 pub struct CompileState<'a> {
     pub options: &'a ResolvedOptions,
     /// Absolute source filename, '/'-separated.
     pub filename: Option<String>,
     pub cwd: String,
     pub imports: ImportTable,
-    pub semantic: Semantic<'a>,
+    scoping: Scoping<'a>,
     /// (babel constantViolations non-empty, evaluate-path.js isMutated) per
     /// symbol, computed on first query: eval touches a handful of symbols.
     constness: RefCell<FxHashMap<SymbolId, (bool, bool)>>,
@@ -122,19 +166,43 @@ impl<'a> CompileState<'a> {
         cwd: String,
         imports: ImportTable,
     ) -> Self {
+        Self::build_with_imports_using(
+            program,
+            options,
+            filename,
+            cwd,
+            imports,
+            ScopeBackend::from_env(),
+        )
+    }
+
+    /// [`Self::build_with_imports`] on an explicit scope backend.
+    pub fn build_with_imports_using(
+        program: &'a Program<'a>,
+        options: &'a ResolvedOptions,
+        filename: Option<String>,
+        cwd: String,
+        imports: ImportTable,
+        backend: ScopeBackend,
+    ) -> Self {
         let _t = crate::timings::start(crate::timings::Stage::Semantic);
-        let semantic = SemanticBuilder::new()
-            .with_stats(estimated_stats(program.source_text.len()))
-            .with_build_nodes(true)
-            .build(program)
-            .semantic;
+        let scoping = match backend {
+            ScopeBackend::Oxc => Scoping::Oxc(
+                SemanticBuilder::new()
+                    .with_stats(estimated_stats(program.source_text.len()))
+                    .with_build_nodes(true)
+                    .build(program)
+                    .semantic,
+            ),
+            ScopeBackend::Native => Scoping::Native(ScopeModel::build(program)),
+        };
         drop(_t);
         CompileState {
             options,
             filename,
             cwd,
             imports,
-            semantic,
+            scoping,
             constness: RefCell::new(FxHashMap::default()),
             style_vars_to_keep: Vec::new(),
             rules: Vec::new(),
@@ -178,13 +246,22 @@ impl<'a> CompileState<'a> {
         resolved
     }
 
+    pub fn backend(&self) -> ScopeBackend {
+        match &self.scoping {
+            Scoping::Oxc(_) => ScopeBackend::Oxc,
+            Scoping::Native(_) => ScopeBackend::Native,
+        }
+    }
+
     /// babel `path.scope.getBinding(name)` for a reference site.
     pub fn symbol_of(&self, id: &IdentifierReference<'a>) -> Option<SymbolId> {
-        let reference_id = id.reference_id.get()?;
-        self.semantic
-            .scoping()
-            .get_reference(reference_id)
-            .symbol_id()
+        match &self.scoping {
+            Scoping::Oxc(semantic) => {
+                let reference_id = id.reference_id.get()?;
+                semantic.scoping().get_reference(reference_id).symbol_id()
+            }
+            Scoping::Native(model) => model.symbol_of(id),
+        }
     }
 
     /// babel `binding.constantViolations.length > 0` (= `!binding.constant`).
@@ -198,16 +275,24 @@ impl<'a> CompileState<'a> {
     }
 
     fn constness(&self, symbol: SymbolId) -> (bool, bool) {
+        let semantic = match &self.scoping {
+            Scoping::Oxc(semantic) => semantic,
+            Scoping::Native(model) => return model.constness(symbol),
+        };
         if let Some(&flags) = self.constness.borrow().get(&symbol) {
             return flags;
         }
-        let flags = non_constant_flags(&self.semantic, symbol);
+        let flags = non_constant_flags(semantic, symbol);
         self.constness.borrow_mut().insert(symbol, flags);
         flags
     }
 
     pub fn binding_info(&self, symbol: SymbolId) -> BindingInfo<'a> {
-        let node = self.semantic.symbol_declaration(symbol);
+        let semantic = match &self.scoping {
+            Scoping::Oxc(semantic) => semantic,
+            Scoping::Native(model) => return model.binding_info(symbol),
+        };
+        let node = semantic.symbol_declaration(symbol);
         let span = node.kind().span();
         match node.kind() {
             AstKind::VariableDeclarator(declarator) => BindingInfo {
@@ -232,8 +317,7 @@ impl<'a> CompileState<'a> {
             },
             AstKind::CatchParameter(_) => {
                 // babel registers catch bindings on the whole CatchClause.
-                let clause_span = self
-                    .semantic
+                let clause_span = semantic
                     .nodes()
                     .ancestors(node.id())
                     .find_map(|ancestor| match ancestor.kind() {
@@ -280,15 +364,27 @@ impl<'a> CompileState<'a> {
     /// Records a replaced-init value for a module-level binding by name
     /// (visitors only replace top-level declarator inits).
     pub fn record_root_override(&mut self, name: &str, value: EvalValue) {
-        if let Some(symbol) = self.semantic.scoping().get_root_binding(name.into()) {
+        if let Some(symbol) = self.root_binding(name) {
             self.binding_overrides.insert(symbol, value);
+        }
+    }
+
+    /// babel `program.scope.getBinding(name)`.
+    pub fn root_binding(&self, name: &str) -> Option<SymbolId> {
+        match &self.scoping {
+            Scoping::Oxc(semantic) => semantic.scoping().get_root_binding(name.into()),
+            Scoping::Native(model) => model.root_binding(name),
         }
     }
 
     /// babel generateUid collision surface: globals plus every declaration in
     /// the file (registerBinding marks program.references even when unused).
     pub fn uid_name_taken(&self, name: &str) -> bool {
-        let scoping = self.semantic.scoping();
+        let semantic = match &self.scoping {
+            Scoping::Oxc(semantic) => semantic,
+            Scoping::Native(model) => return model.uid_name_taken(name),
+        };
+        let scoping = semantic.scoping();
         if scoping
             .root_unresolved_references()
             .keys()
@@ -304,26 +400,33 @@ impl<'a> CompileState<'a> {
     /// Sorted start offsets of every identifier reference named in `names`,
     /// whichever binding it resolves to (the visitors match by name, as upstream).
     pub fn reference_starts(&self, names: &[&str]) -> Vec<u32> {
-        self.reference_starts_where(names, |_, _, _| true)
+        self.reference_starts_where(names, |_, _| true)
     }
 
     /// [`Self::reference_starts`] keeping only the references `keep` accepts,
-    /// given the reference's name and node.
+    /// given the reference's name and site.
     pub fn reference_starts_where(
         &self,
         names: &[&str],
-        keep: impl Fn(&str, &AstNodes<'a>, NodeId) -> bool,
+        keep: impl Fn(&str, RefSite<'_, 'a>) -> bool,
     ) -> Vec<u32> {
         let mut starts = Vec::new();
         if names.is_empty() {
             return starts;
         }
-        let scoping = self.semantic.scoping();
-        let nodes = self.semantic.nodes();
+        let semantic = match &self.scoping {
+            Scoping::Oxc(semantic) => semantic,
+            Scoping::Native(model) => return model.reference_starts_where(names, keep),
+        };
+        let scoping = semantic.scoping();
+        let nodes = semantic.nodes();
         let mut push_all = |name: &str, ids: &[ReferenceId]| {
             for &id in ids {
                 let node_id = scoping.get_reference(id).node_id();
-                if keep(name, nodes, node_id) {
+                let site = RefSite {
+                    inner: RefSiteInner::Oxc(nodes, node_id),
+                };
+                if keep(name, site) {
                     starts.push(nodes.kind(node_id).span().start);
                 }
             }
@@ -346,18 +449,26 @@ impl<'a> CompileState<'a> {
     /// Whether `name` at the scope holding `node` resolves to the given
     /// program-level symbol (babel `path.scope.getBinding(n) === programBinding`).
     pub fn resolves_to_root_binding(&self, node_id: NodeId, name: &str) -> bool {
-        let scoping = self.semantic.scoping();
+        let semantic = match &self.scoping {
+            Scoping::Oxc(semantic) => semantic,
+            Scoping::Native(model) => return model.resolves_to_root_binding(node_id, name),
+        };
+        let scoping = semantic.scoping();
         let Some(root_symbol) = scoping.get_root_binding(name.into()) else {
             return false;
         };
-        let scope = self.semantic.nodes().get_node(node_id).scope_id();
+        let scope = semantic.nodes().get_node(node_id).scope_id();
         scoping.find_binding(scope, name.into()) == Some(root_symbol)
     }
 
     // parity: ast-helpers.js isProgramLevel — false when the walk to Program
     // crosses a function or a statement hanging off anything but Program/export.
     pub fn is_program_level(&self, node_id: NodeId) -> bool {
-        let nodes = self.semantic.nodes();
+        let semantic = match &self.scoping {
+            Scoping::Oxc(semantic) => semantic,
+            Scoping::Native(model) => return model.is_program_level(node_id),
+        };
+        let nodes = semantic.nodes();
         let mut current = nodes.get_node(node_id);
         for parent in nodes.ancestors(node_id) {
             let parent_kind = parent.kind();
@@ -378,7 +489,11 @@ impl<'a> CompileState<'a> {
     /// babel getProgramStatement: start offset of the top-level statement
     /// containing `node` (hoisted consts insert before it).
     pub fn program_statement_start(&self, node_id: NodeId) -> u32 {
-        let nodes = self.semantic.nodes();
+        let semantic = match &self.scoping {
+            Scoping::Oxc(semantic) => semantic,
+            Scoping::Native(model) => return model.program_statement_start(node_id),
+        };
+        let nodes = semantic.nodes();
         let mut current = nodes.get_node(node_id);
         for parent in nodes.ancestors(node_id) {
             if matches!(parent.kind(), AstKind::Program(_)) {
@@ -391,11 +506,61 @@ impl<'a> CompileState<'a> {
 
     /// babel `path.scope.hasBinding(name)` at the scope holding `node`.
     pub fn any_binding_at(&self, node_id: NodeId, name: &str) -> bool {
-        let scope = self.semantic.nodes().get_node(node_id).scope_id();
-        self.semantic
+        let semantic = match &self.scoping {
+            Scoping::Oxc(semantic) => semantic,
+            Scoping::Native(model) => return model.any_binding_at(node_id, name),
+        };
+        let scope = semantic.nodes().get_node(node_id).scope_id();
+        semantic
             .scoping()
             .find_binding(scope, name.into())
             .is_some()
+    }
+
+    /// Every symbol as (name, babel decl type, declaring span), unordered.
+    #[cfg(test)]
+    pub(crate) fn debug_symbols(&self) -> Vec<(String, &'static str, Span)> {
+        let label = |info: BindingInfo<'_>| match info.decl {
+            BindingDecl::Declarator(_) => "VariableDeclarator",
+            BindingDecl::NamedImport => "NamedImport",
+            BindingDecl::DefaultImport => "DefaultImport",
+            BindingDecl::NamespaceImport => "NamespaceImport",
+            BindingDecl::Opaque(type_name) => type_name,
+        };
+        match &self.scoping {
+            Scoping::Oxc(semantic) => {
+                let scoping = semantic.scoping();
+                scoping
+                    .symbol_ids()
+                    .map(|s| {
+                        let info = self.binding_info(s);
+                        let span = info.span;
+                        (scoping.symbol_name(s).to_string(), label(info), span)
+                    })
+                    .collect()
+            }
+            Scoping::Native(model) => model
+                .symbol_ids()
+                .map(|s| {
+                    let info = model.binding_info(s);
+                    let span = info.span;
+                    (model.symbol_name(s).to_string(), label(info), span)
+                })
+                .collect(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn any_symbol_named(&self, name: &str) -> Option<SymbolId> {
+        match &self.scoping {
+            Scoping::Oxc(semantic) => {
+                let scoping = semantic.scoping();
+                scoping
+                    .symbol_ids()
+                    .find(|s| scoping.symbol_name(*s) == name)
+            }
+            Scoping::Native(model) => model.symbol_ids().find(|s| model.symbol_name(*s) == name),
+        }
     }
 
     pub fn record_treeshake_import(&mut self, specifier: &str, decl_start: u32, source_span: Span) {
@@ -428,9 +593,17 @@ impl<'a> CompileState<'a> {
     }
 }
 
+fn ref_parent_of<'a>(nodes: &AstNodes<'a>, node: NodeId) -> RefParent<'a> {
+    let (_, parent) = climb_parens(nodes, node);
+    match member_object_span(nodes.kind(parent)) {
+        Some((_, property)) => RefParent::Member { property },
+        None => RefParent::Other,
+    }
+}
+
 // babel's Statement alias: oxc's list plus declaration statements it omits
 // (fn/class declarations, imports, named/all exports, TS decl statements).
-fn babel_is_statement(kind: AstKind<'_>) -> bool {
+pub(crate) fn babel_is_statement(kind: AstKind<'_>) -> bool {
     kind.is_statement()
         || matches!(kind, AstKind::Function(f) if f.is_declaration())
         || matches!(kind, AstKind::Class(c) if c.is_declaration())
@@ -449,7 +622,7 @@ fn babel_is_statement(kind: AstKind<'_>) -> bool {
         )
 }
 
-fn babel_is_export_declaration(kind: AstKind<'_>) -> bool {
+pub(crate) fn babel_is_export_declaration(kind: AstKind<'_>) -> bool {
     matches!(
         kind,
         AstKind::ExportDeclaration(_)
@@ -459,7 +632,7 @@ fn babel_is_export_declaration(kind: AstKind<'_>) -> bool {
     )
 }
 
-fn binding_pattern_type_name(pattern: &BindingPattern<'_>) -> &'static str {
+pub(crate) fn binding_pattern_type_name(pattern: &BindingPattern<'_>) -> &'static str {
     match pattern {
         BindingPattern::BindingIdentifier(_) => "Identifier",
         BindingPattern::ObjectPattern(_) => "ObjectPattern",
@@ -519,7 +692,7 @@ fn is_var_for_head(nodes: &AstNodes<'_>, declaration: NodeId) -> bool {
     matches!(left, ForStatementLeft::VariableDeclaration(head) if std::ptr::eq(&**head, decl))
 }
 
-const MUTATING_ARRAY_METHODS: [&str; 9] = [
+pub(crate) const MUTATING_ARRAY_METHODS: [&str; 9] = [
     "push",
     "pop",
     "shift",
@@ -540,7 +713,7 @@ const MUTATING_OBJECT_STATICS: [&str; 4] = [
 
 /// Climbs from `node` through ParenthesizedExpression parents (babel has no
 /// paren nodes, so they are transparent to its parent checks).
-pub(crate) fn climb_parens(nodes: &AstNodes<'_>, node: NodeId) -> (NodeId, NodeId) {
+fn climb_parens(nodes: &AstNodes<'_>, node: NodeId) -> (NodeId, NodeId) {
     let mut child = node;
     let mut parent = nodes.parent_id(child);
     while child != parent && matches!(nodes.kind(parent), AstKind::ParenthesizedExpression(_)) {
@@ -608,7 +781,7 @@ fn reference_is_mutation(nodes: &AstNodes<'_>, ref_node: NodeId) -> bool {
 }
 
 // parity: babel matchesPattern('Object.assign') & co — name-only, no bindings.
-fn callee_is_object_mutator(callee: &Expression<'_>) -> bool {
+pub(crate) fn callee_is_object_mutator(callee: &Expression<'_>) -> bool {
     let mut expr = callee;
     while let Expression::ParenthesizedExpression(paren) = expr {
         expr = &paren.expression;
@@ -695,21 +868,32 @@ mod tests {
     use oxc_parser::Parser;
     use oxc_span::SourceType;
 
-    fn with_state<R>(source: &str, f: impl FnOnce(&CompileState<'_>) -> R) -> R {
-        let allocator = Allocator::default();
-        let ret = Parser::new(&allocator, source, SourceType::tsx()).parse();
-        assert!(!ret.panicked);
-        let options = ResolvedOptions::default();
-        let state = CompileState::build(&ret.program, &options, None, String::new()).unwrap();
-        f(&state)
+    /// Runs `f` once per scope backend: every assertion pins both.
+    fn with_state<R>(source: &str, f: impl Fn(&CompileState<'_>) -> R) -> R {
+        let mut out = None;
+        for backend in [ScopeBackend::Oxc, ScopeBackend::Native] {
+            let allocator = Allocator::default();
+            let ret = Parser::new(&allocator, source, SourceType::tsx()).parse();
+            assert!(!ret.panicked);
+            let options = ResolvedOptions::default();
+            let imports = scan_imports(&ret.program, &options).unwrap();
+            let state = CompileState::build_with_imports_using(
+                &ret.program,
+                &options,
+                None,
+                String::new(),
+                imports,
+                backend,
+            );
+            out = Some(f(&state));
+        }
+        out.unwrap()
     }
 
     fn root_symbol(state: &CompileState<'_>, name: &str) -> SymbolId {
         state
-            .semantic
-            .scoping()
-            .get_root_binding(name.into())
-            .unwrap_or_else(|| panic!("no root binding {name}"))
+            .root_binding(name)
+            .unwrap_or_else(|| panic!("no root binding {name} ({:?})", state.backend()))
     }
 
     #[test]
@@ -723,13 +907,7 @@ mod tests {
                 }
                 let f = state.binding_info(root_symbol(state, "f"));
                 assert!(matches!(f.decl, BindingDecl::Opaque("FunctionDeclaration")));
-                assert!(
-                    state
-                        .semantic
-                        .scoping()
-                        .get_root_binding("inner".into())
-                        .is_none()
-                );
+                assert!(state.root_binding("inner").is_none());
             },
         );
     }
@@ -787,11 +965,7 @@ mod tests {
         with_state(
             "for (var k in {}) {}\nfor (const c of []) {}\nvar d = 1;\nvar d = 2;\n",
             |state| {
-                let scoping = state.semantic.scoping();
-                let c = scoping
-                    .symbol_ids()
-                    .find(|s| scoping.symbol_name(*s) == "c")
-                    .expect("for-of binding");
+                let c = state.any_symbol_named("c").expect("for-of binding");
                 assert!(state.is_non_constant(root_symbol(state, "k")));
                 assert!(!state.is_non_constant(c));
                 assert!(state.is_non_constant(root_symbol(state, "d")));
@@ -810,11 +984,7 @@ mod tests {
                 assert!(state.is_non_constant(root_symbol(state, "a")));
                 assert!(state.is_non_constant(root_symbol(state, "b")));
                 assert!(state.is_non_constant(root_symbol(state, "early")));
-                let scoping = state.semantic.scoping();
-                let l = scoping
-                    .symbol_ids()
-                    .find(|s| scoping.symbol_name(*s) == "l")
-                    .expect("for-of let binding");
+                let l = state.any_symbol_named("l").expect("for-of let binding");
                 assert!(!state.is_non_constant(l));
             },
         );

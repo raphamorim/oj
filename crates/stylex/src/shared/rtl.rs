@@ -2,6 +2,8 @@
 // parity: babel-plugin src/shared/physical-rtl/{generate-ltr,generate-rtl}.js
 
 use crate::options::{ResolvedOptions, StyleResolution};
+use std::borrow::Cow;
+
 use crate::shared::css_value::{Kind, Node, parse, stringify, unit};
 
 /// The three options `generateLtr`/`generateRtl` read; upstream passes none
@@ -161,62 +163,70 @@ fn map_background_position(value: &str, start_to: &str, end_to: &str) -> String 
 
 /// The ltr declaration for a `[dashed-key, value]` pair (identity when no
 /// rewrite applies).
-pub fn generate_ltr(key: &str, value: &str, ctx: RtlContext) -> (String, String) {
+pub fn generate_ltr<'k, 'v>(
+    key: &'k str,
+    value: &'v str,
+    ctx: RtlContext,
+) -> (Cow<'k, str>, Cow<'v, str>) {
+    let identity = (Cow::Borrowed(key), Cow::Borrowed(value));
     if ctx.legacy() {
         if !ctx.enable_logical_styles_polyfill {
-            return (key.to_string(), value.to_string());
+            return identity;
         }
         if let Some(mapped) = inline_ltr_property(key) {
-            return (mapped.to_string(), value.to_string());
+            return (Cow::Borrowed(mapped), Cow::Borrowed(value));
         }
     }
     if let Some(mapped) = ltr_property(key) {
-        return (mapped.to_string(), value.to_string());
+        return (Cow::Borrowed(mapped), Cow::Borrowed(value));
     }
     match key {
         "float" | "clear" => (
-            key.to_string(),
-            ltr_value(value).map_or_else(|| value.to_string(), str::to_string),
+            Cow::Borrowed(key),
+            Cow::Borrowed(ltr_value(value).unwrap_or(value)),
         ),
         "background-position" => (
-            key.to_string(),
-            map_background_position(value, "left", "right"),
+            Cow::Borrowed(key),
+            Cow::Owned(map_background_position(value, "left", "right")),
         ),
-        _ => (key.to_string(), value.to_string()),
+        _ => identity,
     }
 }
 
 /// The rtl declaration, or `None` when the pair does not flip.
-pub fn generate_rtl(key: &str, value: &str, ctx: RtlContext) -> Option<(String, String)> {
+pub fn generate_rtl<'k, 'v>(
+    key: &'k str,
+    value: &'v str,
+    ctx: RtlContext,
+) -> Option<(Cow<'k, str>, Cow<'v, str>)> {
     if ctx.legacy() {
         // The polyfill gates every rtl rule, legacy value flipping included.
         if !ctx.enable_logical_styles_polyfill {
             return None;
         }
         if let Some(mapped) = inline_rtl_property(key) {
-            return Some((mapped.to_string(), value.to_string()));
+            return Some((Cow::Borrowed(mapped), Cow::Borrowed(value)));
         }
     }
     if let Some(mapped) = rtl_property(key) {
-        return Some((mapped.to_string(), value.to_string()));
+        return Some((Cow::Borrowed(mapped), Cow::Borrowed(value)));
     }
     match key {
-        "float" | "clear" => rtl_value(value).map(|v| (key.to_string(), v.to_string())),
+        "float" | "clear" => rtl_value(value).map(|v| (Cow::Borrowed(key), Cow::Borrowed(v))),
         "background-position" => {
-            let words: Vec<&str> = value.split(' ').collect();
-            if !words.contains(&"start") && !words.contains(&"end") {
+            if !value.split(' ').any(|w| w == "start" || w == "end") {
                 return None;
             }
             Some((
-                key.to_string(),
-                map_background_position(value, "right", "left"),
+                Cow::Borrowed(key),
+                Cow::Owned(map_background_position(value, "right", "left")),
             ))
         }
         "cursor" if ctx.enable_legacy_value_flipping => {
-            cursor_flip(value).map(|v| (key.to_string(), v.to_string()))
+            cursor_flip(value).map(|v| (Cow::Borrowed(key), Cow::Borrowed(v)))
         }
         "box-shadow" | "text-shadow" if ctx.enable_legacy_value_flipping => {
-            flip_shadow(value).map(|v| (key.to_string(), v))
+            flip_shadow(value).map(|v| (Cow::Borrowed(key), Cow::Owned(v)))
         }
         _ => None,
     }
@@ -292,6 +302,15 @@ fn flip_sign(part: &str) -> String {
 mod tests {
     use super::*;
 
+    fn ltr(key: &str, value: &str, ctx: RtlContext) -> (String, String) {
+        let (k, v) = generate_ltr(key, value, ctx);
+        (k.into_owned(), v.into_owned())
+    }
+
+    fn rtl(key: &str, value: &str, ctx: RtlContext) -> Option<(String, String)> {
+        generate_rtl(key, value, ctx).map(|(k, v)| (k.into_owned(), v.into_owned()))
+    }
+
     fn legacy(polyfill: bool) -> RtlContext {
         RtlContext {
             style_resolution: StyleResolution::LegacyExpandShorthands,
@@ -312,39 +331,39 @@ mod tests {
         // Pinned via probes 2026-08-27 against @stylexjs/babel-plugin 0.19.0.
         let d = RtlContext::DEFAULTS;
         assert_eq!(
-            generate_ltr("margin-start", "10px", d),
+            ltr("margin-start", "10px", d),
             ("margin-left".to_string(), "10px".to_string())
         );
         assert_eq!(
-            generate_rtl("margin-start", "10px", d),
+            rtl("margin-start", "10px", d),
             Some(("margin-right".to_string(), "10px".to_string()))
         );
         assert_eq!(
-            generate_ltr("float", "inline-start", d),
+            ltr("float", "inline-start", d),
             ("float".to_string(), "left".to_string())
         );
         assert_eq!(
-            generate_rtl("float", "inline-start", d),
+            rtl("float", "inline-start", d),
             Some(("float".to_string(), "right".to_string()))
         );
         assert_eq!(
-            generate_ltr("float", "left", d),
+            ltr("float", "left", d),
             ("float".to_string(), "left".to_string())
         );
-        assert_eq!(generate_rtl("float", "left", d), None);
+        assert_eq!(rtl("float", "left", d), None);
         assert_eq!(
-            generate_ltr("background-position", "start top", d),
+            ltr("background-position", "start top", d),
             ("background-position".to_string(), "left top".to_string())
         );
         assert_eq!(
-            generate_rtl("background-position", "start top", d),
+            rtl("background-position", "start top", d),
             Some(("background-position".to_string(), "right top".to_string()))
         );
-        assert_eq!(generate_rtl("background-position", "left top", d), None);
-        assert_eq!(generate_rtl("cursor", "e-resize", d), None);
-        assert_eq!(generate_rtl("margin-inline-start", "1px", d), None);
+        assert_eq!(rtl("background-position", "left top", d), None);
+        assert_eq!(rtl("cursor", "e-resize", d), None);
+        assert_eq!(rtl("margin-inline-start", "1px", d), None);
         assert_eq!(
-            generate_ltr("margin-inline-start", "1px", d),
+            ltr("margin-inline-start", "1px", d),
             ("margin-inline-start".to_string(), "1px".to_string())
         );
     }
@@ -353,43 +372,40 @@ mod tests {
     fn legacy_polyfill_gates_every_rtl_rule() {
         // polyfill off: ltr is identity for everything and there is no rtl.
         assert_eq!(
-            generate_ltr("margin-inline-start", "1px", legacy(false)),
+            ltr("margin-inline-start", "1px", legacy(false)),
             ("margin-inline-start".to_string(), "1px".to_string())
         );
+        assert_eq!(rtl("margin-inline-start", "1px", legacy(false)), None);
         assert_eq!(
-            generate_rtl("margin-inline-start", "1px", legacy(false)),
-            None
-        );
-        assert_eq!(
-            generate_ltr("margin-start", "1px", legacy(false)),
+            ltr("margin-start", "1px", legacy(false)),
             ("margin-start".to_string(), "1px".to_string())
         );
-        assert_eq!(generate_rtl("margin-start", "1px", legacy(false)), None);
+        assert_eq!(rtl("margin-start", "1px", legacy(false)), None);
         assert_eq!(
-            generate_ltr("background-position", "start top", legacy(false)),
+            ltr("background-position", "start top", legacy(false)),
             ("background-position".to_string(), "start top".to_string())
         );
 
         // polyfill on: the inline table fires first, then the normal one.
         assert_eq!(
-            generate_ltr("border-start-start-radius", "1px", legacy(true)),
+            ltr("border-start-start-radius", "1px", legacy(true)),
             ("border-top-left-radius".to_string(), "1px".to_string())
         );
         assert_eq!(
-            generate_rtl("border-start-start-radius", "1px", legacy(true)),
+            rtl("border-start-start-radius", "1px", legacy(true)),
             Some(("border-top-right-radius".to_string(), "1px".to_string()))
         );
         assert_eq!(
-            generate_ltr("border-start-width", "1px", legacy(true)),
+            ltr("border-start-width", "1px", legacy(true)),
             ("border-left-width".to_string(), "1px".to_string())
         );
         // camelCase background-position words map in ltr but never produce rtl.
         assert_eq!(
-            generate_ltr("background-position", "insetInlineStart 0", legacy(true)),
+            ltr("background-position", "insetInlineStart 0", legacy(true)),
             ("background-position".to_string(), "left 0".to_string())
         );
         assert_eq!(
-            generate_rtl("background-position", "insetInlineStart 0", legacy(true)),
+            rtl("background-position", "insetInlineStart 0", legacy(true)),
             None
         );
     }
@@ -400,13 +416,13 @@ mod tests {
             enable_legacy_value_flipping: true,
             ..legacy(false)
         };
-        assert_eq!(generate_rtl("cursor", "e-resize", leg_flip), None);
+        assert_eq!(rtl("cursor", "e-resize", leg_flip), None);
         let leg_flip_poly = RtlContext {
             enable_logical_styles_polyfill: true,
             ..leg_flip
         };
         assert_eq!(
-            generate_rtl("cursor", "e-resize", leg_flip_poly),
+            rtl("cursor", "e-resize", leg_flip_poly),
             Some(("cursor".to_string(), "w-resize".to_string()))
         );
     }
@@ -414,12 +430,12 @@ mod tests {
     #[test]
     fn cursor_and_shadow_flips() {
         let f = flipping();
-        let rtl = |k: &str, v: &str| generate_rtl(k, v, f).map(|(_, v)| v);
+        let rtl = |k: &str, v: &str| rtl(k, v, f).map(|(_, v)| v);
         assert_eq!(rtl("cursor", "nesw-resize").as_deref(), Some("nwse-resize"));
         assert_eq!(rtl("cursor", "n-resize"), None);
         assert_eq!(rtl("cursor", "E-resize"), None);
         assert_eq!(rtl("cursor", "url(a.png),e-resize"), None);
-        assert_eq!(generate_ltr("cursor", "e-resize", f).1, "e-resize");
+        assert_eq!(ltr("cursor", "e-resize", f).1, "e-resize");
 
         assert_eq!(
             rtl("box-shadow", "1px 1px #000").as_deref(),

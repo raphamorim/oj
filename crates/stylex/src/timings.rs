@@ -32,9 +32,10 @@ pub enum Stage {
     AssembleSort,
     AssembleSubst,
     AssembleRender,
+    CreateMiss,
 }
 
-const STAGE_COUNT: usize = 24;
+const STAGE_COUNT: usize = 25;
 const NAMES: [&str; STAGE_COUNT] = [
     "ndjson_in",
     "options",
@@ -60,6 +61,7 @@ const NAMES: [&str; STAGE_COUNT] = [
     "assemble_sort",
     "assemble_subst",
     "assemble_render",
+    "create_miss",
 ];
 
 static TOTAL_NS: [AtomicU64; STAGE_COUNT] = [const { AtomicU64::new(0) }; STAGE_COUNT];

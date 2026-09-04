@@ -1,6 +1,8 @@
 //! CSS value tokenizer, behavior-equivalent to postcss-value-parser@4.2.0.
 // parity: postcss-value-parser lib/{parse,walk,stringify,unit}.js
 
+use std::borrow::Cow;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Word,
@@ -91,7 +93,7 @@ fn is_unicode_range(token: &[u8]) -> bool {
 pub fn parse(input: &str) -> Vec<Node> {
     // The buffer can grow (unclosed string/url get a synthetic closer); `max`
     // stays at the original length, exactly like upstream's captured `value.length`.
-    let mut value: Vec<u8> = input.as_bytes().to_vec();
+    let mut value: Cow<[u8]> = Cow::Borrowed(input.as_bytes());
     let max = value.len();
     let mut pos: usize = 0;
 
@@ -155,7 +157,7 @@ pub fn parse(input: &str) -> Vec<Node> {
                         }
                     }
                     None => {
-                        value.push(quote);
+                        value.to_mut().push(quote);
                         next = value.len() - 1;
                         unclosed = true;
                     }
@@ -241,7 +243,7 @@ pub fn parse(input: &str) -> Vec<Node> {
                             }
                         }
                         None => {
-                            value.push(b')');
+                            value.to_mut().push(b')');
                             next2 = value.len() - 1;
                             func.unclosed = true;
                         }
@@ -399,9 +401,9 @@ fn stringify_node(node: &Node, out: &mut String) {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Dimension {
-    pub number: String,
-    pub unit: String,
+pub struct Dimension<'a> {
+    pub number: &'a str,
+    pub unit: &'a str,
 }
 
 // https://www.w3.org/TR/css-syntax-3/#starts-with-a-number
@@ -418,7 +420,7 @@ fn like_number(b: &[u8]) -> bool {
     }
 }
 
-pub fn unit(value: &str) -> Option<Dimension> {
+pub fn unit(value: &str) -> Option<Dimension<'_>> {
     let b = value.as_bytes();
     if b.is_empty() || !like_number(b) {
         return None;
@@ -454,8 +456,8 @@ pub fn unit(value: &str) -> Option<Dimension> {
         }
     }
     Some(Dimension {
-        number: value[..pos].to_string(),
-        unit: value[pos..].to_string(),
+        number: &value[..pos],
+        unit: &value[pos..],
     })
 }
 
@@ -540,29 +542,29 @@ mod tests {
         assert_eq!(
             unit("500ms"),
             Some(Dimension {
-                number: "500".into(),
-                unit: "ms".into()
+                number: "500",
+                unit: "ms"
             })
         );
         assert_eq!(
             unit(".5.5px"),
             Some(Dimension {
-                number: ".5".into(),
-                unit: ".5px".into()
+                number: ".5",
+                unit: ".5px"
             })
         );
         assert_eq!(
             unit("1e-7px"),
             Some(Dimension {
-                number: "1e-7".into(),
-                unit: "px".into()
+                number: "1e-7",
+                unit: "px"
             })
         );
         assert_eq!(
             unit("-0px"),
             Some(Dimension {
-                number: "-0".into(),
-                unit: "px".into()
+                number: "-0",
+                unit: "px"
             })
         );
         assert_eq!(unit("Infinityms"), None);
@@ -571,8 +573,8 @@ mod tests {
         assert_eq!(
             unit("5e"),
             Some(Dimension {
-                number: "5".into(),
-                unit: "e".into()
+                number: "5",
+                unit: "e"
             })
         );
     }

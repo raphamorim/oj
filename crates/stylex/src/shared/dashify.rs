@@ -1,5 +1,7 @@
 //! camelCase -> dash-case plus the dev-classname sanitizer.
 
+use std::borrow::Cow;
+
 /// Equivalent of `str.replace(/(^|[a-z])([A-Z])/g, '$1-$2').toLowerCase()`.
 // parity: babel-plugin src/shared/utils/dashify.js
 pub fn dashify(s: &str) -> String {
@@ -17,9 +19,9 @@ pub fn dashify(s: &str) -> String {
 
 /// Custom properties keep their exact spelling; everything else is dashified.
 // parity: babel-plugin src/shared/utils/convert-to-className.js:40
-pub fn dashed_key(key: &str) -> String {
+pub fn dashed_key(key: &str) -> Cow<'_, str> {
     if key.starts_with("--") {
-        return key.to_string();
+        return Cow::Borrowed(key);
     }
     // ASCII lower/digit/'-'/'_' strings are dashify fixed points (no dash
     // insertion, toLowerCase identity): skip the two-string rebuild.
@@ -27,9 +29,9 @@ pub fn dashed_key(key: &str) -> String {
         .bytes()
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
     {
-        return key.to_string();
+        return Cow::Borrowed(key);
     }
-    dashify(key)
+    Cow::Owned(dashify(key))
 }
 
 /// Equivalent of `className.replace(/[^.a-zA-Z0-9_-]/g, '')`.

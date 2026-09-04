@@ -77,7 +77,7 @@ fn normalize_whitespace(nodes: &mut Vec<Node>) -> Result<(), CssValueError> {
             return Err(CssValueError::EmptyValue);
         }
         match nodes[i].kind {
-            Kind::Space => nodes[i].value = " ".to_string(),
+            Kind::Space => set_single_space(&mut nodes[i].value),
             Kind::Div => normalize_div_spacing(&mut nodes[i]),
             Kind::Func => {
                 nodes[i].before.clear();
@@ -100,15 +100,22 @@ fn normalize_div_spacing(node: &mut Node) {
         node.before.clear();
         node.after.clear();
     } else {
-        node.before = " ".to_string();
-        node.after = " ".to_string();
+        set_single_space(&mut node.before);
+        set_single_space(&mut node.after);
+    }
+}
+
+fn set_single_space(s: &mut String) {
+    if s != " " {
+        s.clear();
+        s.push(' ');
     }
 }
 
 fn whitespace_walk_nested(nodes: &mut [Node]) {
     for node in nodes.iter_mut() {
         match node.kind {
-            Kind::Space => node.value = " ".to_string(),
+            Kind::Space => set_single_space(&mut node.value),
             Kind::Div => normalize_div_spacing(node),
             Kind::Func => {
                 node.before.clear();
@@ -164,7 +171,7 @@ fn normalize_zero_dimensions(nodes: &mut [Node], key: &str) {
         if dimension.number != "0" {
             return;
         }
-        let unit_str = dimension.unit.as_str();
+        let unit_str = dimension.unit;
         if matches!(unit_str, "deg" | "grad" | "turn" | "rad") {
             node.value = "0deg".to_string();
         } else if matches!(unit_str, "ms" | "s") {
@@ -190,7 +197,7 @@ fn normalize_leading_zero(nodes: &mut [Node]) {
         };
         if (0.0..1.0).contains(&value) {
             let unit_str = unit(&node.value).map(|d| d.unit).unwrap_or_default();
-            node.value = js_number_to_string(value).replacen("0.", ".", 1) + &unit_str;
+            node.value = js_number_to_string(value).replacen("0.", ".", 1) + unit_str;
         }
     });
 }
@@ -232,7 +239,7 @@ fn convert_font_size_to_rem(nodes: &mut [Node], key: &str) {
         if dimension.unit != "px" {
             return;
         }
-        let number = js_parse_float(&dimension.number).unwrap_or(f64::NAN);
+        let number = js_parse_float(dimension.number).unwrap_or(f64::NAN);
         node.value = js_number_to_string(number / 16.0) + "rem";
     });
 }

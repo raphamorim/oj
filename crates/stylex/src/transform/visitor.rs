@@ -49,7 +49,7 @@ use crate::shared::position_try::{position_try, position_try_shared};
 use crate::shared::types::create_css_type;
 use crate::shared::view_transition::view_transition_class;
 use crate::shared::when::{WhenRelation, when_selector};
-use crate::state::{CompileState, climb_parens, member_object_span};
+use crate::state::{CompileState, RefParent};
 use crate::transform::ast_backend::{
     AstPlan, DynamicEntry, HoistValue, InsertOp, JsxOp, PrologueStmt, RemoveOp, SynthExpr,
     SynthStmt,
@@ -400,13 +400,14 @@ fn pass_a_index(state: &CompileState<'_>, source: &str) -> SiteIndex {
         .map(|(name, _)| name.as_str())
         .chain(imports.stylex_namespaces.iter().map(String::as_str))
         .collect();
-    let mut starts = state.reference_starts_where(&names, |name, nodes, node| {
+    let mut starts = state.reference_starts_where(&names, |name, site| {
         if !imports.is_stylex_namespace(name) {
             return true;
         }
-        let (_, parent) = climb_parens(nodes, node);
-        match member_object_span(nodes.kind(parent)) {
-            Some((_, Some(property))) => !matches!(
+        match site.parent() {
+            RefParent::Member {
+                property: Some(property),
+            } => !matches!(
                 member_api_kind(property),
                 None | Some(CallKind::Props | CallKind::Attrs)
             ),
@@ -1338,31 +1339,46 @@ pub fn transform_module<'a>(
     if let Some(error) = shared.error.take() {
         return Err(error);
     }
-    let index = pass_b1_index(shared.state, &shared.style_map);
-    {
-        let mut pass = PassB1 {
-            s: &mut shared,
-            index,
-        };
-        walk_program(&mut pass, program);
-    }
-    if !shared.state.imports.atom_imports.is_empty()
-        || !shared.state.imports.atom_binding_locals.is_empty()
-    {
-        let mut pass = PassAtoms {
-            s: &mut shared,
-            callee_spans: BTreeSet::new(),
-        };
-        walk_program(&mut pass, program);
-    }
-    if let Some(error) = shared.error.take() {
-        return Err(error);
-    }
-    let index = pass_b2_index(shared.state, &shared.sx_sites);
-    {
+    let has_atoms = !shared.state.imports.atom_imports.is_empty()
+        || !shared.state.imports.atom_binding_locals.is_empty();
+    if has_atoms {
+        let index = pass_b1_index(shared.state, &shared.style_map);
+        {
+            let mut pass = PassB1 {
+                s: &mut shared,
+                index,
+            };
+            walk_program(&mut pass, program);
+        }
+        {
+            let mut pass = PassAtoms {
+                s: &mut shared,
+                callee_spans: BTreeSet::new(),
+            };
+            walk_program(&mut pass, program);
+        }
+        if let Some(error) = shared.error.take() {
+            return Err(error);
+        }
+        let index = pass_b2_index(shared.state, &shared.sx_sites);
         let mut pass = PassB2 {
             s: &mut shared,
             index,
+        };
+        walk_program(&mut pass, program);
+    } else {
+        // The atoms pass is the only writer of dead spans between B1 and B2;
+        // without it the two Program.exit walks fuse into one.
+        let mut index = pass_b1_index(shared.state, &shared.style_map);
+        index
+            .starts
+            .extend(pass_b2_index(shared.state, &shared.sx_sites).starts);
+        index.starts.sort_unstable();
+        let mut pass = PassB12 {
+            s: &mut shared,
+            index,
+            b1_skip: None,
+            b2_skip: None,
         };
         walk_program(&mut pass, program);
     }
@@ -3729,54 +3745,46 @@ struct PassB1<'w, 'a, 'env> {
     index: SiteIndex,
 }
 
-impl<'a> Hooks<'a> for PassB1<'_, 'a, '_> {
-    fn done(&self) -> bool {
-        false
-    }
-
-    fn wants(&self, span: Span) -> bool {
-        self.index.any_in(span)
-    }
-
-    fn call(&mut self, call: &'a CallExpression<'a>, _parent: ExprParent<'_>) -> Flow {
+impl<'a> Shared<'a, '_> {
+    fn b1_call(&self, call: &'a CallExpression<'a>) -> Flow {
         // Dead spans still walk when they carry live (spliced) sub-spans; the
         // identifier/member hooks re-check per node.
-        if self.s.in_dead(call.span) && !self.s.contains_live(call.span) {
+        if self.in_dead(call.span) && !self.contains_live(call.span) {
             return Flow::Skip;
         }
-        match call_kind(call, self.s.state) {
+        match call_kind(call, self.state) {
             Some(CallKind::Props | CallKind::Attrs | CallKind::LegacyMerge) => Flow::Skip,
             _ => Flow::Walk,
         }
     }
 
-    fn jsx_attribute(&mut self, attr: &'a JSXAttribute<'a>) -> Flow {
-        if self.s.sx_sites.iter().any(|s| s.attr_span == attr.span) {
+    fn b1_jsx_attribute(&self, attr: &'a JSXAttribute<'a>) -> Flow {
+        if self.sx_sites.iter().any(|s| s.attr_span == attr.span) {
             Flow::Skip
         } else {
             Flow::Walk
         }
     }
 
-    fn identifier(&mut self, name: &str, span: Span) {
-        if self.s.in_dead(span) || !self.s.style_map.contains_key(name) {
+    fn b1_identifier(&mut self, name: &str, span: Span) {
+        if self.in_dead(span) || !self.style_map.contains_key(name) {
             return;
         }
-        self.s.tuples.push(StyleVarToKeep {
+        self.tuples.push(StyleVarToKeep {
             var_name: name.to_string(),
             namespace: None,
             non_null_props: crate::transform::merge::NonNullProps::True,
         });
     }
 
-    fn member(&mut self, info: &MemberInfo<'a>) -> MemberFlow {
-        if info.optional || self.s.in_dead(info.span) {
+    fn b1_member(&mut self, info: &MemberInfo<'a>) -> MemberFlow {
+        if info.optional || self.in_dead(info.span) {
             return MemberFlow::Walk;
         }
         let Expression::Identifier(object) = unwrap_parens(info.object) else {
             return MemberFlow::Walk;
         };
-        if !self.s.style_map.contains_key(object.name.as_str()) {
+        if !self.style_map.contains_key(object.name.as_str()) {
             return MemberFlow::Walk;
         }
         let namespace = match &info.prop {
@@ -3787,7 +3795,7 @@ impl<'a> Hooks<'a> for PassB1<'_, 'a, '_> {
                 _ => None,
             },
         };
-        self.s.tuples.push(StyleVarToKeep {
+        self.tuples.push(StyleVarToKeep {
             var_name: object.name.to_string(),
             namespace,
             non_null_props: crate::transform::merge::NonNullProps::True,
@@ -3795,8 +3803,54 @@ impl<'a> Hooks<'a> for PassB1<'_, 'a, '_> {
         MemberFlow::SkipObject
     }
 
+    fn b2_call(&mut self, call: &'a CallExpression<'a>, parent: ExprParent<'_>) -> Flow {
+        if self.in_dead(call.span) {
+            return Flow::Skip;
+        }
+        match call_kind(call, self.state) {
+            Some(CallKind::LegacyMerge) => self.process_legacy_merge_call(call),
+            Some(CallKind::Props) => self.process_props_call(call, parent, MergeMode::Props),
+            Some(CallKind::Attrs) => self.process_props_call(call, parent, MergeMode::Attrs),
+            _ => Flow::Walk,
+        }
+    }
+
+    fn b2_jsx_attribute(&mut self, attr: &'a JSXAttribute<'a>) -> Flow {
+        let index = self.sx_sites.iter().position(|s| s.attr_span == attr.span);
+        match index {
+            Some(index) => self.process_sx(index),
+            None => Flow::Walk,
+        }
+    }
+}
+
+impl<'a> Hooks<'a> for PassB1<'_, 'a, '_> {
+    fn done(&self) -> bool {
+        false
+    }
+
+    fn wants(&self, span: Span) -> bool {
+        self.index.any_in(span)
+    }
+
+    fn call(&mut self, call: &'a CallExpression<'a>, _parent: ExprParent<'_>) -> Flow {
+        self.s.b1_call(call)
+    }
+
+    fn jsx_attribute(&mut self, attr: &'a JSXAttribute<'a>) -> Flow {
+        self.s.b1_jsx_attribute(attr)
+    }
+
+    fn identifier(&mut self, name: &str, span: Span) {
+        self.s.b1_identifier(name, span);
+    }
+
+    fn member(&mut self, info: &MemberInfo<'a>) -> MemberFlow {
+        self.s.b1_member(info)
+    }
+
     fn export_local(&mut self, name: &str, _span: Span) {
-        self.identifier(name, Span::default());
+        self.s.b1_identifier(name, Span::default());
     }
 }
 
@@ -3871,27 +3925,88 @@ impl<'a> Hooks<'a> for PassB2<'_, 'a, '_> {
     }
 
     fn call(&mut self, call: &'a CallExpression<'a>, parent: ExprParent<'_>) -> Flow {
-        if self.s.in_dead(call.span) {
-            return Flow::Skip;
-        }
-        match call_kind(call, self.s.state) {
-            Some(CallKind::LegacyMerge) => self.s.process_legacy_merge_call(call),
-            Some(CallKind::Props) => self.s.process_props_call(call, parent, MergeMode::Props),
-            Some(CallKind::Attrs) => self.s.process_props_call(call, parent, MergeMode::Attrs),
-            _ => Flow::Walk,
-        }
+        self.s.b2_call(call, parent)
     }
 
     fn jsx_attribute(&mut self, attr: &'a JSXAttribute<'a>) -> Flow {
-        let index = self
-            .s
-            .sx_sites
-            .iter()
-            .position(|s| s.attr_span == attr.span);
-        match index {
-            Some(index) => self.s.process_sx(index),
-            None => Flow::Walk,
+        self.s.b2_jsx_attribute(attr)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pass B1 + B2 in one walk (no atoms pass between them)
+
+/// Each pass keeps its own skipped subtree: the walk descends when either
+/// pass wants to, and a pass's hooks stay silent inside the span it skipped.
+struct PassB12<'w, 'a, 'env> {
+    s: &'w mut Shared<'a, 'env>,
+    index: SiteIndex,
+    b1_skip: Option<Span>,
+    b2_skip: Option<Span>,
+}
+
+fn within(skip: Option<Span>, span: Span) -> bool {
+    skip.is_some_and(|s| s.start <= span.start && span.end <= s.end)
+}
+
+fn skip_or_walk(flow: Flow, skip: &mut Option<Span>, span: Span, walk: &mut bool) {
+    match flow {
+        Flow::Skip => *skip = Some(span),
+        Flow::Walk | Flow::ArgsOnly => *walk = true,
+    }
+}
+
+impl<'a> Hooks<'a> for PassB12<'_, 'a, '_> {
+    fn done(&self) -> bool {
+        self.s.error.is_some()
+    }
+
+    fn wants(&self, span: Span) -> bool {
+        self.index.any_in(span)
+    }
+
+    fn call(&mut self, call: &'a CallExpression<'a>, parent: ExprParent<'_>) -> Flow {
+        let mut walk = false;
+        if !within(self.b1_skip, call.span) {
+            let flow = self.s.b1_call(call);
+            skip_or_walk(flow, &mut self.b1_skip, call.span, &mut walk);
         }
+        if !within(self.b2_skip, call.span) {
+            let flow = self.s.b2_call(call, parent);
+            skip_or_walk(flow, &mut self.b2_skip, call.span, &mut walk);
+        }
+        if walk { Flow::Walk } else { Flow::Skip }
+    }
+
+    fn jsx_attribute(&mut self, attr: &'a JSXAttribute<'a>) -> Flow {
+        let mut walk = false;
+        if !within(self.b1_skip, attr.span) {
+            let flow = self.s.b1_jsx_attribute(attr);
+            skip_or_walk(flow, &mut self.b1_skip, attr.span, &mut walk);
+        }
+        if !within(self.b2_skip, attr.span) {
+            let flow = self.s.b2_jsx_attribute(attr);
+            skip_or_walk(flow, &mut self.b2_skip, attr.span, &mut walk);
+        }
+        if walk { Flow::Walk } else { Flow::Skip }
+    }
+
+    fn identifier(&mut self, name: &str, span: Span) {
+        if !within(self.b1_skip, span) {
+            self.s.b1_identifier(name, span);
+        }
+    }
+
+    fn member(&mut self, info: &MemberInfo<'a>) -> MemberFlow {
+        if within(self.b1_skip, info.span) {
+            MemberFlow::Walk
+        } else {
+            self.s.b1_member(info)
+        }
+    }
+
+    fn export_local(&mut self, name: &str, _span: Span) {
+        self.s.b1_identifier(name, Span::default());
     }
 }
 
@@ -3973,7 +4088,7 @@ fn style_map_member_info(info: &MemberInfo<'_>) -> Option<(String, Option<String
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -4018,7 +4133,7 @@ mod tests {
         }
     }
 
-    fn corpus_sources() -> Vec<(String, String)> {
+    pub(crate) fn corpus_sources() -> Vec<(String, String)> {
         let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../conformance"));
         let mut out = Vec::new();
         // Vendored copies of this crate ship without the conformance corpus.

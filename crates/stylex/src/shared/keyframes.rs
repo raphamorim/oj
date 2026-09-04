@@ -39,12 +39,14 @@ pub fn keyframes(
                 unreachable!("transform stage only stores strings");
             };
             let (lk, lv) = generate_ltr(key, value, ctx);
-            ltr.insert(lk, EvalValue::Str(lv));
-            let (rk, rv) =
-                generate_rtl(key, value, ctx).unwrap_or_else(|| (key.to_string(), value.clone()));
+            ltr.insert(lk, EvalValue::Str(lv.into_owned()));
+            let (rk, rv) = generate_rtl(key, value, ctx).map_or_else(
+                || (key.to_string(), value.clone()),
+                |(k, v)| (k.into_owned(), v.into_owned()),
+            );
             rtl.insert(rk, EvalValue::Str(rv));
             let (sk, sv) = generate_ltr(key, value, RtlContext::DEFAULTS);
-            stable.insert(sk, EvalValue::Str(sv));
+            stable.insert(sk, EvalValue::Str(sv.into_owned()));
         }
         ltr_frames.push((frame_name.to_string(), ltr));
         rtl_frames.push((frame_name.to_string(), rtl));
