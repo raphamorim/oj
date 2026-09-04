@@ -28,7 +28,7 @@ const CACHE_DIR = process.env.OJ_CACHE_ROOT ?? pathResolve(HERE, "..");
 const BASE_FILES = [
   "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "package.json",
   "vite.config.ts", "vite.config.js", "vite.config.mjs", "vite.config.mts", "vite.config.cjs", "vite.config.cts",
-  "oj.config.ts", "oj.config.js", "oj.config.mjs",
+  "oj.config.ts", "oj.config.js", "oj.config.mjs", "oj.config.json",
 ];
 const LOADER_FILES = ["loader.mjs", "loader-util.mjs", "glob-transform.mjs", "vite-plugin-bridge.mjs", "resolve-pkg.mjs"];
 const hashAdd = (h, label, bytes) => { h.update(label); h.update("\0"); h.update(bytes); h.update("\0"); };
@@ -156,6 +156,8 @@ const EPOCH = (() => {
     // Cached resolutions embed condition choices (browser vs node builds), so a
     // conditions change must invalidate them or stale wrong-runtime picks replay.
     hashAdd(h, "resolve-conditions", process.env.OJ_RESOLVE_CONDITIONS ?? "");
+    hashAdd(h, "external-conditions", process.env.OJ_EXTERNAL_CONDITIONS ?? "");
+    hashAdd(h, "ssr-externals", process.env.OJ_SSR_EXTERNALS ?? "");
     return h.digest("hex");
   } catch {
     return null;
