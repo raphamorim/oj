@@ -31,6 +31,9 @@ env.isPreview = env.isPreview ?? false;
 // config it hands the host, so createResolver — which plugins like wyw-in-js use
 // to resolve modules during CSS evaluation — would otherwise see no aliases.
 let userResolveAlias = null;
+// The user's config file as loaded (before oj's overlay and any resolve):
+// buildEnvironments consults it to tell a user-chosen option from a default.
+let userViteConfig = null;
 
 // This process hosts untrusted third-party plugin code. A plugin that spawns a
 // worker or a floating promise which throws asynchronously would otherwise take
@@ -385,6 +388,7 @@ try {
   if (initial.pluginsFormat === "vite") {
     const cfg = await loadViteConfig(pluginsPath);
     userConfig = cfg && typeof cfg === "object" ? cfg : null;
+    userViteConfig = userConfig;
     userResolveAlias = cfg?.resolve?.alias ?? null;
     list = await Promise.all((cfg?.plugins ?? []).flat(Infinity));
   } else {
@@ -975,6 +979,9 @@ function wsConnection() {
 }
 
 let middlewarePort = null;
+// Whether buildEnvironments produced real Vite DevEnvironments (the Cloudflare
+// path); Rust reads it via getCfEnvironments to gate its SSR-runner handling.
+let cfEnvironmentsBuilt = false;
 // The ViteDevServer stand-in handed to configureServer; hotUpdate/handleHotUpdate
 // contexts carry it as `server` (plugins call server.ws.send / moduleGraph on it).
 let devServer = null;
@@ -1008,57 +1015,256 @@ async function buildEnvironments(server) {
     // their config hooks run a second time, so we accept a second resolve. The
     // environments bind to these fresh instances; oj drives its own instances
     // in configureServer, and the two agree because both resolve from `root`.
+    hostPhase("cf: resolveConfig begin");
     rc = await vite.resolveConfig({ root, configFile: undefined, mode: environment.mode }, "serve", "development", "development");
+    hostPhase("cf: resolveConfig done");
   } catch (e) {
     process.stderr.write(`${OJ} plugin host: vite.resolveConfig failed: ${(e && e.message) || e}\n`);
     return undefined;
   }
   server.config = rc;
-  const environments = {};
+  // import-analysis pre-warms a module's static imports only when the
+  // environment's dev.preTransformRequests is on, and Vite defaults it off for
+  // server consumers; without it the module runner walks its graph one serial
+  // fetchModule at a time. Turn it on for server environments unless the user
+  // chose a value (the environments read this resolved object live).
   for (const [name, envOpts] of Object.entries(rc.environments || {})) {
+    if (!envOpts) continue;
+    const consumer = envOpts.consumer ?? (name === "client" ? "client" : "server");
+    if (consumer === "client" || userSetPreTransformRequests(name)) continue;
+    if (envOpts.dev && typeof envOpts.dev === "object") envOpts.dev.preTransformRequests = true;
+    else envOpts.dev = { preTransformRequests: true };
+  }
+  const environments = {};
+  // Vite's createServer creates and inits every environment in parallel.
+  await Promise.all(Object.entries(rc.environments || {}).map(async ([name, envOpts]) => {
+    let ei;
     try {
       const factory = envOpts && envOpts.dev && envOpts.dev.createEnvironment;
-      environments[name] = factory
+      ei = factory
         ? await factory(name, rc, { ws: server.ws })
         : new vite.DevEnvironment(name, rc, { hot: true, transport: server.ws });
+      hostPhase(`cf: createEnvironment(${name}) done`);
     } catch (e) {
       process.stderr.write(`${OJ} plugin host: createEnvironment(${name}) failed: ${(e && e.message) || e}\n`);
+      return;
     }
-  }
-  for (const [name, ei] of Object.entries(environments)) {
-    try { if (ei && typeof ei.init === "function") await ei.init({ watcher: server.watcher }); }
-    catch (e) { process.stderr.write(`${OJ} plugin host: env.init(${name}) failed: ${(e && e.message) || e}\n`); }
-  }
+    environments[name] = ei;
+    try {
+      if (ei && typeof ei.init === "function") {
+        await ei.init({ watcher: server.watcher });
+        hostPhase(`cf: init(${name}) done`);
+      }
+    } catch (e) {
+      process.stderr.write(`${OJ} plugin host: env.init(${name}) failed: ${(e && e.message) || e}\n`);
+    }
+  }));
   return environments;
 }
 
-// On a source edit oj POSTs the changed paths to /__oj_invalidate; invalidate the
-// affected modules in each DevEnvironment's graph and tell its runner to reload,
-// so the plugin's Miniflare/workerd re-fetches changed modules (Vite's watcher
-// does this itself; oj drives it since it owns the file watcher).
-function invalidateEnvironments(environments, watcher, paths) {
+function hostPhase(label) {
+  if (process.env.OJ_BOOT_PHASES) process.stderr.write(`[oj-phase] ${Date.now()} ${label}\n`);
+}
+
+function userSetPreTransformRequests(name) {
+  for (const cfg of [userViteConfig, initial.config]) {
+    if (!cfg) continue;
+    if (cfg.environments?.[name]?.dev?.preTransformRequests !== undefined) return true;
+    if (cfg.server?.preTransformRequests !== undefined) return true;
+  }
+  return false;
+}
+
+// On a source edit oj POSTs the changed paths to /__oj_invalidate. For each
+// runner-backed (real Vite) DevEnvironment this mirrors the core of Vite's
+// handleHMRUpdate/updateModules/propagateUpdate: invalidate the changed modules,
+// walk the module graph to the nearest accept boundaries and send a targeted
+// {type:"update"} so the runner re-fetches only the invalidated chain (the
+// Cloudflare plugin's worker entry self-accepts). Propagation dead-ends, hook
+// errors and graphs without the walk API fall back to Vite's full-reload.
+// (Vite's watcher drives all of this itself; oj drives it since it owns the
+// file watcher. Runner-sent vite:invalidate is handled by the DevEnvironment.)
+async function invalidateEnvironments(environments, watcher, paths) {
   for (const file of paths) {
     try { watcher.emit("change", file); } catch {}
   }
   if (!environments) return;
+  const timestamp = Date.now();
   for (const env of Object.values(environments)) {
     // oj's own HMR already covers the stub environments; only runner-backed
-    // (real Vite) environments need their graph invalidated and a reload sent.
+    // (real Vite) environments need their graph invalidated and updates sent.
     if (!env || env.__ojStub) continue;
-    try {
-      const mg = env.moduleGraph;
-      for (const file of paths) {
-        if (mg && typeof mg.getModulesByFile === "function") {
-          const mods = mg.getModulesByFile(file);
-          if (mods) for (const m of mods) mg.invalidateModule && mg.invalidateModule(m);
-        }
-        if (mg && typeof mg.onFileChange === "function") mg.onFileChange(file);
+    for (const file of paths) {
+      try {
+        await hotUpdateEnvironment(env, String(file).replace(/\\/g, "/"), timestamp);
+      } catch (e) {
+        process.stderr.write(`${OJ} plugin host: hot update failed (${env.name}): ${(e && e.stack) || e}\n`);
+        hotSend(env, { type: "full-reload" });
       }
-      if (env.hot && typeof env.hot.send === "function") env.hot.send({ type: "full-reload" });
-    } catch (e) {
-      process.stderr.write(`${OJ} plugin host: invalidate failed: ${(e && e.message) || e}\n`);
     }
   }
+}
+
+function hotSend(env, payload) {
+  try {
+    if (env.hot && typeof env.hot.send === "function") env.hot.send(payload);
+  } catch (e) {
+    process.stderr.write(`${OJ} plugin host: hot.send failed (${env.name}): ${(e && e.message) || e}\n`);
+  }
+}
+
+// Vite's getSortedPluginsByHotUpdateHook, hotUpdate hooks only (the legacy
+// handleHotUpdate is a mixed-graph client hook; oj covers it for its own
+// environments elsewhere).
+function sortedHotUpdatePlugins(env) {
+  const sorted = [];
+  let pre = 0, normal = 0, post = 0;
+  for (const plugin of env.plugins ?? []) {
+    const hook = plugin && plugin.hotUpdate;
+    if (!hook) continue;
+    const order = typeof hook === "object" ? hook.order : undefined;
+    if (order === "pre") sorted.splice(pre++, 0, plugin);
+    else if (order === "post") sorted.splice(pre + normal + post++, 0, plugin);
+    else sorted.splice(pre + normal++, 0, plugin);
+  }
+  return sorted;
+}
+
+async function hotUpdateEnvironment(env, file, timestamp) {
+  const mg = env.moduleGraph;
+  if (!mg || typeof mg.getModulesByFile !== "function") {
+    hotSend(env, { type: "full-reload" });
+    return;
+  }
+  if (typeof mg.onFileChange === "function") mg.onFileChange(file);
+  const options = {
+    type: "update",
+    file,
+    timestamp,
+    modules: [...(mg.getModulesByFile(file) ?? [])],
+    read: () => readFile(file, "utf-8"),
+    server: devServer,
+  };
+  for (const plugin of sortedHotUpdatePlugins(env)) {
+    const hook = plugin.hotUpdate;
+    const handler = typeof hook === "object" ? hook.handler : hook;
+    const context = (env.pluginContainer && env.pluginContainer.minimalContext) || { environment: env };
+    const filtered = await handler.call(context, options);
+    if (filtered) options.modules = [...filtered];
+  }
+  // No module of this environment is affected: nothing to send, as in Vite
+  // ("no modules matched"), except a client html edit which reloads the page.
+  if (!options.modules.length) {
+    if (file.endsWith(".html") && env.name === "client") hotSend(env, { type: "full-reload", triggeredBy: file, path: "*" });
+    return;
+  }
+  updateModules(env, file, options.modules, timestamp);
+}
+
+// Vite's updateModules: invalidate each changed module, propagate to accept
+// boundaries, send targeted updates, full-reload on a propagation dead end.
+function updateModules(env, file, modules, timestamp) {
+  const updates = [];
+  const invalidatedModules = new Set();
+  const traversedModules = new Set();
+  let needFullReload = false;
+  for (const mod of modules) {
+    const boundaries = [];
+    const hasDeadEnd = propagateUpdate(mod, traversedModules, boundaries);
+    if (typeof env.moduleGraph.invalidateModule === "function") {
+      env.moduleGraph.invalidateModule(mod, invalidatedModules, timestamp, true);
+    }
+    if (needFullReload) continue;
+    if (hasDeadEnd) {
+      needFullReload = true;
+      continue;
+    }
+    updates.push(...boundaries.map(({ boundary, acceptedVia, isWithinCircularImport }) => ({
+      type: `${boundary.type ?? "js"}-update`,
+      timestamp,
+      path: normalizeHmrUrl(boundary.url),
+      acceptedPath: normalizeHmrUrl(acceptedVia.url),
+      explicitImportRequired: (boundary.type ?? "js") === "js" ? isExplicitImportRequired(acceptedVia.url) : false,
+      isWithinCircularImport,
+    })));
+  }
+  const isClientHtmlChange = file.endsWith(".html") && env.name === "client" && modules.every((m) => m.type !== "js");
+  if (needFullReload || isClientHtmlChange) {
+    hotSend(env, { type: "full-reload", triggeredBy: file, path: "*" });
+    return;
+  }
+  if (updates.length === 0) return;
+  hotSend(env, { type: "update", updates });
+}
+
+// Vite's propagateUpdate over EnvironmentModuleNodes: stop at self-accepting
+// modules and accepting importers, dead-end (-> full reload) at a root with no
+// boundary. Returns true on a dead end.
+function propagateUpdate(node, traversedModules, boundaries, currentChain = [node]) {
+  if (traversedModules.has(node)) return false;
+  traversedModules.add(node);
+  // Not analyzed yet (never transformed): nothing imported it, stop quietly.
+  if (node.id && node.isSelfAccepting === undefined) return false;
+  if (node.isSelfAccepting) {
+    boundaries.push({ boundary: node, acceptedVia: node, isWithinCircularImport: isNodeWithinCircularImports(node, currentChain) });
+    return false;
+  }
+  if (node.acceptedHmrExports) {
+    boundaries.push({ boundary: node, acceptedVia: node, isWithinCircularImport: isNodeWithinCircularImports(node, currentChain) });
+  } else if (!node.importers || !node.importers.size) {
+    return true;
+  }
+  for (const importer of node.importers) {
+    const subChain = currentChain.concat(importer);
+    if (importer.acceptedHmrDeps && importer.acceptedHmrDeps.has(node)) {
+      boundaries.push({ boundary: importer, acceptedVia: node, isWithinCircularImport: isNodeWithinCircularImports(importer, subChain) });
+      continue;
+    }
+    if (node.id && node.acceptedHmrExports && importer.importedBindings) {
+      const importedBindingsFromNode = importer.importedBindings.get(node.id);
+      if (importedBindingsFromNode && areAllImportsAccepted(importedBindingsFromNode, node.acceptedHmrExports)) continue;
+    }
+    if (!currentChain.includes(importer) && propagateUpdate(importer, traversedModules, boundaries, subChain)) return true;
+  }
+  return false;
+}
+
+// Vite's isNodeWithinCircularImports: an accepted module inside an import loop
+// cannot recover its execution order; the runner full-reloads on the flag.
+function isNodeWithinCircularImports(node, nodeChain, currentChain = [node], traversedModules = new Set()) {
+  if (traversedModules.has(node)) return false;
+  traversedModules.add(node);
+  for (const importer of node.importers ?? []) {
+    if (importer === node) continue;
+    if (nodeChain.includes(importer)) return true;
+    if (!currentChain.includes(importer)) {
+      if (isNodeWithinCircularImports(importer, nodeChain, currentChain.concat(importer), traversedModules)) return true;
+    }
+  }
+  return false;
+}
+
+function areAllImportsAccepted(importedBindings, acceptedExports) {
+  for (const binding of importedBindings) if (!acceptedExports.has(binding)) return false;
+  return true;
+}
+
+// Vite's normalizeHmrUrl: bare/virtual urls travel wrapped as /@id/.
+function normalizeHmrUrl(url) {
+  if (url[0] !== "." && url[0] !== "/") {
+    url = url.startsWith("/@id/") ? url : "/@id/" + url.replace("\0", "__x00__");
+  }
+  return url;
+}
+
+// Vite's isExplicitImportRequired: a non-js, non-css boundary url needs the
+// runner client to append ?import.
+const knownJsSrcRE = /\.(?:[jt]sx?|m[jt]s|vue|marko|svelte|astro|imba|mdx)(?:$|\?)/;
+const knownCssSrcRE = /\.(?:css|less|sass|scss|styl|stylus|pcss|postcss|sss)(?:$|\?)/;
+function isExplicitImportRequired(url) {
+  const clean = url.split("?", 1)[0].split("#", 1)[0];
+  const isJs = knownJsSrcRE.test(url) || (!/\.[^/]+$/.test(clean) && clean[clean.length - 1] !== "/");
+  return !isJs && !knownCssSrcRE.test(url);
 }
 
 // Vite's `server.httpServer` is the Node http.Server oj's Rust listener stands in
@@ -1225,6 +1431,7 @@ async function setupConfigureServer() {
   if (plugins.some((p) => p && p.name === "vite-plugin-cloudflare:dev")) {
     try {
       server.environments = await buildEnvironments(server);
+      cfEnvironmentsBuilt = !!server.environments;
     } catch (e) {
       process.stderr.write(`${OJ} plugin host: buildEnvironments failed: ${(e && e.message) || e}\n`);
     }
@@ -1277,10 +1484,12 @@ async function setupConfigureServer() {
     if (req.method === "POST" && req.url === "/__oj_invalidate") {
       let body = "";
       req.on("data", (c) => (body += c));
-      req.on("end", () => {
+      req.on("end", async () => {
         let paths = [];
         try { paths = JSON.parse(body || "{}").paths || []; } catch {}
-        invalidateEnvironments(server.environments, fileWatcher, paths);
+        // Answer only once the invalidation is done, so the Rust side's POST
+        // completing means a next request cannot be served from stale modules.
+        try { await invalidateEnvironments(server.environments, fileWatcher, paths); } catch {}
         res.statusCode = 204;
         res.end();
       });
@@ -1946,6 +2155,7 @@ async function run(hook, args) {
     return JSON.stringify({ watchChange: watchChangeHook, handleHotUpdate: hotUpdateHook });
   }
   if (hook === "getMiddlewarePort") return middlewarePort == null ? null : String(middlewarePort);
+  if (hook === "getCfEnvironments") return String(cfEnvironmentsBuilt);
   if (hook === "wsMessage") {
     const event = args[0];
     const data = args[1] ? JSON.parse(args[1]) : null;
