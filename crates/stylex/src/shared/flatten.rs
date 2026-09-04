@@ -31,7 +31,7 @@ pub enum PreRule<'a> {
     Rule {
         property: Cow<'a, str>,
         value: PreRuleValue<'a>,
-        key_path: Vec<Cow<'a, str>>,
+        key_path: Option<Box<[Cow<'a, str>]>>,
     },
     Set(Vec<PreRule<'a>>),
 }
@@ -75,6 +75,9 @@ impl<'a> PreRule<'a> {
                 value,
                 key_path,
             } => {
+                let key_path = key_path
+                    .as_deref()
+                    .unwrap_or_else(|| std::slice::from_ref(property));
                 let decl = convert_style_to_class_name(property, value, key_path, options)?;
                 f(decl, key_path);
                 Ok(())
@@ -379,8 +382,11 @@ fn rule_key_path<'a>(
     key_path: &[Cow<'a, str>],
     includes_key: &str,
     property: Cow<'a, str>,
-) -> Vec<Cow<'a, str>> {
-    if key_path.iter().any(|k| k == includes_key) {
+) -> Option<Box<[Cow<'a, str>]>> {
+    if key_path.is_empty() {
+        return None;
+    }
+    Some(if key_path.iter().any(|k| k == includes_key) {
         key_path
             .iter()
             .map(|k| {
@@ -395,8 +401,8 @@ fn rule_key_path<'a>(
         let mut path = Vec::with_capacity(key_path.len() + 1);
         path.extend_from_slice(key_path);
         path.push(property);
-        path
-    }
+        path.into_boxed_slice()
+    })
 }
 
 fn flatten_inner<'a>(

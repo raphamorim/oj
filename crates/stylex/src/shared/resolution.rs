@@ -159,6 +159,18 @@ enum Expansion {
     Alias(&'static str),
 }
 
+pub(super) fn is_unexpanded_property(key: &str, resolution: StyleResolution) -> bool {
+    match resolution {
+        StyleResolution::PropertySpecificity => {
+            matches!(property_specificity_expansion(key), Expansion::None)
+        }
+        StyleResolution::ApplicationOrder => {
+            key != "all" && application_order_expansion(key).is_none()
+        }
+        StyleResolution::LegacyExpandShorthands => !legacy_has_expansion(key),
+    }
+}
+
 fn property_specificity_expansion(key: &str) -> Expansion {
     if crate::errors::banned_shorthand_message(key).is_some() {
         return Expansion::Banned;

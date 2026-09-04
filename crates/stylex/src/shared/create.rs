@@ -13,9 +13,11 @@ use crate::shared::dev_naming::{
     DebugPathInfo, convert_to_test_styles, create_short_filename, dev_class_prefix,
 };
 use crate::shared::flatten::{
-    PreRule, flatten_raw_style_object, media_order_transform, validate_namespace,
+    PreRule, PreRuleValue, StyleScalar, flatten_raw_style_object, media_order_transform,
+    validate_namespace,
 };
 use crate::shared::generate_rule::CompiledDecl;
+use crate::shared::resolution::is_unexpanded_property;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -59,7 +61,6 @@ pub type ClassPathsInNamespace = Vec<(String, Vec<String>)>;
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateOutput {
     /// namespace name → compiled object (className strings / null, `$$css`).
-    /// Rc-shared with the namespace memo: prod-mode consumers never clone.
     pub compiled: Arc<JsObjectMap>,
     /// Injected rules in traversal order, deduped by className (first wins).
     pub rules: Vec<StylexRule>,
@@ -203,31 +204,46 @@ fn compile_namespaces_core(
         if namespace_name == "__proto__" {
             continue;
         }
-        validate_namespace(namespace_value)?;
         let EvalValue::Obj(namespace) = namespace_value else {
-            unreachable!("validate_namespace only accepts objects");
+            return Err(StylexError::illegal_namespace_value());
         };
 
         let transformed;
-        let namespace_ref = match media_order_transform(namespace, options)? {
-            Some(rebuilt) => {
-                transformed = rebuilt;
-                &transformed
+        let entries = if namespace.get("__proto__").is_none()
+            && namespace.entries().all(|(key, value)| {
+                matches!(
+                    value,
+                    EvalValue::Null | EvalValue::Str(_) | EvalValue::Num(_)
+                ) && !key.contains('(')
+                    && is_unexpanded_property(key, options.style_resolution)
+            }) {
+            NamespaceEntries::Raw {
+                namespace,
+                index: 0,
             }
-            None => namespace,
+        } else {
+            validate_namespace(namespace_value)?;
+            let namespace_ref = match media_order_transform(namespace, options)? {
+                Some(rebuilt) => {
+                    transformed = rebuilt;
+                    &transformed
+                }
+                None => namespace,
+            };
+            NamespaceEntries::Prepared(
+                dedupe_last_wins(flatten_raw_style_object(namespace_ref, options)?).into_iter(),
+            )
         };
-        let flattened = flatten_raw_style_object(namespace_ref, options)?;
-        let deduped = dedupe_last_wins(flattened);
 
-        let mut namespace_obj = JsObjectMap::with_capacity(deduped.len() + 2);
+        let mut namespace_obj = JsObjectMap::with_capacity(entries.len() + 2);
         if let Some(dev_class) = shape.dev_class(namespace_name) {
             namespace_obj.insert(dev_class.clone(), EvalValue::Str(dev_class));
         }
         let mut paths_in_namespace: Vec<(String, Vec<String>)> = Vec::new();
-        for (key, pre_rule) in &deduped {
+        for (key, pre_rule) in entries {
             // Variables-as-keys skip minification to avoid dynamic-style regressions.
             let display_key = if options.enable_minified_keys && !key.starts_with("--") {
-                minified_display_key(key, options.debug)
+                minified_display_key(&key, options.debug)
             } else {
                 key.to_string()
             };
@@ -298,6 +314,58 @@ fn compile_namespaces_core(
     })
 }
 
+enum NamespaceEntries<'a> {
+    Raw {
+        namespace: &'a JsObjectMap,
+        index: usize,
+    },
+    Prepared(std::vec::IntoIter<(Cow<'a, str>, PreRule<'a>)>),
+}
+
+impl<'a> Iterator for NamespaceEntries<'a> {
+    type Item = (Cow<'a, str>, PreRule<'a>);
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len(), Some(self.len()))
+    }
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Prepared(entries) => entries.next(),
+            Self::Raw { namespace, index } => {
+                if *index == namespace.len() {
+                    return None;
+                }
+                let (key, value) = namespace.entry_at(*index);
+                *index += 1;
+                let key = Cow::Borrowed(key);
+                let scalar = match value {
+                    EvalValue::Null => return Some((key, PreRule::Null)),
+                    EvalValue::Num(n) => StyleScalar::Num(*n),
+                    EvalValue::Str(s) => StyleScalar::Str(Cow::Borrowed(s)),
+                    _ => unreachable!("raw entries are scalar"),
+                };
+                Some((
+                    key.clone(),
+                    PreRule::Rule {
+                        property: key,
+                        value: PreRuleValue::Single(scalar),
+                        key_path: None,
+                    },
+                ))
+            }
+        }
+    }
+}
+
+impl ExactSizeIterator for NamespaceEntries<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Raw { namespace, index } => namespace.len() - index,
+            Self::Prepared(entries) => entries.len(),
+        }
+    }
+}
+
 // parity: stylex-create.js reduceRight dedupe — the LAST occurrence of a key
 // wins and keeps its (last) position.
 fn dedupe_last_wins<'a>(
@@ -361,6 +429,7 @@ fn minified_display_key(key: &str, debug: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::options::StyleResolution;
 
     fn obj(entries: &[(&str, EvalValue)]) -> EvalValue {
         EvalValue::Obj(
@@ -396,6 +465,58 @@ mod tests {
         assert_eq!(out.rules.len(), 2);
         assert_eq!(&*out.rules[0].ltr, ".xju2f9n{color:blue}");
         assert_eq!(&*out.rules[1].ltr, ".xrkmrrc{background-color:red}");
+    }
+
+    #[test]
+    fn flat_namespace_keeps_numeric_order_and_css_marker_position() {
+        let mut namespaces = JsObjectMap::new();
+        namespaces.insert(
+            "a",
+            obj(&[
+                ("color", s("blue")),
+                ("2", s("b")),
+                ("1", s("a")),
+                ("$$css", EvalValue::Null),
+                ("width", EvalValue::Null),
+            ]),
+        );
+        let options = ResolvedOptions {
+            style_resolution: StyleResolution::PropertySpecificity,
+            enable_minified_keys: false,
+            ..ResolvedOptions::default()
+        };
+        let output = compile_namespaces(&namespaces, &CreateContext::new(&options), true).unwrap();
+        let Some(EvalValue::Obj(namespace)) = output.compiled.get("a") else {
+            panic!("compiled namespace");
+        };
+        assert_eq!(
+            namespace.keys().collect::<Vec<_>>(),
+            ["1", "2", "color", "$$css", "width"]
+        );
+        assert_eq!(namespace.get("$$css"), Some(&EvalValue::Bool(true)));
+        assert_eq!(namespace.get("width"), Some(&EvalValue::Null));
+        assert_eq!(
+            output.class_paths[0]
+                .1
+                .iter()
+                .map(|(_, path)| path.clone())
+                .collect::<Vec<_>>(),
+            vec![vec!["1"], vec!["2"], vec!["color"]]
+        );
+    }
+
+    #[test]
+    fn flattening_errors_precede_scalar_normalization_errors() {
+        let mut namespaces = JsObjectMap::new();
+        namespaces.insert("a", obj(&[("color", s("")), ("all", s("initial"))]));
+        let options = ResolvedOptions {
+            style_resolution: StyleResolution::PropertySpecificity,
+            property_validation_mode: crate::options::PropertyValidationMode::Throw,
+            ..ResolvedOptions::default()
+        };
+        let error =
+            compile_namespaces(&namespaces, &CreateContext::new(&options), false).unwrap_err();
+        assert_eq!(error, StylexError::banned_shorthand("all").unwrap());
     }
 
     #[test]

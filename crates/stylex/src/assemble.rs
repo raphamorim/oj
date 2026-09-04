@@ -3,8 +3,8 @@
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::hash::BuildHasherDefault;
-use std::sync::Arc;
+use std::hash::{BuildHasher, BuildHasherDefault};
+use std::sync::{Arc, Weak};
 
 use crate::fxhash::{FxHashMap, FxHashSet};
 use crate::jsrt::{ASCII_LOCALE_KEYS, locale_key, utf16_cmp};
@@ -1066,7 +1066,7 @@ struct PreparedRule {
 }
 
 struct FilePrep {
-    rules: Vec<PreparedRule>,
+    rules: PreparedRules,
     const_decls: Vec<(String, ConstVal)>,
     // safe = every sort key verified and every priority finite: the exact
     // preconditions under which sorted-by-key order equals the stable sort.
@@ -1074,9 +1074,86 @@ struct FilePrep {
     logical_float: bool,
 }
 
-fn prepare_file(rules: &[StylexRule], legacy: bool, consts: &[PreparedConst]) -> FilePrep {
+struct SharedPreparedRule {
+    source: StylexRule,
+    prepared: PreparedRule,
+}
+
+enum PreparedRules {
+    Inline(Vec<PreparedRule>),
+    Shared(Vec<Arc<SharedPreparedRule>>),
+}
+
+impl PreparedRules {
+    fn len(&self) -> usize {
+        match self {
+            Self::Inline(rules) => rules.len(),
+            Self::Shared(rules) => rules.len(),
+        }
+    }
+}
+
+impl std::ops::Index<usize> for PreparedRules {
+    type Output = PreparedRule;
+
+    fn index(&self, i: usize) -> &Self::Output {
+        match self {
+            Self::Inline(rules) => &rules[i],
+            Self::Shared(rules) => &rules[i].prepared,
+        }
+    }
+}
+
+type PreparedPool = HashMap<u64, Vec<Weak<SharedPreparedRule>>, BuildHasherDefault<IdentityHasher>>;
+
+fn prefer_shared_preparation(files: &BTreeMap<String, Vec<StylexRule>>) -> bool {
+    let mut seen = FxHashSet::default();
+    let mut total = 0;
+    let hasher = crate::fxhash::FxBuildHasher::default();
+    for rule in files.values().flatten().filter(|r| !is_const_rule(r)) {
+        total += 1;
+        seen.insert(hasher.hash_one((
+            &rule.class_name,
+            &rule.ltr,
+            &rule.rtl,
+            rule.priority.to_bits(),
+        )));
+    }
+    total >= 256 && seen.len() * 2 <= total
+}
+
+fn prepare_rule(r: &StylexRule, legacy: bool, consts: &[PreparedConst]) -> PreparedRule {
+    let ltr = substitute_consts(&r.ltr, consts)
+        .map(Arc::from)
+        .unwrap_or_else(|| r.ltr.clone());
+    let rtl = r.rtl.as_ref().map(|t| {
+        substitute_consts(t, consts)
+            .map(Arc::from)
+            .unwrap_or_else(|| t.clone())
+    });
+    PreparedRule {
+        class_name: r.class_name.clone(),
+        class_hash: class_hash64(&r.class_name),
+        priority: r.priority,
+        key: RuleKey::for_rule(r, legacy),
+        plain_split: plain_split(&ltr, rtl.as_deref()),
+        ltr,
+        rtl,
+    }
+}
+
+fn prepare_file(
+    rules: &[StylexRule],
+    legacy: bool,
+    consts: &[PreparedConst],
+    pool: &mut Option<PreparedPool>,
+) -> FilePrep {
     let mut prep = FilePrep {
-        rules: Vec::with_capacity(rules.len()),
+        rules: if pool.is_some() {
+            PreparedRules::Shared(Vec::with_capacity(rules.len()))
+        } else {
+            PreparedRules::Inline(Vec::with_capacity(rules.len()))
+        },
         const_decls: Vec::new(),
         safe: true,
         logical_float: false,
@@ -1087,25 +1164,31 @@ fn prepare_file(rules: &[StylexRule], legacy: bool, consts: &[PreparedConst]) ->
             continue;
         }
         prep.logical_float |= rule_has_logical_float(r);
-        let key = RuleKey::for_rule(r, legacy);
-        prep.safe &= r.priority.is_finite() && key.verified();
-        let ltr = substitute_consts(&r.ltr, consts)
-            .map(Arc::from)
-            .unwrap_or_else(|| r.ltr.clone());
-        let rtl = r.rtl.as_ref().map(|t| {
-            substitute_consts(t, consts)
-                .map(Arc::from)
-                .unwrap_or_else(|| t.clone())
-        });
-        prep.rules.push(PreparedRule {
-            class_name: r.class_name.clone(),
-            class_hash: class_hash64(&r.class_name),
-            priority: r.priority,
-            key,
-            plain_split: plain_split(&ltr, rtl.as_deref()),
-            ltr,
-            rtl,
-        });
+        match &mut prep.rules {
+            PreparedRules::Inline(rules) => rules.push(prepare_rule(r, legacy, consts)),
+            PreparedRules::Shared(rules) => {
+                let bucket = pool
+                    .as_mut()
+                    .expect("shared preparation pool")
+                    .entry(class_hash64(&r.class_name))
+                    .or_default();
+                let shared = bucket
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .find(|p| p.source == *r)
+                    .unwrap_or_else(|| {
+                        let shared = Arc::new(SharedPreparedRule {
+                            source: r.clone(),
+                            prepared: prepare_rule(r, legacy, consts),
+                        });
+                        bucket.push(Arc::downgrade(&shared));
+                        shared
+                    });
+                rules.push(shared);
+            }
+        }
+        let prepared = &prep.rules[prep.rules.len() - 1];
+        prep.safe &= prepared.priority.is_finite() && prepared.key.verified();
     }
     prep
 }
@@ -1136,6 +1219,7 @@ struct IncrState {
     prepared_consts: Vec<PreparedConst>,
     paths: Vec<String>,
     files: Vec<FilePrep>,
+    pool: Option<PreparedPool>,
     sorted: Vec<(u32, u32)>,
 }
 
@@ -1202,7 +1286,11 @@ impl RuleRegistry {
         {
             return result.clone();
         }
-        let result = match self.try_incremental(cfg) {
+        let prepared = self.try_incremental(cfg).or_else(|| {
+            self.rebuild_incr_state(cfg);
+            self.try_incremental(cfg)
+        });
+        let result = match prepared {
             Some(css) => {
                 // Debug cross-check: the incremental path must match one-shot output.
                 #[cfg(debug_assertions)]
@@ -1216,11 +1304,7 @@ impl RuleRegistry {
                 }
                 Ok(css)
             }
-            None => {
-                let result = assemble(&self.all_rules(), cfg);
-                self.rebuild_incr_state(cfg);
-                result
-            }
+            None => assemble(&self.all_rules(), cfg),
         };
         self.cache = Some((self.generation, cfg.clone(), result.clone()));
         result
@@ -1256,6 +1340,7 @@ impl RuleRegistry {
                 files.get(path)?,
                 state.cfg.use_legacy_classnames_sort,
                 &state.prepared_consts,
+                &mut state.pool,
             );
             if !prep.safe {
                 return None;
@@ -1266,6 +1351,17 @@ impl RuleRegistry {
                 .collect();
             fresh.sort_unstable_by(|&a, &b| entry_cmp(&state.files, a, b));
             state.sorted = merge_sorted(&state.files, &state.sorted, rank, fresh);
+        }
+        if let Some(pool) = &mut state.pool {
+            let mut unique = 0;
+            pool.retain(|_, bucket| {
+                bucket.retain(|rule| rule.strong_count() != 0);
+                unique += bucket.len();
+                !bucket.is_empty()
+            });
+            if unique * 2 > state.sorted.len() {
+                return None;
+            }
         }
 
         if files.values().all(|rules| rules.is_empty()) {
@@ -1288,8 +1384,14 @@ impl RuleRegistry {
         let prepared_consts = prepare_consts(&consts);
         let mut paths = Vec::with_capacity(self.files.len());
         let mut fps = Vec::with_capacity(self.files.len());
+        let mut pool = prefer_shared_preparation(&self.files).then(PreparedPool::default);
         for (path, rules) in &self.files {
-            let prep = prepare_file(rules, cfg.use_legacy_classnames_sort, &prepared_consts);
+            let prep = prepare_file(
+                rules,
+                cfg.use_legacy_classnames_sort,
+                &prepared_consts,
+                &mut pool,
+            );
             if !prep.safe {
                 return;
             }
@@ -1313,6 +1415,7 @@ impl RuleRegistry {
             prepared_consts,
             paths,
             files: fps,
+            pool,
             sorted,
         });
     }
@@ -1447,4 +1550,36 @@ fn render(state: &IncrState) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+
+    #[test]
+    fn edits_that_remove_repetition_switch_back_to_inline_storage() {
+        let rule = |i: usize| StylexRule {
+            class_name: format!("x{i}").into(),
+            ltr: format!(".x{i}{{width:{i}px}}").into(),
+            rtl: None,
+            const_key: None,
+            const_val: None,
+            priority: 3000.0,
+        };
+        let mut registry = RuleRegistry::new();
+        let cfg = AssembleConfig::default();
+        for i in 0..64 {
+            registry.set_file_rules(&format!("{i:03}.ts"), vec![rule(0); 8]);
+        }
+        registry.emit(&cfg).unwrap();
+        assert!(registry.incr[0].pool.is_some());
+        for i in 0..64 {
+            registry.set_file_rules(
+                &format!("{i:03}.ts"),
+                (1 + i * 8..1 + (i + 1) * 8).map(rule).collect(),
+            );
+            assert_eq!(registry.emit(&cfg), assemble(&registry.all_rules(), &cfg));
+        }
+        assert!(registry.incr[0].pool.is_none());
+    }
 }
