@@ -57,6 +57,19 @@ struct StartState {
 // plugin host boots (the definitive flag is BuiltApp::runner_environments). A plain
 // text search of the config file: false for every non-Cloudflare app, so their
 // boot path is untouched.
+// Vite's watcher distinguishes add/change/unlink; notify's batched events are
+// classified at send time: gone from disk is a delete, seen as a Create in this
+// batch is a create, anything else an update.
+fn change_type(p: &Path, created: &std::collections::HashSet<PathBuf>) -> &'static str {
+    if !p.exists() {
+        "delete"
+    } else if created.contains(p) {
+        "create"
+    } else {
+        "update"
+    }
+}
+
 fn config_mentions_cloudflare_plugin(root: &Path, config: &Option<PathBuf>) -> bool {
     let file = config
         .clone()
@@ -379,8 +392,14 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
         // otherwise looked like an edit of every source file and rebuilt again.
         let mut changes = oj_server::ContentChanges::new();
         loop {
+            let mut created: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
             let mut paths: std::collections::HashSet<PathBuf> = match rx.recv() {
-                Ok(Ok(ev)) => changes.changed_paths(&ev).into_iter().collect(),
+                Ok(Ok(ev)) => {
+                    if matches!(ev.kind, notify::EventKind::Create(_)) {
+                        created.extend(ev.paths.iter().cloned());
+                    }
+                    changes.changed_paths(&ev).into_iter().collect()
+                }
                 Ok(Err(_)) => continue,
                 Err(_) => break,
             };
@@ -392,13 +411,13 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             // so the repeat send is the safe side); the OS watcher's own
             // delivery latency is the remaining, unclosable window.
             if let Some(port) = state.plugin_mw_port {
-                let early: Vec<String> = paths
+                let early: Vec<(String, &'static str)> = paths
                     .iter()
                     .filter(|p| {
                         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
                         !name.contains("routeTree.gen") && !p.is_dir()
                     })
-                    .map(|p| p.to_string_lossy().into_owned())
+                    .map(|p| (p.to_string_lossy().into_owned(), change_type(p, &created)))
                     .collect();
                 if !early.is_empty() {
                     rt.spawn(async move {
@@ -408,7 +427,12 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             }
             loop {
                 match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                    Ok(Ok(ev)) => paths.extend(changes.changed_paths(&ev)),
+                    Ok(Ok(ev)) => {
+                        if matches!(ev.kind, notify::EventKind::Create(_)) {
+                            created.extend(ev.paths.iter().cloned());
+                        }
+                        paths.extend(changes.changed_paths(&ev));
+                    }
                     Ok(Err(_)) => {}
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => return,
@@ -450,9 +474,9 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             let _ = state.ws_tx.send(oj_server::update_progress_frame(
                 batch, "watch", 0, 0, None, false,
             ));
-            let changed_paths: Vec<String> = paths
+            let changed_paths: Vec<(String, &'static str)> = paths
                 .iter()
-                .map(|p| p.to_string_lossy().into_owned())
+                .map(|p| (p.to_string_lossy().into_owned(), change_type(p, &created)))
                 .collect();
             rt.block_on(async {
                 let (r, c, m) = (root.clone(), cache.clone(), state.mode.clone());

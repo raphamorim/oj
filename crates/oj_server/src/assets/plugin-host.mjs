@@ -2,13 +2,14 @@
 // Copyright (c) 2026 Raphael Amorim
 
 import http from "node:http";
-import { createReadStream, existsSync, fstatSync, openSync, statSync, write as fsWrite, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, fstatSync, openSync, statSync, unlinkSync, write as fsWrite, writeFileSync } from "node:fs";
 import { readFile, stat as fsStat } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, isAbsolute, join, resolve as pathResolve } from "node:path";
 import readline from "node:readline";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { stripVTControlCharacters } from "node:util";
 import { EventEmitter } from "node:events";
 
 const pluginsPath = process.argv[2];
@@ -353,9 +354,19 @@ async function loadViteConfig(configPath) {
         __filename: JSON.stringify(configPath),
       },
     });
-    const out = join(dirname(fileURLToPath(import.meta.url)), "oj-vite-config.mjs");
+    // A unique path per process: the config extractor bundles the same config
+    // into this directory concurrently at boot, and two writers on one filename
+    // made either importer see a truncated bundle.
+    const out = join(
+      dirname(fileURLToPath(import.meta.url)),
+      `oj-vite-config-${process.pid}-${Math.random().toString(36).slice(2)}.tmp.mjs`,
+    );
     writeFileSync(out, result.outputFiles[0].text);
-    mod = await import(pathToFileURL(out).href);
+    try {
+      mod = await import(pathToFileURL(out).href);
+    } finally {
+      try { unlinkSync(out); } catch {}
+    }
   } else {
     mod = await import(pathToFileURL(configPath).href);
   }
@@ -1076,18 +1087,21 @@ function userSetPreTransformRequests(name) {
   return false;
 }
 
-// On a source edit oj POSTs the changed paths to /__oj_invalidate. For each
-// runner-backed (real Vite) DevEnvironment this mirrors the core of Vite's
+// On a source edit oj POSTs the changes ({path, type} with Vite's watcher event
+// types: update | create | delete) to /__oj_invalidate. For each runner-backed
+// (real Vite) DevEnvironment this mirrors the core of Vite's
 // handleHMRUpdate/updateModules/propagateUpdate: invalidate the changed modules,
 // walk the module graph to the nearest accept boundaries and send a targeted
 // {type:"update"} so the runner re-fetches only the invalidated chain (the
-// Cloudflare plugin's worker entry self-accepts). Propagation dead-ends, hook
-// errors and graphs without the walk API fall back to Vite's full-reload.
+// Cloudflare plugin's worker entry self-accepts). Propagation dead-ends and
+// graphs without the walk API fall back to Vite's full-reload; a throwing
+// hotUpdate hook becomes {type:"error"}, as in Vite's hmr().
 // (Vite's watcher drives all of this itself; oj drives it since it owns the
 // file watcher. Runner-sent vite:invalidate is handled by the DevEnvironment.)
-async function invalidateEnvironments(environments, watcher, paths) {
-  for (const file of paths) {
-    try { watcher.emit("change", file); } catch {}
+const WATCHER_EVENT = { update: "change", create: "add", delete: "unlink" };
+async function invalidateEnvironments(environments, watcher, changes) {
+  for (const { path: file, type } of changes) {
+    try { watcher.emit(WATCHER_EVENT[type] || "change", file); } catch {}
   }
   if (!environments) return;
   const timestamp = Date.now();
@@ -1095,16 +1109,31 @@ async function invalidateEnvironments(environments, watcher, paths) {
     // oj's own HMR already covers the stub environments; only runner-backed
     // (real Vite) environments need their graph invalidated and updates sent.
     if (!env || env.__ojStub) continue;
-    for (const file of paths) {
+    for (const { path: file, type } of changes) {
       try {
-        await hotUpdateEnvironment(env, String(file).replace(/\\/g, "/"), timestamp);
+        await hotUpdateEnvironment(env, String(file).replace(/\\/g, "/"), timestamp, type || "update");
       } catch (e) {
         process.stderr.write(`${OJ} plugin host: hot update failed (${env.name}): ${(e && e.stack) || e}\n`);
-        hotSend(env, { type: "full-reload" });
+        hotSend(env, { type: "error", err: prepareErrorPayload(e) });
       }
     }
   }
 }
+
+// Vite's prepareError: the payload hot.send({type:"error"}) carries.
+function prepareErrorPayload(err) {
+  const e = err && typeof err === "object" ? err : { message: String(err) };
+  return {
+    message: stripVTControlCharacters(e.message || String(err)),
+    stack: stripVTControlCharacters(e.stack || ""),
+    id: e.id,
+    frame: stripVTControlCharacters(e.frame || ""),
+    plugin: e.plugin,
+    pluginCode: e.pluginCode != null ? String(e.pluginCode) : undefined,
+    loc: e.loc,
+  };
+}
+
 
 function hotSend(env, payload) {
   try {
@@ -1114,44 +1143,78 @@ function hotSend(env, payload) {
   }
 }
 
-// Vite's getSortedPluginsByHotUpdateHook, hotUpdate hooks only (the legacy
-// handleHotUpdate is a mixed-graph client hook; oj covers it for its own
-// environments elsewhere).
+// Vite's getSortedPluginsByHotUpdateHook: order by the hotUpdate (or legacy
+// handleHotUpdate) hook's declared order, cached per environment like Vite.
+const sortedHotUpdateCache = new WeakMap();
 function sortedHotUpdatePlugins(env) {
-  const sorted = [];
+  let sorted = sortedHotUpdateCache.get(env);
+  if (sorted) return sorted;
+  sorted = [];
   let pre = 0, normal = 0, post = 0;
   for (const plugin of env.plugins ?? []) {
-    const hook = plugin && plugin.hotUpdate;
+    const hook = plugin && (plugin.hotUpdate ?? plugin.handleHotUpdate);
     if (!hook) continue;
     const order = typeof hook === "object" ? hook.order : undefined;
     if (order === "pre") sorted.splice(pre++, 0, plugin);
     else if (order === "post") sorted.splice(pre + normal + post++, 0, plugin);
     else sorted.splice(pre + normal++, 0, plugin);
   }
+  sortedHotUpdateCache.set(env, sorted);
   return sorted;
 }
 
-async function hotUpdateEnvironment(env, file, timestamp) {
+async function hotUpdateEnvironment(env, file, timestamp, type) {
   const mg = env.moduleGraph;
   if (!mg || typeof mg.getModulesByFile !== "function") {
     hotSend(env, { type: "full-reload" });
     return;
   }
-  if (typeof mg.onFileChange === "function") mg.onFileChange(file);
+  // Vite's watcher wiring: watchChange on every event; onFileChange for
+  // updates, onFileDelete for deletes.
+  if (env.pluginContainer && typeof env.pluginContainer.watchChange === "function") {
+    await env.pluginContainer.watchChange(file, { event: type });
+  }
+  if (type === "delete") {
+    if (typeof mg.onFileDelete === "function") mg.onFileDelete(file);
+  } else if (type === "update" && typeof mg.onFileChange === "function") {
+    mg.onFileChange(file);
+  }
+  const mods = new Set(mg.getModulesByFile(file) ?? []);
+  // A created file may fix imports that previously failed to resolve: retry
+  // those modules, as Vite does on "create".
+  if (type === "create" && mg._hasResolveFailedErrorModules) {
+    for (const m of mg._hasResolveFailedErrorModules) mods.add(m);
+  }
   const options = {
-    type: "update",
+    type,
     file,
     timestamp,
-    modules: [...(mg.getModulesByFile(file) ?? [])],
-    read: () => readFile(file, "utf-8"),
+    modules: [...mods],
+    read: () => readModifiedFile(file),
     server: devServer,
   };
+  const context = (env.pluginContainer && env.pluginContainer.minimalContext) || { environment: env };
   for (const plugin of sortedHotUpdatePlugins(env)) {
-    const hook = plugin.hotUpdate;
-    const handler = typeof hook === "object" ? hook.handler : hook;
-    const context = (env.pluginContainer && env.pluginContainer.minimalContext) || { environment: env };
-    const filtered = await handler.call(context, options);
-    if (filtered) options.modules = [...filtered];
+    if (plugin.hotUpdate) {
+      const hook = plugin.hotUpdate;
+      const handler = typeof hook === "object" ? hook.handler : hook;
+      const filtered = await handler.call(context, options);
+      if (filtered) options.modules = [...filtered];
+    } else if (env.name === "client" && type === "update") {
+      // Legacy handleHotUpdate is a client-only hook in Vite; the mixed module
+      // graph its context carries is approximated with the client
+      // environment's own modules.
+      const hook = plugin.handleHotUpdate;
+      const handler = typeof hook === "object" ? hook.handler : hook;
+      const filtered = await handler.call(context, {
+        file,
+        timestamp,
+        modules: options.modules,
+        read: options.read,
+        server: devServer,
+      });
+      if (filtered) options.modules = [...filtered];
+    }
   }
   // No module of this environment is affected: nothing to send, as in Vite
   // ("no modules matched"), except a client html edit which reloads the page.
@@ -1486,11 +1549,15 @@ async function setupConfigureServer() {
       let body = "";
       req.on("data", (c) => (body += c));
       req.on("end", async () => {
-        let paths = [];
-        try { paths = JSON.parse(body || "{}").paths || []; } catch {}
+        let changes = [];
+        try {
+          const parsed = JSON.parse(body || "{}");
+          changes = parsed.changes
+            || (parsed.paths || []).map((p) => ({ path: p, type: "update" }));
+        } catch {}
         // Answer only once the invalidation is done, so the Rust side's POST
         // completing means a next request cannot be served from stale modules.
-        try { await invalidateEnvironments(server.environments, fileWatcher, paths); } catch {}
+        try { await invalidateEnvironments(server.environments, fileWatcher, changes); } catch {}
         res.statusCode = 204;
         res.end();
       });
