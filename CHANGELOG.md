@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `resolve.externalConditions` set in a `vite.config.*` was silently dropped: the extractor only carried `extensions`/`mainFields`/`conditions`, so the option worked from `oj.config.json` alone while externalized SSR deps fell back to the default conditions. It is now extracted top-level, through Vite's `ssr.resolve` sugar and the `environments.ssr.resolve` spelling (the environment wins), and looked up with the same precedence.
+- The SSR loader's persistent caches were keyed without `resolve.externalConditions` and `ssr.noExternal`/`external`, so editing either and restarting replayed the previous run's resolutions; `oj.config.json` was also missing from the cache's base inputs. All three now invalidate the cache.
+- `browser` was stripped from the user's ssr `resolve.conditions` for every app; it is now dropped only from a workerd-shaped list (one that also names `workerd`, the Cloudflare plugin's set, which must not pick browser builds in the Node loader) and an explicit user `browser` condition is honored, as Vite honors user conditions.
+- A metadata-only file event on a never-seen path was dropped, so the first `touch` of a file per session did nothing (a second worked). With no recorded baseline, a fresh modification time now counts as a change; an old one is still the access-time noise the filter exists to ignore.
 - The dev watchers treated attribute-only file events as changes. On Linux the first read of a file after it was written updates its access time, which inotify reports as an attribute change, so a rebuild that reads every source file (the TanStack Start client bundle does) looked like an edit of every source file and triggered another rebuild until the access times settled, with the HMR gate filling up with phantom changes. Both watchers now apply chokidar's rule: a change is a data change or a moved modification time; an attribute event with an unchanged mtime (or on a file never seen before) is ignored, and a `touch` still counts.
 
 ## [0.1.16] - 2026-09-03
