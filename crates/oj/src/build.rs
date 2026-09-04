@@ -794,6 +794,19 @@ async fn compile_stylesheet(
             }
         }
     }
+    // A native plugin's directive is masked before any preprocessor or sidecar
+    // sees the sheet (see oj_css::directive). The sentinel stays in the output:
+    // a sheet loaded while rolldown is still transforming modules must not be
+    // expanded yet, since the plugins have not seen every module that feeds
+    // them. Collected sheets are expanded after the bundle
+    // (`unmask_collected_css`); the callers that leave the pipeline early
+    // (`?url`, `?inline`, html-linked sheets) expand with
+    // `unmask_native_directives` themselves.
+    for (directive, _) in native_plugins().css_directives() {
+        if let Some(masked) = oj_css::directive::mask(&source, directive) {
+            source = masked;
+        }
+    }
     if oj_css::is_sass(path) {
         let lang = if path.ends_with(".sass") { "sass" } else { "scss" };
         let data = oj_config::css_additional_data(&cfg, lang);
@@ -1052,7 +1065,7 @@ impl Plugin for OjCssPlugin {
                     // `import u from './a.scss?url'`: the URL of the COMPILED
                     // stylesheet, emitted as a `.css` asset (Vite css.ts), not the
                     // raw preprocessor source.
-                    let out = compile_stylesheet(
+                    let mut out = compile_stylesheet(
                         &root,
                         &host,
                         &css_transform_enabled,
@@ -1063,6 +1076,7 @@ impl Plugin for OjCssPlugin {
                         &id,
                     )
                     .await?;
+                    out.css = unmask_native_directives(std::mem::take(&mut out.css));
                     let stem = std::path::Path::new(file)
                         .file_stem()
                         .and_then(|n| n.to_str())
@@ -1181,7 +1195,7 @@ impl Plugin for OjCssPlugin {
                 if is_stylesheet_path(file) {
                     // `import css from './a.css?inline'` is the compiled CSS text,
                     // as in dev and Vite, not a base64 data URI of the source.
-                    let out = compile_stylesheet(
+                    let mut out = compile_stylesheet(
                         &root,
                         &host,
                         &css_transform_enabled,
@@ -1192,6 +1206,7 @@ impl Plugin for OjCssPlugin {
                         &id,
                     )
                     .await?;
+                    out.css = unmask_native_directives(std::mem::take(&mut out.css));
                     return Ok(Some(rolldown_plugin::HookLoadOutput {
                         code: arcstr::ArcStr::from(format!(
                             "export default {};",
@@ -2133,13 +2148,17 @@ async fn user_plugin_host(
         }
         oj_server::plugins::PluginSource::ViteConfig(p) => (p, "vite", "vite.config".to_string()),
     };
-    let config = serde_json::json!({
+    let mut config = serde_json::json!({
         "config": { "root": root.display().to_string(), "base": base, "mode": mode, "command": "build", "define": define, "environments": environments },
         "env": { "command": "build", "mode": mode },
         "environment": { "name": env_name, "mode": "build" },
         "pluginsFormat": plugins_format,
-    })
-    .to_string();
+    });
+    let replaced = native_plugins().replaced_js_plugins();
+    if !replaced.is_empty() {
+        config["nativePluginNames"] = serde_json::json!(replaced);
+    }
+    let config = config.to_string();
     match PluginHost::spawn(root, &file, &config).await {
         Ok(host) => {
             println!("oj build ({env_name}): plugins from {label}");
@@ -2289,10 +2308,59 @@ fn warn_unsupported_build_options(config: &oj_config::OjConfig) {
     }
 }
 
+/// The native plugins active for this build process, set once by `build()`
+/// and read by the stylesheet pipeline and the plugin host handshake, which
+/// run far from the plugin list.
+static NATIVE_PLUGINS: std::sync::OnceLock<oj_plugin::SharedRegistry> = std::sync::OnceLock::new();
+
+fn native_plugins() -> oj_plugin::SharedRegistry {
+    NATIVE_PLUGINS
+        .get()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(oj_plugin::Registry::new(Path::new("."))))
+}
+
+/// Expand every native plugin directive sentinel in `css` with the plugin's
+/// CSS as of now. For a sheet that depends on the module graph this is only
+/// right once the bundle has run every module through the plugins.
+fn unmask_native_directives(css: String) -> String {
+    if !oj_css::directive::has_sentinel(&css) {
+        return css;
+    }
+    let mut css = css;
+    for (directive, plugin) in native_plugins().css_directives() {
+        css = oj_css::directive::unmask(&css, directive, &plugin.css_for_directive());
+    }
+    css
+}
+
+/// The collected stylesheets with their plugin directives expanded, called
+/// right after `bundler.write()` so no sheet is expanded against a registry
+/// that is still being fed by concurrent module transforms.
+fn unmask_collected_css(collected: &Arc<Mutex<Vec<(String, String)>>>) {
+    let mut entries = collected.lock().unwrap();
+    for (_, css) in entries.iter_mut() {
+        if oj_css::directive::has_sentinel(css) {
+            *css = unmask_native_directives(std::mem::take(css));
+        }
+    }
+}
+
+/// The native plugins as rolldown plugins: each plugin's own hooks, plus the
+/// one adapter that runs every `pre_transform_ast` when any has an AST pass.
+fn native_rolldown_plugins(native: &oj_plugin::SharedRegistry, ssr: bool, sourcemap: bool) -> Vec<SharedPluginable> {
+    let mut out = native.rolldown_plugins();
+    if native.has_ast_passes() {
+        out.push(Arc::new(oj_plugin::build::AstPassPlugin::new(Arc::clone(native), ssr, sourcemap)));
+    }
+    out
+}
+
 pub async fn build(
     root: PathBuf,
     cli_mode: Option<&str>,
     cli: CliOptions,
+    native_factory: Option<oj_server::NativePluginFactory>,
 ) -> anyhow::Result<()> {
     let root = root
         .canonicalize()
@@ -2325,6 +2393,14 @@ pub async fn build(
     }
     apply_cli_options(&mut config);
     warn_unsupported_build_options(&config);
+    let native: oj_plugin::SharedRegistry = Arc::new(match &native_factory {
+        Some(factory) => factory(&root, &config),
+        None => oj_plugin::Registry::new(&root),
+    });
+    let _ = NATIVE_PLUGINS.set(Arc::clone(&native));
+    if !native.is_empty() {
+        println!("oj build: native plugins: {}", native.names().join(", "));
+    }
     let mode: &str = &mode_owned;
     let build_cfg = config.build.clone().unwrap_or_default();
     let ro_opts = oj_config::rolldown_options(&config);
@@ -2503,6 +2579,11 @@ pub async fn build(
             Arc::clone(&emit),
         )));
     }
+    oj_plugins.extend(native_rolldown_plugins(
+        &native,
+        false,
+        oj_config::build_sourcemap(&config) != oj_config::Sourcemap::Off,
+    ));
     let client_minify = oj_config::environment_build_bool(&config, "client", "minify").unwrap_or(minify);
     let client_define: Vec<(String, String)> = {
         let env = oj_env::with_process_env(loaded_env.clone(), std::env::vars(), &env_prefix_refs);
@@ -2606,6 +2687,7 @@ pub async fn build(
             return Err(fail_with_plugin_hooks(anyhow::anyhow!("build failed:\n{detail}"), &plugin_host).await);
         }
     };
+    unmask_collected_css(&collected_css);
     bundler
         .close()
         .await
@@ -2811,6 +2893,32 @@ pub async fn build(
     } else {
         Vec::new()
     };
+    // Native plugin virtual sheets: one hashed asset each, in the manifest as
+    // `@oj/<name>.css` and on every entry, linked from every page.
+    let native_css_names: Vec<(String, String)> = {
+        let mut names = Vec::new();
+        for sheet in native.virtual_css() {
+            let hash = content_hash(sheet.css.as_bytes());
+            let css_name = render_asset_name(css_asset_opts.asset_names, &sheet.name, &hash, "css");
+            if let Some(parent) = out_dir.join(&css_name).parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(out_dir.join(&css_name), &sheet.css)?;
+            emitted.push((css_name.clone(), sheet.css.len()));
+            for entry in &mut manifest_entries {
+                if entry.is_entry {
+                    entry.css.push(css_name.clone());
+                }
+            }
+            manifest_assets.push(ManifestAsset {
+                key: format!("@oj/{}.css", sheet.name),
+                file: css_name.clone(),
+                name: Path::new(&css_name).file_name().and_then(|n| n.to_str()).map(str::to_string),
+            });
+            names.push((sheet.name.clone(), css_name));
+        }
+        names
+    };
     let mut all_sync_chunks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     if let Some(name) = oj_config::ssr_manifest_name(&config) {
         let manifest = ssr_manifest(&output, &root, &base, &chunk_css, &combined_css_name, &imports_map);
@@ -2890,7 +2998,7 @@ pub async fn build(
                     continue;
                 }
                 let src_str = src.to_string_lossy().into_owned();
-                let out = compile_stylesheet(
+                let mut out = compile_stylesheet(
                     &root,
                     &plugin_host,
                     &link_css_transform_enabled,
@@ -2902,6 +3010,7 @@ pub async fn build(
                 )
                 .await
                 .with_context(|| format!("stylesheet {href} linked from {}", doc.out_rel))?;
+                out.css = unmask_native_directives(std::mem::take(&mut out.css));
                 let dir = src.parent().map(Path::to_path_buf).unwrap_or_else(|| root.clone());
                 let css = rebase_css_urls(
                     &out.css,
@@ -2968,6 +3077,19 @@ pub async fn build(
             let links = split_css_links(&chunk_css, &doc_entry_files, &imports_map, &page_base);
             if !links.is_empty() {
                 rewritten_html = insert_before_head(&rewritten_html, &links);
+            }
+        }
+        // A page that already links the dev url of a virtual sheet
+        // (`/@oj/<name>.css`) gets that href pointed at the emitted asset;
+        // otherwise the asset is linked from the head.
+        for (sheet_name, css_name) in &native_css_names {
+            let dev_href = oj_plugin::virtual_css_url(sheet_name);
+            let href = with_base(css_name, &page_base);
+            if rewritten_html.contains(&dev_href) {
+                rewritten_html = rewritten_html.replace(&dev_href, &href);
+            } else {
+                let link = format!("<link rel=\"stylesheet\" href=\"{href}\" crossorigin />");
+                rewritten_html = insert_before_head(&rewritten_html, &link);
             }
         }
 
@@ -3757,6 +3879,11 @@ pub(crate) async fn build_ssr(
             Arc::clone(&emit),
         )));
     }
+    oj_plugins.extend(native_rolldown_plugins(
+        &native_plugins(),
+        true,
+        oj_config::build_sourcemap(&config) != oj_config::Sourcemap::Off,
+    ));
     oj_plugins.push(Arc::new(OjCssPlugin {
         collected: Arc::clone(&collected_css),
         root: root.to_path_buf(),
@@ -3826,6 +3953,7 @@ pub(crate) async fn build_ssr(
         Ok(output) => output,
         Err(err) => return Err(fail_with_plugin_hooks(err, &plugin_host).await),
     };
+    unmask_collected_css(&collected_css);
     bundler
         .close()
         .await
@@ -4354,6 +4482,7 @@ async fn build_client_entry(
         Ok(output) => output,
         Err(err) => return Err(fail_with_plugin_hooks(err, &plugin_host).await),
     };
+    unmask_collected_css(&collected_css);
     bundler
         .close()
         .await
@@ -4588,6 +4717,7 @@ async fn build_library(
             .write()
             .await
             .map_err(rolldown_failure!("lib build ({fmt}) failed"))?;
+        unmask_collected_css(&collected_css);
         for asset in &output.assets {
             if let rolldown_common::Output::Chunk(c) = asset {
                 emitted.push((c.filename.to_string(), c.code.len()));
@@ -5643,7 +5773,7 @@ mod tests {
             .unwrap();
             fs::write(root.join("shared.js"), r#"export const shared = "ready";"#).unwrap();
 
-            build(root.clone(), Some("production"), CliOptions::default())
+            build(root.clone(), Some("production"), CliOptions::default(), None)
                 .await
                 .expect("synthetic shared-chunk fixture should build");
 
@@ -5776,7 +5906,7 @@ mod tests {
             fs::write(root.join("main.js"), "window.ready = true;").unwrap();
             fs::write(root.join("public/asset.txt"), "public asset").unwrap();
 
-            build(root.clone(), Some("production"), CliOptions::default())
+            build(root.clone(), Some("production"), CliOptions::default(), None)
                 .await
                 .expect("synthetic public-directory fixture should build");
 
@@ -5810,7 +5940,7 @@ mod tests {
         .unwrap();
         fs::write(root.join("server.js"), "export const flag = process.env.SOME_FLAG;\n").unwrap();
 
-        build(root.clone(), Some("production"), CliOptions::default())
+        build(root.clone(), Some("production"), CliOptions::default(), None)
             .await
             .expect("client build");
         let mut client = String::new();
@@ -5869,7 +5999,7 @@ mod tests {
         .unwrap();
         fs::write(root.join("public/manifest.webmanifest"), "{}").unwrap();
 
-        build(root.clone(), Some("production"), CliOptions::default())
+        build(root.clone(), Some("production"), CliOptions::default(), None)
             .await
             .expect("html asset fixture should build");
         let html = fs::read_to_string(root.join("dist/index.html")).unwrap();
@@ -5916,7 +6046,7 @@ mod tests {
             "export default { build: { lib: { entry: 'src/index.ts', name: 'MyLib' } } };",
         )
         .unwrap();
-        build(root.clone(), Some("production"), CliOptions::default())
+        build(root.clone(), Some("production"), CliOptions::default(), None)
             .await
             .expect("vite.config build.lib should build");
         assert!(root.join("dist/my-lib.js").is_file(), "es output named after the unscoped package");
@@ -5936,7 +6066,7 @@ mod tests {
             "export default { build: { lib: { entry: { main: 'src/a.ts', extra: 'src/b.ts' }, cssFileName: 'theme' } } };",
         )
         .unwrap();
-        build(root.clone(), Some("production"), CliOptions::default())
+        build(root.clone(), Some("production"), CliOptions::default(), None)
             .await
             .expect("multi-entry lib should build");
         for f in ["main.mjs", "extra.mjs", "main.js", "extra.js"] {
@@ -5955,7 +6085,7 @@ mod tests {
             "export default { build: { lib: { entry: 'src/index.ts', formats: ['umd'] } } };",
         )
         .unwrap();
-        let err = build(root.clone(), Some("production"), CliOptions::default())
+        let err = build(root.clone(), Some("production"), CliOptions::default(), None)
             .await
             .expect_err("umd needs build.lib.name");
         assert!(err.to_string().contains("build.lib.name"), "{err}");
@@ -5993,7 +6123,7 @@ mod tests {
             r#"<html><body><script type="module" src="/src/main.js"></script></body></html>"#,
         )
         .unwrap();
-        build(root.clone(), Some("production"), CliOptions::default())
+        build(root.clone(), Some("production"), CliOptions::default(), None)
             .await
             .expect("inline worker fixture should build");
         let mut code = String::new();

@@ -1,0 +1,23 @@
+[package]
+name = "oj_plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native plugin seam: the OjPlugin trait, the registry, and the shared AST pass for dev and build"
+
+[dependencies]
+oj_compiler.workspace = true
+oxc_allocator.workspace = true
+oxc_ast.workspace = true
+oxc_parser.workspace = true
+oxc_span.workspace = true
+oxc_codegen.workspace = true
+rolldown_plugin = "1.2.5"
+rolldown_common = "1.2.5"
+rolldown_utils = "1.2.5"
+serde_json.workspace = true
+anyhow.workspace = true
+oxc_sourcemap = "8.0.2"
+
+[dev-dependencies]
+oxc_ast_visit.workspace = true

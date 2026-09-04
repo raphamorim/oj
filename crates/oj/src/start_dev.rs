@@ -92,6 +92,7 @@ pub async fn start_dev(
             no_cache: false,
             lazy: false,
             mode: Some(mode.clone()),
+            native_plugins: None,
         }
         .build_app(),
     );

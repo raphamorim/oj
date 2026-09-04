@@ -49,6 +49,7 @@ pub async fn ssr_dev(
         no_cache: false,
         lazy: false,
             mode: None,
+        native_plugins: None,
 }
     .build_app()
     .await?;

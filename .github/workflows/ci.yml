@@ -16,6 +16,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+      - name: example native plugin unit tests (behind its feature)
+        run: cargo test -p oj --features example-plugin native_plugins
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -195,6 +197,9 @@ jobs:
       - name: start dev holds the page reload behind the editor HMR gate until the flush
         if: matrix.mode == 'unbundled'
         run: node e2e/start-hmr-gate.mjs
+      - name: native plugin seam in dev (AST pass, virtual css, css-update, warm replay)
+        if: matrix.mode == 'unbundled'
+        run: node e2e/native-plugin-dev.mjs
 
   # i need to fix this or automate
   build:
@@ -324,3 +329,5 @@ jobs:
         run: node e2e/build-css-options.mjs
       - name: bare Less imports resolve through node_modules
         run: node e2e/less-bare-imports.mjs
+      - name: native plugin seam in build (rewritten chunk, emitted sheet, manifest row)
+        run: node e2e/native-plugin-build.mjs

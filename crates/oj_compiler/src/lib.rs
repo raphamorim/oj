@@ -25,6 +25,42 @@ use oxc_transformer_plugins::{ReplaceGlobalDefines, ReplaceGlobalDefinesConfig};
 
 pub type ImportRewriter<'r> = dyn FnMut(&str) -> Option<String> + 'r;
 
+/// What a pre-transformer sees: the parsed module before JSX and TypeScript
+/// are stripped, so a pass can rewrite syntax the way a Babel plugin would.
+/// `program` is mutable and lives in `allocator`; new nodes a pass creates
+/// must either carry spans inside `source` or an empty span, since the
+/// source map is generated from the same program afterwards.
+pub struct AstCx<'a, 'p> {
+    pub allocator: &'a Allocator,
+    pub program: &'p mut Program<'a>,
+    pub path: &'p Path,
+    pub source: &'p str,
+    /// rolldown's module type vocabulary: `js`, `jsx`, `ts` or `tsx`.
+    pub module_type: &'static str,
+    pub dev: bool,
+    pub ssr: bool,
+}
+
+/// Side channels a pre-transformer reports for one module, keyed by the
+/// plugin that produced each: what the host caches next to the compiled code
+/// and replays as `module_seen` on warm starts.
+pub type PluginMeta = Vec<(String, serde_json::Value)>;
+
+/// The pre-transformer slot: runs between parse and semantic analysis, once
+/// per compiled module. `Err` aborts the compile as a transform error.
+pub type PreTransformer<'r> = dyn FnMut(&mut AstCx<'_, '_>) -> Result<PluginMeta, String> + 'r;
+
+/// rolldown's module type name for a source path (`js`, `jsx`, `ts`, `tsx`);
+/// `js` for anything the parser accepts that has no better name.
+pub fn module_type_of(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("tsx") => "tsx",
+        Some("ts" | "mts" | "cts") => "ts",
+        Some("jsx") => "jsx",
+        _ => "js",
+    }
+}
+
 pub const COMPILE_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 // SIMD substring scanners (memchr), built once and reused as cheap gates before
@@ -171,6 +207,9 @@ pub struct CompileOutput {
     /// `Some` when the module references `import.meta.hot` (it needs a hot
     /// context injected); what its `accept` calls declared.
     pub hot_accept: Option<HotAccept>,
+    /// Side channels the pre-transformer slot reported, keyed by plugin name.
+    /// Empty when no pre-transformer ran.
+    pub meta: PluginMeta,
 }
 
 /// The `import.meta.hot.accept(...)` forms a module uses (Vite's
@@ -293,8 +332,22 @@ pub fn compile_module_with_maps(
     path: &Path,
     source_text: &str,
     opts: &CompileOptions,
+    rewriter: Option<&mut ImportRewriter>,
+    input_maps: &[String],
+) -> Result<CompileOutput, CompileError> {
+    compile_module_full(path, source_text, opts, rewriter, input_maps, None)
+}
+
+/// The full pipeline: parse, the pre-transformer slot, semantic analysis, the
+/// oxc transforms, oj's own expansions, specifier rewriting, codegen. With
+/// `pre_transform` absent this is exactly `compile_module_with_maps`.
+pub fn compile_module_full(
+    path: &Path,
+    source_text: &str,
+    opts: &CompileOptions,
     mut rewriter: Option<&mut ImportRewriter>,
     input_maps: &[String],
+    pre_transform: Option<&mut PreTransformer>,
 ) -> Result<CompileOutput, CompileError> {
     let source_type = SourceType::from_path(path)
         .map_err(|_| CompileError::UnsupportedFileType(path.to_path_buf()))?;
@@ -315,6 +368,25 @@ pub fn compile_module_with_maps(
         });
     }
     let mut program = parsed.program;
+
+    // Native plugin passes run here, on the program as written (JSX and TS
+    // still present), before any oxc lowering.
+    let mut meta = PluginMeta::new();
+    if let Some(pre) = pre_transform {
+        let mut cx = AstCx {
+            allocator: &allocator,
+            program: &mut program,
+            path,
+            source: source_text,
+            module_type: module_type_of(path),
+            dev: opts.dev,
+            ssr: opts.ssr,
+        };
+        meta = pre(&mut cx).map_err(|message| CompileError::Transform {
+            path: path.to_path_buf(),
+            message,
+        })?;
+    }
 
     let semantic_ret = SemanticBuilder::new()
         .with_excess_capacity(2.0)
@@ -421,6 +493,7 @@ pub fn compile_module_with_maps(
         dynamic_imports,
         is_refresh_boundary,
         hot_accept,
+        meta,
     })
 }
 

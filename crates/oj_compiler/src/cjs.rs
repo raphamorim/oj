@@ -217,6 +217,7 @@ export default (module.exports && module.exports.__esModule) ? module.exports["d
         dynamic_imports: Vec::new(),
         is_refresh_boundary: false,
         hot_accept: None,
+        meta: Vec::new(),
     })
 }
 

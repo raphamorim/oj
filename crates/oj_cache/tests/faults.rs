@@ -228,6 +228,7 @@ fn an_entry_is_only_ever_published_whole() {
         fs_allow: vec!["/tmp/a b/c".into()],
         watch_files: vec!["\\\\?\\C:\\x".into()],
         hot: None,
+        meta: Vec::new(),
     };
     f.cache.put(&key, &written);
     assert_eq!(f.cache.get(&key), Some(written));
