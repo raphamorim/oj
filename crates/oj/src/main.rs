@@ -38,6 +38,10 @@ enum Command {
         /// Vite's `--mode` for the dev server (default `development`).
         #[arg(long)]
         mode: Option<String>,
+        /// StyleX config as JSON (same schema as the `stylex` config section;
+        /// also OJ_STYLEX_CONFIG=<path>), for apps whose config can't carry it.
+        #[arg(long)]
+        stylex_config: Option<PathBuf>,
         /// Enable the experimental on-disk module cache (also OJ_ENABLE_CACHE=1).
         /// Off by default; warm restarts then re-serve compiled modules from disk.
         #[arg(long)]
@@ -105,6 +109,10 @@ enum Command {
         /// configured environment, so this is accepted as a no-op.
         #[arg(long)]
         app: bool,
+        /// StyleX config as JSON (same schema as the `stylex` config section;
+        /// also OJ_STYLEX_CONFIG=<path>), for apps whose config can't carry it.
+        #[arg(long)]
+        stylex_config: Option<PathBuf>,
     },
     Preview {
         root: Option<PathBuf>,
@@ -148,6 +156,7 @@ async fn run() -> anyhow::Result<()> {
             host,
             config,
             mode,
+            stylex_config,
             enable_cache,
             no_cache,
             lazy,
@@ -171,6 +180,7 @@ async fn run() -> anyhow::Result<()> {
                     bundle,
                     host,
                     config,
+                    stylex_config,
                     enable_cache,
                     no_cache,
                     lazy,
@@ -209,6 +219,7 @@ async fn run() -> anyhow::Result<()> {
             ssr_manifest,
             watch,
             app: _,
+            stylex_config,
         } => {
             let root = root.unwrap_or_else(|| {
                 let playground = PathBuf::from("playground");
@@ -240,6 +251,7 @@ async fn run() -> anyhow::Result<()> {
                         ssr_manifest,
                         watch,
                     },
+                    stylex_config,
                 )
                 .await
             }

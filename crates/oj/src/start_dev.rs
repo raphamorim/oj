@@ -88,6 +88,7 @@ pub async fn start_dev(
             bundle: false,
             host,
             config,
+            stylex_config: None,
             enable_cache: false,
             no_cache: false,
             lazy: false,

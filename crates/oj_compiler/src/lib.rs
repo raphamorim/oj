@@ -9,6 +9,7 @@ pub mod interop;
 pub mod ssr;
 pub mod json;
 pub mod pkgbundle;
+pub mod stylex;
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -131,15 +132,16 @@ impl JsxConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct CompileOptions {
+pub struct CompileOptions<'a> {
     pub dev: bool,
     pub refresh: bool,
     pub sourcemap: bool,
     pub ssr: bool,
     pub jsx: JsxConfig,
+    pub stylex: Option<&'a stylex::StylexPassConfig>,
 }
 
-impl CompileOptions {
+impl<'a> CompileOptions<'a> {
     pub fn dev() -> Self {
         Self {
             dev: true,
@@ -147,6 +149,7 @@ impl CompileOptions {
             sourcemap: true,
             ssr: false,
             jsx: JsxConfig::default(),
+            stylex: None,
         }
     }
 
@@ -157,6 +160,7 @@ impl CompileOptions {
             sourcemap: true,
             ssr: false,
             jsx: JsxConfig::default(),
+            stylex: None,
         }
     }
 }
@@ -171,6 +175,7 @@ pub struct CompileOutput {
     /// `Some` when the module references `import.meta.hot` (it needs a hot
     /// context injected); what its `accept` calls declared.
     pub hot_accept: Option<HotAccept>,
+    pub stylex_rules: Vec<stylex::StylexRule>,
 }
 
 /// The `import.meta.hot.accept(...)` forms a module uses (Vite's
@@ -299,6 +304,12 @@ pub fn compile_module_with_maps(
     let source_type = SourceType::from_path(path)
         .map_err(|_| CompileError::UnsupportedFileType(path.to_path_buf()))?;
 
+    // Cheap StyleX pre-gate (path glob + SIMD scan) before the parse; the pass
+    // itself runs on the parsed AST below.
+    let stylex_cfg = opts
+        .stylex
+        .filter(|cfg| cfg.is_candidate(path, source_text));
+
     let allocator = Allocator::default();
 
     let parsed = Parser::new(&allocator, source_text, source_type).parse();
@@ -315,6 +326,25 @@ pub fn compile_module_with_maps(
         });
     }
     let mut program = parsed.program;
+
+    // StyleX mutates the freshly parsed AST, before semantic/Transformer
+    // lowering (babel-parity position: sx JSX props and TS types still
+    // visible). Synthesized nodes carry replaced-node (or empty) spans, so the
+    // codegen sourcemap below maps the ORIGINAL source — the string seam's
+    // transformed-source map trade is gone. Asymmetry: the build path
+    // (rolldown plugin, oj/src/build.rs) stays on the string-level
+    // `stylex_pass`, string-in/string-out by nature.
+    let stylex_rules = match stylex_cfg {
+        Some(cfg) => {
+            stylex::stylex_pass_ast(&allocator, &mut program, path, source_text, cfg)
+                .map_err(|message| CompileError::Transform {
+                    path: path.to_path_buf(),
+                    message,
+                })?
+                .rules
+        }
+        None => Vec::new(),
+    };
 
     let semantic_ret = SemanticBuilder::new()
         .with_excess_capacity(2.0)
@@ -398,7 +428,8 @@ pub fn compile_module_with_maps(
 
     // Synthesized nodes (glob / dynamic-import-vars) carry generated-string spans
     // with no origin in this module's source; sourcemapping them panics oxc's
-    // builder on out-of-range spans, so skip the map for those modules.
+    // builder on out-of-range spans, so skip the map for those modules. StyleX
+    // nodes are exempt: they carry in-range replaced-node spans or empty spans.
     let codegen_options = CodegenOptions {
         source_map_path: (opts.sourcemap && !synthesized).then(|| path.to_path_buf()),
         ..CodegenOptions::default()
@@ -421,6 +452,7 @@ pub fn compile_module_with_maps(
         dynamic_imports,
         is_refresh_boundary,
         hot_accept,
+        stylex_rules,
     })
 }
 
@@ -1022,6 +1054,7 @@ export const used: A extends B ? number : number = c + d;
                 sourcemap: false,
                 ssr: false,
                 jsx: JsxConfig::default(),
+                stylex: None,
             },
             None,
         )
@@ -1039,6 +1072,134 @@ export const used: A extends B ? number : number = c + d;
         assert!(
             matches!(err, CompileError::UnsupportedFileType(_)),
             "got {err:?}"
+        );
+    }
+
+    fn stylex_cfg() -> stylex::StylexPassConfig {
+        stylex::StylexPassConfig::new(
+            PathBuf::from("/app"),
+            PathBuf::from("/app"),
+            &["src/**".into()],
+            &[],
+            true,
+            false,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn stylex_seam_compiles_source_and_attaches_rules() {
+        let cfg = stylex_cfg();
+        let src = "import * as stylex from '@stylexjs/stylex';\n\
+                   const styles = stylex.create({ root: { color: 'red', ':hover': { color: 'blue' } } });\n\
+                   export const attrs = stylex.props(styles.root);\n";
+        let mut opts = CompileOptions::dev();
+        opts.stylex = Some(&cfg);
+        let out = compile_module(Path::new("/app/src/a.ts"), src, &opts, None).unwrap();
+        assert!(!out.code.contains("stylex.create"), "create compiled away");
+        assert!(
+            !out.code.contains("@stylexjs/stylex"),
+            "import removed via DCE"
+        );
+        assert_eq!(out.stylex_rules.len(), 2, "base + hover rule");
+        for rule in &out.stylex_rules {
+            assert!(out.code.contains(&*rule.class_name) || rule.ltr.contains(":hover"));
+        }
+        assert!(
+            out.map_data_url.is_some(),
+            "stylex-modified module keeps a real map"
+        );
+    }
+
+    fn b64_decode(s: &str) -> Vec<u8> {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let idx = |c: u8| ALPHABET.iter().position(|&a| a == c).unwrap() as u32;
+        let bytes: Vec<u8> = s.bytes().filter(|&c| c != b'=' && c != b'\n').collect();
+        let mut out = Vec::new();
+        for chunk in bytes.chunks(4) {
+            let mut v = 0u32;
+            for (i, &c) in chunk.iter().enumerate() {
+                v |= idx(c) << (18 - 6 * i);
+            }
+            out.push((v >> 16) as u8);
+            if chunk.len() > 2 {
+                out.push((v >> 8) as u8);
+            }
+            if chunk.len() > 3 {
+                out.push(v as u8);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn stylex_seam_sourcemap_maps_the_original_source() {
+        let cfg = stylex_cfg();
+        // `styles` is exported so DCE keeps the compiled create object (an
+        // unexported, fully-inlined one is pruned along with its mapping).
+        let src = "import * as stylex from '@stylexjs/stylex';\n\
+                   export const styles = stylex.create({ root: { color: 'red' } });\n\
+                   export const attrs = stylex.props(styles.root);\n";
+        let mut opts = CompileOptions::dev();
+        opts.stylex = Some(&cfg);
+        let out = compile_module(Path::new("/app/src/a.ts"), src, &opts, None).unwrap();
+        let url = out
+            .map_data_url
+            .expect("stylex-modified module keeps a real map");
+        let json = String::from_utf8(b64_decode(url.rsplit(',').next().unwrap())).unwrap();
+        let map = oxc_sourcemap::SourceMap::from_json_string(&json).unwrap();
+        assert_eq!(
+            map.get_source_content(0),
+            Some(src),
+            "sourcesContent is the ORIGINAL source, not the transformed text"
+        );
+        // The compiled create/props replacements keep mappings into their
+        // source lines (0-based lines 1 and 2).
+        assert!(map.get_tokens().any(|t| t.get_src_line() == 1), "{json}");
+        assert!(map.get_tokens().any(|t| t.get_src_line() == 2), "{json}");
+        let n_lines = src.lines().count() as u32;
+        assert!(
+            map.get_tokens().all(|t| t.get_src_line() < n_lines),
+            "every mapping stays inside the original source"
+        );
+    }
+
+    #[test]
+    fn stylex_seam_skips_unmatched_paths_and_stylex_free_sources() {
+        let cfg = stylex_cfg();
+        let mut opts = CompileOptions::dev();
+        opts.stylex = Some(&cfg);
+        let src = "import * as stylex from '@stylexjs/stylex';\nexport const x = stylex;\n";
+        let outside = compile_module(Path::new("/app/lib/a.ts"), src, &opts, None).unwrap();
+        assert!(outside.stylex_rules.is_empty());
+        assert!(
+            outside.code.contains("@stylexjs/stylex"),
+            "untouched outside the glob"
+        );
+        let plain = compile_module(
+            Path::new("/app/src/b.ts"),
+            "export const y = 1;",
+            &opts,
+            None,
+        )
+        .unwrap();
+        assert!(plain.stylex_rules.is_empty());
+    }
+
+    #[test]
+    fn stylex_authoring_error_surfaces_as_transform_error() {
+        let cfg = stylex_cfg();
+        let mut opts = CompileOptions::dev();
+        opts.stylex = Some(&cfg);
+        let src = "import * as stylex from '@stylexjs/stylex';\n\
+                   const dyn = Math.random();\n\
+                   export const styles = stylex.create({ root: { color: dyn } });\n";
+        let err = compile_module(Path::new("/app/src/a.ts"), src, &opts, None).unwrap_err();
+        assert!(
+            matches!(err, CompileError::Transform { .. }),
+            "stylex errors ride the transform-error path, got {err:?}"
         );
     }
 
@@ -1125,6 +1286,7 @@ export const used: A extends B ? number : number = c + d;
                 sourcemap: false,
                 ssr: false,
                 jsx: JsxConfig::default(),
+                stylex: None,
             },
             None,
         )

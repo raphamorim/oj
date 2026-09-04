@@ -212,6 +212,9 @@ struct OjCssPlugin {
     /// Source ids of `?worker` / `?worker&url` entries emitted as chunks, so the
     /// document-only build helpers can skip chunks that only a worker loads.
     worker_entries: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// StyleX pass configured: swap the `@stylex;` directive for the build
+    /// sentinel so the assembled sheet can be spliced in after bundling.
+    stylex: bool,
 }
 
 /// The app build settings an inline worker bundle shares with its importer:
@@ -772,6 +775,7 @@ async fn compile_stylesheet(
     resolve: &oj_css::CssResolveConfig,
     path: &str,
     id: &str,
+    stylex: bool,
 ) -> anyhow::Result<oj_css::CssOutput> {
     let cfg = oj_config::OjConfig {
         css: css.clone(),
@@ -781,6 +785,11 @@ async fn compile_stylesheet(
     let is_stylus = oj_server::sidecar::is_stylus(path);
     let mut source =
         std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+    // Mirrors the dev path: `@stylex;` handling precedes the sidecars.
+    let stylex_sentinel = stylex && oj_server::stylex::has_directive(&source);
+    if stylex_sentinel {
+        source = oj_server::stylex::substitute_directive(&source, STYLEX_SENTINEL_COMMENT);
+    }
     // Run the plugin transform chain on the raw CSS source first, so directive
     // transformers (UnoCSS `@apply`/`@unocss-include`, etc.) resolve before oj
     // preprocesses and compiles it.
@@ -834,6 +843,10 @@ async fn compile_stylesheet(
     // way), on the source as transformed so far rather than re-read from disk.
     if tailwind || has_postcss {
         source = expand_css_via_sidecar(root, std::path::Path::new(path), &source)?;
+    }
+    if stylex_sentinel {
+        // lightningcss drops comments; the unknown at-rule survives.
+        source = source.replace(STYLEX_SENTINEL_COMMENT, STYLEX_SENTINEL_AT);
     }
     let css_id = match std::path::Path::new(path).strip_prefix(root) {
         Ok(rel) => format!("/{}", rel.display()),
@@ -1033,6 +1046,7 @@ impl Plugin for OjCssPlugin {
         let host = self.host.clone();
         let css_transform_enabled = Arc::clone(&self.css_transform_enabled);
         let self_has_postcss = self.has_postcss;
+        let stylex = self.stylex;
         let css_cfg = self.css.clone();
         let css_resolve = self.resolve.clone();
         let html_inline = Arc::clone(&self.html_inline);
@@ -1061,6 +1075,7 @@ impl Plugin for OjCssPlugin {
                         &css_resolve,
                         file,
                         &id,
+                        stylex,
                     )
                     .await?;
                     let stem = std::path::Path::new(file)
@@ -1190,6 +1205,7 @@ impl Plugin for OjCssPlugin {
                         &css_resolve,
                         file,
                         &id,
+                        stylex,
                     )
                     .await?;
                     return Ok(Some(rolldown_plugin::HookLoadOutput {
@@ -1252,6 +1268,7 @@ impl Plugin for OjCssPlugin {
                         worker: worker.clone(),
                         resolve: css_resolve.clone(),
                         worker_entries: Arc::clone(&worker_entries),
+                        stylex: false,
                     };
                     let code = bundle_worker_inline(&root, file, worker.as_ref(), nested).await?;
                     let literal = serde_json::Value::String(code).to_string();
@@ -1331,6 +1348,7 @@ impl Plugin for OjCssPlugin {
                 &css_resolve,
                 path,
                 &id,
+                stylex,
             )
             .await?;
             // A CSS module: the class map as default plus named exports per
@@ -1357,6 +1375,110 @@ impl Plugin for OjCssPlugin {
             }))
         }
     }
+}
+
+/// What the `@stylex;` directive becomes while css sidecars run (postcss and
+/// friends keep comments)…
+const STYLEX_SENTINEL_COMMENT: &str = "/*__OJ_STYLEX__*/";
+/// …and what rides through `oj_css::compile_css`: lightningcss drops comments
+/// but prints unknown at-rules verbatim, minified output included.
+const STYLEX_SENTINEL_AT: &str = "@-oj-stylex-sentinel;";
+
+/// The build-path StyleX pass: the string-level `stylex_pass` as a rolldown
+/// transform hook (hooks are string-in/string-out and see raw TSX — rolldown's
+/// builtin oxc lowering runs after them). The dev pipeline instead mutates its
+/// own parsed AST via `stylex_pass_ast`; this seam stays on strings by nature.
+/// Rules accumulate per module; the sheet is assembled once after bundling and
+/// spliced into `collected_css`.
+#[derive(Debug)]
+struct OjStylexPlugin {
+    pass: Arc<oj_server::stylex::StylexPassConfig>,
+    rules: StylexRules,
+}
+
+/// Keyed by module path (mirrors the dev registry's BTreeMap) so the rule feed
+/// into assembly is deterministic under rolldown's parallel module transforms.
+type StylexRules =
+    Arc<Mutex<std::collections::BTreeMap<PathBuf, Vec<oj_server::stylex::StylexRule>>>>;
+
+impl Plugin for OjStylexPlugin {
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Borrowed("oj:stylex")
+    }
+
+    fn register_hook_usage(&self) -> rolldown_plugin::HookUsage {
+        rolldown_plugin::HookUsage::Transform
+    }
+
+    fn transform(
+        &self,
+        _ctx: SharedTransformPluginContext,
+        args: &HookTransformArgs<'_>,
+    ) -> impl std::future::Future<Output = HookTransformReturn> + Send {
+        let id = args.id.to_string();
+        let code = args.code.to_string();
+        let pass = Arc::clone(&self.pass);
+        let rules = Arc::clone(&self.rules);
+        async move {
+            let path_str = id.split(['?', '#']).next().unwrap_or(&id);
+            let path = Path::new(path_str);
+            if !pass.is_candidate(path, &code) {
+                return Ok(None);
+            }
+            let out = oj_compiler::stylex::stylex_pass(path, &code, &pass)
+                .map_err(|e| anyhow::anyhow!("stylex: {e}"))?;
+            if !out.rules.is_empty() {
+                rules.lock().unwrap().insert(path.to_path_buf(), out.rules);
+            }
+            let map = out.map;
+            Ok(out.code.map(|code| rolldown_plugin::HookTransformOutput {
+                code: Some(code),
+                // The splice moves line positions, so reporting no map would
+                // leave rolldown composing against the pre-transform text.
+                map: match map.as_deref().and_then(parse_sourcemap) {
+                    Some(map) => HookTransformOutputMap::Sourcemap(Box::new(map)),
+                    None => HookTransformOutputMap::Null,
+                },
+                ..Default::default()
+            }))
+        }
+    }
+}
+
+/// The splice map arrives as JSON; rolldown wants an owned SourceMap.
+fn parse_sourcemap(json: &str) -> Option<rolldown_sourcemap::SourceMap> {
+    let parsed: rolldown_sourcemap::JSONSourceMap = serde_json::from_str(json).ok()?;
+    rolldown_sourcemap::SourceMap::from_json(parsed).ok()
+}
+
+/// Assemble the collected rules and splice the sheet over every sentinel in
+/// `collected_css`. Returns the sheet when rules exist but no stylesheet
+/// carried the directive, so the caller can emit it standalone.
+fn join_stylex_css(
+    pass: &oj_server::stylex::StylexPassConfig,
+    rules: &StylexRules,
+    collected_css: &Arc<Mutex<Vec<(String, String)>>>,
+) -> anyhow::Result<Option<String>> {
+    let all: Vec<oj_server::stylex::StylexRule> =
+        rules.lock().unwrap().values().flatten().cloned().collect();
+    let mut entries = collected_css.lock().unwrap();
+    let has_sentinel = entries
+        .iter()
+        .any(|(_, css)| css.contains(STYLEX_SENTINEL_AT));
+    if all.is_empty() && !has_sentinel {
+        return Ok(None);
+    }
+    let sheet = oj_server::stylex::assemble_sheet(&all, pass)
+        .map_err(|e| anyhow::anyhow!("stylex assemble error: {e}"))?;
+    if has_sentinel {
+        for (_, css) in entries.iter_mut() {
+            if css.contains(STYLEX_SENTINEL_AT) {
+                *css = css.replace(STYLEX_SENTINEL_AT, &sheet);
+            }
+        }
+        return Ok(None);
+    }
+    Ok((!all.is_empty()).then_some(sheet))
 }
 
 /// Tailwind / PostCSS over `css` (the file's content as processed so far, not
@@ -2125,6 +2247,7 @@ async fn user_plugin_host(
     environments: &serde_json::Value,
     env_name: &str,
     mode: &str,
+    stylex_native: bool,
 ) -> Option<Arc<PluginHost>> {
     let (file, plugins_format, label) = match oj_server::plugins::plugin_source(root)? {
         oj_server::plugins::PluginSource::OjPlugins(p) => {
@@ -2133,13 +2256,18 @@ async fn user_plugin_host(
         }
         oj_server::plugins::PluginSource::ViteConfig(p) => (p, "vite", "vite.config".to_string()),
     };
-    let config = serde_json::json!({
+    let mut config = serde_json::json!({
         "config": { "root": root.display().to_string(), "base": base, "mode": mode, "command": "build", "define": define, "environments": environments },
         "env": { "command": "build", "mode": mode },
         "environment": { "name": env_name, "mode": "build" },
         "pluginsFormat": plugins_format,
-    })
-    .to_string();
+    });
+    if stylex_native {
+        // Same dedupe as dev: the native pass replaces the pilot's Babel Vite
+        // plugin; hosting both would transform stylex modules twice.
+        config["nativePluginNames"] = serde_json::json!(["lovable:stylex-transform"]);
+    }
+    let config = config.to_string();
     match PluginHost::spawn(root, &file, &config).await {
         Ok(host) => {
             println!("oj build ({env_name}): plugins from {label}");
@@ -2293,6 +2421,7 @@ pub async fn build(
     root: PathBuf,
     cli_mode: Option<&str>,
     cli: CliOptions,
+    stylex_config: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let root = root
         .canonicalize()
@@ -2485,6 +2614,16 @@ pub async fn build(
     let worker_entries: Arc<Mutex<std::collections::HashSet<String>>> =
         Arc::new(Mutex::new(std::collections::HashSet::new()));
     let css_split = css_code_split_of(&config);
+    // Build defaults to prod rules (no debug classnames) unless the config's
+    // `dev` key says otherwise; the dev-server default is NODE_ENV-driven.
+    let stylex_pass = oj_server::stylex::resolve_pass_config(
+        stylex_config.as_deref(),
+        &config,
+        &root,
+        mode != "production",
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stylex_rules: StylexRules = Arc::default();
     let plugin_host = user_plugin_host(
         &root,
         &base,
@@ -2492,6 +2631,7 @@ pub async fn build(
         &serde_json::json!(config.environments),
         "client",
         mode,
+        stylex_pass.is_some(),
     )
     .await;
     let plugin_defines = plugin_config_defines(&plugin_host).await;
@@ -2516,6 +2656,16 @@ pub async fn build(
         pairs.extend(plugin_defines);
         pairs
     };
+    if let Some(pass) = &stylex_pass {
+        println!(
+            "oj build: stylex native pass enabled ({} include glob(s))",
+            pass.include.len()
+        );
+        oj_plugins.push(Arc::new(OjStylexPlugin {
+            pass: Arc::new(pass.clone()),
+            rules: Arc::clone(&stylex_rules),
+        }));
+    }
     oj_plugins.push(Arc::new(OjCssPlugin {
         collected: Arc::clone(&collected_css),
         root: root.to_path_buf(),
@@ -2535,6 +2685,7 @@ pub async fn build(
             minify: client_minify,
         })),
         worker_entries: Arc::clone(&worker_entries),
+        stylex: stylex_pass.is_some(),
     }));
     let out_ov = ro_output_overrides(ro_opts);
     // Vite's build import analysis (preload wrapping, polyfill) only applies to
@@ -2752,6 +2903,39 @@ pub async fn build(
         }
     }
 
+    // StyleX joins before either CSS emission path reads `collected_css`: the
+    // assembled sheet replaces the sentinel in place. When rules exist but no
+    // stylesheet carried the directive, the sheet becomes its own entry: a
+    // synthetic `collected_css` member when CSS is combined, a standalone
+    // hashed stylesheet linked from every page when CSS is split (a synthetic
+    // entry would match no chunk's modules and be dropped).
+    let mut stylex_css_link: Option<String> = None;
+    if let Some(pass) = &stylex_pass {
+        if let Some(sheet) = join_stylex_css(pass, &stylex_rules, &collected_css)? {
+            if css_split {
+                fs::create_dir_all(out_dir.join("assets"))?;
+                let hash = content_hash(sheet.as_bytes());
+                let css_name = format!("assets/stylex-{}.css", &hash[..8]);
+                fs::write(out_dir.join(&css_name), &sheet)?;
+                emitted.push((css_name.clone(), sheet.len()));
+                for entry in &mut manifest_entries {
+                    if entry.is_entry {
+                        entry.css.push(css_name.clone());
+                    }
+                }
+                stylex_css_link = Some(format!(
+                    "<link rel=\"stylesheet\" href=\"{}\" />",
+                    with_base(&css_name, &base)
+                ));
+            } else {
+                collected_css
+                    .lock()
+                    .unwrap()
+                    .push((root.join("stylex.css").display().to_string(), sheet));
+            }
+        }
+    }
+
     // Non-split CSS is one combined stylesheet linked from every page.
     let combined_css_name: Option<String> = if !css_split {
         let mut css_entries = collected_css.lock().unwrap().clone();
@@ -2899,6 +3083,7 @@ pub async fn build(
                     &link_css_resolve,
                     &src_str,
                     &src_str,
+                    stylex_pass.is_some(),
                 )
                 .await
                 .with_context(|| format!("stylesheet {href} linked from {}", doc.out_rel))?;
@@ -2958,6 +3143,9 @@ pub async fn build(
             });
         }
 
+        if let Some(link) = &stylex_css_link {
+            rewritten_html = insert_before_head(&rewritten_html, link);
+        }
         if let Some(css_name) = &combined_css_name {
             let link = format!(
                 "<link rel=\"stylesheet\" href=\"{}\" crossorigin />",
@@ -3713,6 +3901,7 @@ pub(crate) async fn build_ssr(
         &serde_json::json!(config.environments),
         "ssr",
         mode,
+        false,
     )
     .await;
     let plugin_defines = plugin_config_defines(&plugin_host).await;
@@ -3771,6 +3960,7 @@ pub(crate) async fn build_ssr(
         html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
         worker: None,
         worker_entries: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        stylex: false,
     }));
     let mut bundler = BundlerBuilder::default()
         .with_plugins(oj_plugins)
@@ -3932,6 +4122,7 @@ async fn build_server_fns(root: &Path, out_dir: &Path, mode: &str) -> anyhow::Re
                 html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 worker: None,
                 worker_entries: Arc::new(Mutex::new(std::collections::HashSet::new())),
+                stylex: false,
             })])
             .with_options(BundlerOptions {
                 input: Some(vec![InputItem {
@@ -4284,6 +4475,7 @@ async fn build_client_entry(
         &serde_json::json!(config.environments),
         "client",
         mode,
+        false,
     )
     .await;
     let plugin_defines = plugin_config_defines(&plugin_host).await;
@@ -4309,6 +4501,7 @@ async fn build_client_entry(
         html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
         worker: None,
         worker_entries: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        stylex: false,
     }));
 
     let mut bundler = BundlerBuilder::default()
@@ -4542,6 +4735,7 @@ async fn build_library(
                 html_inline: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 worker: None,
                 worker_entries: Arc::new(Mutex::new(std::collections::HashSet::new())),
+                stylex: false,
             })])
             .with_options(BundlerOptions {
                 input: Some(
@@ -5643,7 +5837,7 @@ mod tests {
             .unwrap();
             fs::write(root.join("shared.js"), r#"export const shared = "ready";"#).unwrap();
 
-            build(root.clone(), Some("production"), CliOptions::default())
+            build(root.clone(), Some("production"), CliOptions::default(), None)
                 .await
                 .expect("synthetic shared-chunk fixture should build");
 
@@ -5776,7 +5970,7 @@ mod tests {
             fs::write(root.join("main.js"), "window.ready = true;").unwrap();
             fs::write(root.join("public/asset.txt"), "public asset").unwrap();
 
-            build(root.clone(), Some("production"), CliOptions::default())
+            build(root.clone(), Some("production"), CliOptions::default(), None)
                 .await
                 .expect("synthetic public-directory fixture should build");
 
@@ -5810,7 +6004,7 @@ mod tests {
         .unwrap();
         fs::write(root.join("server.js"), "export const flag = process.env.SOME_FLAG;\n").unwrap();
 
-        build(root.clone(), Some("production"), CliOptions::default())
+        build(root.clone(), Some("production"), CliOptions::default(), None)
             .await
             .expect("client build");
         let mut client = String::new();
@@ -5869,7 +6063,7 @@ mod tests {
         .unwrap();
         fs::write(root.join("public/manifest.webmanifest"), "{}").unwrap();
 
-        build(root.clone(), Some("production"), CliOptions::default())
+        build(root.clone(), Some("production"), CliOptions::default(), None)
             .await
             .expect("html asset fixture should build");
         let html = fs::read_to_string(root.join("dist/index.html")).unwrap();
@@ -5916,7 +6110,7 @@ mod tests {
             "export default { build: { lib: { entry: 'src/index.ts', name: 'MyLib' } } };",
         )
         .unwrap();
-        build(root.clone(), Some("production"), CliOptions::default())
+        build(root.clone(), Some("production"), CliOptions::default(), None)
             .await
             .expect("vite.config build.lib should build");
         assert!(root.join("dist/my-lib.js").is_file(), "es output named after the unscoped package");
@@ -5936,7 +6130,7 @@ mod tests {
             "export default { build: { lib: { entry: { main: 'src/a.ts', extra: 'src/b.ts' }, cssFileName: 'theme' } } };",
         )
         .unwrap();
-        build(root.clone(), Some("production"), CliOptions::default())
+        build(root.clone(), Some("production"), CliOptions::default(), None)
             .await
             .expect("multi-entry lib should build");
         for f in ["main.mjs", "extra.mjs", "main.js", "extra.js"] {
@@ -5955,7 +6149,7 @@ mod tests {
             "export default { build: { lib: { entry: 'src/index.ts', formats: ['umd'] } } };",
         )
         .unwrap();
-        let err = build(root.clone(), Some("production"), CliOptions::default())
+        let err = build(root.clone(), Some("production"), CliOptions::default(), None)
             .await
             .expect_err("umd needs build.lib.name");
         assert!(err.to_string().contains("build.lib.name"), "{err}");
@@ -5993,7 +6187,7 @@ mod tests {
             r#"<html><body><script type="module" src="/src/main.js"></script></body></html>"#,
         )
         .unwrap();
-        build(root.clone(), Some("production"), CliOptions::default())
+        build(root.clone(), Some("production"), CliOptions::default(), None)
             .await
             .expect("inline worker fixture should build");
         let mut code = String::new();
@@ -6678,4 +6872,100 @@ mod tests {
         assert!(out.contains("var d = 1;"), "classic scripts untouched: {out}");
     }
 
+    #[test]
+    fn stylex_sentinel_at_rule_survives_css_minification() {
+        // The whole reason the directive rides as an at-rule and not as the
+        // sidecar-phase comment: lightningcss drops comments (collapsing the
+        // then-empty layer), but prints unknown at-rules verbatim.
+        let src = format!("@layer stylex {{\n  {STYLEX_SENTINEL_AT}\n}}\nbody{{margin:0}}");
+        let out = oj_css::compile_css("/src/styles.css", &src, true).unwrap();
+        assert_eq!(
+            out.css,
+            format!("@layer stylex{{{STYLEX_SENTINEL_AT}}}body{{margin:0}}")
+        );
+        let commented =
+            format!("@layer stylex {{\n  {STYLEX_SENTINEL_COMMENT}\n}}\nbody{{margin:0}}");
+        let out = oj_css::compile_css("/src/styles.css", &commented, true).unwrap();
+        assert!(
+            !out.css.contains("__OJ_STYLEX__"),
+            "comment unexpectedly survived — the two-stage swap can be dropped: {}",
+            out.css
+        );
+    }
+
+    fn stylex_test_pass() -> oj_server::stylex::StylexPassConfig {
+        oj_server::stylex::StylexPassConfig::new(
+            PathBuf::from("/app"),
+            PathBuf::from("/app"),
+            &["src/**".into()],
+            &[],
+            false,
+            true,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn stylex_rule(class: &str, ltr: &str, priority: f64) -> oj_server::stylex::StylexRule {
+        oj_server::stylex::StylexRule {
+            class_name: class.into(),
+            ltr: ltr.into(),
+            rtl: None,
+            const_key: None,
+            const_val: None,
+            priority,
+        }
+    }
+
+    #[test]
+    fn stylex_join_substitutes_every_sentinel_in_place() {
+        let pass = stylex_test_pass();
+        let rules: StylexRules = Arc::default();
+        rules.lock().unwrap().insert(
+            PathBuf::from("/app/src/a.tsx"),
+            vec![stylex_rule("x1", ".x1{color:red}", 3000.0)],
+        );
+        let collected = Arc::new(Mutex::new(vec![
+            (
+                "/app/src/styles.css".to_string(),
+                format!("@layer stylex{{{STYLEX_SENTINEL_AT}}}"),
+            ),
+            (
+                "/app/src/plain.css".to_string(),
+                "body{margin:0}".to_string(),
+            ),
+        ]));
+        let standalone = join_stylex_css(&pass, &rules, &collected).unwrap();
+        assert!(standalone.is_none(), "sentinel found: no standalone sheet");
+        let entries = collected.lock().unwrap();
+        assert_eq!(
+            entries[0].1,
+            "@layer stylex{\n@layer priority1;\n@layer priority1{\n.x1{color:red}\n}}"
+        );
+        assert_eq!(entries[1].1, "body{margin:0}", "non-sentinel css untouched");
+    }
+
+    #[test]
+    fn stylex_join_returns_a_standalone_sheet_without_a_sentinel() {
+        let pass = stylex_test_pass();
+        let rules: StylexRules = Arc::default();
+        rules.lock().unwrap().insert(
+            PathBuf::from("/app/src/a.tsx"),
+            vec![stylex_rule("x1", ".x1{color:red}", 3000.0)],
+        );
+        let collected = Arc::new(Mutex::new(vec![(
+            "/app/src/plain.css".to_string(),
+            "body{margin:0}".to_string(),
+        )]));
+        let standalone = join_stylex_css(&pass, &rules, &collected).unwrap();
+        assert_eq!(
+            standalone.as_deref(),
+            Some("\n@layer priority1;\n@layer priority1{\n.x1{color:red}\n}")
+        );
+        // No rules and no sentinel: nothing to do.
+        let empty: StylexRules = Arc::default();
+        assert!(join_stylex_css(&pass, &empty, &collected)
+            .unwrap()
+            .is_none());
+    }
 }

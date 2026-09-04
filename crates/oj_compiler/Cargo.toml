@@ -23,6 +23,7 @@ serde_json.workspace = true
 oxc_codegen.workspace = true
 oxc_sourcemap = "8.0.2"
 thiserror.workspace = true
+fru.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

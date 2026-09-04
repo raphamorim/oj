@@ -44,6 +44,7 @@ pub struct OjConfig {
     /// Vite's `html` block (`cspNonce`).
     pub html: Option<HtmlConfig>,
     pub legacy: Option<LegacyConfig>,
+    pub stylex: Option<StylexConfig>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -71,6 +72,22 @@ impl From<String> for BoolOrString {
     fn from(s: String) -> Self {
         BoolOrString::Str(s)
     }
+}
+
+/// Native StyleX pass. Presence of the section enables it.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct StylexConfig {
+    /// Root-relative globs selecting the files the pass may transform.
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    /// Base dir for the globs (and debug names later); defaults to the root.
+    pub root_dir: Option<String>,
+    /// Defaults to NODE_ENV != "production".
+    pub dev: Option<bool>,
+    pub use_css_layers: Option<bool>,
+    /// Generated class-name prefix (compiler default: "x").
+    pub class_name_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
