@@ -143,6 +143,9 @@ jobs:
       - name: start prod build for @cloudflare/vite-plugin is a Worker bundle that renders in workerd
         if: matrix.mode == 'unbundled'
         run: node e2e/start-cloudflare.mjs
+      - name: start dev for @cloudflare/vite-plugin serves from the worker; an edit yields a fresh document
+        if: matrix.mode == 'unbundled'
+        run: node e2e/start-cloudflare-dev.mjs
       - name: transformIndexHtml ctx (path, filename, server, bundle, chunk) and hook errors fail
         if: matrix.mode == 'unbundled'
         run: node e2e/plugin-html-ctx.mjs
