@@ -979,9 +979,10 @@ function wsConnection() {
 }
 
 let middlewarePort = null;
-// Whether buildEnvironments produced real Vite DevEnvironments (the Cloudflare
-// path); Rust reads it via getCfEnvironments to gate its SSR-runner handling.
-let cfEnvironmentsBuilt = false;
+// Whether buildEnvironments produced real runner-backed Vite DevEnvironments
+// (today: the Cloudflare plugin's Environment-API path); reported through
+// getServeInfo, which Rust reads to gate its SSR-runner handling.
+let runnerEnvironmentsBuilt = false;
 // The ViteDevServer stand-in handed to configureServer; hotUpdate/handleHotUpdate
 // contexts carry it as `server` (plugins call server.ws.send / moduleGraph on it).
 let devServer = null;
@@ -1431,7 +1432,7 @@ async function setupConfigureServer() {
   if (plugins.some((p) => p && p.name === "vite-plugin-cloudflare:dev")) {
     try {
       server.environments = await buildEnvironments(server);
-      cfEnvironmentsBuilt = !!server.environments;
+      runnerEnvironmentsBuilt = !!server.environments;
     } catch (e) {
       process.stderr.write(`${OJ} plugin host: buildEnvironments failed: ${(e && e.message) || e}\n`);
     }
@@ -2154,8 +2155,9 @@ async function run(hook, args) {
     const hotUpdateHook = hotUpdatePlugins().length > 0;
     return JSON.stringify({ watchChange: watchChangeHook, handleHotUpdate: hotUpdateHook });
   }
-  if (hook === "getMiddlewarePort") return middlewarePort == null ? null : String(middlewarePort);
-  if (hook === "getCfEnvironments") return String(cfEnvironmentsBuilt);
+  if (hook === "getServeInfo") {
+    return JSON.stringify({ middlewarePort, runnerEnvironments: runnerEnvironmentsBuilt });
+  }
   if (hook === "wsMessage") {
     const event = args[0];
     const data = args[1] ? JSON.parse(args[1]) : null;

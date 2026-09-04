@@ -367,10 +367,10 @@ pub struct BuiltApp {
     pub strict_port: bool,
     pub proxy_prefixes: Vec<String>,
     pub plugin_mw_port: Option<u16>,
-    /// The plugin host built real Vite DevEnvironments for the app's
-    /// `@cloudflare/vite-plugin`: documents are served by the plugin's worker
-    /// and the Start path may keep its Node SSR runner cold.
-    pub cf_environments: bool,
+    /// The plugin host built real runner-backed Vite DevEnvironments (the
+    /// Environment-API path, today the Cloudflare plugin): documents are served
+    /// by the plugin middleware and the Start path may keep its SSR runner cold.
+    pub runner_environments: bool,
     pub root: PathBuf,
     pub started: Instant,
     /// Sender for the `/__ws` broadcast — the channel the editor reads
@@ -641,17 +641,15 @@ impl DevServer {
             None => None,
         };
         boot_phase("plugin host ready");
-        let plugin_mw_port = match &plugin_host {
-            Some(host) => host.middleware_port().await,
-            None => None,
+        let serve_info = match &plugin_host {
+            Some(host) => host.serve_info().await,
+            None => plugins::ServeInfo::default(),
         };
+        let plugin_mw_port = serve_info.middleware_port;
         if let Some(p) = plugin_mw_port {
             println!("  plugin middleware: forwarding unmatched requests to :{p}");
         }
-        let cf_environments = match &plugin_host {
-            Some(host) if plugin_mw_port.is_some() => host.cf_environments().await,
-            _ => false,
-        };
+        let runner_environments = plugin_mw_port.is_some() && serve_info.runner_environments;
         if let Some(host) = &plugin_host {
             // Fold config()-hook env mutations (e.g. a plugin flipping a VITE_*
             // flag) into the client defines before any module compiles.
@@ -1092,7 +1090,7 @@ impl DevServer {
             strict_port,
             proxy_prefixes,
             plugin_mw_port,
-            cf_environments,
+            runner_environments,
             root,
             started,
             reload_tx,

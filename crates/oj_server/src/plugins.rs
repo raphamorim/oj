@@ -14,6 +14,17 @@ use tokio::sync::oneshot;
 pub const PLUGIN_HOST_JS: &str = include_str!("assets/plugin-host.mjs");
 pub const VITE_EXTRACT_JS: &str = include_str!("assets/vite-extract.mjs");
 
+/// The host's `getServeInfo` report: how requests are served.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ServeInfo {
+    /// Loopback port of the configureServer middleware stack, when any plugin
+    /// registered a middleware.
+    pub middleware_port: Option<u16>,
+    /// Real runner-backed Vite DevEnvironments were built (the Environment-API
+    /// path): documents are served by the plugin middleware.
+    pub runner_environments: bool,
+}
+
 #[derive(Debug)]
 pub struct EmittedFile {
     pub file_name: String,
@@ -1248,22 +1259,31 @@ impl PluginHost {
         .map(|_| ())
     }
 
-    #[inline]
-    pub async fn middleware_port(&self) -> Option<u16> {
-        self.call("getMiddlewarePort", &[])
+    /// How the host serves requests: the loopback port of its configureServer
+    /// middleware stack (when any plugin registered one), and whether it built
+    /// real runner-backed Vite DevEnvironments (documents are then served by
+    /// the plugin middleware, not the Node SSR runner). Defaults on RPC
+    /// failure, so an uncertain host keeps the runner eagerly warm.
+    pub async fn serve_info(&self) -> ServeInfo {
+        let Some(v) = self
+            .call("getServeInfo", &[])
             .await
             .ok()
             .flatten()
-            .and_then(|s| s.parse().ok())
-    }
-
-    /// Whether the host built real Vite DevEnvironments for the app's
-    /// `@cloudflare/vite-plugin` (documents are then served by the plugin's
-    /// worker, not the Node SSR runner). False on RPC failure, so an uncertain
-    /// host keeps the runner eagerly warm.
-    #[inline]
-    pub async fn cf_environments(&self) -> bool {
-        matches!(self.call("getCfEnvironments", &[]).await, Ok(Some(s)) if s == "true")
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        else {
+            return ServeInfo::default();
+        };
+        ServeInfo {
+            middleware_port: v
+                .get("middlewarePort")
+                .and_then(|p| p.as_u64())
+                .and_then(|p| u16::try_from(p).ok()),
+            runner_environments: v
+                .get("runnerEnvironments")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false),
+        }
     }
 
     /// Number of plugins still active after oj filters out the ones it
