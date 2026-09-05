@@ -367,6 +367,10 @@ pub struct BuiltApp {
     pub strict_port: bool,
     pub proxy_prefixes: Vec<String>,
     pub plugin_mw_port: Option<u16>,
+    /// The plugin host built real runner-backed Vite DevEnvironments (the
+    /// Environment-API path, today the Cloudflare plugin): documents are served
+    /// by the plugin middleware and the Start path may keep its SSR runner cold.
+    pub runner_environments: bool,
     pub root: PathBuf,
     pub started: Instant,
     /// Sender for the `/__ws` broadcast — the channel the editor reads
@@ -637,13 +641,15 @@ impl DevServer {
             None => None,
         };
         boot_phase("plugin host ready");
-        let plugin_mw_port = match &plugin_host {
-            Some(host) => host.middleware_port().await,
-            None => None,
+        let serve_info = match &plugin_host {
+            Some(host) => host.serve_info().await,
+            None => plugins::ServeInfo::default(),
         };
+        let plugin_mw_port = serve_info.middleware_port;
         if let Some(p) = plugin_mw_port {
             println!("  plugin middleware: forwarding unmatched requests to :{p}");
         }
+        let runner_environments = plugin_mw_port.is_some() && serve_info.runner_environments;
         if let Some(host) = &plugin_host {
             // Fold config()-hook env mutations (e.g. a plugin flipping a VITE_*
             // flag) into the client defines before any module compiles.
@@ -1084,6 +1090,7 @@ impl DevServer {
             strict_port,
             proxy_prefixes,
             plugin_mw_port,
+            runner_environments,
             root,
             started,
             reload_tx,
@@ -2847,12 +2854,25 @@ async fn forward_to_plugin_middleware(
 // SSR. Used by the TanStack start path, where GET requests are otherwise
 // SSR'd and would never reach editor endpoints (the dev-server bridge).
 // Tell a plugin's configureServer middleware server that source files changed,
-// so it can invalidate the DevEnvironments' module graphs and reload the worker
-// runner (the Cloudflare-plugin HMR path). Fire-and-forget.
-pub async fn notify_plugin_mw_invalidate(port: u16, paths: &[String]) {
+// so it can invalidate the DevEnvironments' module graphs and send targeted
+// HMR updates (the Cloudflare-plugin HMR path). Each change carries Vite's
+// watcher event type: "update" | "create" | "delete". Fire-and-forget.
+pub async fn notify_plugin_mw_invalidate(port: u16, changes: &[(String, &'static str)]) {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    let client = CLIENT.get_or_init(reqwest::Client::new);
-    let body = serde_json::json!({ "paths": paths }).to_string();
+    // The endpoint answers only after the plugin hotUpdate hooks ran, and the
+    // settled-batch call blocks the watcher thread: a hung hook must not
+    // freeze rebuilds for the session, so the request is bounded.
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default()
+    });
+    let changes: Vec<serde_json::Value> = changes
+        .iter()
+        .map(|(path, kind)| serde_json::json!({ "path": path, "type": kind }))
+        .collect();
+    let body = serde_json::json!({ "changes": changes }).to_string();
     let _ = client
         .post(format!("http://127.0.0.1:{port}/__oj_invalidate"))
         .header(header::CONTENT_TYPE, "application/json")

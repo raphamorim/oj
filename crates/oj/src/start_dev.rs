@@ -44,6 +44,47 @@ struct StartState {
     /// The HMR gate, when the editor drives it: rebuilds still happen at once, the
     /// page reload waits for the flush.
     gate: Option<oj_server::HmrGateHandle>,
+    /// Cloudflare worker environments serve the documents; the runner is only a
+    /// fallback, kept cold and reloaded lazily (see `runner_dirty`) instead of
+    /// eagerly on every edit.
+    lazy_runner: bool,
+    /// Set on a source change while `lazy_runner`; the next request that can
+    /// reach the runner reloads it first (`ensure_runner_fresh`).
+    runner_dirty: std::sync::atomic::AtomicBool,
+}
+
+// Static hint that the app uses @cloudflare/vite-plugin, readable before the
+// plugin host boots (the definitive flag is BuiltApp::runner_environments). A plain
+// text search of the config file: false for every non-Cloudflare app, so their
+// boot path is untouched.
+// What the watcher forwards and rebuilds on: not the generated route tree (its
+// writes would loop the generator) and not bare directory events (Linux inotify
+// emits a parent-dir event alongside the file write; Vite never hands
+// directories to hotUpdate hooks either).
+fn watch_relevant(p: &Path) -> bool {
+    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    !name.contains("routeTree.gen") && !p.is_dir()
+}
+
+// Vite's watcher distinguishes add/change/unlink; notify's batched events are
+// classified at send time: gone from disk is a delete, seen as a Create in this
+// batch is a create, anything else an update.
+fn change_type(p: &Path, created: &std::collections::HashSet<PathBuf>) -> &'static str {
+    if !p.exists() {
+        "delete"
+    } else if created.contains(p) {
+        "create"
+    } else {
+        "update"
+    }
+}
+
+fn config_mentions_cloudflare_plugin(root: &Path, config: &Option<PathBuf>) -> bool {
+    let file = config
+        .clone()
+        .or_else(|| oj_server::plugins::vite_config_file(root));
+    file.and_then(|f| std::fs::read_to_string(f).ok())
+        .is_some_and(|s| s.contains("@cloudflare/vite-plugin"))
 }
 
 // A --config path is resolved against the app root, the way `build` resolves
@@ -72,6 +113,7 @@ pub async fn start_dev(
     // Same order `build` uses: pin the override before anything reads a config,
     // so the Rust side and the plugin host agree on which file is the config.
     let config = config_path(&root, config);
+    let cf_hint = config_mentions_cloudflare_plugin(&root, &config);
     if let Some(cfg) = &config {
         oj_server::plugins::set_vite_config_override(cfg.clone());
     }
@@ -117,10 +159,20 @@ pub async fn start_dev(
     ));
     oj_server::boot_phase("runner spawned");
     let (reload_tx, _) = broadcast::channel::<()>(16);
+    // Whether the plugin's worker environments serve the documents is known only
+    // once the plugin host is up (BuiltApp::runner_environments); the cf_hint keeps
+    // the non-Cloudflare prewarm overlapping the build exactly as before, while
+    // a Cloudflare config holds the prewarm until the flag arrives (and skips
+    // it: warming the runner is wasted CPU when the worker renders).
+    let (cf_tx, cf_rx) = tokio::sync::oneshot::channel::<bool>();
     {
         let runner = Arc::clone(&runner);
         let reload_tx = reload_tx.clone();
         tokio::spawn(async move {
+            if cf_hint && cf_rx.await.unwrap_or(false) {
+                oj_server::boot_phase("prewarm skipped (worker environments)");
+                return;
+            }
             let _ = forward(&runner, "GET".into(), "/".into(), &header::HeaderMap::new(), None).await;
             oj_server::boot_phase("prewarm complete");
             if revalidate_runner(&runner).await {
@@ -132,6 +184,7 @@ pub async fn start_dev(
     let (bundle_res, built_res) = tokio::join!(bundle, built_task);
     let pinned = bundle_res??;
     let built = built_res??;
+    let _ = cf_tx.send(built.runner_environments);
     oj_server::boot_phase("bundle+build joined");
     let css_host = if app_uses_tailwind(&root) {
         spawn_node_service(&root, &cache.join("css-host.mjs"), &mode)
@@ -154,6 +207,8 @@ pub async fn start_dev(
         gate: built.hmr_gate.clone(),
         css_host,
         mode: mode.clone(),
+        lazy_runner: built.runner_environments,
+        runner_dirty: std::sync::atomic::AtomicBool::new(false),
     });
 
     // A gate flush (the editor's POST /__hmr_flush, or the hold cap) releases
@@ -236,6 +291,20 @@ async fn revalidate_runner(runner: &Arc<tokio::sync::Mutex<Runner>>) -> bool {
         .ok()
         .and_then(|v| v.get("reloaded").and_then(|b| b.as_bool()))
         .unwrap_or(false)
+}
+
+/// On the Cloudflare path the runner is only a fallback: edits mark it dirty
+/// instead of reloading it, and the reload happens here, before a request can
+/// reach it (the document fallback, and anything the plugin middleware may pipe
+/// upstream via x-oj-forward-to).
+async fn ensure_runner_fresh(state: &StartState) {
+    if state.lazy_runner
+        && state
+            .runner_dirty
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        reload_runner(state).await;
+    }
 }
 
 async fn reload_runner(state: &StartState) {
@@ -332,14 +401,44 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
         // otherwise looked like an edit of every source file and rebuilt again.
         let mut changes = oj_server::ContentChanges::new();
         loop {
+            let mut created: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
             let mut paths: std::collections::HashSet<PathBuf> = match rx.recv() {
-                Ok(Ok(ev)) => changes.changed_paths(&ev).into_iter().collect(),
+                Ok(Ok(ev)) => {
+                    if matches!(ev.kind, notify::EventKind::Create(_)) {
+                        created.extend(ev.paths.iter().cloned());
+                    }
+                    changes.changed_paths(&ev).into_iter().collect()
+                }
                 Ok(Err(_)) => continue,
                 Err(_) => break,
             };
+            // A request can arrive milliseconds after a save: invalidate the
+            // worker environments on the first raw event, before the settle
+            // window and the rebuild, so a fast follow-up document is not
+            // rendered from stale modules. The settled batch is invalidated
+            // again below (a write landing inside the window changes content,
+            // so the repeat send is the safe side); the OS watcher's own
+            // delivery latency is the remaining, unclosable window.
+            if let Some(port) = state.plugin_mw_port {
+                let early: Vec<(String, &'static str)> = paths
+                    .iter()
+                    .filter(|p| watch_relevant(p))
+                    .map(|p| (p.to_string_lossy().into_owned(), change_type(p, &created)))
+                    .collect();
+                if !early.is_empty() {
+                    rt.spawn(async move {
+                        oj_server::notify_plugin_mw_invalidate(port, &early).await;
+                    });
+                }
+            }
             loop {
                 match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                    Ok(Ok(ev)) => paths.extend(changes.changed_paths(&ev)),
+                    Ok(Ok(ev)) => {
+                        if matches!(ev.kind, notify::EventKind::Create(_)) {
+                            created.extend(ev.paths.iter().cloned());
+                        }
+                        paths.extend(changes.changed_paths(&ev));
+                    }
                     Ok(Err(_)) => {}
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => return,
@@ -353,10 +452,7 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             // events (Linux inotify emits a parent-dir event alongside the file
             // write, which would otherwise slip past a filename-only filter and
             // retrigger the generator on every reload).
-            let relevant = paths.iter().any(|p| {
-                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                !name.contains("routeTree.gen") && !p.is_dir()
-            });
+            let relevant = paths.iter().any(|p| watch_relevant(p));
             if !relevant {
                 continue;
             }
@@ -381,9 +477,10 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             let _ = state.ws_tx.send(oj_server::update_progress_frame(
                 batch, "watch", 0, 0, None, false,
             ));
-            let changed_paths: Vec<String> = paths
+            let changed_paths: Vec<(String, &'static str)> = paths
                 .iter()
-                .map(|p| p.to_string_lossy().into_owned())
+                .filter(|p| watch_relevant(p))
+                .map(|p| (p.to_string_lossy().into_owned(), change_type(p, &created)))
                 .collect();
             rt.block_on(async {
                 let (r, c, m) = (root.clone(), cache.clone(), state.mode.clone());
@@ -401,7 +498,16 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
                 if let Some(port) = state.plugin_mw_port {
                     oj_server::notify_plugin_mw_invalidate(port, &changed_paths).await;
                 }
-                let (pinned, _) = tokio::join!(client, reload_runner(&state));
+                let reload = async {
+                    if state.lazy_runner {
+                        state
+                            .runner_dirty
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    } else {
+                        reload_runner(&state).await;
+                    }
+                };
+                let (pinned, _) = tokio::join!(client, reload);
                 if let Ok(Some(pinned)) = pinned {
                     *state.bundle.write().unwrap() = Arc::new(pinned);
                 }
@@ -1050,13 +1156,27 @@ async fn forward_document(
     // x-oj-fallthrough when it does not own the path, and then we SSR.
     if let Some(port) = state.plugin_mw_port {
         if let Some(resp) = oj_server::forward_get_to_plugin_mw(port, &raw, headers).await {
-            return resp;
+            // A worker-served document needs the live-reload client like the
+            // runner-served ones, or edits never reload the page.
+            return inject_reload_client(resp);
         }
     }
+    ensure_runner_fresh(state).await;
     forward(&state.runner, "GET".into(), document_url(&raw), headers, None).await
 }
 
 async fn forward_with_body(state: &Arc<StartState>, req: Request) -> Response {
+    // The middleware may pipe an unclaimed request on to the runner
+    // (x-oj-forward-to), so start refreshing it — without blocking this
+    // request, which the worker middleware typically serves itself.
+    if state.lazy_runner
+        && state
+            .runner_dirty
+            .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        let st = Arc::clone(state);
+        tokio::spawn(async move { ensure_runner_fresh(&st).await });
+    }
     let method = req.method().to_string();
     let url = req
         .uri()
@@ -1274,7 +1394,14 @@ fn inject_reload_client(resp: Response) -> Response {
         .get(header::CONTENT_TYPE)
         .and_then(|c| c.to_str().ok())
         .is_some_and(|c| c.contains("text/html"));
-    if !is_html {
+    // A compressed body (a worker may set content-encoding) cannot take a
+    // plain-text tail without corrupting the stream.
+    let encoded = resp
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .and_then(|c| c.to_str().ok())
+        .is_some_and(|c| !c.eq_ignore_ascii_case("identity"));
+    if !is_html || encoded {
         return resp;
     }
     let (parts, body) = resp.into_parts();
@@ -1406,6 +1533,54 @@ mod tests {
         assert!(!names.contains(&"OJ_RESOLVE_CONDITIONS"));
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&plain);
+    }
+
+    // The static Cloudflare hint gates skipping the boot prewarm: true only
+    // when the config file names @cloudflare/vite-plugin, so every other app
+    // keeps the current boot path.
+    #[test]
+    fn cloudflare_hint_reads_the_config_file() {
+        let root = tmp("cf-hint");
+        assert!(!config_mentions_cloudflare_plugin(&root, &None));
+        std::fs::write(
+            root.join("vite.config.ts"),
+            "import { cloudflare } from \"@cloudflare/vite-plugin\";\nexport default {};\n",
+        )
+        .unwrap();
+        assert!(config_mentions_cloudflare_plugin(&root, &None));
+        std::fs::write(root.join("other.config.ts"), "export default {};\n").unwrap();
+        assert!(!config_mentions_cloudflare_plugin(
+            &root,
+            &Some(root.join("other.config.ts"))
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The live-reload tail goes onto html responses only, and never onto a
+    // compressed body (appending plain text would corrupt the encoding).
+    #[test]
+    fn reload_client_injection_gates_on_html_and_encoding() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let body_of = |resp: Response| {
+            rt.block_on(async {
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                String::from_utf8_lossy(&bytes).into_owned()
+            })
+        };
+        let resp = |ct: &str, enc: Option<&str>| {
+            let mut b = Response::builder().header(header::CONTENT_TYPE, ct);
+            if let Some(e) = enc {
+                b = b.header(header::CONTENT_ENCODING, e);
+            }
+            b.body(axum::body::Body::from("<html></html>")).unwrap()
+        };
+        assert!(body_of(inject_reload_client(resp("text/html", None))).contains(RELOAD_CLIENT));
+        assert!(!body_of(inject_reload_client(resp("text/html", Some("gzip")))).contains(RELOAD_CLIENT));
+        assert!(body_of(inject_reload_client(resp("text/html", Some("identity")))).contains(RELOAD_CLIENT));
+        assert!(!body_of(inject_reload_client(resp("text/javascript", None))).contains(RELOAD_CLIENT));
     }
 
     // Vite's NODE_ENV rule for the dev server: the shell wins (so

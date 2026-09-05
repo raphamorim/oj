@@ -14,6 +14,17 @@ use tokio::sync::oneshot;
 pub const PLUGIN_HOST_JS: &str = include_str!("assets/plugin-host.mjs");
 pub const VITE_EXTRACT_JS: &str = include_str!("assets/vite-extract.mjs");
 
+/// The host's `getServeInfo` report: how requests are served.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ServeInfo {
+    /// Loopback port of the configureServer middleware stack, when any plugin
+    /// registered a middleware.
+    pub middleware_port: Option<u16>,
+    /// Real runner-backed Vite DevEnvironments were built (the Environment-API
+    /// path): documents are served by the plugin middleware.
+    pub runner_environments: bool,
+}
+
 #[derive(Debug)]
 pub struct EmittedFile {
     pub file_name: String,
@@ -295,8 +306,22 @@ fn extract_vite_values_with(
     }
     let cache = oj_cache::cache_root(root);
     let _ = std::fs::create_dir_all(&cache);
+    // Several extractions run concurrently at boot (route tree, server-fn
+    // resolver, config values), so everything here is per call or atomic: the
+    // script lands via rename (a plain write truncates it under a concurrent
+    // reader's import), and the result file is unique per call (a shared name
+    // is read-and-deleted by whichever caller gets there first).
+    static EXTRACT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = EXTRACT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let script = cache.join("oj-vite-extract.mjs");
-    std::fs::write(&script, VITE_EXTRACT_JS).ok()?;
+    if std::fs::read(&script).ok().as_deref() != Some(VITE_EXTRACT_JS.as_bytes()) {
+        let tmp = cache.join(format!("oj-vite-extract-{}-{seq}.tmp.mjs", std::process::id()));
+        std::fs::write(&tmp, VITE_EXTRACT_JS).ok()?;
+        std::fs::rename(&tmp, &script).ok()?;
+    }
+    // The JSON comes back through a file, not stdout: evaluating the config
+    // runs plugin code (route generators, banners) that may print to stdout.
+    let result_path = cache.join(format!("oj-vite-extract-{}-{seq}.tmp.json", std::process::id()));
     let out = std::process::Command::new("node")
         .arg(&script)
         .arg(&vite)
@@ -304,6 +329,7 @@ fn extract_vite_values_with(
         .arg(command)
         .arg(mode)
         .arg(if mode_explicit { "explicit" } else { "default" })
+        .arg(&result_path)
         .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
         .env("NODE_COMPILE_CACHE", crate::node_compile_cache(root))
         .current_dir(root)
@@ -311,9 +337,11 @@ fn extract_vite_values_with(
         .ok()?;
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     print_extraction_stderr(&stderr);
-    let parsed = serde_json::from_slice::<serde_json::Value>(&out.stdout);
+    let raw = std::fs::read(&result_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&result_path);
+    let parsed = serde_json::from_slice::<serde_json::Value>(&raw);
     let parse_err = parsed.as_ref().err().map(|e| e.to_string());
-    if let Some(why) = extraction_failure(out.status, &out.stdout, parse_err.as_deref()) {
+    if let Some(why) = extraction_failure(out.status, &raw, parse_err.as_deref()) {
         eprintln!("oj: extracting {} {why}", vite.display());
     }
     let json: serde_json::Value = parsed.ok()?;
@@ -342,7 +370,7 @@ fn extract_vite_values_with(
         command,
         mode_key,
         &deps,
-        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&raw),
         &stderr,
     );
     crate::boot_phase("vite-extract cache miss (subprocess ran)");
@@ -1251,13 +1279,31 @@ impl PluginHost {
         .map(|_| ())
     }
 
-    #[inline]
-    pub async fn middleware_port(&self) -> Option<u16> {
-        self.call("getMiddlewarePort", &[])
+    /// How the host serves requests: the loopback port of its configureServer
+    /// middleware stack (when any plugin registered one), and whether it built
+    /// real runner-backed Vite DevEnvironments (documents are then served by
+    /// the plugin middleware, not the Node SSR runner). Defaults on RPC
+    /// failure, so an uncertain host keeps the runner eagerly warm.
+    pub async fn serve_info(&self) -> ServeInfo {
+        let Some(v) = self
+            .call("getServeInfo", &[])
             .await
             .ok()
             .flatten()
-            .and_then(|s| s.parse().ok())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        else {
+            return ServeInfo::default();
+        };
+        ServeInfo {
+            middleware_port: v
+                .get("middlewarePort")
+                .and_then(|p| p.as_u64())
+                .and_then(|p| u16::try_from(p).ok()),
+            runner_environments: v
+                .get("runnerEnvironments")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false),
+        }
     }
 
     /// Number of plugins still active after oj filters out the ones it

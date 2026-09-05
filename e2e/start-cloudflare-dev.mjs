@@ -1,0 +1,217 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Raphael Amorim
+
+// A TanStack Start app on Cloudflare under `oj dev`: with @cloudflare/vite-plugin
+// in the config the plugin's worker (Miniflare/workerd) renders the documents.
+// This drives the edit loop end to end: boot, render a route in the worker,
+// verify the live-reload client is injected into the worker-served document,
+// edit a route file and require the next document to be fresh (the targeted
+// HMR invalidation of the worker environments). Deps come from the same
+// install recipe as start-cloudflare.mjs (or OJ_E2E_CF_DEPS).
+
+import { spawn, execSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const repo = path.join(here, "..");
+const fixture = path.join(here, "fixtures", "start-app");
+const oj = path.join(repo, "target", "debug", "oj");
+const PORT = 6835;
+
+const installed =
+  fs.existsSync(path.join(fixture, "node_modules", "@tanstack", "react-start")) &&
+  fs.existsSync(path.join(fixture, "node_modules", "rolldown"));
+if (!installed) {
+  console.log("SKIP start cloudflare dev: fixture deps not installed");
+  console.log("  enable with: (cd e2e/fixtures/start-app && npm install)");
+  process.exit(0);
+}
+
+execSync("cargo build -p oj", { cwd: repo, stdio: "inherit" });
+
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "oj-start-cf-dev-"));
+const app = path.join(tmp, "app");
+const keep = !!process.env.OJ_E2E_KEEP;
+// Retried: the SIGKILLed server's node children flush caches for a beat and
+// race the removal (ENOTEMPTY), like start.mjs handles.
+const cleanup = () => {
+  if (keep) return;
+  for (let i = 0; ; i++) {
+    try {
+      return fs.rmSync(tmp, { recursive: true, force: true });
+    } catch (e) {
+      if (i >= 20) throw e;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    }
+  }
+};
+
+function installCloudflareDeps() {
+  const prepared = process.env.OJ_E2E_CF_DEPS;
+  if (prepared) {
+    fs.symlinkSync(path.join(path.resolve(prepared), "node_modules"), path.join(tmp, "node_modules"), "dir");
+    return;
+  }
+  fs.writeFileSync(path.join(tmp, "package.json"), JSON.stringify({ name: "oj-cf-deps", private: true, type: "module" }));
+  execSync("npm install --no-audit --no-fund --no-package-lock @cloudflare/vite-plugin wrangler", { cwd: tmp, stdio: "inherit" });
+}
+
+function makeApp() {
+  fs.mkdirSync(app);
+  for (const f of ["src", "public", "styles", "packages", "tsconfig.json", "package.json"]) {
+    fs.cpSync(path.join(fixture, f), path.join(app, f), { recursive: true });
+  }
+  fs.symlinkSync(path.join(fixture, "node_modules"), path.join(app, "node_modules"), "dir");
+  fs.writeFileSync(path.join(app, "wrangler.jsonc"), [
+    "{",
+    '  "name": "oj-start-fixture",',
+    '  "main": "@tanstack/react-start/server-entry",',
+    '  "compatibility_date": "2025-09-01",',
+    '  "compatibility_flags": ["nodejs_compat"],',
+    '  "vars": { "EDITION": "fixture-edition" }',
+    "}",
+    "",
+  ].join("\n"));
+  const original = fs.readFileSync(path.join(fixture, "vite.config.ts"), "utf8");
+  const withImport = original.replace(
+    'import { defineConfig } from "vite";',
+    'import { defineConfig } from "vite";\nimport { cloudflare } from "@cloudflare/vite-plugin";',
+  );
+  const config = withImport.replace(/^(\s*)tanstackStart\(/m, '$1cloudflare({ viteEnvironment: { name: "ssr" } }),\n$1tanstackStart(');
+  if (config === original || config === withImport) throw new Error("fixture vite.config.ts changed shape; update this script");
+  fs.writeFileSync(path.join(app, "vite.config.ts"), config);
+  // The dev worker path runs the app through the app's OWN Vite pipeline into
+  // workerd, where the full fixture index route does not run even under
+  // `vite dev` + the plugin (its CommonJS dep fails in the ESM module runner,
+  // and the tsconfig-paths alias has no plugin support). Slim the index route
+  // to what this test drives: a worker render with a server function reading a
+  // wrangler var. The full-fat route stays covered by start.mjs (Node runner)
+  // and start-cloudflare.mjs (prod worker build).
+  fs.writeFileSync(path.join(app, "src", "routes", "index.tsx"), [
+    'import { createRoute, useLoaderData } from "@tanstack/react-router";',
+    'import { rootRoute } from "./__root";',
+    'import { getGreeting } from "../server/data";',
+    'import { shout } from "#lib/format";',
+    "",
+    "export const indexRoute = createRoute({",
+    "  getParentRoute: () => rootRoute,",
+    '  path: "/",',
+    "  loader: async () => await getGreeting(),",
+    "  component: Index,",
+    "});",
+    "",
+    "function Index() {",
+    "  const data = useLoaderData({ from: indexRoute.id });",
+    "  return (",
+    "    <main>",
+    '      <h1 className="fixture-heading">{shout("home")}</h1>',
+    '      <p data-testid="server-fn">{data.message} / edition={data.edition}</p>',
+    "    </main>",
+    "  );",
+    "}",
+    "",
+  ].join("\n"));
+  // The fixture reads the wrangler var through `@cloudflare/vite-plugin/server`,
+  // an alias oj itself provides; in the plugin's own worker pipeline the real
+  // API is the `cloudflare:workers` env import.
+  fs.writeFileSync(path.join(app, "src", "server", "data.ts"), [
+    'import { createServerFn } from "@tanstack/react-start";',
+    'import { env } from "cloudflare:workers";',
+    "",
+    'export const getGreeting = createServerFn({ method: "GET" }).handler(async () => {',
+    "  const edition = (env as unknown as Record<string, unknown>).EDITION ?? \"unknown\";",
+    '  return { message: "server-fn-marker", edition: String(edition) };',
+    "});",
+    "",
+  ].join("\n"));
+}
+
+const get = async (route) => {
+  const res = await fetch(`http://127.0.0.1:${PORT}${route}`);
+  return { status: res.status, body: await res.text() };
+};
+
+async function runDev() {
+  let log = "";
+  const srv = spawn(oj, ["dev", app, "--port", String(PORT)], {
+    cwd: app,
+    detached: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, WRANGLER_SEND_METRICS: "false", CI: "1", NO_COLOR: "1", FORCE_COLOR: "0" },
+  });
+  srv.stdout.on("data", (d) => (log += d));
+  srv.stderr.on("data", (d) => (log += d));
+  const stop = () => {
+    try { process.kill(-srv.pid, "SIGTERM"); } catch {}
+    setTimeout(() => { try { process.kill(-srv.pid, "SIGKILL"); } catch {} }, 2000).unref();
+  };
+  try {
+    let up = false;
+    for (let i = 0; i < 240 && !up; i++) {
+      if (srv.exitCode != null) break;
+      try { up = (await fetch(`http://127.0.0.1:${PORT}/`)).status === 200; } catch {}
+      if (!up) await new Promise((r) => setTimeout(r, 500));
+    }
+    if (!up) throw new Error(`oj dev did not serve on :${PORT}; log:\n${log.slice(-4000)}`);
+
+    // The document must have rendered in the worker (the wrangler var proves
+    // it) and must carry the live-reload client even though the plugin
+    // middleware served it.
+    const home = await get("/");
+    if (home.status !== 200) throw new Error(`/ returned ${home.status}`);
+    for (const [what, marker] of [
+      ["home render", "HOME!"],
+      ["worker render (wrangler var)", "fixture-edition"],
+      ["server function", "server-fn-marker"],
+    ]) {
+      if (!home.body.includes(marker)) throw new Error(`/: missing ${what} ("${marker}")\n${home.body.slice(0, 1500)}`);
+    }
+    if (!home.body.includes("/@oj-start/live-reload.js")) {
+      throw new Error("worker-served document lacks the live-reload client");
+    }
+
+    const about = await get("/about");
+    if (about.status !== 200 || !about.body.includes("about-page-marker")) {
+      throw new Error(`/about did not render (${about.status})`);
+    }
+
+    // The edit loop: change the route, require the next document to be fresh.
+    const target = path.join(app, "src", "routes", "about.tsx");
+    fs.writeFileSync(
+      target,
+      fs.readFileSync(target, "utf8").replace("about-page-marker", "about-page-edited-marker"),
+    );
+    const t0 = Date.now();
+    let fresh = null;
+    for (let i = 0; i < 200; i++) {
+      const res = await get("/about");
+      if (res.status === 200 && res.body.includes("about-page-edited-marker")) {
+        fresh = Date.now() - t0;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (fresh == null) {
+      throw new Error(`/about still stale 20s after the edit; log tail:\n${log.slice(-4000)}`);
+    }
+
+    console.log(`start-cloudflare-dev: worker render + live-reload client + fresh document ${fresh}ms after the edit`);
+  } finally {
+    stop();
+  }
+}
+
+try {
+  installCloudflareDeps();
+  makeApp();
+  await runDev();
+  cleanup();
+} catch (e) {
+  console.error(e?.stack || e);
+  if (keep) console.error(`kept ${tmp}`);
+  else cleanup();
+  process.exit(1);
+}
