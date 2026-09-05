@@ -1053,11 +1053,20 @@ pub struct PluginHost {
     spawned: tokio::time::Instant,
     /// Per-spawn init-wait policy: how long a call may wait for the host's
     /// top-level init. The boot/serve host takes the long init deadline (boot
-    /// correctness depends on its snapshot RPCs); a lazily spawned host (the
-    /// SSR environment host, spawned on the first SSR request) takes the short
-    /// per-call bound, so a wedged init degrades like a slow hook instead of
-    /// freezing the watcher thread and browser-facing SSR transforms.
+    /// correctness depends on its snapshot RPCs), shared across calls and
+    /// measured from spawn; a lazily spawned host (the SSR environment host,
+    /// spawned on the first SSR request) takes the short per-call bound,
+    /// measured from EACH call's own start (see `lazy`), so a wedged init
+    /// degrades like a slow hook instead of freezing the watcher thread and
+    /// browser-facing SSR transforms.
     init_wait: std::time::Duration,
+    /// Whether this host was lazily spawned: its init wait is then anchored to
+    /// each call's own start rather than to the spawn instant — a
+    /// spawn-anchored short bound gave calls arriving after `spawn +
+    /// init_wait` during a still-pending init a zero-length window (instant
+    /// failure), where pre-init-gate semantics gave every call its own
+    /// per-call timeout.
+    lazy: bool,
     /// The env knob named when the init wait elapses (matches `init_wait`).
     init_knob: &'static str,
     /// Last "still initializing" progress line, so concurrent init-gated calls
@@ -1172,6 +1181,23 @@ impl std::fmt::Debug for PluginHost {
     }
 }
 
+/// The init deadline one `call` waits out while the host is uninitialized: a
+/// boot host shares the spawn-anchored deadline (`spawned + init_wait`), a
+/// lazy host anchors `init_wait` to the CALL's own start so a call arriving
+/// long after spawn still gets a full window (init landing releases it early).
+fn call_init_deadline(
+    lazy: bool,
+    spawned: tokio::time::Instant,
+    init_wait: std::time::Duration,
+    now: tokio::time::Instant,
+) -> tokio::time::Instant {
+    if lazy {
+        now + init_wait
+    } else {
+        spawned + init_wait
+    }
+}
+
 /// The init-wait policy per spawn kind (see `PluginHost::init_wait`): a boot
 /// host gets the long init deadline, a lazily spawned host the short per-call
 /// bound — each named after the env knob that adjusts it.
@@ -1255,6 +1281,7 @@ impl PluginHost {
             host_gone: tokio::sync::watch::channel(false).0,
             spawned: tokio::time::Instant::now(),
             init_wait,
+            lazy,
             init_knob,
             init_progress: Mutex::new(std::time::Instant::now()),
         });
@@ -1397,7 +1424,18 @@ impl PluginHost {
         // the first reply, all preceding any wait here.
         let mut init_rx = self.initialized.subscribe();
         if !*init_rx.borrow_and_update() {
-            let deadline = self.init_deadline_at();
+            // A boot host's deadline is shared and spawn-anchored (boot RPCs
+            // ride one deadline instead of stacking). A lazy host's is
+            // per-call: each call gets its own full `init_wait` window from
+            // its own start — spawn-anchoring the short bound made every call
+            // arriving after `spawn + init_wait` (with init still pending)
+            // fail instantly instead of degrading like a slow hook.
+            let deadline = call_init_deadline(
+                self.lazy,
+                self.spawned,
+                self.init_wait,
+                tokio::time::Instant::now(),
+            );
             let mut progress = tokio::time::interval_at(
                 tokio::time::Instant::now() + std::time::Duration::from_secs(30),
                 std::time::Duration::from_secs(30),
@@ -2107,6 +2145,23 @@ mod vite_values_tests {
         let (lazy_wait, lazy_knob) = init_wait_policy(true);
         assert_eq!(lazy_wait, plugin_rpc_timeout());
         assert_eq!(lazy_knob, "OJ_PLUGIN_TIMEOUT");
+    }
+
+    // A lazy host's init gate is per-call: a call arriving AFTER spawn +
+    // init_wait (init still pending) gets its own full window from its own
+    // start, never the spawn-anchored deadline's zero-length remainder. A boot
+    // host keeps the shared spawn-anchored deadline.
+    #[test]
+    fn lazy_call_past_the_spawn_deadline_gets_its_own_init_window() {
+        let wait = std::time::Duration::from_secs(20);
+        let spawned = tokio::time::Instant::now();
+        // A call 40 s after spawn, with the 20 s window long since elapsed.
+        let now = spawned + std::time::Duration::from_secs(40);
+        let lazy = call_init_deadline(true, spawned, wait, now);
+        assert_eq!(lazy, now + wait, "the lazy window anchors to the call's own start");
+        let boot = call_init_deadline(false, spawned, wait, now);
+        assert_eq!(boot, spawned + wait, "the boot deadline stays shared and spawn-anchored");
+        assert!(boot <= now, "sanity: the boot deadline has elapsed for this call");
     }
 
     // An oj.config.json that sets one ssr key (noExternal) must not drop the
