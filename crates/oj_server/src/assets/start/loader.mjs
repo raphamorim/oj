@@ -686,7 +686,9 @@ function withUserConditions(context) {
 const EXTERNAL_CONDITIONS = (() => {
   try {
     const list = conditionList(JSON.parse(process.env.OJ_EXTERNAL_CONDITIONS || "null"));
-    if (list) return list;
+    // An empty list falls back to the default: the Rust side never sets an
+    // empty one (it skips the var instead), so the two halves agree here.
+    if (list && list.length) return list;
   } catch {}
   return ["module-sync"];
 })();
