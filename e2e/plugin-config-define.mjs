@@ -69,6 +69,38 @@ try {
   const js = fs.readdirSync(path.join(app, "dist", "assets")).filter((f) => f.endsWith(".js"))
     .map((f) => fs.readFileSync(path.join(app, "dist", "assets", f), "utf8")).join("\n");
   check(js, "build");
+
+  // Slow boot: the host's top-level init (a 5s configureServer, standing in for
+  // plugin fleets / Miniflare) outlives a shrunk per-RPC timeout. RPC sends are
+  // init-gated, so boot blocks briefly-but-correctly instead of the boot RPCs
+  // (config defines included) burning their own timeouts and permanently
+  // snapshotting wrong defaults — the config() define must still reach a served
+  // module, byte-identical to the fast boot.
+  fs.rmSync(path.join(app, ".oj-cache"), { recursive: true, force: true });
+  fs.writeFileSync(
+    path.join(app, "oj.plugins.mjs"),
+    `export default [{
+      name: "definer",
+      config() {
+        return { define: { __FROM_PLUGIN__: JSON.stringify("plugin-define"), __SHARED__: JSON.stringify("plugin-shared"), __PLUGIN_NUM__: 41 } };
+      },
+      async configureServer() { await new Promise((r) => setTimeout(r, 5000)); },
+    }];\n`,
+  );
+  const SLOW_PORT = PORT + 1;
+  const slow = spawn(oj, ["dev", app, "--port", String(SLOW_PORT)], {
+    stdio: "ignore",
+    env: { ...process.env, OJ_PLUGIN_TIMEOUT: "2" },
+  });
+  try {
+    let up = false;
+    for (let i = 0; i < 150; i++) { try { if ((await fetch(`http://localhost:${SLOW_PORT}/`)).ok) { up = true; break; } } catch {} await sleep(200); }
+    assert.ok(up, "slow-boot dev server never came up (boot RPCs raced init instead of waiting)");
+    check(await (await fetch(`http://localhost:${SLOW_PORT}/src/main.js`)).text(), "slow-boot dev");
+  } finally {
+    slow.kill("SIGKILL");
+    await sleep(300);
+  }
   console.log("PLUGIN-CONFIG-DEFINE E2E PASSED");
 } catch (err) {
   failed = true;

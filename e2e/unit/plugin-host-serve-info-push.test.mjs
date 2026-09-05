@@ -54,6 +54,62 @@ test("a delayed configureServer still yields the ojServeInfo push, ahead of any 
   }
 });
 
+// With OJ_CONTROL_TOKEN in the spawn env (the Rust spawn always sets one) the
+// host frames EVERY protocol line — pushes and RPC replies — with the token, so
+// a plugin's print sharing stdout can never be parsed as protocol: a forged,
+// unframed ojServeInfo line is ignored, and the framed real push wins. The push
+// is also re-sent until the driver ACKs (a spliced copy must not be lost
+// forever) and stops on { ojServeInfoAck }.
+test("control-token framing: forged unframed pushes are ignored, re-push stops on ack", async () => {
+  const fx = tmpProject({ prefix: "oj-serveinfo-token-" });
+  fx.write(
+    "oj.plugins.mjs",
+    `export default [{
+       name: "forger",
+       async configureServer(server) {
+         // A plugin (or attacker-controlled content it echoes) printing the
+         // exact JSON shape, unframed: must never be accepted as protocol.
+         process.stdout.write(JSON.stringify({ ojServeInfo: { middlewarePort: 9999, runnerEnvironments: true } }) + "\\n");
+         // An unterminated partial line: the framed push must survive it.
+         process.stdout.write("partial log without newline ");
+         server.middlewares.use((req, res, next) => next());
+       },
+     }];\n`,
+  );
+  const token = "oj-test-token-1:";
+  const host = rpcSidecar("plugin-host.mjs", {
+    args: [path.join(fx.root, "oj.plugins.mjs"), JSON.stringify({ root: fx.root })],
+    env: { OJ_CACHE_ROOT: fx.root },
+    cwd: fx.root,
+    controlToken: token,
+  });
+  try {
+    const pushed = await host.serveInfo();
+    assert.equal(typeof pushed.middlewarePort, "number");
+    assert.notEqual(pushed.middlewarePort, 9999, "the forged unframed push must be ignored");
+    assert.equal(pushed.runnerEnvironments, false);
+
+    // Framed RPC replies still round-trip (past the dangling partial line).
+    const reply = await host.send({ id: 3, hook: "getServeInfo" }, 20_000);
+    assert.equal(reply.id, 3);
+    assert.equal(JSON.parse(reply.result).middlewarePort, pushed.middlewarePort);
+
+    // Un-acked, the push re-sends about once a second...
+    await new Promise((r) => setTimeout(r, 2600));
+    const beforeAck = host.serveInfoPushCount();
+    assert.ok(beforeAck >= 2, `expected re-pushes without an ack, saw ${beforeAck}`);
+    // ...and the ack stops it.
+    host.ackServeInfo();
+    await new Promise((r) => setTimeout(r, 400));
+    const settled = host.serveInfoPushCount();
+    await new Promise((r) => setTimeout(r, 2400));
+    assert.equal(host.serveInfoPushCount(), settled, "pushes must stop after the ack");
+  } finally {
+    host.close();
+    fx.cleanup();
+  }
+});
+
 test("with no middleware registered the push still arrives, with a null port", async () => {
   const fx = tmpProject({ prefix: "oj-serveinfo-none-" });
   fx.write(

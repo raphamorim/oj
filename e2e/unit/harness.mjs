@@ -82,13 +82,20 @@ export function runSidecar(sidecarRel, config, { cwd, timeout = 30_000 } = {}) {
 // writes one frame and resolves with the next stdout frame (parsed); a frame
 // that isn't the reply you expect is returned as-is, so callers that trigger
 // host->driver requests can dispatch on it. Always `close()` in a finally.
-export function rpcSidecar(sidecarRel, { args = [], env, cwd } = {}) {
+export function rpcSidecar(sidecarRel, { args = [], env, cwd, controlToken } = {}) {
   // An absolute path runs a copy of the sidecar from elsewhere (a test that
   // reproduces the cache-dir shape); a relative name runs the asset in place.
   const script = path.isAbsolute(sidecarRel) ? sidecarRel : asset(sidecarRel);
   const child = spawn("node", [script, ...args], {
     cwd,
-    env: env ? { ...process.env, ...env } : process.env,
+    env: {
+      ...process.env,
+      // The plugin host frames every protocol line with this token when set
+      // (the Rust spawn always sets one); the reader below then mimics the
+      // Rust side: unframed lines are plugin prints, never protocol.
+      ...(controlToken ? { OJ_CONTROL_TOKEN: controlToken } : {}),
+      ...(env ?? {}),
+    },
     stdio: ["pipe", "pipe", "pipe"],
   });
   const frames = [];
@@ -96,16 +103,24 @@ export function rpcSidecar(sidecarRel, { args = [], env, cwd } = {}) {
   // The plugin host pushes `{ ojServeInfo }` once its top-level init completes
   // (the Rust reader consumes it out-of-band the same way); it is not a reply
   // to anything, so it never enters the frame queue. Tests that care read it
-  // via `serveInfo()` / `serveInfoPushed()`.
+  // via `serveInfo()` / `serveInfoPushed()`. Re-pushed until acked, so a
+  // count is kept too (`serveInfoPushCount()`); `ackServeInfo()` sends the
+  // { ojServeInfoAck } the Rust side sends, stopping the re-push.
   let serveInfoPushed;
+  let serveInfoPushCount = 0;
   let serveInfoResolve;
   const serveInfoArrived = new Promise((r) => (serveInfoResolve = r));
   readline.createInterface({ input: child.stdout }).on("line", (line) => {
     if (!line.trim()) return;
+    if (controlToken) {
+      if (!line.startsWith(controlToken)) return;
+      line = line.slice(controlToken.length);
+    }
     try {
       const parsed = JSON.parse(line);
       if (parsed && typeof parsed === "object" && "ojServeInfo" in parsed) {
         serveInfoPushed = parsed.ojServeInfo;
+        serveInfoPushCount += 1;
         serveInfoResolve(parsed.ojServeInfo);
         return;
       }
@@ -143,6 +158,10 @@ export function rpcSidecar(sidecarRel, { args = [], env, cwd } = {}) {
     // has arrived so far (`serveInfoPushed()`, undefined until the push lands).
     serveInfo: () => serveInfoArrived,
     serveInfoPushed: () => serveInfoPushed,
+    serveInfoPushCount: () => serveInfoPushCount,
+    ackServeInfo() {
+      child.stdin.write('{"ojServeInfoAck":true}\n');
+    },
     async nextFrame(ms = 10_000) {
       return JSON.parse(await nextLine(ms));
     },

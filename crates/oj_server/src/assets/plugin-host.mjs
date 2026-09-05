@@ -58,6 +58,22 @@ const ojStartMode = initial.ojStartMode === true;
 const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
 const OJ = _ojTTY ? "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m" : "oj";
 
+// The one writer for every oj protocol line (RPC replies, ctx-RPC requests,
+// and the ojServeInfo/ojServer/ojWs pushes). Plugin code shares this stdout,
+// so the frame defends the control plane on both sides: the leading newline
+// terminates any unterminated partial line a plugin left on the stream (a
+// spliced frame would otherwise be silently dropped), and the per-session
+// token (OJ_CONTROL_TOKEN, minted by the Rust spawn) marks the line as oj's —
+// the Rust reader ignores unframed lines, so a plugin's print, or
+// attacker-controlled content a plugin echoes, can never forge a reply or a
+// push. Forging with the token requires reading this process's env: the same
+// trust domain as running plugin code at all. Without the env (tests driving
+// the host directly) the frame degrades to the bare line protocol.
+const CONTROL_TOKEN = process.env.OJ_CONTROL_TOKEN || "";
+function ctl(obj) {
+  process.stdout.write("\n" + CONTROL_TOKEN + JSON.stringify(obj) + "\n");
+}
+
 let ssrBridgeDir = null;
 let ssrContainer = null;
 let ssrEnvDelta = {};
@@ -567,7 +583,7 @@ function ctxRpc(method, args) {
   const rpc = rpcCounter++;
   return new Promise((resolve, reject) => {
     rpcPending.set(rpc, { resolve, reject });
-    process.stdout.write(JSON.stringify({ rpc, method, args }) + "\n");
+    ctl({ rpc, method, args });
   });
 }
 
@@ -970,7 +986,7 @@ process.stderr.write(
 // Events for the Rust server (not the browser): a plugin invalidating a module
 // through server.moduleGraph, or asking for server.restart().
 function ojServerEvent(action, data) {
-  process.stdout.write(JSON.stringify({ ojServer: { action, ...(data ?? {}) } }) + "\n");
+  ctl({ ojServer: { action, ...(data ?? {}) } });
 }
 
 // A ModuleGraph stand-in for plugins that reach into `server.moduleGraph` (or an
@@ -1053,7 +1069,7 @@ const moduleGraph = createModuleGraph();
 
 const wsListeners = new Map();
 function ojWsSend(event, data) {
-  process.stdout.write(JSON.stringify({ ojWs: { event, data: data ?? null } }) + "\n");
+  ctl({ ojWs: { event, data: data ?? null } });
 }
 const wsApi = {
   on(event, cb) {
@@ -1777,16 +1793,31 @@ async function setupConfigureServer() {
   middlewarePort = srv.address().port;
   process.stderr.write(`${OJ} plugin host: configureServer middleware on :${middlewarePort}\n`);
 }
+// Re-pushed until Rust ACKs ({ ojServeInfoAck } on stdin): the serve info is a
+// one-shot, state-bearing push, and a copy spliced by a plugin's partial stdout
+// write must not be lost forever. Bounded so a driver that never ACKs (tests
+// poking the host directly) is not spammed indefinitely.
+let serveInfoRepush = null;
+function stopServeInfoRepush() {
+  if (serveInfoRepush) clearInterval(serveInfoRepush);
+  serveInfoRepush = null;
+}
 if (env.command !== "build") {
   await setupConfigureServer();
   // Push the serve info the moment it exists (like the {ojWs} pushes): the RPC
   // listener below only registers after every top-level await, so on a slow
-  // boot (many plugins, Miniflare) Rust's getServeInfo RPC times out and the
-  // worker path would silently never activate. The push reaches Rust whenever
-  // the host comes up, however late, and Rust flips to the middleware then.
-  process.stdout.write(JSON.stringify({
-    ojServeInfo: { middlewarePort, runnerEnvironments: runnerEnvironmentsBuilt },
-  }) + "\n");
+  // boot (many plugins, Miniflare) Rust's boot-time RPCs cannot be answered and
+  // the worker path would silently never activate. The push reaches Rust
+  // whenever the host comes up, however late, and Rust flips to the middleware
+  // then (it also flips Rust's "initialized" gate for RPC timeouts).
+  const pushServeInfo = () =>
+    ctl({ ojServeInfo: { middlewarePort, runnerEnvironments: runnerEnvironmentsBuilt } });
+  pushServeInfo();
+  let repushes = 0;
+  serveInfoRepush = setInterval(() => {
+    if (++repushes > 120) return stopServeInfoRepush();
+    pushServeInfo();
+  }, 1000);
 }
 
 if (ssrBridgeDir) {
@@ -2478,6 +2509,10 @@ rl.on("line", async (line) => {
   } catch {
     return;
   }
+  if (msg.ojServeInfoAck) {
+    stopServeInfoRepush();
+    return;
+  }
   if (msg.rpcReply != null) {
     const p = rpcPending.get(msg.rpcReply);
     if (p) {
@@ -2490,8 +2525,8 @@ rl.on("line", async (line) => {
   const { id, hook, args } = msg;
   try {
     const result = await run(hook, args ?? []);
-    process.stdout.write(JSON.stringify({ id, result: result ?? null }) + "\n");
+    ctl({ id, result: result ?? null });
   } catch (e) {
-    process.stdout.write(JSON.stringify({ id, error: String((e && e.stack) || e) }) + "\n");
+    ctl({ id, error: String((e && e.stack) || e) });
   }
 });
