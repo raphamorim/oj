@@ -4,7 +4,7 @@
 import { createRequire, isBuiltin } from "node:module";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { dirname, isAbsolute, resolve } from "node:path";
-import { writeFileSync, readFileSync, realpathSync, existsSync, unlinkSync } from "node:fs";
+import { writeFileSync, readFileSync, realpathSync, existsSync, unlinkSync, writeSync } from "node:fs";
 
 const configPath = process.argv[2];
 const appRoot = process.argv[3];
@@ -166,40 +166,128 @@ function injectFileScopeVariablesPlugin() {
   };
 }
 
+// A plugin appended LAST to the config handed to resolveConfig (enforce
+// "post", both hooks `order: "post"`): Vite's own hook pipeline runs it at the
+// very end of the config phase (getSortedPluginsByHook makes hook.order
+// primary), so it observes the fully hook-merged config BEFORE Vite
+// default-fills every environment's dev.createEnvironment
+// (resolveDevEnvironmentOptions runs only after runConfigEnvironmentHook).
+// That makes runner-backed detection resolveConfig's OWN single hook run —
+// no re-run on the same plugin instances, no skip lists needed here — and it
+// sees config-hook declarations (via the merged config.environments) and
+// configEnvironment declarations (per environment, post-merge) alike.
+function detectionSentinel() {
+  let declared = false;
+  const sniff = (cfg) => {
+    if (declaresRunnerEnvironment(cfg)) declared = true;
+  };
+  return {
+    plugin: {
+      name: "oj:runner-environment-detection",
+      enforce: "post",
+      config: { order: "post", handler: sniff },
+      configEnvironment: {
+        order: "post",
+        handler(name, envConfig) {
+          if (envConfig && envConfig.dev && typeof envConfig.dev.createEnvironment === "function") {
+            declared = true;
+          }
+        },
+      },
+    },
+    declared: () => declared,
+  };
+}
+
 async function loadConfig() {
   let viteErr = null;
   const vitePath = resolvePkg("vite");
   if (vitePath) {
     try {
       const vite = await import(pathToFileURL(vitePath).href);
+      // Vite evaluates the config file ONCE: resolveConfig itself calls
+      // loadConfigFromFile and merges the inline config over the file's
+      // (node.js resolveConfig: `config = mergeConfig(loadResult.config,
+      // config)`). Mirror that single-eval flow — the file loaded first, its
+      // config fed back through `configFile: false` — so the raw config and
+      // the resolved one come from one evaluation. The old shape (resolveConfig
+      // from the file, then loadConfigFromFile again for the raw copy) ran
+      // module-level side effects twice, and the second load could fail alone,
+      // leaving raw null and runner-backed detection silently false while the
+      // resolved workerd sugar was still emitted.
+      let loaded = null;
+      let loadErr = null;
+      if (typeof vite.loadConfigFromFile === "function") {
+        try {
+          // The configEnv Vite computes before the file loads: mode from the
+          // inline config only, isSsrBuild from the inline config only (see
+          // the emit below for the isSsrBuild rule).
+          const configEnv = { command, mode, isSsrBuild: false };
+          loaded = (await vite.loadConfigFromFile(configEnv, configPath, appRoot)) ?? null;
+        } catch (e) {
+          loadErr = e;
+        }
+      }
       // resolveConfig runs the plugins' config hooks, so plugin-injected values
       // (e.g. TanStack Start's resolve.alias for `#tanstack-router-entry`) are
       // present. loadConfigFromFile only reads the raw user config and misses them.
       if (typeof vite.resolveConfig === "function") {
+        const singleEval = !!(loaded && loaded.config && typeof vite.mergeConfig === "function");
         try {
-          const inline = { root: appRoot, configFile: configPath };
-          if (modeExplicit) inline.mode = mode;
-          const resolved = await vite.resolveConfig(inline, command, mode, mode);
+          let resolved;
+          let detect = null;
+          if (singleEval) {
+            detect = detectionSentinel();
+            const inline = modeExplicit ? { root: appRoot, mode } : { root: appRoot };
+            const merged = vite.mergeConfig(loaded.config, inline);
+            merged.configFile = false;
+            merged.plugins = [
+              ...(Array.isArray(merged.plugins) ? merged.plugins : []),
+              detect.plugin,
+            ];
+            resolved = await vite.resolveConfig(merged, command, mode, mode);
+          } else {
+            const inline = { root: appRoot, configFile: configPath };
+            if (modeExplicit) inline.mode = mode;
+            resolved = await vite.resolveConfig(inline, command, mode, mode);
+          }
           if (resolved) {
-            // The user's own file, for the "not applied" warnings: the resolved
+            // The raw user file, for the "not applied" warnings: the resolved
             // config carries Vite's defaults for every option (esbuild.jsxDev,
             // worker, ssr.resolve, cors.origin, terserOptions...), which are not
             // configuration oj is failing to honor.
-            let raw = null;
-            try {
-              raw = (await vite.loadConfigFromFile({ command, mode }, configPath, appRoot))?.config ?? null;
-            } catch {}
-            return { config: resolved, raw, deps: absDeps(resolved.configFileDependencies) };
+            const raw = loaded?.config ?? null;
+            if (raw == null) {
+              // Loud, never silent: with no raw config, runner-backed detection
+              // cannot run and the emit below withholds the resolved ssr sugar.
+              warn(
+                `could not load the raw config from ${configPath}` +
+                  `${loadErr ? ` (${(loadErr && loadErr.message) || loadErr})` : ""}; ` +
+                  "runner-backed detection and ssr.resolve conditions are unavailable",
+              );
+            }
+            return {
+              config: resolved,
+              raw,
+              deps: absDeps(singleEval ? loaded.dependencies : resolved.configFileDependencies),
+              // Decided inside resolveConfig's own hook run; null when the
+              // sentinel could not ride along (the caller falls back to
+              // detectSsrRunnerBacked on the raw config's fresh instances).
+              runnerBacked: detect ? detect.declared() : null,
+              merge: typeof vite.mergeConfig === "function" ? vite.mergeConfig : null,
+            };
           }
         } catch {
           // fall through to the raw loader below
         }
       }
-      if (typeof vite.loadConfigFromFile === "function") {
-        const loaded = await vite.loadConfigFromFile({ command, mode }, configPath, appRoot);
-        if (loaded && loaded.config) {
-          return { config: loaded.config, raw: loaded.config, deps: absDeps(loaded.dependencies) };
-        }
+      if (loaded && loaded.config) {
+        return {
+          config: loaded.config,
+          raw: loaded.config,
+          deps: absDeps(loaded.dependencies),
+          merge: typeof vite.mergeConfig === "function" ? vite.mergeConfig : null,
+        };
       }
     } catch (e) {
       viteErr = e;
@@ -551,7 +639,7 @@ const configHookContext = {
   },
 };
 
-async function detectSsrRunnerBacked(raw, configEnv) {
+async function detectSsrRunnerBacked(raw, configEnv, merge = mergeConfigLite) {
   if (!raw || typeof raw !== "object") return false;
   if (declaresRunnerEnvironment(raw)) return true;
   const env = {
@@ -560,10 +648,13 @@ async function detectSsrRunnerBacked(raw, configEnv) {
     isSsrBuild: configEnv?.isSsrBuild ?? false,
     isPreview: false,
   };
-  // Vite's config.ts, mirrored on the raw config's own fresh plugin instances
-  // (this extractor is an isolated one-shot process, the established re-run
-  // pattern): asyncFlatten the plugin list (a factory may return an array,
-  // possibly promised), drop falsy entries, filter by `apply(config, env)` /
+  // Vite's config.ts, mirrored on the raw config's own fresh plugin instances.
+  // This port runs ONLY on the paths where resolveConfig never ran (the esbuild
+  // and plain-import config loaders, or an app Vite too old to resolve): on the
+  // resolveConfig path the detection sentinel rode Vite's own single hook run,
+  // so no plugin instance ever has its config hooks run twice. Mechanics:
+  // asyncFlatten the plugin list (a factory may return an array, possibly
+  // promised), drop falsy entries, filter by `apply(config, env)` /
   // `apply === command` (filterPlugin), order by `enforce` (sortUserPlugins),
   // then by the config hook's own `order` (getSortedPluginsByHook), and call
   // each `handler.call(ctx, config, env)`, merging every return into the
@@ -589,43 +680,95 @@ async function detectSsrRunnerBacked(raw, configEnv) {
   const enforceRank = (p) => (p.enforce === "pre" ? -1 : p.enforce === "post" ? 1 : 0);
   const hookRank = (h) =>
     h && typeof h === "object" ? (h.order === "pre" ? -1 : h.order === "post" ? 1 : 0) : 0;
-  const withHook = list
-    .map((p, i) => ({ p, i, hook: p.config }))
-    .filter((e) => e.hook && (typeof e.hook === "function" || typeof e.hook.handler === "function"));
-  withHook.sort(
-    (a, b) => enforceRank(a.p) - enforceRank(b.p) || hookRank(a.hook) - hookRank(b.hook) || a.i - b.i,
-  );
+  // Vite's getSortedPluginsByHook walks the enforce-sorted plugin list and
+  // splices `order: "pre"` hooks to the very FRONT of the result (and "post"
+  // to the very back): the hook's own order is PRIMARY, enforce only orders
+  // plugins within one order band (an enforce-pre plugin's plain hook runs
+  // AFTER a plain plugin's order-pre hook).
+  const hooksOf = (hookName) => {
+    const withHook = list
+      .map((p, i) => ({ p, i, hook: p[hookName] }))
+      .filter((e) => e.hook && (typeof e.hook === "function" || typeof e.hook.handler === "function"));
+    withHook.sort(
+      (a, b) => hookRank(a.hook) - hookRank(b.hook) || enforceRank(a.p) - enforceRank(b.p) || a.i - b.i,
+    );
+    return withHook;
+  };
   let conf = { ...raw, plugins: list };
-  for (const { p, hook } of withHook) {
+  for (const { p, hook } of hooksOf("config")) {
     if (skipsConfigHook(p)) continue;
     const handler = typeof hook === "object" ? hook.handler : hook;
     let res;
     try {
       res = await handler.call(configHookContext, conf, env);
     } catch (e) {
-      // A hook error must not fail extraction: no declaration from this
-      // plugin, said once on stderr.
+      // A hook error (a throw, or the hook calling this.error) must not fail
+      // extraction, but it IS a real failure of that plugin's evaluation:
+      // Vite aborts here, oj deliberately degrades to no-declaration from
+      // this plugin — loudly, naming it.
       warn(`config hook of plugin "${p.name ?? "?"}" failed during extraction: ${(e && e.message) || e}`);
       continue;
     }
     if (res && res !== conf) {
-      conf = mergeConfigLite(conf, res);
+      conf = merge(conf, res);
       // Vite resolves the plugin list once; every hook sees the same array.
       conf.plugins = list;
     }
   }
-  return declaresRunnerEnvironment(conf);
+  if (declaresRunnerEnvironment(conf)) return true;
+  // Vite fills the implicit environments after the config hooks (resolveConfig:
+  // `config.environments ??= {}`, then the ssr and client entries), and only
+  // then runs every plugin's configEnvironment hook once per environment name,
+  // merging each return into that environment (runConfigEnvironmentHook) —
+  // still BEFORE the default dev.createEnvironment fill, so a factory declared
+  // here is a real declaration. Same skip lists and per-hook guard as above.
+  const environments = { ...(conf.environments ?? {}) };
+  const isBuild = env.command === "build";
+  if (!environments.ssr && (!isBuild || conf.ssr || conf.build?.ssr)) environments.ssr = {};
+  if (!environments.client) environments.client = {};
+  for (const { p, hook } of hooksOf("configEnvironment")) {
+    if (skipsConfigHook(p)) continue;
+    const handler = typeof hook === "object" ? hook.handler : hook;
+    for (const name of Object.keys(environments)) {
+      let res;
+      try {
+        res = await handler.call(configHookContext, name, environments[name], {
+          ...env,
+          isSsrTargetWebworker: conf.ssr?.target === "webworker" && name === "ssr",
+        });
+      } catch (e) {
+        warn(
+          `configEnvironment hook of plugin "${p.name ?? "?"}" failed during extraction: ${(e && e.message) || e}`,
+        );
+        continue;
+      }
+      if (res) environments[name] = merge(environments[name], res);
+    }
+  }
+  return declaresRunnerEnvironment({ environments });
 }
 
 // The slice of Vite's mergeConfigRecursively this detection needs: null and
 // undefined override values are skipped, arrays concatenate, plain objects
-// merge recursively, scalars and functions take the later value.
-function mergeConfigLite(defaults, overrides) {
+// merge recursively, scalars and functions take the later value — and a `true`
+// on either side of ssr/resolve `noExternal`/`external` wins over lists
+// (mergeConfigRecursively's special case). The fallback when the app's own
+// vite.mergeConfig is unavailable (the esbuild and plain-import loaders).
+const environmentPathRE = /^environments\.[^.]+$/;
+function mergeConfigLite(defaults, overrides, rootPath = "") {
   const merged = { ...defaults };
   for (const key of Object.keys(overrides ?? {})) {
     const value = overrides[key];
     if (value == null) continue;
     const existing = merged[key];
+    if (
+      (key === "noExternal" || key === "external") &&
+      (rootPath === "ssr" || rootPath === "resolve") &&
+      (existing === true || value === true)
+    ) {
+      merged[key] = true;
+      continue;
+    }
     if (existing == null) merged[key] = value;
     else if (Array.isArray(existing) || Array.isArray(value)) {
       merged[key] = [
@@ -633,7 +776,13 @@ function mergeConfigLite(defaults, overrides) {
         ...(Array.isArray(value) ? value : [value]),
       ];
     } else if (typeof existing === "object" && typeof value === "object") {
-      merged[key] = mergeConfigLite(existing, value);
+      // As in Vite: an `environments.<name>` node restarts path tracking, so
+      // `environments.ssr.resolve.noExternal` merges like `resolve.noExternal`.
+      merged[key] = mergeConfigLite(
+        existing,
+        value,
+        rootPath && !environmentPathRE.test(rootPath) ? `${rootPath}.${key}` : key,
+      );
     } else merged[key] = value;
   }
   return merged;
@@ -805,27 +954,51 @@ const isMainRun = (() => {
   };
   return real(self) === real(entry);
 })();
-export { detectSsrRunnerBacked, extractAlias, extractOptimizeDeps, extractProxy, extractResolve, extractSsr, warnUnsupported };
+export { detectSsrRunnerBacked, extractAlias, extractOptimizeDeps, extractProxy, extractResolve, extractSsr, mergeConfigLite, warnUnsupported };
 
 const emitResult = (json) => {
   if (resultPath) writeFileSync(resultPath, json);
-  else process.stdout.write(json);
+  // Synchronous even on a pipe: process.exit right after must not truncate it.
+  else writeSync(1, json);
 };
 
-if (isMainRun) try {
-  const { config, raw, deps } = (await loadConfig()) ?? {};
+if (isMainRun) {
+try {
+  const { config, raw, deps, runnerBacked, merge } = (await loadConfig()) ?? {};
   const c = config ?? {};
   warnUnsupported(raw ?? c);
-  // Declaration detection runs on the RAW config's fresh plugin instances (the
-  // resolved list's hooks already ran inside resolveConfig; re-running them on
-  // those instances would corrupt stateful plugins). Vite's mode rule
-  // (config.ts): an explicit inline mode wins, else the config file's own.
-  const ssrRunnerBacked = await detectSsrRunnerBacked(raw, {
-    command,
-    mode: modeExplicit ? mode : typeof raw?.mode === "string" ? raw.mode : mode,
-    isSsrBuild: command === "build" && !!raw?.build?.ssr,
-  });
-  const ssr = extractSsr(c.ssr, c.environments?.ssr);
+  // Extraction is the single runner-backed detection authority (the plugin
+  // host and every Rust consumer read what it publishes). On the resolveConfig
+  // path the sentinel decided inside Vite's own hook run; otherwise the port
+  // runs the RAW config's fresh plugin instances (no resolved-config hooks ran
+  // in this process then). Vite's mode rule (config.ts): an explicit inline
+  // mode wins, else the config file's own. isSsrBuild: Vite computes it from
+  // the INLINE config BEFORE the file loads (`config = inlineConfig`;
+  // `isSsrBuild: command === "build" && !!config.build?.ssr`) and never
+  // recomputes it, so a build.ssr that only the config FILE sets is invisible
+  // to config hooks under Vite too; oj has no inline build.ssr at extraction
+  // time, so it is false for serve AND build.
+  const ssrRunnerBacked =
+    typeof runnerBacked === "boolean"
+      ? runnerBacked
+      : await detectSsrRunnerBacked(
+          raw,
+          {
+            command,
+            mode: modeExplicit ? mode : typeof raw?.mode === "string" ? raw.mode : mode,
+            isSsrBuild: false,
+          },
+          merge ?? mergeConfigLite,
+        );
+  let ssr = extractSsr(c.ssr, c.environments?.ssr);
+  if (raw == null && ssr) {
+    // No raw config means detection could not run: the resolved ssr.resolve
+    // conditions may describe a plugin's foreign runtime (workerd) that Node
+    // consumers must never adopt undetected. Correctness over completeness:
+    // withhold the sugar (loadConfig already warned) and let defaults stand.
+    delete ssr.resolve;
+    if (Object.keys(ssr).length === 0) ssr = null;
+  }
   emitResult(
     JSON.stringify({
       __ok: true,
@@ -876,4 +1049,10 @@ if (isMainRun) try {
 } catch (e) {
   process.stderr.write(`oj: could not extract vite.config values: ${(e && e.stack) || e}\n`);
   emitResult("{}");
+}
+// The result is emitted; nothing may keep this one-shot subprocess alive. A
+// config/configEnvironment hook is real plugin code and may have started a
+// watcher, an interval or a server (the TanStack router generator does), and
+// the Rust caller would wait on the process, not the file.
+process.exit(0);
 }

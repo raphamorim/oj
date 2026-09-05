@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { detectSsrRunnerBacked, extractAlias, extractOptimizeDeps, extractProxy, extractResolve, extractSsr, warnUnsupported } from "../../crates/oj_server/src/assets/vite-extract.mjs";
+import { detectSsrRunnerBacked, extractAlias, extractOptimizeDeps, extractProxy, extractResolve, extractSsr, mergeConfigLite, warnUnsupported } from "../../crates/oj_server/src/assets/vite-extract.mjs";
 
 test("optimizeDeps carries needsInterop and force alongside the lists", () => {
   const out = extractOptimizeDeps({
@@ -256,4 +256,146 @@ test("detectSsrRunnerBacked: raw or config-hook environment declaration", async 
   assert.equal(await detectSsrRunnerBacked({ ssr: { target: "node" }, plugins: [{ name: "react" }] }), false);
   assert.equal(await detectSsrRunnerBacked(null), false);
   assert.equal(await detectSsrRunnerBacked({ environments: { ssr: { resolve: { conditions: ["workerd"] } } } }), false);
+});
+
+// Vite's getSortedPluginsByHook makes the HOOK's own `order` primary: an
+// `order: "pre"` hook splices to the very front of the enforce-sorted list, so
+// a plain plugin's order-pre config hook runs BEFORE an enforce-pre plugin's
+// plain config hook. Pinned via the successive-merge visibility rule.
+test("detectSsrRunnerBacked: hook order is primary, enforce secondary (Vite getSortedPluginsByHook)", async () => {
+  const orderPre = {
+    name: "plain-plugin-order-pre-hook",
+    config: { order: "pre", handler: () => ({ custom: { first: true } }) },
+  };
+  const enforcePre = {
+    name: "enforce-pre-plain-hook",
+    enforce: "pre",
+    config: (conf) =>
+      conf.custom?.first
+        ? { environments: { ssr: { dev: { createEnvironment: () => ({}) } } } }
+        : null,
+  };
+  // The enforce-pre plugin sorts earlier by enforce, but its plain hook must
+  // still run AFTER the order-pre hook — so it sees the marker and declares.
+  assert.equal(await detectSsrRunnerBacked({ plugins: [enforcePre, orderPre] }), true);
+
+  // Inverted expectation guard: were enforce primary, the marker would be
+  // invisible and nothing would declare. Prove the sensitivity of the pin.
+  const enforcePreFirstSees = {
+    name: "sees-nothing",
+    enforce: "pre",
+    config: (conf) => (conf.custom?.first ? null : { probe: { ranFirst: true } }),
+  };
+  const late = {
+    name: "late-post",
+    config: {
+      order: "post",
+      handler: (conf) =>
+        conf.probe?.ranFirst
+          ? null
+          : { environments: { ssr: { dev: { createEnvironment: () => ({}) } } } },
+    },
+  };
+  // orderPre runs first, then the enforce-pre plain hook (probe NOT set since
+  // custom.first is visible), then the order-post hook declares.
+  assert.equal(await detectSsrRunnerBacked({ plugins: [enforcePreFirstSees, orderPre, late] }), true);
+});
+
+// Vite honors configEnvironment declarations too: runConfigEnvironmentHook
+// runs after the config hooks, once per environment name, and merges each
+// return into config.environments[name] BEFORE the default factory fill — a
+// dev.createEnvironment declared there is a real runner declaration.
+test("detectSsrRunnerBacked: configEnvironment-declared factories are seen", async () => {
+  const viaEnvHook = {
+    name: "acme-workerd",
+    configEnvironment: (name) =>
+      name === "ssr" ? { dev: { createEnvironment: () => ({}) } } : null,
+  };
+  assert.equal(await detectSsrRunnerBacked({ plugins: [viaEnvHook] }), true);
+
+  // The hook sees environments the config hooks declared by name, and the
+  // implicit client/ssr fill exists for it (Vite fills both before running it).
+  const seen = [];
+  const recorder = { name: "recorder", configEnvironment: (name) => void seen.push(name) };
+  const addsEnv = { name: "adds-env", config: () => ({ environments: { worker: {} } }) };
+  assert.equal(await detectSsrRunnerBacked({ plugins: [recorder, addsEnv] }), false);
+  assert.deepEqual(seen.sort(), ["client", "ssr", "worker"]);
+
+  // Skip lists and the per-hook guard apply exactly as for config hooks.
+  const skipped = {
+    name: "tanstack-router",
+    configEnvironment: () => ({ dev: { createEnvironment: () => ({}) } }),
+  };
+  assert.equal(await detectSsrRunnerBacked({ plugins: [skipped] }), false);
+  const throwing = { name: "boom-env", configEnvironment: () => { throw new Error("boom"); } };
+  assert.equal(await detectSsrRunnerBacked({ plugins: [throwing, viaEnvHook] }), true);
+
+  // Under `command: "build"` with no ssr config there is no implicit ssr
+  // environment (Vite only fills it for serve, or when ssr/build.ssr is set).
+  const ssrOnly = {
+    name: "ssr-only",
+    configEnvironment: (name) => (name === "ssr" ? { dev: { createEnvironment: () => ({}) } } : null),
+  };
+  assert.equal(await detectSsrRunnerBacked({ plugins: [ssrOnly] }, { command: "build" }), false);
+  assert.equal(
+    await detectSsrRunnerBacked({ ssr: {}, plugins: [ssrOnly] }, { command: "build" }),
+    true,
+  );
+});
+
+// A config hook that calls this.error() fails that plugin's evaluation the way
+// a throw does: loud on stderr, naming the plugin, and no declaration from it
+// (Vite aborts outright; the extractor deliberately degrades — but never
+// silently).
+test("detectSsrRunnerBacked: this.error() in a config hook is a named failure, not a silent no-op", async () => {
+  const erroring = {
+    name: "self-erroring",
+    config() {
+      this.error("configuration exploded");
+    },
+  };
+  let result;
+  const lines = [];
+  const write = process.stderr.write;
+  process.stderr.write = (chunk) => { lines.push(String(chunk)); return true; };
+  try {
+    result = await detectSsrRunnerBacked({ plugins: [erroring] });
+  } finally {
+    process.stderr.write = write;
+  }
+  assert.equal(result, false);
+  const err = lines.join("");
+  assert.match(err, /self-erroring/);
+  assert.match(err, /configuration exploded/);
+});
+
+// The true-wins rule of Vite's mergeConfigRecursively: on ssr/resolve
+// noExternal|external a `true` on either side wins over lists instead of
+// concatenating into a nonsense array; environments.<name> restarts the path.
+test("mergeConfigLite: ssr/resolve noExternal|external true wins over lists", () => {
+  assert.deepEqual(
+    mergeConfigLite({ ssr: { noExternal: ["a"] } }, { ssr: { noExternal: true } }),
+    { ssr: { noExternal: true } },
+  );
+  assert.deepEqual(
+    mergeConfigLite({ ssr: { external: true } }, { ssr: { external: ["b"] } }),
+    { ssr: { external: true } },
+  );
+  assert.deepEqual(
+    mergeConfigLite(
+      { environments: { ssr: { resolve: { noExternal: true } } } },
+      { environments: { ssr: { resolve: { noExternal: ["x"] } } } },
+    ),
+    { environments: { ssr: { resolve: { noExternal: true } } } },
+  );
+  // Outside those paths, arrays still concatenate and scalars still replace.
+  assert.deepEqual(
+    mergeConfigLite({ ssr: { noExternal: ["a"] } }, { ssr: { noExternal: ["b"] } }),
+    { ssr: { noExternal: ["a", "b"] } },
+  );
+  // ... and outside those paths the rule does NOT apply (as in Vite, where
+  // the special case is keyed on the ssr/resolve rootPath): arrays concat.
+  assert.deepEqual(mergeConfigLite({ other: { external: ["a"] } }, { other: { external: true } }), {
+    other: { external: ["a", true] },
+  });
 });

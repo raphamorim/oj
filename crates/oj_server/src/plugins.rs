@@ -279,6 +279,69 @@ fn extraction_failure(status: std::process::ExitStatus, stdout: &[u8], parse: Op
     }
 }
 
+/// How long the config-extraction subprocess may run before it is killed. The
+/// extractor runs real plugin code (config hooks) and exits itself right after
+/// emitting the result, so 60 s is generous headroom for a cold first run;
+/// `OJ_EXTRACT_TIMEOUT=<seconds>` raises it for configs that legitimately take
+/// longer. Unbounded was worse: a config hook that opened a socket or timer
+/// used to be able to wedge boot forever (Vite has no bound here, but Vite is
+/// also not waiting on a subprocess).
+fn extraction_timeout() -> std::time::Duration {
+    extraction_timeout_from(std::env::var("OJ_EXTRACT_TIMEOUT").ok().as_deref())
+}
+
+fn extraction_timeout_from(raw: Option<&str>) -> std::time::Duration {
+    let secs = raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(60);
+    std::time::Duration::from_secs(secs)
+}
+
+/// `Command::output()` with a deadline: `Ok(None)` means the child ran past
+/// `timeout` and was killed (and reaped). Both pipes are drained on threads for
+/// the whole wait, so a chatty child can never deadlock on a full pipe.
+fn bounded_output(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<std::process::Output>> {
+    use std::io::Read;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut out_pipe = child.stdout.take().expect("piped stdout");
+    let mut err_pipe = child.stderr.take().expect("piped stderr");
+    let out_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = out_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let err_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = err_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = out_thread.join();
+            let _ = err_thread.join();
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    let stdout = out_thread.join().unwrap_or_default();
+    let stderr = err_thread.join().unwrap_or_default();
+    Ok(Some(std::process::Output { status, stdout, stderr }))
+}
+
 /// Evaluate the app's `vite.config` for `command` ("serve" | "build") and `mode`.
 /// A config exported as a function (`defineConfig(({ command, mode }) => ...)`)
 /// branches on both, so a build must be extracted as a build: evaluating it as
@@ -343,8 +406,8 @@ fn extract_vite_values_with(
     // The JSON comes back through a file, not stdout: evaluating the config
     // runs plugin code (route generators, banners) that may print to stdout.
     let result_path = cache.join(format!("oj-vite-extract-{}-{seq}.tmp.json", std::process::id()));
-    let out = std::process::Command::new("node")
-        .arg(&script)
+    let mut cmd = std::process::Command::new("node");
+    cmd.arg(&script)
         .arg(&vite)
         .arg(root)
         .arg(command)
@@ -353,9 +416,23 @@ fn extract_vite_values_with(
         .arg(&result_path)
         .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
         .env("NODE_COMPILE_CACHE", crate::node_compile_cache(root))
-        .current_dir(root)
-        .output()
-        .ok()?;
+        .current_dir(root);
+    // Bounded: the extractor exits itself after emitting, but the config's
+    // plugin code runs before that and must never wedge boot forever.
+    let timeout = extraction_timeout();
+    let out = match bounded_output(&mut cmd, timeout) {
+        Ok(Some(out)) => out,
+        Ok(None) => {
+            eprintln!(
+                "oj: extracting {}: the config evaluation did not finish within {}s and was killed (raise OJ_EXTRACT_TIMEOUT for slower configs)",
+                vite.display(),
+                timeout.as_secs()
+            );
+            let _ = std::fs::remove_file(&result_path);
+            return None;
+        }
+        Err(_) => return None,
+    };
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     print_extraction_stderr(&stderr);
     let raw = std::fs::read(&result_path).unwrap_or_default();
@@ -1332,7 +1409,10 @@ impl PluginHost {
 
     /// The shared init deadline, measured from the host's spawn (this host's
     /// init-wait policy, so a lazily spawned host reports its short bound).
-    pub(crate) fn init_deadline_at(&self) -> tokio::time::Instant {
+    /// A caller gating separate work on the host's initialization (the Start
+    /// prewarm waiting for serve info) anchors to THIS deadline instead of
+    /// starting a fresh full period of its own.
+    pub fn init_deadline_at(&self) -> tokio::time::Instant {
         self.spawned + self.init_wait
     }
 
@@ -1881,6 +1961,42 @@ mod vite_values_tests {
         assert_eq!(plugin_init_timeout_from(Some("2")).as_secs(), 2);
         assert_eq!(plugin_init_timeout_from(Some("soon")).as_secs(), 300);
         assert_eq!(plugin_init_timeout_from(Some("0")).as_secs(), 300);
+    }
+
+    #[test]
+    fn extraction_timeout_defaults_and_reads_env_seconds() {
+        assert_eq!(extraction_timeout_from(None).as_secs(), 60);
+        assert_eq!(extraction_timeout_from(Some("120")).as_secs(), 120);
+        assert_eq!(extraction_timeout_from(Some("junk")).as_secs(), 60);
+        assert_eq!(extraction_timeout_from(Some("0")).as_secs(), 60);
+    }
+
+    // The extraction subprocess wait is bounded: a config hook that keeps the
+    // event loop alive past the deadline gets the child killed instead of
+    // wedging boot forever; a child that finishes yields its full output.
+    #[test]
+    fn bounded_output_kills_past_the_deadline_and_collects_output_before_it() {
+        let mut quick = std::process::Command::new("node");
+        quick.arg("-e").arg("process.stdout.write('done')");
+        let out = match bounded_output(&mut quick, std::time::Duration::from_secs(30)) {
+            Ok(out) => out,
+            // No node on this machine: nothing to test (extraction itself
+            // cannot run either).
+            Err(_) => return,
+        };
+        let out = out.expect("a finishing child is not a timeout");
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"done");
+
+        let mut hung = std::process::Command::new("node");
+        hung.arg("-e").arg("setInterval(() => {}, 1000)");
+        let started = std::time::Instant::now();
+        let out = bounded_output(&mut hung, std::time::Duration::from_millis(300)).unwrap();
+        assert!(out.is_none(), "a child past the deadline is killed and reported as a timeout");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the wait must end at the deadline, not at the child's leisure"
+        );
     }
 
     // The per-spawn init-wait policy: a boot host waits out the long init
