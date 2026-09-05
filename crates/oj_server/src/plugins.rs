@@ -873,8 +873,22 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
     if config.esbuild.is_none() {
         config.esbuild = v.esbuild;
     }
-    if config.ssr.is_none() {
-        config.ssr = v.ssr;
+    // The ssr block merges PER-KEY, not whole-block: an oj.config.json that
+    // sets one ssr key (say noExternal) must not drop the extractor's other
+    // keys — above all `runnerBacked`, which ONLY extraction produces and every
+    // consumer of the worker path reads, so it is always adopted.
+    match (config.ssr.as_mut(), v.ssr) {
+        (None, vssr) => config.ssr = vssr,
+        (Some(existing), Some(vssr)) => {
+            if let (Some(obj), Some(vobj)) = (existing.as_object_mut(), vssr.as_object()) {
+                for (k, val) in vobj {
+                    if k == "runnerBacked" || !obj.contains_key(k) {
+                        obj.insert(k.clone(), val.clone());
+                    }
+                }
+            }
+        }
+        (Some(_), None) => {}
     }
     if config.mode.is_none() {
         config.mode = v.mode;
@@ -2011,6 +2025,41 @@ mod vite_values_tests {
         let (lazy_wait, lazy_knob) = init_wait_policy(true);
         assert_eq!(lazy_wait, plugin_rpc_timeout());
         assert_eq!(lazy_knob, "OJ_PLUGIN_TIMEOUT");
+    }
+
+    // An oj.config.json that sets one ssr key (noExternal) must not drop the
+    // extractor's verdict: the ssr block merges per-key, and `runnerBacked` —
+    // which only extraction produces — is always adopted.
+    #[test]
+    fn merge_fills_ssr_per_key_and_always_adopts_runner_backed() {
+        let mut config = oj_config::OjConfig::default();
+        config.ssr = Some(serde_json::json!({ "noExternal": true }));
+        let v = ViteValues {
+            ssr: Some(serde_json::json!({
+                "noExternal": ["from-vite"],
+                "target": "webworker",
+                "runnerBacked": true,
+                "resolve": { "conditions": ["workerd"] }
+            })),
+            ..Default::default()
+        };
+        merge_vite_values(&mut config, v);
+        let ssr = config.ssr.as_ref().unwrap();
+        assert_eq!(ssr["noExternal"], serde_json::json!(true), "the oj config's key wins");
+        assert_eq!(ssr["target"], "webworker", "extractor keys fill where oj lacks them");
+        assert_eq!(ssr["resolve"]["conditions"][0], "workerd");
+        assert!(oj_config::ssr_runner_backed(&config), "the verdict survives an oj-side ssr key");
+
+        // runnerBacked is always the extractor's, even against a (stale)
+        // oj-side value: only extraction produces it.
+        let mut config = oj_config::OjConfig::default();
+        config.ssr = Some(serde_json::json!({ "runnerBacked": false }));
+        let v = ViteValues {
+            ssr: Some(serde_json::json!({ "runnerBacked": true })),
+            ..Default::default()
+        };
+        merge_vite_values(&mut config, v);
+        assert!(oj_config::ssr_runner_backed(&config));
     }
 
     #[test]
