@@ -659,16 +659,23 @@ function resolveDirEntry(dir) {
 const isRequire = (context) => context.conditions && context.conditions.includes("require");
 
 // This loader executes modules in Node: a `browser` conditional export matched
-// here runs DOM code server-side (`document is not defined`). A workerd-shaped
-// list (the Cloudflare plugin sets `browser` alongside `workerd` for its own
-// runtime, where `worker` wins first) drops `browser`; a list without `workerd`
-// is honored verbatim, as Vite honors user conditions. Mirrors the same strip
-// in oj's start_dev env plumbing — this is the last line of defense should a
-// workerd-shaped list reach the loader through any other path.
+// here runs DOM code server-side (`document is not defined`), and a non-Node
+// runtime condition (the Cloudflare plugin sets `browser` alongside `workerd`)
+// resolves builds written for that runtime, not Node. A list carrying any
+// non-Node runtime marker drops `browser` AND the markers themselves (a
+// workerd-only exports key must fall through to node/default); `worker` is
+// runtime-neutral by convention and kept. A list without a marker is honored
+// verbatim, as Vite honors user conditions. Byte-consistent with
+// oj_config::node_safe_conditions — the same strip in oj's env plumbing; this
+// is the last line of defense should such a list reach the loader through any
+// other path.
+const NON_NODE_RUNTIME_MARKERS = ["workerd", "edge-light", "deno", "bun", "react-native"];
 function nodeSafeConditions(list) {
   if (!Array.isArray(list)) return null;
   const out = list.filter((c) => typeof c === "string" && c);
-  return out.includes("workerd") ? out.filter((c) => c !== "browser") : out;
+  return out.some((c) => NON_NODE_RUNTIME_MARKERS.includes(c))
+    ? out.filter((c) => c !== "browser" && !NON_NODE_RUNTIME_MARKERS.includes(c))
+    : out;
 }
 // The config's `resolve.conditions` (OJ_RESOLVE_CONDITIONS from oj), added to
 // Node's export conditions for every resolution, as Vite's resolver honors a

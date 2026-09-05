@@ -737,6 +737,33 @@ pub fn resolve_conditions_for(config: &OjConfig, env_name: &str, dev: bool) -> V
         .to_vec()
 }
 
+/// Export-condition names that mark a `resolve.conditions` list as written for
+/// a non-Node runtime (the Cloudflare plugin's `workerd` set, Vercel's
+/// `edge-light`, deno/bun/react-native presets). `worker` is NOT one: it is
+/// conventionally runtime-neutral ("any worker-like environment") and packages
+/// use it for their Node-safe non-DOM build.
+pub const NON_NODE_RUNTIME_MARKERS: [&str; 5] =
+    ["workerd", "edge-light", "deno", "bun", "react-native"];
+
+/// Make an environment's `resolve.conditions` safe for a consumer that executes
+/// the resolved modules in Node (the SSR loader, the unbundled SSR resolver).
+/// A list carrying any non-Node runtime marker was written for that runtime,
+/// not for Node: drop `browser` (a browser conditional export runs DOM code at
+/// module scope — `document is not defined`) AND the markers themselves (Node
+/// must never activate them; a `workerd`-only exports key falls through to
+/// `node`/`default`). Everything else — `worker` included — is kept. A list
+/// with no marker is returned verbatim: an explicit user `browser` for
+/// happy-dom-style Node SSR stays honored, as Vite honors user conditions.
+pub fn node_safe_conditions(list: Vec<String>) -> Vec<String> {
+    let is_marker = |c: &str| NON_NODE_RUNTIME_MARKERS.contains(&c);
+    if !list.iter().any(|c| is_marker(c)) {
+        return list;
+    }
+    list.into_iter()
+        .filter(|c| c != "browser" && !is_marker(c))
+        .collect()
+}
+
 pub fn resolve_dedupe(config: &OjConfig) -> Vec<String> {
     config
         .resolve
@@ -1096,6 +1123,55 @@ mod tests {
         let top = from(r#"{ "resolve": { "conditions": ["top"] } }"#);
         assert_eq!(super::user_resolve_conditions(&top, "ssr"), Some(vec!["top".to_string()]));
         assert_eq!(super::user_resolve_conditions(&OjConfig::default(), "ssr"), None);
+    }
+
+    // Node-executing consumers strip conditions written for another runtime.
+    // Any non-Node runtime marker (workerd, edge-light, deno, bun,
+    // react-native) marks the list: `browser` and the markers themselves go,
+    // `worker` (runtime-neutral by convention) and everything else stay. A
+    // marker-less list passes verbatim — an explicit user `browser` for
+    // happy-dom-style Node SSR is honored.
+    #[test]
+    fn node_safe_conditions_strip_browser_and_runtime_markers() {
+        let list = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            super::node_safe_conditions(list(&["workerd", "worker", "module", "browser", "development"])),
+            list(&["worker", "module", "development"])
+        );
+        assert_eq!(
+            super::node_safe_conditions(list(&["edge-light", "worker", "module", "browser"])),
+            list(&["worker", "module"])
+        );
+        for marker in super::NON_NODE_RUNTIME_MARKERS {
+            assert!(!super::node_safe_conditions(list(&[marker, "browser"])).iter().any(|c| c == marker || c == "browser"));
+        }
+        // No marker: verbatim, browser included.
+        assert_eq!(
+            super::node_safe_conditions(list(&["browser", "module"])),
+            list(&["browser", "module"])
+        );
+        assert_eq!(super::node_safe_conditions(Vec::new()), Vec::<String>::new());
+    }
+
+    // The exact composition the unbundled SSR path (oj_server's ssr_resolver)
+    // uses: a sugar-only workerd-shaped config resolves to a Node-safe list —
+    // no browser, no workerd, worker/import/default kept — instead of feeding
+    // the workerd set (browser included) verbatim to a Node resolver.
+    #[test]
+    fn ssr_resolver_conditions_are_node_safe_for_a_sugar_only_workerd_config() {
+        let config: OjConfig = serde_json::from_str(
+            r#"{ "ssr": { "resolve": { "conditions": ["workerd", "worker", "module", "browser", "development|production"] } } }"#,
+        )
+        .unwrap();
+        let conditions =
+            super::node_safe_conditions(super::resolve_conditions(&config, "ssr"));
+        assert_eq!(
+            conditions,
+            vec!["worker", "module", "development", "import", "default"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
     }
 
     /// A config may declare a TypeScript `enum`, and lowering one needs scoping

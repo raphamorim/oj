@@ -968,7 +968,14 @@ impl DevServer {
             ssr_resolver: Arc::new(OjResolver::with_settings(
                 &root,
                 oj_resolver::ResolveSettings {
-                    conditions: oj_config::resolve_conditions(&config, "ssr"),
+                    // This resolver feeds the unbundled Node SSR path: a
+                    // conditions list written for another runtime (browser +
+                    // workerd from the Cloudflare plugin's ssr environment,
+                    // reachable via the ssr.resolve sugar) must be made
+                    // Node-safe or it resolves browser builds server-side.
+                    conditions: oj_config::node_safe_conditions(
+                        oj_config::resolve_conditions(&config, "ssr"),
+                    ),
                     alias: oj_config::resolve_alias(&config, "ssr"),
                     dedupe: oj_config::resolve_dedupe(&config),
                     extensions: oj_config::resolve_extensions(&config),
