@@ -896,12 +896,25 @@ pub struct PluginHost {
     // In an Option so it can be taken + killed explicitly (the reader task holds
     // an Arc clone, so dropping the caller's Arc alone never triggers kill_on_drop).
     child: Mutex<Option<tokio::process::Child>>,
-    /// The host's `{ ojServeInfo: ... }` stdout push: None until the host's
-    /// top-level init completes. On a slow boot (many plugins, Miniflare) the
-    /// boot-time `getServeInfo` RPC times out; subscribers of this channel see
-    /// the info whenever the host eventually comes up and can activate the
+    /// The host's `{ ojServeInfo: ... }` control push: None until the host's
+    /// top-level init completes. Subscribers see the info whenever the host
+    /// eventually comes up, however slow the boot, and can activate the
     /// middleware path late instead of silently degrading to the SSR runner.
     serve_info_push: tokio::sync::watch::Sender<Option<ServeInfo>>,
+    /// Whether the host finished its top-level init: flipped by the serve-info
+    /// push or by the first RPC reply (the host's RPC listener only registers
+    /// after every top-level await, so any reply proves init completed). RPC
+    /// sends are gated on this — see `call`.
+    initialized: tokio::sync::watch::Sender<bool>,
+    /// The host's stdout closed (the process exited): fail calls fast instead
+    /// of waiting out the init deadline or the per-call timeout.
+    host_gone: std::sync::atomic::AtomicBool,
+    /// When the host was spawned; the init deadline is measured from here, so
+    /// boot RPCs share one deadline instead of stacking a fresh one each.
+    spawned: tokio::time::Instant,
+    /// Last "still initializing" progress line, so concurrent init-gated calls
+    /// print one line per interval, not one each.
+    init_progress: Mutex<std::time::Instant>,
 }
 
 async fn handle_ctx_rpc(
@@ -987,6 +1000,24 @@ fn plugin_rpc_timeout_from(raw: Option<&str>) -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// How long the plugin host may take to finish its top-level init (loading the
+/// config, config/configResolved/configureServer, a Miniflare boot) before an
+/// RPC waiting on it gives up. The host answers RPCs only after init, so this
+/// gates `call` instead of racing the per-call timeout against a slow boot;
+/// Vite has no bound at all here (its startup simply awaits the hooks).
+/// `OJ_PLUGIN_INIT_TIMEOUT=<seconds>` adjusts it.
+pub fn plugin_init_timeout() -> std::time::Duration {
+    plugin_init_timeout_from(std::env::var("OJ_PLUGIN_INIT_TIMEOUT").ok().as_deref())
+}
+
+fn plugin_init_timeout_from(raw: Option<&str>) -> std::time::Duration {
+    let secs = raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(300);
+    std::time::Duration::from_secs(secs)
+}
+
 impl std::fmt::Debug for PluginHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PluginHost")
@@ -1005,12 +1036,19 @@ impl PluginHost {
         }
         std::fs::write(&script, PLUGIN_HOST_JS)?;
 
+        // The host shares its stdout with plugin code (no console redirection),
+        // so every oj protocol line is framed with a per-session random token
+        // only this spawn and the host know: the reader below ignores unframed
+        // lines, so a plugin's print — or attacker-controlled content a plugin
+        // echoes — can never be parsed as a reply or a control push.
+        let control_token = format!("oj{}:", crate::new_ws_token());
         let mut child = tokio::process::Command::new("node")
             .arg(&script)
             .arg(plugins_file)
             .arg(config_json)
             .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
         .env("NODE_COMPILE_CACHE", crate::node_compile_cache(root))
+            .env("OJ_CONTROL_TOKEN", &control_token)
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1029,6 +1067,10 @@ impl PluginHost {
             server_events: Mutex::new(None),
             child: Mutex::new(Some(child)),
             serve_info_push: tokio::sync::watch::channel(None).0,
+            initialized: tokio::sync::watch::channel(false).0,
+            host_gone: std::sync::atomic::AtomicBool::new(false),
+            spawned: tokio::time::Instant::now(),
+            init_progress: Mutex::new(std::time::Instant::now()),
         });
 
         let resolver = std::sync::Arc::new(OjResolver::new(root));
@@ -1037,7 +1079,12 @@ impl PluginHost {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
+                // Only token-framed lines are protocol (see spawn); anything
+                // else on this stream is a plugin's own print.
+                let Some(line) = line.strip_prefix(control_token.as_str()) else {
+                    continue;
+                };
+                let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
                     continue;
                 };
                 if let Some(rpc) = msg["rpc"].as_u64() {
@@ -1051,6 +1098,12 @@ impl PluginHost {
                     reader_ref
                         .serve_info_push
                         .send_replace(Some(ServeInfo::from_json(info)));
+                    let _ = reader_ref.initialized.send_replace(true);
+                    // ACK so the host stops re-pushing (it re-sends until
+                    // acknowledged, healing a copy a plugin's unterminated
+                    // partial write may have spliced).
+                    let mut stdin = reader_ref.stdin.lock().await;
+                    let _ = stdin.write_all(b"{\"ojServeInfoAck\":true}\n").await;
                     continue;
                 }
                 if let Some(ev) = msg.get("ojServer") {
@@ -1085,6 +1138,9 @@ impl PluginHost {
                 let Some(id) = msg["id"].as_u64() else {
                     continue;
                 };
+                // Any reply proves the host's top-level init completed: the RPC
+                // listener only registers after every top-level await.
+                let _ = reader_ref.initialized.send_replace(true);
                 let result = if let Some(err) = msg.get("error").and_then(|e| e.as_str()) {
                     Err(err.to_string())
                 } else {
@@ -1097,11 +1153,30 @@ impl PluginHost {
                     let _ = tx.send(result);
                 }
             }
+            // stdout closed: the host exited. Fail everything pending now, and
+            // every future call fast, instead of letting an init-gated call
+            // wait out the whole init deadline on a dead process.
+            reader_ref
+                .host_gone
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let drained: Vec<_> = reader_ref
+                .pending
+                .lock()
+                .unwrap()
+                .drain()
+                .map(|(_, tx)| tx)
+                .collect();
+            for tx in drained {
+                let _ = tx.send(Err("plugin host exited".into()));
+            }
         });
         Ok(host)
     }
 
     async fn call(&self, hook: &str, args: &[&str]) -> Result<Option<String>, String> {
+        if self.host_gone.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("plugin host exited".into());
+        }
         let req_id = self.counter.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(req_id, tx);
@@ -1117,6 +1192,58 @@ impl PluginHost {
                 return Err("plugin host died".into());
             }
         }
+        let mut rx = rx;
+        // The host answers RPCs only after its top-level init completes (the
+        // listener registers after every top-level await), so a call during a
+        // slow boot must wait for init — bounded by the generous init deadline,
+        // shared across calls and measured from spawn — instead of racing its
+        // own per-call timeout against the boot and permanently snapshotting
+        // wrong defaults. Fast boots are untouched: initialized flips with the
+        // serve-info push or the first reply, both preceding any wait here.
+        let mut init_rx = self.initialized.subscribe();
+        if !*init_rx.borrow_and_update() {
+            let deadline = self.init_deadline_at();
+            let mut progress = tokio::time::interval_at(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(30),
+            );
+            loop {
+                tokio::select! {
+                    res = &mut rx => {
+                        // The reply itself proves init completed.
+                        return match res {
+                            Ok(result) => result,
+                            Err(_) => Err("plugin host exited".into()),
+                        };
+                    }
+                    changed = init_rx.changed() => {
+                        if changed.is_err() || *init_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = progress.tick() => {
+                        // One line per interval across concurrent waiters.
+                        let elapsed = self.spawned.elapsed().as_secs();
+                        let mut last = self
+                            .init_progress
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if last.elapsed().as_secs() >= 29 {
+                            *last = std::time::Instant::now();
+                            eprintln!("oj: plugin host still initializing ({elapsed}s)…");
+                        }
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        self.pending.lock().unwrap().remove(&req_id);
+                        return Err(format!(
+                            "plugin host still initializing after {}s running {hook} (raise OJ_PLUGIN_INIT_TIMEOUT for slower boots)",
+                            plugin_init_timeout().as_secs()
+                        ));
+                    }
+                }
+            }
+        }
+        // Initialized: the ordinary per-call timeout applies unchanged.
         match tokio::time::timeout(plugin_rpc_timeout(), rx).await {
             Ok(Ok(result)) => result,
             _ => Err(format!(
@@ -1124,6 +1251,17 @@ impl PluginHost {
                 plugin_rpc_timeout().as_secs()
             )),
         }
+    }
+
+    /// Whether the host finished its top-level init (the serve-info push, or
+    /// any RPC reply, whichever came first).
+    pub fn is_initialized(&self) -> bool {
+        *self.initialized.borrow()
+    }
+
+    /// The shared init deadline, measured from the host's spawn.
+    pub(crate) fn init_deadline_at(&self) -> tokio::time::Instant {
+        self.spawned + plugin_init_timeout()
     }
 
     pub async fn transform(
@@ -1312,19 +1450,23 @@ impl PluginHost {
     /// How the host serves requests: the loopback port of its configureServer
     /// middleware stack (when any plugin registered one), and whether it built
     /// real runner-backed Vite DevEnvironments (documents are then served by
-    /// the plugin middleware, not the Node SSR runner). The host pushes this on
-    /// stdout the moment its init completes, so a value that already arrived is
-    /// returned without an RPC round trip; otherwise the RPC is tried and, on
-    /// failure (a slow host still mid-init), the default is returned — the
-    /// caller can then watch `serve_info_updates` for the late push instead of
-    /// degrading silently.
+    /// the plugin middleware, not the Node SSR runner). The host pushes this
+    /// the moment its init completes, and RPCs are init-gated (see `call`), so
+    /// a value that already arrived is returned without a round trip and the
+    /// push is preferred at any point; only a host that blew the init deadline
+    /// yields the default — the caller can then watch `serve_info_updates` for
+    /// the late push instead of degrading silently.
     pub async fn serve_info(&self) -> ServeInfo {
         if let Some(info) = *self.serve_info_push.borrow() {
             return info;
         }
-        let Some(v) = self
-            .call("getServeInfo", &[])
-            .await
+        let rpc = self.call("getServeInfo", &[]).await;
+        // The push may have landed while the RPC ran (or failed); it is the
+        // definitive value.
+        if let Some(info) = *self.serve_info_push.borrow() {
+            return info;
+        }
+        let Some(v) = rpc
             .ok()
             .flatten()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -1646,6 +1788,14 @@ mod vite_values_tests {
         // Garbage and zero fall back to the default rather than disabling the guard.
         assert_eq!(plugin_rpc_timeout_from(Some("soon")).as_secs(), 20);
         assert_eq!(plugin_rpc_timeout_from(Some("0")).as_secs(), 20);
+    }
+
+    #[test]
+    fn plugin_init_timeout_defaults_and_reads_env_seconds() {
+        assert_eq!(plugin_init_timeout_from(None).as_secs(), 300);
+        assert_eq!(plugin_init_timeout_from(Some("2")).as_secs(), 2);
+        assert_eq!(plugin_init_timeout_from(Some("soon")).as_secs(), 300);
+        assert_eq!(plugin_init_timeout_from(Some("0")).as_secs(), 300);
     }
 
     #[test]

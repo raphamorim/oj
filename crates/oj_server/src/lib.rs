@@ -1397,7 +1397,7 @@ fn render_client_js(
 /// A fresh random token for this process (Vite: `crypto.randomBytes(9)`, as
 /// base64url). rustls' provider RNG is already linked; a hash of process-unique
 /// state is the fallback if it ever fails.
-fn new_ws_token() -> String {
+pub(crate) fn new_ws_token() -> String {
     let mut bytes = [0u8; 16];
     let filled = rustls::crypto::aws_lc_rs::default_provider()
         .secure_random
