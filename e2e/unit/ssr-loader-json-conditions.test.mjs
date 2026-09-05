@@ -156,13 +156,16 @@ test("SSR loader: linked (workspace) packages take the environment's conditions,
   }
 });
 
-// This loader executes modules in Node: a workerd-shaped condition list (the
-// Cloudflare plugin sets `browser` alongside `workerd`/`worker` for its own
-// runtime) must never let `browser` win here — a browser conditional export
-// runs DOM code at module scope (`document is not defined`). The package
-// mirrors decode-named-character-reference, browser-first so only the strip
-// (not condition order) saves it.
-test("SSR loader: a workerd-shaped condition list never matches browser builds in Node", () => {
+// Conditions never cross runtimes: on a runner-backed ssr environment (the
+// Cloudflare plugin's workerd DevEnvironments) oj sends this Node loader
+// Vite's Node server defaults — DEFAULT_SERVER_CONDITIONS for OJ_RESOLVE_CONDITIONS,
+// DEFAULT_EXTERNAL_CONDITIONS for OJ_EXTERNAL_CONDITIONS — never the workerd
+// list (see start_script_env), and the loader applies what it is given
+// verbatim. The package mirrors decode-named-character-reference: a
+// browser-first exports map whose browser build runs DOM code at module scope
+// (`document is not defined`), so the node-default list is what keeps oj's
+// Node fallback correct.
+test("SSR loader: node-default conditions resolve node builds; an explicit browser list stays honored", () => {
   const app = realpathSync(mkdtempSync(join(tmpdir(), "oj-ssr-workerd-cond-")));
   const source = join(app, "src");
   const dompkg = join(app, "node_modules", "dompkg");
@@ -195,22 +198,26 @@ test("SSR loader: a workerd-shaped condition list never matches browser builds i
     timeout: 10_000,
     env: { ...process.env, OJ_APP_ROOT: app, OJ_CACHE_ROOT: join(app, "cache"), OJ_SSR_LOADER_CACHE: "off", ...extraEnv },
   });
-  const workerdList = JSON.stringify(["workerd", "worker", "module", "browser", "development"]);
+  // What start_script_env sends for a runner-backed (workerd) ssr environment.
+  const nodeDefaults = JSON.stringify(["module", "node", "development", "import", "default"]);
+  const nodeExternalDefaults = JSON.stringify(["node", "module-sync"]);
   // The Cloudflare ssr environment sets `resolve.noExternal: true`, so every
   // bare import takes the environment's conditions.
   const noExternalAll = JSON.stringify({ noExternalAll: true });
   try {
-    // Environment conditions path (noExternal): browser is stripped, worker wins.
-    const viaConditions = run({ OJ_RESOLVE_CONDITIONS: workerdList, OJ_SSR_EXTERNALS: noExternalAll });
+    // Environment conditions path (noExternal): with node defaults the
+    // browser-first exports map falls through to the node build.
+    const viaConditions = run({ OJ_RESOLVE_CONDITIONS: nodeDefaults, OJ_SSR_EXTERNALS: noExternalAll });
     assert.equal(viaConditions.status, 0, viaConditions.stderr || viaConditions.error?.message);
     assert.equal(JSON.parse(viaConditions.stdout).build, "node-safe");
 
-    // Externalized path: a workerd-shaped externalConditions list is stripped too.
-    const viaExternal = run({ OJ_EXTERNAL_CONDITIONS: workerdList });
+    // Externalized path: DEFAULT_EXTERNAL_CONDITIONS resolve the node build too.
+    const viaExternal = run({ OJ_EXTERNAL_CONDITIONS: nodeExternalDefaults });
     assert.equal(viaExternal.status, 0, viaExternal.stderr || viaExternal.error?.message);
     assert.equal(JSON.parse(viaExternal.stdout).build, "node-safe");
 
-    // A browser list without workerd stays honored (Vite honors user conditions).
+    // A user browser list on a non-runner-backed environment travels through
+    // unchanged and stays honored (Vite honors user conditions).
     const honored = run({ OJ_RESOLVE_CONDITIONS: JSON.stringify(["browser"]), OJ_SSR_EXTERNALS: noExternalAll });
     assert.equal(honored.status, 1, "a plain browser user condition still picks the browser build");
     assert.match(honored.stderr ?? "", /document is not defined/);
@@ -219,11 +226,11 @@ test("SSR loader: a workerd-shaped condition list never matches browser builds i
   }
 });
 
-// The runtime markers themselves are stripped too, not just `browser`: Node
-// activating `workerd` resolves a workerd-only exports key to code written for
-// that runtime; it must fall through to node/default instead. And any non-Node
-// runtime marker (edge-light here) marks the list, not workerd alone.
-test("SSR loader: runtime markers are stripped — workerd-only keys fall through, edge-light lists lose browser", () => {
+// The loader applies its lists verbatim — the runtime-crossing decision lives
+// where the lists are selected (start_script_env / the extractor's
+// `ssr.runnerBacked`), not here. With node defaults a workerd-only exports key
+// is simply never activated and falls through to node/default.
+test("SSR loader: node-default conditions never activate foreign-runtime exports keys", () => {
   const app = realpathSync(mkdtempSync(join(tmpdir(), "oj-ssr-marker-cond-")));
   const source = join(app, "src");
   const cfonly = join(app, "node_modules", "cfonly");
@@ -270,25 +277,28 @@ test("SSR loader: runtime markers are stripped — workerd-only keys fall throug
     env: { ...process.env, OJ_APP_ROOT: app, OJ_CACHE_ROOT: join(app, "cache"), OJ_SSR_LOADER_CACHE: "off", ...extraEnv },
   });
   const noExternalAll = JSON.stringify({ noExternalAll: true });
+  const nodeDefaults = JSON.stringify(["module", "node", "development", "import", "default"]);
+  const nodeExternalDefaults = JSON.stringify(["node", "module-sync"]);
   try {
-    // A workerd-shaped list: the workerd marker itself is stripped, so the
-    // workerd-only key falls through to default (environment conditions path).
-    const workerdList = JSON.stringify(["workerd", "worker", "module", "browser", "development"]);
-    const viaConditions = run({ OJ_RESOLVE_CONDITIONS: workerdList, OJ_SSR_EXTERNALS: noExternalAll });
+    // Environment conditions path: no workerd/browser in the node defaults, so
+    // the workerd-only key falls through to default and the browser-first map
+    // resolves its node build.
+    const viaConditions = run({ OJ_RESOLVE_CONDITIONS: nodeDefaults, OJ_SSR_EXTERNALS: noExternalAll });
     assert.equal(viaConditions.status, 0, viaConditions.stderr || viaConditions.error?.message);
     assert.deepEqual(JSON.parse(viaConditions.stdout), { cf: "node-safe", dom: "node-safe" });
 
     // Externalized path too.
-    const viaExternal = run({ OJ_EXTERNAL_CONDITIONS: workerdList });
+    const viaExternal = run({ OJ_EXTERNAL_CONDITIONS: nodeExternalDefaults });
     assert.equal(viaExternal.status, 0, viaExternal.stderr || viaExternal.error?.message);
     assert.deepEqual(JSON.parse(viaExternal.stdout), { cf: "node-safe", dom: "node-safe" });
 
-    // edge-light marks the list like workerd does: browser is stripped, worker
-    // (runtime-neutral) is kept and wins over the browser build.
-    const edgeList = JSON.stringify(["edge-light", "worker", "module", "browser"]);
-    const viaEdge = run({ OJ_RESOLVE_CONDITIONS: edgeList, OJ_SSR_EXTERNALS: noExternalAll });
-    assert.equal(viaEdge.status, 0, viaEdge.stderr || viaEdge.error?.message);
-    assert.equal(JSON.parse(viaEdge.stdout).dom, "node-safe");
+    // Raw top-level user extras ride along with the defaults (start_script_env
+    // appends them): a runtime-neutral `worker` extra is honored and picks the
+    // worker build over browser, exactly as given — the loader adds no policy.
+    const withExtra = JSON.stringify(["module", "node", "development", "worker", "import", "default"]);
+    const viaExtra = run({ OJ_RESOLVE_CONDITIONS: withExtra, OJ_SSR_EXTERNALS: noExternalAll });
+    assert.equal(viaExtra.status, 0, viaExtra.stderr || viaExtra.error?.message);
+    assert.deepEqual(JSON.parse(viaExtra.stdout), { cf: "node-safe", dom: "node-safe" });
   } finally {
     rmSync(app, { recursive: true, force: true });
   }

@@ -824,44 +824,47 @@ fn start_script_env(root: &Path, command: &str, mode: &str) -> anyhow::Result<Ve
     if !defines.is_empty() {
         vars.push(("OJ_DEFINE".into(), serde_json::Value::Object(defines).to_string()));
     }
-    // The user's `resolve.conditions` (the ssr environment's first), added to
-    // Node's export conditions by the SSR loader the way Vite's resolver honors
-    // them; the `development|production` placeholder is the dev one here.
-    if let Some(user) = oj_config::user_resolve_conditions(&config, "ssr") {
-        // The loader runs in Node: a list written for another runtime (the
-        // Cloudflare plugin sets `browser` alongside `workerd`) must not steer
-        // Node resolution into browser or runtime-specific builds — a browser
-        // conditional export executes DOM code server-side (`document is not
-        // defined`). `node_safe_conditions` drops `browser` and the runtime
-        // markers from such a list; a user list without a marker is honored
-        // verbatim, as Vite honors user conditions.
-        let conditions: Vec<String> = oj_config::node_safe_conditions(user)
-            .into_iter()
-            .map(|c| if c == "development|production" { "development".to_string() } else { c })
-            .collect();
-        if !conditions.is_empty() {
-            vars.push((
-                "OJ_RESOLVE_CONDITIONS".into(),
-                serde_json::to_string(&conditions).unwrap_or_default(),
-            ));
-        }
+    // The conditions the SSR loader adds to Node's export conditions, and the
+    // externalConditions swap for externalized deps. Vite-shaped selection:
+    // conditions never cross runtimes. When the ssr environment is
+    // runner-backed (its code executes in the Cloudflare plugin's workerd
+    // DevEnvironments), its condition list describes THAT runtime and never
+    // steers the loader — the loader is oj's own Node fallback and takes
+    // Vite's Node server semantics instead (DEFAULT_SERVER_CONDITIONS /
+    // DEFAULT_EXTERNAL_CONDITIONS plus the user's RAW top-level lists).
+    // Otherwise the user's list (environment → `ssr.resolve` sugar → top
+    // level) passes verbatim — an explicit `browser` for happy-dom-style Node
+    // SSR stays honored, as Vite honors user conditions — with the
+    // `development|production` placeholder mapped for the command.
+    let dev = command != "build";
+    let map_dev = |list: Vec<String>| -> Vec<String> {
+        let dev_prod = if dev { "development" } else { "production" };
+        list.into_iter()
+            .map(|c| if c == "development|production" { dev_prod.to_string() } else { c })
+            .collect()
+    };
+    let runner_backed = oj_config::ssr_runner_backed(&config);
+    let resolve_conditions = if runner_backed {
+        Some(oj_config::node_server_conditions(&config, dev))
+    } else {
+        oj_config::user_resolve_conditions(&config, "ssr").map(&map_dev)
+    };
+    if let Some(conditions) = resolve_conditions.filter(|c| !c.is_empty()) {
+        vars.push((
+            "OJ_RESOLVE_CONDITIONS".into(),
+            serde_json::to_string(&conditions).unwrap_or_default(),
+        ));
     }
-    // `resolve.externalConditions` (Vite: what externalized SSR deps resolve
-    // with instead of the environment's conditions); the loader defaults to
-    // module-sync when unset.
-    if let Some(user) = oj_config::user_external_conditions(&config, "ssr") {
-        // Same Node-safety rule as resolve.conditions above: externalized deps
-        // resolve in Node too.
-        let conditions: Vec<String> = oj_config::node_safe_conditions(user)
-            .into_iter()
-            .map(|c| if c == "development|production" { "development".to_string() } else { c })
-            .collect();
-        if !conditions.is_empty() {
-            vars.push((
-                "OJ_EXTERNAL_CONDITIONS".into(),
-                serde_json::to_string(&conditions).unwrap_or_default(),
-            ));
-        }
+    let external_conditions = if runner_backed {
+        Some(oj_config::node_server_external_conditions(&config, dev))
+    } else {
+        oj_config::user_external_conditions(&config, "ssr").map(&map_dev)
+    };
+    if let Some(conditions) = external_conditions.filter(|c| !c.is_empty()) {
+        vars.push((
+            "OJ_EXTERNAL_CONDITIONS".into(),
+            serde_json::to_string(&conditions).unwrap_or_default(),
+        ));
     }
     // `ssr.noExternal`/`external`, consumed by the SSR loader to transform (rather
     // than hand to Node) the dependencies Vite would bundle.
@@ -1742,32 +1745,63 @@ mod tests {
         assert_eq!(get("OJ_DEFINE_CLIENT").as_deref(), Some(r#"{"__SIDE__":"\"client\""}"#));
         assert_eq!(get("OJ_RESOLVE_CONDITIONS").as_deref(), Some(r#"["custom","development"]"#));
 
-        // A list carrying a non-Node runtime marker (workerd here) is made
-        // Node-safe: `browser` AND the marker itself are stripped (in Node a
-        // browser conditional export would run DOM code, and a workerd-only
-        // exports key must fall through to node/default). A user list without
-        // a marker is honored verbatim, as Vite honors user conditions.
+        // Conditions never cross runtimes: on a runner-backed ssr environment
+        // (the extractor's `ssr.runnerBacked`, set when the Cloudflare plugin
+        // drives workerd DevEnvironments) the environment's own list —
+        // conditions AND externalConditions — describes workerd and never
+        // reaches the Node loader; Vite's Node server semantics apply instead
+        // (DEFAULT_SERVER_CONDITIONS / DEFAULT_EXTERNAL_CONDITIONS plus the
+        // user's RAW top-level lists). Without the flag a user list is honored
+        // verbatim, as Vite honors user conditions.
         {
-            let browser_root = tmp("script-env-browser-cond");
+            let runner_backed = tmp("script-env-runner-backed");
             std::fs::write(
-                browser_root.join("oj.config.json"),
-                r#"{ "environments": { "ssr": { "resolve": { "conditions": ["workerd", "module", "browser", "development|production"], "externalConditions": ["custom-ext", "development|production"] } } } }"#,
+                runner_backed.join("oj.config.json"),
+                r#"{ "ssr": { "runnerBacked": true, "resolve": { "conditions": ["workerd", "worker", "module", "browser", "development|production"], "externalConditions": ["workerd", "development|production"] } } }"#,
             )
             .unwrap();
-            let vars = start_script_env(&browser_root, "serve", "development").unwrap();
+            let vars = start_script_env(&runner_backed, "serve", "development").unwrap();
             let var = |k: &str| {
                 vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
             };
             assert_eq!(
                 var("OJ_RESOLVE_CONDITIONS").as_deref(),
-                Some(r#"["module","development"]"#),
-                "browser and the workerd marker must be stripped from a workerd-shaped condition list"
+                Some(r#"["module","node","development","import","default"]"#),
+                "a runner-backed environment's workerd list must not steer the Node loader; node defaults apply"
+            );
+            assert_eq!(
+                var("OJ_EXTERNAL_CONDITIONS").as_deref(),
+                Some(r#"["node","module-sync"]"#),
+                "the workerd externalConditions never cross either; Vite's DEFAULT_EXTERNAL_CONDITIONS apply"
+            );
+            let _ = std::fs::remove_dir_all(&runner_backed);
+
+            // The user's RAW top-level lists (the extractor's `rawResolve`)
+            // are user-authored and runtime-neutral: conditions join the node
+            // defaults, externalConditions replace them, dev|prod mapped.
+            let with_raw = tmp("script-env-runner-raw");
+            std::fs::write(
+                with_raw.join("oj.config.json"),
+                r#"{ "ssr": { "runnerBacked": true, "resolve": { "conditions": ["workerd", "module", "browser"] } },
+                     "rawResolve": { "conditions": ["custom", "module"], "externalConditions": ["custom-ext", "development|production"] },
+                     "resolve": { "conditions": ["module", "browser", "development|production"] } }"#,
+            )
+            .unwrap();
+            let vars = start_script_env(&with_raw, "serve", "development").unwrap();
+            let var = |k: &str| {
+                vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+            };
+            assert_eq!(
+                var("OJ_RESOLVE_CONDITIONS").as_deref(),
+                Some(r#"["module","node","development","custom","import","default"]"#),
+                "raw top-level user conditions join the node defaults; the resolved client list never does"
             );
             assert_eq!(
                 var("OJ_EXTERNAL_CONDITIONS").as_deref(),
                 Some(r#"["custom-ext","development"]"#),
-                "externalConditions pass through with dev/prod mapped"
+                "raw top-level externalConditions replace the default, as a user list does in Vite"
             );
+            let _ = std::fs::remove_dir_all(&with_raw);
 
             let plain_browser = tmp("script-env-browser-honored");
             std::fs::write(
@@ -1783,19 +1817,18 @@ mod tests {
             assert_eq!(
                 cond.as_deref(),
                 Some(r#"["browser","module"]"#),
-                "a user browser condition without workerd is honored"
+                "a user browser condition on a non-runner-backed environment is honored verbatim"
             );
 
             // The extraction shape on a Cloudflare Start app: the resolved ssr
-            // environment's conditions arrive on the `ssr.resolve` sugar while
-            // the top-level list carries Vite's resolved client defaults. The
-            // sugar must win (made Node-safe: browser and workerd stripped,
-            // worker kept); the client list leaking into the Node loader
-            // resolved browser builds server-side.
+            // environment's workerd conditions arrive on the `ssr.resolve`
+            // sugar with `runnerBacked` alongside, and the resolved top-level
+            // list carries Vite's client defaults. Neither list may steer the
+            // Node loader: node defaults win.
             let cf_shape = tmp("script-env-cf-shape");
             std::fs::write(
                 cf_shape.join("oj.config.json"),
-                r#"{ "ssr": { "noExternal": true, "target": "node", "resolve": { "conditions": ["workerd", "worker", "module", "browser", "development|production"] } },
+                r#"{ "ssr": { "runnerBacked": true, "noExternal": true, "target": "node", "resolve": { "conditions": ["workerd", "worker", "module", "browser", "development|production"] } },
                      "resolve": { "conditions": ["module", "browser", "development|production"] } }"#,
             )
             .unwrap();
@@ -1806,8 +1839,8 @@ mod tests {
                 .map(|(_, v)| v.clone());
             assert_eq!(
                 cond.as_deref(),
-                Some(r#"["worker","module","development"]"#),
-                "the ssr sugar's workerd list must win over the top-level client defaults, made Node-safe"
+                Some(r#"["module","node","development","import","default"]"#),
+                "neither the workerd sugar nor the client top-level list crosses into the Node loader"
             );
             let _ = std::fs::remove_dir_all(&cf_shape);
         }

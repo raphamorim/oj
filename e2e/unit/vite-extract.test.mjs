@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { extractAlias, extractOptimizeDeps, extractProxy, extractResolve, extractSsr, warnUnsupported } from "../../crates/oj_server/src/assets/vite-extract.mjs";
+import { detectSsrRunnerBacked, extractAlias, extractOptimizeDeps, extractProxy, extractResolve, extractSsr, warnUnsupported } from "../../crates/oj_server/src/assets/vite-extract.mjs";
 
 test("optimizeDeps carries needsInterop and force alongside the lists", () => {
   const out = extractOptimizeDeps({
@@ -159,4 +159,30 @@ test("resolve.externalConditions is extracted, top-level and through the ssr sug
   // An environments-only config still produces the ssr resolve block.
   const envOnly = extractSsr(undefined, { resolve: { externalConditions: ["only-env"] } });
   assert.deepEqual(envOnly.resolve, { externalConditions: ["only-env"] });
+});
+
+// The runner-backed signal is structural, never config-text matching: the RAW
+// config declares `environments.ssr.dev.createEnvironment`, or the
+// instantiated plugin list carries the Cloudflare dev plugin by its declared
+// name — the exact gate plugin-host.mjs's buildEnvironments uses. The RESOLVED
+// config's environments are deliberately not consulted: Vite fills every
+// environment's dev.createEnvironment with its own default factory, so
+// presence there says nothing.
+test("detectSsrRunnerBacked: raw createEnvironment or the Cloudflare dev plugin, structurally", () => {
+  // A user-declared custom dev runtime factory in the RAW config.
+  const rawWithFactory = { environments: { ssr: { dev: { createEnvironment: () => ({}) } } } };
+  assert.equal(detectSsrRunnerBacked(rawWithFactory, []), true);
+
+  // The Cloudflare dev plugin, matched on the plugin object's declared name —
+  // in a resolved (flat) list and in a raw (nested, factory-returned) list.
+  const cf = { name: "vite-plugin-cloudflare:dev", configureServer: () => {} };
+  assert.equal(detectSsrRunnerBacked(null, [{ name: "react" }, cf]), true);
+  assert.equal(detectSsrRunnerBacked({}, [[{ name: "vite-plugin-cloudflare" }, [cf]]]), true);
+
+  // Neither signal: a plain SSR app is not runner-backed, and a comment or a
+  // similarly named string in config text cannot false-positive (only plugin
+  // objects are consulted).
+  assert.equal(detectSsrRunnerBacked({ ssr: { target: "node" } }, [{ name: "react" }]), false);
+  assert.equal(detectSsrRunnerBacked(null, undefined), false);
+  assert.equal(detectSsrRunnerBacked({ environments: { ssr: { resolve: { conditions: ["workerd"] } } } }, []), false);
 });
