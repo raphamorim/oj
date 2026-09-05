@@ -6,8 +6,11 @@
 // callable `server.middlewares` connect app. oj does not depend on Vite: its
 // plugin host loads the *app's* installed Vite, resolves a real config, and
 // builds each `server.environments[name]` via that env's
-// `dev.createEnvironment(name, config, { ws })`. This pins that wiring with a
-// stub `vite` in the fixture (no real Vite/Miniflare needed).
+// `dev.createEnvironment(name, config, { ws })`. The path activates the way
+// Vite decides it: a plugin DECLARES its dev runtime by returning
+// `environments.<name>.dev.createEnvironment` from its `config` hook (no
+// vendor name check). This pins that wiring with a stub `vite` in the fixture
+// (no real Vite/Miniflare needed).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -15,7 +18,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { rpcSidecar, tmpProject } from "./harness.mjs";
 
-test("cloudflare-style plugin gets server.environments (built from the app's Vite) and a callable middlewares app", async () => {
+// The plugin here is deliberately NOT cloudflare-named: any plugin declaring
+// an environment activates the Environment-API path.
+test("an environment-declaring plugin gets server.environments (built from the app's Vite) and a callable middlewares app", async () => {
   const fx = tmpProject({ prefix: "oj-cf-envapi-" });
 
   // Stub the app's installed Vite: resolveConfig returns two environments,
@@ -42,7 +47,8 @@ test("cloudflare-style plugin gets server.environments (built from the app's Vit
     "oj.plugins.mjs",
     `let seen = {};
      export default [{
-       name: "vite-plugin-cloudflare:dev",
+       name: "acme-workerd:dev",
+       config: () => ({ environments: { worker: { dev: { createEnvironment: () => ({}) } } } }),
        configureServer(server) {
          seen.middlewaresCallable = typeof server.middlewares === "function";
          seen.middlewaresHasUse = typeof server.middlewares.use === "function";
@@ -175,6 +181,7 @@ test("a source edit sends a targeted update to the accept boundary; dead ends st
     "oj.plugins.mjs",
     `export default [{
        name: "vite-plugin-cloudflare:dev",
+       config: () => ({ environments: { worker: { dev: { createEnvironment: () => ({}) } } } }),
        configureServer(server) {
          server.middlewares.use("/__probe", (req, res) => {
            const w = server.environments.worker;
@@ -290,6 +297,7 @@ test("a user-set preTransformRequests is not overridden", async () => {
     "oj.plugins.mjs",
     `export default [{
        name: "vite-plugin-cloudflare:dev",
+       config: () => ({ environments: { worker: { dev: { createEnvironment: () => ({}) } } } }),
        configureServer(server) {
          server.middlewares.use("/__probe", (req, res) => {
            res.setHeader("content-type", "application/json");
@@ -437,6 +445,7 @@ test("create retries failed resolutions, delete prunes, legacy hooks and hook er
     "oj.plugins.mjs",
     `export default [{
        name: "vite-plugin-cloudflare:dev",
+       config: () => ({ environments: { worker: { dev: { createEnvironment: () => ({}) } } } }),
        configureServer(server) {
          server.middlewares.use("/__probe", (req, res) => {
            const w = server.environments.worker;
@@ -572,6 +581,7 @@ test("invalidate dedup: content identity, atomic-save create, read errors", asyn
     "oj.plugins.mjs",
     `export default [{
        name: "vite-plugin-cloudflare:dev",
+       config: () => ({ environments: { worker: { dev: { createEnvironment: () => ({}) } } } }),
        configureServer(server) {
          const emits = [];
          server.watcher.on("change", (f) => emits.push("change:" + f.split("/").pop()));

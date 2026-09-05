@@ -491,32 +491,152 @@ function extractSsr(ssr, ssrEnvironment) {
   if (res) out.resolve = res;
   return Object.keys(out).length ? out : null;
 }
-// Whether the ssr environment is "runner-backed": its modules execute in a
-// plugin-driven runtime (today the Cloudflare plugin's workerd
+// Whether an environment is "runner-backed": its modules execute in a
+// plugin-driven runtime (e.g. the Cloudflare plugin's workerd
 // DevEnvironments), not in oj's own Node SSR runner. Vite-shaped rule:
 // conditions never cross runtimes — the ssr environment's `resolve.conditions`
 // then describe THAT runtime and Node-executing consumers (the Start loader,
 // the unbundled SSR resolver) must take Vite's Node server defaults instead.
 //
-// The signal is structural, decided at config-extraction time (before the
-// plugin host is up, so oj can build the loader's env):
-// - the RAW config declares `environments.ssr.dev.createEnvironment` (a custom
-//   dev runtime factory). The RESOLVED config is useless here: Vite's
-//   resolveDevEnvironmentOptions fills every environment's
-//   `dev.createEnvironment` with its own default factory, so presence there
-//   says nothing about the user's or a plugin's choice.
-// - or the instantiated plugin list carries the Cloudflare dev plugin by its
-//   declared name — the exact gate plugin-host.mjs uses before
-//   buildEnvironments creates real runner-backed DevEnvironments. This matches
-//   the plugin object's `name`, not config text, so a commented-out import
-//   cannot false-positive.
-const CLOUDFLARE_DEV_PLUGIN = "vite-plugin-cloudflare:dev";
-function detectSsrRunnerBacked(raw, plugins) {
-  if (raw?.environments?.ssr?.dev?.createEnvironment) return true;
-  // Raw plugin lists nest (a plugin factory returns an array); resolved lists
-  // are already flat. Flatten either way.
-  const flat = Array.isArray(plugins) ? plugins.flat(Infinity) : [];
-  return flat.some((p) => p && p.name === CLOUDFLARE_DEV_PLUGIN);
+// The signal is Vite's own declaration mechanism, decided at config-extraction
+// time (before the plugin host is up, so oj can build the loader's env): a
+// plugin that drives its own dev runtime DECLARES it by returning
+// `environments.<name>.dev.createEnvironment` from its `config` hook (the
+// user's raw config may declare one directly). Vite's resolveConfig runs those
+// hooks and merges each return into the user config (runConfigHook:
+// `conf = mergeConfig(conf, res)`, so later hooks see earlier merges) and only
+// LATER default-fills every environment's `dev.createEnvironment`
+// (resolveDevEnvironmentOptions), so the merged PRE-default-fill config
+// carries exactly the user's and the plugins' declarations. The RESOLVED
+// config is useless here: after the fill, presence says nothing.
+const declaresRunnerEnvironment = (cfg) =>
+  !!cfg &&
+  typeof cfg === "object" &&
+  Object.values(cfg.environments ?? {}).some(
+    (e) => e && e.dev && typeof e.dev.createEnvironment === "function",
+  );
+
+// Plugins whose `config` hooks this out-of-band re-run must not execute: the
+// exact rule the Start loader applies when IT re-runs config hooks on fresh
+// instances (start/vite-plugin-bridge.mjs `ojReimplemented`) — the framework
+// plugins oj reimplements natively never ran hooks under oj, and their config
+// hooks have side effects that fight oj's own lifecycle (the TanStack router
+// plugin's config hook starts its route generator) — plus the dev-tooling
+// plugins the plugin host refuses outright (plugin-host.mjs
+// OJ_UNSUPPORTED_PLUGIN_NAMES: vite-plugin-checker spawns a tsc/eslint
+// worker). Tradeoff, stated plainly: a skipped hook is never run, so an
+// `environments` declaration it WOULD return is invisible to this detection
+// (a return cannot be captured without running the hook). That is acceptable:
+// the skipped set is oj-reimplemented framework plugins, whose runtimes oj
+// itself provides, and dev-only tooling, which declares no environments. The
+// Cloudflare plugins match neither rule, so their declaration is seen.
+const ojReimplemented = (name = "") =>
+  name.startsWith("vite:") || /^tanstack[-:]/.test(name) || name.startsWith("@tanstack/");
+const SIDE_EFFECTFUL_CONFIG_PLUGIN_NAMES = new Set(["vite-plugin-checker"]);
+const skipsConfigHook = (p) => {
+  const name = (p && p.name) || "";
+  return ojReimplemented(name) || SIDE_EFFECTFUL_CONFIG_PLUGIN_NAMES.has(name);
+};
+
+// Vite's BasicMinimalPluginContext surface, enough for a config hook to speak.
+const configHookContext = {
+  meta: { rollupVersion: "4.0.0", watchMode: false },
+  debug() {},
+  info() {},
+  warn(m) {
+    warn(typeof m === "string" ? m : (m && m.message) || String(m));
+  },
+  error(m) {
+    throw m instanceof Error ? m : new Error((m && m.message) || String(m));
+  },
+};
+
+async function detectSsrRunnerBacked(raw, configEnv) {
+  if (!raw || typeof raw !== "object") return false;
+  if (declaresRunnerEnvironment(raw)) return true;
+  const env = {
+    command: configEnv?.command ?? "serve",
+    mode: configEnv?.mode ?? "development",
+    isSsrBuild: configEnv?.isSsrBuild ?? false,
+    isPreview: false,
+  };
+  // Vite's config.ts, mirrored on the raw config's own fresh plugin instances
+  // (this extractor is an isolated one-shot process, the established re-run
+  // pattern): asyncFlatten the plugin list (a factory may return an array,
+  // possibly promised), drop falsy entries, filter by `apply(config, env)` /
+  // `apply === command` (filterPlugin), order by `enforce` (sortUserPlugins),
+  // then by the config hook's own `order` (getSortedPluginsByHook), and call
+  // each `handler.call(ctx, config, env)`, merging every return into the
+  // running config so later hooks see earlier merges (runConfigHook).
+  let list = Array.isArray(raw.plugins) ? raw.plugins : [];
+  try {
+    do {
+      list = (await Promise.all(list)).flat(Infinity);
+    } while (list.some((v) => v && typeof v.then === "function"));
+  } catch {
+    return false;
+  }
+  list = list.filter(Boolean);
+  const applyConfig = { ...raw, mode: env.mode };
+  list = list.filter((p) => {
+    if (!p.apply) return true;
+    try {
+      return typeof p.apply === "function" ? !!p.apply(applyConfig, env) : p.apply === env.command;
+    } catch {
+      return false;
+    }
+  });
+  const enforceRank = (p) => (p.enforce === "pre" ? -1 : p.enforce === "post" ? 1 : 0);
+  const hookRank = (h) =>
+    h && typeof h === "object" ? (h.order === "pre" ? -1 : h.order === "post" ? 1 : 0) : 0;
+  const withHook = list
+    .map((p, i) => ({ p, i, hook: p.config }))
+    .filter((e) => e.hook && (typeof e.hook === "function" || typeof e.hook.handler === "function"));
+  withHook.sort(
+    (a, b) => enforceRank(a.p) - enforceRank(b.p) || hookRank(a.hook) - hookRank(b.hook) || a.i - b.i,
+  );
+  let conf = { ...raw, plugins: list };
+  for (const { p, hook } of withHook) {
+    if (skipsConfigHook(p)) continue;
+    const handler = typeof hook === "object" ? hook.handler : hook;
+    let res;
+    try {
+      res = await handler.call(configHookContext, conf, env);
+    } catch (e) {
+      // A hook error must not fail extraction: no declaration from this
+      // plugin, said once on stderr.
+      warn(`config hook of plugin "${p.name ?? "?"}" failed during extraction: ${(e && e.message) || e}`);
+      continue;
+    }
+    if (res && res !== conf) {
+      conf = mergeConfigLite(conf, res);
+      // Vite resolves the plugin list once; every hook sees the same array.
+      conf.plugins = list;
+    }
+  }
+  return declaresRunnerEnvironment(conf);
+}
+
+// The slice of Vite's mergeConfigRecursively this detection needs: null and
+// undefined override values are skipped, arrays concatenate, plain objects
+// merge recursively, scalars and functions take the later value.
+function mergeConfigLite(defaults, overrides) {
+  const merged = { ...defaults };
+  for (const key of Object.keys(overrides ?? {})) {
+    const value = overrides[key];
+    if (value == null) continue;
+    const existing = merged[key];
+    if (existing == null) merged[key] = value;
+    else if (Array.isArray(existing) || Array.isArray(value)) {
+      merged[key] = [
+        ...(Array.isArray(existing) ? existing : [existing]),
+        ...(Array.isArray(value) ? value : [value]),
+      ];
+    } else if (typeof existing === "object" && typeof value === "object") {
+      merged[key] = mergeConfigLite(existing, value);
+    } else merged[key] = value;
+  }
+  return merged;
 }
 
 function extractResolve(r) {
@@ -696,9 +816,15 @@ if (isMainRun) try {
   const { config, raw, deps } = (await loadConfig()) ?? {};
   const c = config ?? {};
   warnUnsupported(raw ?? c);
-  // Prefer the resolved plugin list (flat, `apply`-filtered for this command);
-  // the raw list only stands in when Vite itself could not resolve the config.
-  const ssrRunnerBacked = detectSsrRunnerBacked(raw, Array.isArray(c.plugins) ? c.plugins : raw?.plugins);
+  // Declaration detection runs on the RAW config's fresh plugin instances (the
+  // resolved list's hooks already ran inside resolveConfig; re-running them on
+  // those instances would corrupt stateful plugins). Vite's mode rule
+  // (config.ts): an explicit inline mode wins, else the config file's own.
+  const ssrRunnerBacked = await detectSsrRunnerBacked(raw, {
+    command,
+    mode: modeExplicit ? mode : typeof raw?.mode === "string" ? raw.mode : mode,
+    isSsrBuild: command === "build" && !!raw?.build?.ssr,
+  });
   const ssr = extractSsr(c.ssr, c.environments?.ssr);
   emitResult(
     JSON.stringify({

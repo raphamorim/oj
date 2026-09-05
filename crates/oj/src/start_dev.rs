@@ -1760,8 +1760,9 @@ mod tests {
         assert_eq!(get("OJ_RESOLVE_CONDITIONS").as_deref(), Some(r#"["custom","development"]"#));
 
         // Conditions never cross runtimes: on a runner-backed ssr environment
-        // (the extractor's `ssr.runnerBacked`, set when the Cloudflare plugin
-        // drives workerd DevEnvironments) the environment's own list —
+        // (the extractor's `ssr.runnerBacked`, set when a plugin declares a
+        // dev-runtime environment, e.g. the Cloudflare plugin's workerd
+        // DevEnvironments) the environment's own list —
         // conditions AND externalConditions — describes workerd and never
         // reaches the Node loader; Vite's Node server semantics apply instead
         // (DEFAULT_SERVER_CONDITIONS / DEFAULT_EXTERNAL_CONDITIONS plus the

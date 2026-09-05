@@ -738,12 +738,13 @@ pub fn resolve_conditions_for(config: &OjConfig, env_name: &str, dev: bool) -> V
 }
 
 /// Whether the ssr environment is "runner-backed": its modules execute in a
-/// plugin-driven runtime (the Cloudflare plugin's workerd DevEnvironments),
-/// not in oj's own Node SSR runner. The extractor decides it structurally —
-/// the raw config declares `environments.ssr.dev.createEnvironment`, or the
-/// instantiated plugin list carries the Cloudflare dev plugin (the same gate
-/// plugin-host.mjs's buildEnvironments uses) — and publishes it as
-/// `ssr.runnerBacked` (see detectSsrRunnerBacked in vite-extract.mjs).
+/// plugin-driven runtime (e.g. the Cloudflare plugin's workerd
+/// DevEnvironments), not in oj's own Node SSR runner. The extractor decides it
+/// the way Vite does — the raw config, or a plugin's `config` hook return
+/// merged Vite-style, declares `environments.<name>.dev.createEnvironment`
+/// (the same declaration plugin-host.mjs's buildEnvironments gate reads) —
+/// and publishes it as `ssr.runnerBacked` (see detectSsrRunnerBacked in
+/// vite-extract.mjs).
 ///
 /// Vite-shaped rule: conditions never cross runtimes. An environment's
 /// `resolve.conditions` steer resolution only for code executing in that

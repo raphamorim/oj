@@ -173,28 +173,87 @@ test("resolve.externalConditions is extracted, top-level and through the ssr sug
   assert.deepEqual(envOnly.resolve, { externalConditions: ["only-env"] });
 });
 
-// The runner-backed signal is structural, never config-text matching: the RAW
-// config declares `environments.ssr.dev.createEnvironment`, or the
-// instantiated plugin list carries the Cloudflare dev plugin by its declared
-// name — the exact gate plugin-host.mjs's buildEnvironments uses. The RESOLVED
-// config's environments are deliberately not consulted: Vite fills every
-// environment's dev.createEnvironment with its own default factory, so
-// presence there says nothing.
-test("detectSsrRunnerBacked: raw createEnvironment or the Cloudflare dev plugin, structurally", () => {
+// The runner-backed signal is Vite's declaration mechanism, never a vendor
+// name check: the RAW config, or a plugin's `config` hook return merged
+// Vite-style (runConfigHook), declares `environments.<name>.dev.createEnvironment`.
+// The RESOLVED config's environments are deliberately not consulted: Vite
+// fills every environment's dev.createEnvironment with its own default
+// factory, so presence there says nothing.
+test("detectSsrRunnerBacked: raw or config-hook environment declaration", async () => {
   // A user-declared custom dev runtime factory in the RAW config.
   const rawWithFactory = { environments: { ssr: { dev: { createEnvironment: () => ({}) } } } };
-  assert.equal(detectSsrRunnerBacked(rawWithFactory, []), true);
+  assert.equal(await detectSsrRunnerBacked(rawWithFactory), true);
 
-  // The Cloudflare dev plugin, matched on the plugin object's declared name —
-  // in a resolved (flat) list and in a raw (nested, factory-returned) list.
-  const cf = { name: "vite-plugin-cloudflare:dev", configureServer: () => {} };
-  assert.equal(detectSsrRunnerBacked(null, [{ name: "react" }, cf]), true);
-  assert.equal(detectSsrRunnerBacked({}, [[{ name: "vite-plugin-cloudflare" }, [cf]]]), true);
+  // A plugin declaring its environment from its `config` hook, in a raw
+  // (nested, factory-returned) plugin list. The name does not matter — any
+  // declaring plugin counts (the Cloudflare plugin is one such).
+  const declaring = {
+    name: "acme-runner",
+    config: () => ({ environments: { worker: { dev: { createEnvironment: () => ({}) } } } }),
+  };
+  assert.equal(await detectSsrRunnerBacked({ plugins: [[{ name: "react" }, [declaring]]] }), true);
 
-  // Neither signal: a plain SSR app is not runner-backed, and a comment or a
-  // similarly named string in config text cannot false-positive (only plugin
-  // objects are consulted).
-  assert.equal(detectSsrRunnerBacked({ ssr: { target: "node" } }, [{ name: "react" }]), false);
-  assert.equal(detectSsrRunnerBacked(null, undefined), false);
-  assert.equal(detectSsrRunnerBacked({ environments: { ssr: { resolve: { conditions: ["workerd"] } } } }, []), false);
+  // The Cloudflare plugin's own shape (vite-plugin-cloudflare:config returns
+  // environments from its config hook) must be seen — it is on no skip list.
+  const cfConfig = {
+    name: "vite-plugin-cloudflare:config",
+    config: () => ({ environments: { ssr: { dev: { createEnvironment: () => ({}) } } } }),
+  };
+  assert.equal(await detectSsrRunnerBacked({ plugins: [{ name: "vite-plugin-cloudflare" }, cfConfig] }), true);
+
+  // Object-form hook with `order: "pre"` runs first (getSortedPluginsByHook),
+  // and later hooks see earlier merges (runConfigHook merges successively):
+  // `late` declares only if `early` already contributed its marker.
+  const early = { name: "early", config: { order: "pre", handler: () => ({ custom: { flag: true } }) } };
+  const late = {
+    name: "late",
+    config: {
+      handler: (conf) =>
+        conf.custom?.flag
+          ? { environments: { ssr: { dev: { createEnvironment: () => ({}) } } } }
+          : null,
+    },
+  };
+  assert.equal(await detectSsrRunnerBacked({ plugins: [late, early] }), true);
+
+  // A skipped plugin's hook is never run, so its declaration is invisible:
+  // the skip exists for side effects (the router plugin's config hook starts
+  // its generator), and not running the hook is the only way to avoid them —
+  // a return cannot be captured without executing it.
+  let tanstackRan = false;
+  const skipped = {
+    name: "tanstack-router",
+    config: () => {
+      tanstackRan = true;
+      return { environments: { ssr: { dev: { createEnvironment: () => ({}) } } } };
+    },
+  };
+  assert.equal(await detectSsrRunnerBacked({ plugins: [skipped] }), false);
+  assert.equal(tanstackRan, false);
+  const checker = {
+    name: "vite-plugin-checker",
+    config: () => ({ environments: { ssr: { dev: { createEnvironment: () => ({}) } } } }),
+  };
+  assert.equal(await detectSsrRunnerBacked({ plugins: [checker] }), false);
+
+  // A throwing config hook must not fail extraction nor mask other plugins.
+  const throwing = { name: "boom", config: () => { throw new Error("boom"); } };
+  assert.equal(await detectSsrRunnerBacked({ plugins: [throwing, declaring] }), true);
+  assert.equal(await detectSsrRunnerBacked({ plugins: [throwing] }), false);
+
+  // `apply` gates the hook exactly as Vite's filterPlugin does.
+  assert.equal(
+    await detectSsrRunnerBacked({ plugins: [{ ...declaring, apply: "build" }] }, { command: "serve" }),
+    false,
+  );
+  assert.equal(
+    await detectSsrRunnerBacked({ plugins: [{ ...declaring, apply: "build" }] }, { command: "build" }),
+    true,
+  );
+
+  // No declaration: a plain SSR app is not runner-backed, and a factory-less
+  // environments block (a resolved-config shape) cannot false-positive.
+  assert.equal(await detectSsrRunnerBacked({ ssr: { target: "node" }, plugins: [{ name: "react" }] }), false);
+  assert.equal(await detectSsrRunnerBacked(null), false);
+  assert.equal(await detectSsrRunnerBacked({ environments: { ssr: { resolve: { conditions: ["workerd"] } } } }), false);
 });
