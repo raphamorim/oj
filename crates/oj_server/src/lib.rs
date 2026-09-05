@@ -377,6 +377,11 @@ pub struct PluginServe {
     /// runner dirty here), so no request can observe the flipped mode while
     /// the catch-up is still unarmed.
     on_activate: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Whether a LATE activation happened (a `set` flipping no-middleware to
+    /// middleware after the boot fill). Set before the handler runs, so a
+    /// caller registering its handler late can catch an activation that beat
+    /// the registration by checking this afterwards (see `set_on_activate`).
+    late_activated: std::sync::atomic::AtomicBool,
 }
 
 const RUNNER_ENVS_BIT: u32 = 1 << 16;
@@ -391,21 +396,32 @@ impl std::fmt::Debug for PluginServe {
 }
 
 impl PluginServe {
-    fn from_info(info: &plugins::ServeInfo) -> Self {
-        let s = Self::default();
-        s.set(info);
-        s
-    }
-    fn set(&self, info: &plugins::ServeInfo) {
+    fn pack(info: &plugins::ServeInfo) -> u32 {
         let port = info.middleware_port.map(u32::from).unwrap_or(0);
-        let packed = if port != 0 && info.runner_environments {
+        if port != 0 && info.runner_environments {
             port | RUNNER_ENVS_BIT
         } else {
             port
-        };
+        }
+    }
+    fn from_info(info: &plugins::ServeInfo) -> Self {
+        // The boot fill: not an activation (no reader existed before this
+        // value), so it must not count as `late_activated` — a caller's
+        // post-registration catch-up check is only for post-boot flips.
+        let s = Self::default();
+        s.state
+            .store(Self::pack(info), std::sync::atomic::Ordering::SeqCst);
+        s
+    }
+    fn set(&self, info: &plugins::ServeInfo) {
+        let packed = Self::pack(info);
         // A late activation (no middleware -> middleware up) runs the handler
-        // first: a reader that sees the new mode finds the catch-up armed.
-        if port != 0 && self.mw_port().is_none() {
+        // first: a reader that sees the new mode finds the catch-up armed. The
+        // flag is set before the handler, so a handler registered a moment too
+        // late is caught by the registrar's `activated_late` check instead.
+        if packed & 0xFFFF != 0 && self.mw_port().is_none() {
+            self.late_activated
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             if let Some(hook) = self
                 .on_activate
                 .lock()
@@ -419,12 +435,18 @@ impl PluginServe {
     }
     /// Register the activation handler (see `on_activate`). At most one; a
     /// registration after activation is never called, so callers registering
-    /// late must check the current state themselves.
+    /// late must check `activated_late` afterwards and run their catch-up
+    /// inline when it is set.
     pub fn set_on_activate(&self, hook: Box<dyn Fn() + Send + Sync>) {
         *self
             .on_activate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+    /// Whether a late (post-boot) activation already happened — the check for
+    /// a caller whose `set_on_activate` may have lost the race with it.
+    pub fn activated_late(&self) -> bool {
+        self.late_activated.load(std::sync::atomic::Ordering::SeqCst)
     }
     /// The configureServer middleware's loopback port, when it is up.
     pub fn mw_port(&self) -> Option<u16> {
@@ -469,10 +491,21 @@ fn spawn_late_plugin_serve(plugin_serve: Arc<PluginServe>, host: Arc<PluginHost>
                 }
                 return;
             }
+            // This task's own Arc<PluginHost> keeps the push channel's sender
+            // alive, so `updates.changed()` can never observe the host dying:
+            // wait on the host-gone signal too, reporting the death and
+            // releasing the host instead of pinning it forever.
             if warned {
-                // Wait for the push alone; the host dropping ends the task.
-                if updates.changed().await.is_err() {
-                    return;
+                tokio::select! {
+                    changed = updates.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    _ = host.host_gone_wait() => {
+                        eprintln!("oj: warning: the plugin host exited before initializing; plugin-served routes will not activate");
+                        return;
+                    }
                 }
             } else {
                 tokio::select! {
@@ -480,6 +513,10 @@ fn spawn_late_plugin_serve(plugin_serve: Arc<PluginServe>, host: Arc<PluginHost>
                         if changed.is_err() {
                             return;
                         }
+                    }
+                    _ = host.host_gone_wait() => {
+                        eprintln!("oj: warning: the plugin host exited before initializing; plugin-served routes will not activate");
+                        return;
                     }
                     _ = tokio::time::sleep_until(host.init_deadline_at()) => {
                         if !host.is_initialized() {
@@ -1615,7 +1652,10 @@ async fn ssr_plugin_host(state: &Arc<ServerState>) -> Option<std::sync::Arc<Plug
             let file = match plugins::plugin_source(&state.root)? {
                 plugins::PluginSource::OjPlugins(p) | plugins::PluginSource::ViteConfig(p) => p,
             };
-            match PluginHost::spawn(&state.root, &file, &state.ssr_plugin_config).await {
+            // Lazy spawn (first SSR request): the short init-wait policy, so a
+            // wedged init cannot block the watcher thread's watchChange /
+            // hotUpdate dispatch or SSR transforms for the long init deadline.
+            match PluginHost::spawn_lazy(&state.root, &file, &state.ssr_plugin_config).await {
                 Ok(host) => {
                     eprintln!("oj ssr: plugins (ssr environment) from {}", file.display());
                     Some(host)
@@ -8081,6 +8121,7 @@ mod tests {
                 *sink.lock().unwrap() =
                     Some((inner.mw_port(), inner.runner_environments()));
             }));
+            assert!(!serve.activated_late());
             serve.set(&info(Some(4001), true));
             assert_eq!(
                 *seen.lock().unwrap(),
@@ -8089,6 +8130,8 @@ mod tests {
             );
             assert_eq!(serve.mw_port(), Some(4001));
             assert!(serve.runner_environments());
+            // A registrar that lost the race to this activation can catch up.
+            assert!(serve.activated_late());
             // A repeat set with the same info is not a second activation.
             *seen.lock().unwrap() = None;
             serve.set(&info(Some(4001), true));
@@ -8102,6 +8145,9 @@ mod tests {
         let no_runner = PluginServe::from_info(&info(Some(4002), false));
         assert_eq!(no_runner.mw_port(), Some(4002));
         assert!(!no_runner.runner_environments());
+        // The boot fill is not a late activation: a caller's post-registration
+        // catch-up must not fire (and reload the runner) on every normal boot.
+        assert!(!no_runner.activated_late());
     }
 
     #[test]
