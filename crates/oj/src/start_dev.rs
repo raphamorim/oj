@@ -27,7 +27,11 @@ struct Runner {
 
 struct StartState {
     proxy_prefixes: Vec<String>,
-    plugin_mw_port: Option<u16>,
+    /// Live plugin-middleware state, shared with oj_server: the middleware port
+    /// and whether worker environments serve the documents. A slow plugin host
+    /// (many plugins, Miniflare) activates it after boot, so every read goes
+    /// through it per request instead of a boot-time snapshot.
+    plugin_serve: Arc<oj_server::PluginServe>,
     runner: Arc<tokio::sync::Mutex<Runner>>,
     bundle: std::sync::RwLock<Arc<oj_cache::start_bundle::PinnedBundle>>,
     verify: oj_cache::integrity::VerifyMode,
@@ -44,13 +48,19 @@ struct StartState {
     /// The HMR gate, when the editor drives it: rebuilds still happen at once, the
     /// page reload waits for the flush.
     gate: Option<oj_server::HmrGateHandle>,
+    /// Set on a source change while the runner is lazy (worker environments
+    /// serve the documents; the runner is only a fallback, kept cold); the next
+    /// request that can reach the runner reloads it first (`ensure_runner_fresh`).
+    runner_dirty: std::sync::atomic::AtomicBool,
+}
+
+impl StartState {
     /// Cloudflare worker environments serve the documents; the runner is only a
     /// fallback, kept cold and reloaded lazily (see `runner_dirty`) instead of
-    /// eagerly on every edit.
-    lazy_runner: bool,
-    /// Set on a source change while `lazy_runner`; the next request that can
-    /// reach the runner reloads it first (`ensure_runner_fresh`).
-    runner_dirty: std::sync::atomic::AtomicBool,
+    /// eagerly on every edit. Live: a slow plugin host flips this after boot.
+    fn lazy_runner(&self) -> bool {
+        self.plugin_serve.runner_environments()
+    }
 }
 
 // Static hint that the app uses @cloudflare/vite-plugin, readable before the
@@ -184,7 +194,7 @@ pub async fn start_dev(
     let (bundle_res, built_res) = tokio::join!(bundle, built_task);
     let pinned = bundle_res??;
     let built = built_res??;
-    let _ = cf_tx.send(built.runner_environments);
+    let _ = cf_tx.send(built.plugin_serve.runner_environments());
     oj_server::boot_phase("bundle+build joined");
     let css_host = if app_uses_tailwind(&root) {
         spawn_node_service(&root, &cache.join("css-host.mjs"), &mode)
@@ -196,7 +206,7 @@ pub async fn start_dev(
     };
     let state = Arc::new(StartState {
         proxy_prefixes: built.proxy_prefixes.clone(),
-        plugin_mw_port: built.plugin_mw_port,
+        plugin_serve: Arc::clone(&built.plugin_serve),
         runner,
         bundle: std::sync::RwLock::new(Arc::new(pinned)),
         verify: oj_cache::integrity::VerifyMode::from_env(),
@@ -207,7 +217,6 @@ pub async fn start_dev(
         gate: built.hmr_gate.clone(),
         css_host,
         mode: mode.clone(),
-        lazy_runner: built.runner_environments,
         runner_dirty: std::sync::atomic::AtomicBool::new(false),
     });
 
@@ -298,7 +307,7 @@ async fn revalidate_runner(runner: &Arc<tokio::sync::Mutex<Runner>>) -> bool {
 /// reach it (the document fallback, and anything the plugin middleware may pipe
 /// upstream via x-oj-forward-to).
 async fn ensure_runner_fresh(state: &StartState) {
-    if state.lazy_runner
+    if state.lazy_runner()
         && state
             .runner_dirty
             .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -402,7 +411,7 @@ fn spawn_mw_invalidate(
     paths: &std::collections::HashSet<PathBuf>,
     created: &std::collections::HashSet<PathBuf>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let port = state.plugin_mw_port?;
+    let port = state.plugin_serve.mw_port()?;
     let changed: Vec<(String, &'static str)> = paths
         .iter()
         .filter(|p| watch_relevant(p))
@@ -571,7 +580,7 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             // promptly per settled batch, never behind an in-flight rebundle;
             // the rebundle worker awaits it before that run's browser reload.
             let invalidate = spawn_mw_invalidate(&rt, &state, &paths, &created);
-            if state.lazy_runner {
+            if state.lazy_runner() {
                 state
                     .runner_dirty
                     .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -678,12 +687,12 @@ async fn rebundle_worker(
         // files. Both before this run's browser reload.
         let regen_changed = changed_regen_outputs(&regen_files, &regen_before);
         if !regen_changed.is_empty() {
-            if state.lazy_runner {
+            if state.lazy_runner() {
                 state
                     .runner_dirty
                     .store(true, std::sync::atomic::Ordering::SeqCst);
             }
-            if let Some(port) = state.plugin_mw_port {
+            if let Some(port) = state.plugin_serve.mw_port() {
                 let names: Vec<&str> = regen_changed
                     .iter()
                     .filter_map(|(p, _)| Path::new(p).file_name()?.to_str())
@@ -698,7 +707,7 @@ async fn rebundle_worker(
         // The non-lazy runner reloads strictly after the regen completed (its
         // respawn must import the new generated files, as the inline loop
         // guaranteed) and before the browser reload.
-        if !state.lazy_runner {
+        if !state.lazy_runner() {
             reload_runner(&state).await;
         }
         let held = state.gate.as_ref().is_some_and(|g| g.hold_reload(&paths));
@@ -1341,7 +1350,7 @@ async fn forward_document(
     // with no path prefix, so a GET like /_sandbox/preview/viewers can only
     // be told from an app route by asking the middleware first; it returns
     // x-oj-fallthrough when it does not own the path, and then we SSR.
-    if let Some(port) = state.plugin_mw_port {
+    if let Some(port) = state.plugin_serve.mw_port() {
         if let Some(resp) = oj_server::forward_get_to_plugin_mw(port, &raw, headers).await {
             // A worker-served document needs the live-reload client like the
             // runner-served ones, or edits never reload the page.
@@ -1356,7 +1365,7 @@ async fn forward_with_body(state: &Arc<StartState>, req: Request) -> Response {
     // The middleware may pipe an unclaimed request on to the runner
     // (x-oj-forward-to), so start refreshing it — without blocking this
     // request, which the worker middleware typically serves itself.
-    if state.lazy_runner
+    if state.lazy_runner()
         && state
             .runner_dirty
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -1377,7 +1386,7 @@ async fn forward_with_body(state: &Arc<StartState>, req: Request) -> Response {
     // first; since a streamed body cannot be replayed, the plugin host pipes
     // an unclaimed request on to the runner itself (x-oj-forward-to) instead
     // of falling through.
-    let Some(port) = state.plugin_mw_port else {
+    let Some(port) = state.plugin_serve.mw_port() else {
         return forward(&state.runner, method, url, &headers, Some(req.into_body())).await;
     };
     if let Some(runner_port) = state.runner.lock().await.http_port {
@@ -1733,6 +1742,30 @@ mod tests {
                 Some(r#"["browser","module"]"#),
                 "a user browser condition without workerd is honored"
             );
+
+            // The extraction shape on a Cloudflare Start app: the resolved ssr
+            // environment's conditions arrive on the `ssr.resolve` sugar while
+            // the top-level list carries Vite's resolved client defaults. The
+            // sugar must win (with `browser` stripped); the client list leaking
+            // into the Node loader resolved browser builds server-side.
+            let cf_shape = tmp("script-env-cf-shape");
+            std::fs::write(
+                cf_shape.join("oj.config.json"),
+                r#"{ "ssr": { "noExternal": true, "target": "node", "resolve": { "conditions": ["workerd", "worker", "module", "browser", "development|production"] } },
+                     "resolve": { "conditions": ["module", "browser", "development|production"] } }"#,
+            )
+            .unwrap();
+            let vars = start_script_env(&cf_shape, "serve", "development").unwrap();
+            let cond = vars
+                .iter()
+                .find(|(n, _)| n == "OJ_RESOLVE_CONDITIONS")
+                .map(|(_, v)| v.clone());
+            assert_eq!(
+                cond.as_deref(),
+                Some(r#"["workerd","worker","module","development"]"#),
+                "the ssr sugar's workerd list must win over the top-level client defaults, browser stripped"
+            );
+            let _ = std::fs::remove_dir_all(&cf_shape);
         }
         let ssr: serde_json::Value = serde_json::from_str(&get("OJ_DEFINE_SSR").unwrap()).unwrap();
         assert_eq!(ssr["__SIDE__"], "\"server\"");

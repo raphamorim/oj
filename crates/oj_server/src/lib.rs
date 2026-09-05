@@ -306,7 +306,7 @@ struct ServerState {
     started_at_ms: u64,
     hmr_enabled: bool,
     plugins: Option<std::sync::Arc<PluginHost>>,
-    plugin_mw_port: Option<u16>,
+    plugin_serve: Arc<PluginServe>,
     plugins_ssr: tokio::sync::OnceCell<Option<std::sync::Arc<PluginHost>>>,
     ssr_plugin_config: String,
     plugin_watched: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
@@ -360,17 +360,127 @@ struct ServerState {
     ws_token_check: bool,
 }
 
+/// Live view of how the plugin host serves requests: the configureServer
+/// middleware port and whether runner-backed Vite DevEnvironments serve the
+/// documents. Boot fills it from the host's initial serve info; a host whose
+/// init outlives the boot-time RPC deadline (many plugins, Miniflare) fills it
+/// late — the host pushes `{ ojServeInfo }` on stdout when ready and a
+/// background task flips these — so the request paths read it per request
+/// instead of snapshotting it at boot.
+#[derive(Debug, Default)]
+pub struct PluginServe {
+    /// The middleware's loopback port; 0 = none (yet).
+    port: std::sync::atomic::AtomicU32,
+    runner_environments: std::sync::atomic::AtomicBool,
+}
+
+impl PluginServe {
+    fn from_info(info: &plugins::ServeInfo) -> Self {
+        let s = Self::default();
+        s.set(info);
+        s
+    }
+    fn set(&self, info: &plugins::ServeInfo) {
+        // The flag first: a reader that sees the port must not miss the mode.
+        self.runner_environments.store(
+            info.middleware_port.is_some() && info.runner_environments,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        self.port.store(
+            info.middleware_port.map(u32::from).unwrap_or(0),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+    /// The configureServer middleware's loopback port, when it is up.
+    pub fn mw_port(&self) -> Option<u16> {
+        match self.port.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => None,
+            p => u16::try_from(p).ok(),
+        }
+    }
+    /// Runner-backed Vite DevEnvironments serve the documents (the
+    /// Environment-API path, today the Cloudflare plugin): the Start path may
+    /// keep its SSR runner cold.
+    pub fn runner_environments(&self) -> bool {
+        self.runner_environments
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// The config statically names @cloudflare/vite-plugin, so the app expects the
+/// plugin's worker environments to serve its documents.
+fn config_expects_worker_environments(root: &Path) -> bool {
+    plugins::vite_config_file(root)
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .is_some_and(|s| s.contains("@cloudflare/vite-plugin"))
+}
+
+/// How long a Cloudflare app's worker path may stay down after boot before oj
+/// says so out loud.
+const PLUGIN_SERVE_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Waits for the plugin host's late `{ ojServeInfo }` push and flips the shared
+/// [`PluginServe`] when it arrives, so a host whose init outlives the boot-time
+/// RPC deadline still activates the middleware path. When the app expects
+/// worker environments (Cloudflare) and none are up by the deadline, prints a
+/// warning instead of degrading silently.
+fn spawn_late_plugin_serve(
+    plugin_serve: Arc<PluginServe>,
+    mut updates: tokio::sync::watch::Receiver<Option<plugins::ServeInfo>>,
+    expects_worker: bool,
+) {
+    tokio::spawn(async move {
+        let warn_at = tokio::time::Instant::now() + PLUGIN_SERVE_WARN_AFTER;
+        let mut warned = false;
+        loop {
+            let info = *updates.borrow_and_update();
+            if let Some(info) = info {
+                plugin_serve.set(&info);
+                match plugin_serve.mw_port() {
+                    Some(p) => println!(
+                        "  plugin middleware: forwarding unmatched requests to :{p} (host came up after boot)"
+                    ),
+                    None if expects_worker => eprintln!(
+                        "oj: warning: @cloudflare/vite-plugin is configured but its middleware never came up; documents are served by the Node SSR runner"
+                    ),
+                    None => {}
+                }
+                return;
+            }
+            if warned || !expects_worker {
+                // Wait for the push alone; the host dropping ends the task.
+                if updates.changed().await.is_err() {
+                    return;
+                }
+            } else {
+                tokio::select! {
+                    changed = updates.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    _ = tokio::time::sleep_until(warn_at) => {
+                        eprintln!(
+                            "oj: warning: @cloudflare/vite-plugin is configured but the plugin middleware is still not up {}s after boot; documents are served by the Node SSR runner until it arrives",
+                            PLUGIN_SERVE_WARN_AFTER.as_secs()
+                        );
+                        warned = true;
+                    }
+                }
+            }
+        }
+    });
+}
+
 pub struct BuiltApp {
     pub router: Router,
     pub host: std::net::IpAddr,
     pub port: u16,
     pub strict_port: bool,
     pub proxy_prefixes: Vec<String>,
-    pub plugin_mw_port: Option<u16>,
-    /// The plugin host built real runner-backed Vite DevEnvironments (the
-    /// Environment-API path, today the Cloudflare plugin): documents are served
-    /// by the plugin middleware and the Start path may keep its SSR runner cold.
-    pub runner_environments: bool,
+    /// Live plugin-middleware state (port + runner environments), shared with
+    /// the router's state; a slow plugin host activates it after boot.
+    pub plugin_serve: Arc<PluginServe>,
     pub root: PathBuf,
     pub started: Instant,
     /// Sender for the `/__ws` broadcast — the channel the editor reads
@@ -645,11 +755,22 @@ impl DevServer {
             Some(host) => host.serve_info().await,
             None => plugins::ServeInfo::default(),
         };
-        let plugin_mw_port = serve_info.middleware_port;
-        if let Some(p) = plugin_mw_port {
+        let plugin_serve = Arc::new(PluginServe::from_info(&serve_info));
+        if let Some(p) = plugin_serve.mw_port() {
             println!("  plugin middleware: forwarding unmatched requests to :{p}");
+        } else if let Some(host) = &plugin_host {
+            // No middleware port yet: either no plugin registered one, or the
+            // host's init outlived the boot-time RPC deadline (many plugins,
+            // Miniflare inside configureServer). The host pushes its serve info
+            // on stdout when ready — activate the middleware path then, and
+            // never degrade silently: a Cloudflare app whose worker path stays
+            // down past a deadline gets a loud warning.
+            spawn_late_plugin_serve(
+                Arc::clone(&plugin_serve),
+                host.serve_info_updates(),
+                config_expects_worker_environments(&root),
+            );
         }
-        let runner_environments = plugin_mw_port.is_some() && serve_info.runner_environments;
         if let Some(host) = &plugin_host {
             // Fold config()-hook env mutations (e.g. a plugin flipping a VITE_*
             // flag) into the client defines before any module compiles.
@@ -924,7 +1045,7 @@ impl DevServer {
                 .unwrap_or(0),
             hmr_enabled,
             plugins: plugin_host.clone(),
-            plugin_mw_port,
+            plugin_serve: Arc::clone(&plugin_serve),
             plugins_ssr: tokio::sync::OnceCell::new(),
             ssr_plugin_config,
             plugin_watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -1089,8 +1210,7 @@ impl DevServer {
             port,
             strict_port,
             proxy_prefixes,
-            plugin_mw_port,
-            runner_environments,
+            plugin_serve,
             root,
             started,
             reload_tx,
@@ -2810,7 +2930,7 @@ async fn forward_to_plugin_middleware(
     headers: &HeaderMap,
     body: Vec<u8>,
 ) -> Option<Response> {
-    let port = state.plugin_mw_port?;
+    let port = state.plugin_serve.mw_port()?;
     let pq = uri
         .path_and_query()
         .map(|p| p.as_str())
