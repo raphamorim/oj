@@ -136,6 +136,18 @@ test("warnUnsupported reports only options the user's config sets", () => {
   assert.match(userSets, /worker config is not applied/);
   assert.match(userSets, /esbuild options charset are not applied/);
   assert.match(userSets, /build.terserOptions is not applied/);
+
+  // ssr.resolve.conditions/externalConditions ARE applied (the preferred
+  // source for the Node SSR consumers): no stale blanket warning for them.
+  const applied = captureStderr(() =>
+    warnUnsupported({ ssr: { resolve: { conditions: ["workerd"], externalConditions: ["workerd"] } } }),
+  );
+  assert.equal(applied, "", "applied ssr.resolve subkeys must not warn");
+  // The genuinely-inert subkeys still do, named individually.
+  const inert = captureStderr(() =>
+    warnUnsupported({ ssr: { resolve: { conditions: ["workerd"], mainFields: ["module"], extensions: [".ts"] } } }),
+  );
+  assert.match(inert, /ssr\.resolve\.mainFields\/extensions is not applied \(conditions\/externalConditions are\)/);
 });
 
 test("resolve.externalConditions is extracted, top-level and through the ssr sugar", () => {

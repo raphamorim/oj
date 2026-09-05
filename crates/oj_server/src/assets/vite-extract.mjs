@@ -655,7 +655,12 @@ function warnUnsupported(c) {
   if (typeof c.build?.assetsInlineLimit === "function") {
     warn("build.assetsInlineLimit is a function and cannot be applied; the 4096 byte default is used");
   }
-  if (c.ssr?.resolve) warn("ssr.resolve is not applied (noExternal/external/target are)");
+  if (c.ssr?.resolve && typeof c.ssr.resolve === "object") {
+    // ssr.resolve.conditions/externalConditions ARE applied (the preferred
+    // source for the Node SSR consumers); the remaining subkeys are inert.
+    const inert = Object.keys(c.ssr.resolve).filter((k) => k !== "conditions" && k !== "externalConditions");
+    if (inert.length) warn(`ssr.resolve.${inert.join("/")} is not applied (conditions/externalConditions are)`);
+  }
   if (c.server?.cors && typeof c.server.cors === "object" && c.server.cors.origin instanceof RegExp) {
     warn("server.cors.origin RegExp is not applied; the localhost default is used");
   }
