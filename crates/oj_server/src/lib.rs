@@ -765,6 +765,18 @@ impl DevServer {
             "pluginsFormat": plugins_format,
             "ojStartMode": is_start,
         });
+        if plugins_format == "vite" {
+            // Extraction is the single runner-backed detection authority: the
+            // extractor already evaluated the config (boot fails hard when a
+            // present vite.config does not extract), and the host's
+            // buildEnvironments gate consumes this instead of re-deciding from
+            // its own config-hook run — the host and every Rust consumer of
+            // `ssr.runnerBacked` then read the same verdict. Omitted for oj
+            // plugin files, where no extraction ran (the host falls back to
+            // its own declaration check).
+            plugin_cfg["runnerBacked"] =
+                serde_json::json!(oj_config::ssr_runner_backed(&config));
+        }
         if let Some(dir) = &ssr_bridge_dir {
             plugin_cfg["ssrBridge"] = serde_json::json!({ "dir": dir.display().to_string() });
         }
