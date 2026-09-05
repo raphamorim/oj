@@ -637,20 +637,38 @@ pub fn resolve_conditions(config: &OjConfig, env_name: &str) -> Vec<String> {
 }
 
 /// The user's own `resolve.conditions` for an environment (its
-/// `environments.<name>.resolve.conditions` first, then the top-level list),
-/// verbatim, or None when the config leaves the defaults in place.
+/// `environments.<name>.resolve.conditions` first, then — for the ssr
+/// environment — the `ssr.resolve` sugar, then the top-level list), verbatim,
+/// or None when the config leaves the defaults in place. The ssr sugar must
+/// win over the top-level list: the extractor publishes the resolved ssr
+/// environment's conditions there (e.g. a Cloudflare workerd set), while the
+/// resolved top-level list carries Vite's client defaults (`browser` et al),
+/// which must never steer server-side resolution.
 pub fn user_resolve_conditions(config: &OjConfig, env_name: &str) -> Option<Vec<String>> {
+    let str_list = |c: &serde_json::Value| {
+        c.as_array().map(|c| {
+            c.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+    };
     config
         .environments
         .as_ref()
         .and_then(|e| e.get(env_name))
         .and_then(|e| e.get("resolve"))
         .and_then(|r| r.get("conditions"))
-        .and_then(|c| c.as_array())
-        .map(|c| {
-            c.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect::<Vec<_>>()
+        .and_then(&str_list)
+        .or_else(|| {
+            if env_name != "ssr" {
+                return None;
+            }
+            config
+                .ssr
+                .as_ref()
+                .and_then(|s| s.get("resolve"))
+                .and_then(|r| r.get("conditions"))
+                .and_then(&str_list)
         })
         .or_else(|| config.resolve.as_ref().and_then(|r| r.conditions.clone()))
 }
@@ -1036,6 +1054,48 @@ mod tests {
         let top = from(r#"{ "resolve": { "externalConditions": ["top"] } }"#);
         assert_eq!(super::user_external_conditions(&top, "ssr"), Some(vec!["top".to_string()]));
         assert_eq!(super::user_external_conditions(&OjConfig::default(), "ssr"), None);
+    }
+
+    // `resolve.conditions` falls back the same way: environment, then the ssr
+    // sugar, then the top-level list. The sugar carries the resolved ssr
+    // environment's conditions (e.g. the Cloudflare plugin's workerd set),
+    // while the resolved top-level list is Vite's client defaults (`browser`);
+    // reading the top-level list for the ssr environment steered the Node SSR
+    // loader into browser builds (`document is not defined`).
+    #[test]
+    fn resolve_conditions_fall_back_from_environment_to_ssr_sugar_to_top_level() {
+        let from = |json: &str| -> OjConfig { serde_json::from_str(json).unwrap() };
+        let env = from(
+            r#"{ "environments": { "ssr": { "resolve": { "conditions": ["env"] } } },
+                 "ssr": { "resolve": { "conditions": ["sugar"] } },
+                 "resolve": { "conditions": ["top"] } }"#,
+        );
+        assert_eq!(super::user_resolve_conditions(&env, "ssr"), Some(vec!["env".to_string()]));
+        let sugar = from(
+            r#"{ "ssr": { "resolve": { "conditions": ["workerd", "worker", "module", "browser"] } },
+                 "resolve": { "conditions": ["module", "browser", "development|production"] } }"#,
+        );
+        assert_eq!(
+            super::user_resolve_conditions(&sugar, "ssr"),
+            Some(vec![
+                "workerd".to_string(),
+                "worker".to_string(),
+                "module".to_string(),
+                "browser".to_string()
+            ])
+        );
+        // The ssr sugar names the ssr environment only.
+        assert_eq!(
+            super::user_resolve_conditions(&sugar, "client"),
+            Some(vec![
+                "module".to_string(),
+                "browser".to_string(),
+                "development|production".to_string()
+            ])
+        );
+        let top = from(r#"{ "resolve": { "conditions": ["top"] } }"#);
+        assert_eq!(super::user_resolve_conditions(&top, "ssr"), Some(vec!["top".to_string()]));
+        assert_eq!(super::user_resolve_conditions(&OjConfig::default(), "ssr"), None);
     }
 
     /// A config may declare a TypeScript `enum`, and lowering one needs scoping
