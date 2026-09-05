@@ -1520,8 +1520,15 @@ fn rolldown_resolve(
     // Conditions are always explicit: Vite resolves a build with `production`
     // (its `development|production` default), and the dev server passes the
     // same list, so a dep with a `development` export never differs between
-    // dev and build.
-    let condition_names = Some(oj_config::resolve_conditions_for(config, env, false));
+    // dev and build. Same source selection as every other Node-executing
+    // consumer: a runner-backed ssr environment's list describes the plugin's
+    // runtime (workerd), and this generic server bundle executes under Node,
+    // so it takes Vite's Node server semantics instead of the foreign list.
+    let condition_names = Some(if env == "ssr" && oj_config::ssr_runner_backed(config) {
+        oj_config::node_server_conditions(config, false)
+    } else {
+        oj_config::resolve_conditions_for(config, env, false)
+    });
     let symlinks = config
         .resolve
         .as_ref()
@@ -5545,6 +5552,39 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("oj-{name}-{nanos}"));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // The generic SSR prod bundle executes under Node, so a runner-backed ssr
+    // environment's condition list (workerd-shaped, the plugin runtime's) must
+    // not steer it: same source selection as the dev loader and the unbundled
+    // SSR resolver — runner-backed takes Vite's Node server semantics, a plain
+    // config's list passes verbatim.
+    #[test]
+    fn ssr_rolldown_conditions_swap_to_node_semantics_when_runner_backed() {
+        let from = |json: &str| -> oj_config::OjConfig { serde_json::from_str(json).unwrap() };
+        let root = Path::new("/some/app");
+
+        let runner_backed = from(
+            r#"{ "ssr": { "runnerBacked": true, "resolve": {
+                "conditions": ["workerd", "worker", "module", "browser", "development|production"] } } }"#,
+        );
+        let conditions = rolldown_resolve(root, &runner_backed, "ssr").unwrap().condition_names.unwrap();
+        assert_eq!(conditions, oj_config::node_server_conditions(&runner_backed, false));
+        assert!(conditions.contains(&"node".to_string()));
+        assert!(!conditions.contains(&"workerd".to_string()));
+        assert!(!conditions.contains(&"browser".to_string()));
+
+        // Not runner-backed: the user's ssr list passes verbatim (prod-mapped).
+        let plain = from(r#"{ "ssr": { "resolve": { "conditions": ["custom", "development|production"] } } }"#);
+        let conditions = rolldown_resolve(root, &plain, "ssr").unwrap().condition_names.unwrap();
+        assert!(conditions.contains(&"custom".to_string()));
+        assert!(conditions.contains(&"production".to_string()));
+        assert!(!conditions.contains(&"node".to_string()));
+
+        // The client environment never takes the swap.
+        let conditions = rolldown_resolve(root, &runner_backed, "client").unwrap().condition_names.unwrap();
+        assert!(conditions.contains(&"browser".to_string()));
+        assert!(!conditions.contains(&"node".to_string()));
     }
 
     #[test]
