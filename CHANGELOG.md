@@ -5,7 +5,7 @@ All notable changes to oj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.17] - 2026-09-05
 
 ### Changed
 - Cloudflare dev (`@cloudflare/vite-plugin`): on a source edit the worker environments no longer get a blanket `full-reload` that made the module runner re-walk the whole server graph (the next document after an edit took several times what `vite dev` takes on a large TanStack Start app). oj now mirrors Vite's HMR propagation over each environment's module graph (plugin `hotUpdate` hooks included) and sends targeted `{type:"update"}` payloads to the nearest accept boundary (the plugin's worker entry self-accepts), falling back to `full-reload` where Vite does (a propagation dead end, a graph without the walk API) and sending Vite's `{type:"error"}` payload when a `hotUpdate` hook throws. Changes travel with Vite's watcher event types: a delete goes through `moduleGraph.onFileDelete`, a created file retries the modules whose imports previously failed to resolve, `pluginContainer.watchChange` runs with the matching event, legacy `handleHotUpdate` plugins are dispatched for the client environment, and a hook's `read()` retries a truncated write as Vite's `readModifiedFile` does.
