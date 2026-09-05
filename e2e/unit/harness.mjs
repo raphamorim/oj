@@ -83,7 +83,10 @@ export function runSidecar(sidecarRel, config, { cwd, timeout = 30_000 } = {}) {
 // that isn't the reply you expect is returned as-is, so callers that trigger
 // host->driver requests can dispatch on it. Always `close()` in a finally.
 export function rpcSidecar(sidecarRel, { args = [], env, cwd } = {}) {
-  const child = spawn("node", [asset(sidecarRel), ...args], {
+  // An absolute path runs a copy of the sidecar from elsewhere (a test that
+  // reproduces the cache-dir shape); a relative name runs the asset in place.
+  const script = path.isAbsolute(sidecarRel) ? sidecarRel : asset(sidecarRel);
+  const child = spawn("node", [script, ...args], {
     cwd,
     env: env ? { ...process.env, ...env } : process.env,
     stdio: ["pipe", "pipe", "pipe"],
