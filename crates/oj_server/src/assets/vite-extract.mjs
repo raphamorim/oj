@@ -20,6 +20,16 @@ const resultPath = process.argv[7] || null;
 
 process.env.VITE_CONFIG_NATIVE_IGNORE_WARNING ??= "true";
 
+// Vite sets NODE_ENV before the config file's module evaluation when the
+// environment leaves it unset or empty (node.js resolveConfig:
+// `if (!isNodeEnvSet) process.env.NODE_ENV = defaultNodeEnv` runs BEFORE
+// loadConfigFromFile). The extractor loads the file itself, so without this a
+// config branching on process.env.NODE_ENV at module scope saw `undefined`
+// where Vite shows a value. oj hands `mode` to resolveConfig as defaultNodeEnv
+// (NODE_ENV follows the mode), so the pre-load value is the same one
+// resolveConfig would set.
+if (!process.env.NODE_ENV) process.env.NODE_ENV = mode;
+
 const appRequire = createRequire(pathToFileURL(appRoot + "/package.json").href);
 let directDeps = [];
 try {
@@ -176,12 +186,41 @@ function injectFileScopeVariablesPlugin() {
 // no re-run on the same plugin instances, no skip lists needed here — and it
 // sees config-hook declarations (via the merged config.environments) and
 // configEnvironment declarations (per environment, post-merge) alike.
-function detectionSentinel() {
+// `fileBuildSsr`: the config FILE's own `build.ssr`. The single-eval flow
+// hands the file's config to resolveConfig as the INLINE config
+// (configFile: false), but Vite computes `configEnv.isSsrBuild` from the
+// inline config alone (node.js resolveConfig: `isSsrBuild: command === "build"
+// && !!config.build?.ssr`, before loadConfigFromFile) — so a file-set
+// build.ssr must NOT ride the inline copy, or hooks see isSsrBuild true where
+// real Vite gives false. Under real Vite the value re-enters the config right
+// after the file loads (`config = mergeConfig(loadResult.config, config)`),
+// BEFORE the config hooks run — the pre plugin below reattaches it at exactly
+// that seam (runConfigHook, order "pre", first), so hooks, the environments.ssr
+// default fill, and the base resolution all see it as they would under Vite.
+// The one remaining divergence: a plugin's `apply(config, env)` filter runs
+// before any hook and sees no build.ssr.
+function detectionSentinel(fileBuildSsr) {
   let declared = false;
+  let started = false;
   const sniff = (cfg) => {
     if (declaresRunnerEnvironment(cfg)) declared = true;
   };
   return {
+    // Ordered FIRST (enforce "pre" + hook order "pre", prepended): marks that
+    // resolveConfig's hook run began on these plugin instances — after this, a
+    // resolveConfig failure must never re-run the hooks out of band — and
+    // reattaches the file's build.ssr (above).
+    prePlugin: {
+      name: "oj:extraction-preamble",
+      enforce: "pre",
+      config: {
+        order: "pre",
+        handler() {
+          started = true;
+          if (fileBuildSsr !== undefined) return { build: { ssr: fileBuildSsr } };
+        },
+      },
+    },
     plugin: {
       name: "oj:runner-environment-detection",
       enforce: "post",
@@ -196,7 +235,37 @@ function detectionSentinel() {
       },
     },
     declared: () => declared,
+    // Whether resolveConfig got as far as running config hooks: a throw after
+    // this point leaves side effects behind (run-once guards fired), so the
+    // caller must consume the partial verdict instead of re-running hooks.
+    started: () => started,
   };
+}
+
+// A deep copy of the config's PLAIN data (object literals and arrays), taken
+// before resolveConfig runs any plugin hook: everything the emit later reads
+// from the raw config (the resolve block for rawResolve, the ssr block, the
+// scalars and shapes warnUnsupported inspects) must reflect the FILE's own
+// content, not what a hook mutated in place. Functions, RegExps and class
+// instances are kept by reference — warnUnsupported's `instanceof RegExp` and
+// `typeof === "function"` checks must still see the real values, and plugin
+// instances are not data to copy.
+function snapshotPlainData(v, seen = new WeakMap()) {
+  if (!v || typeof v !== "object") return v;
+  const cached = seen.get(v);
+  if (cached) return cached;
+  if (Array.isArray(v)) {
+    const out = [];
+    seen.set(v, out);
+    for (const x of v) out.push(snapshotPlainData(x, seen));
+    return out;
+  }
+  const proto = Object.getPrototypeOf(v);
+  if (proto !== Object.prototype && proto !== null) return v;
+  const out = {};
+  seen.set(v, out);
+  for (const [k, x] of Object.entries(v)) out[k] = snapshotPlainData(x, seen);
+  return out;
 }
 
 async function loadConfig() {
@@ -233,15 +302,32 @@ async function loadConfig() {
       // present. loadConfigFromFile only reads the raw user config and misses them.
       if (typeof vite.resolveConfig === "function") {
         const singleEval = !!(loaded && loaded.config && typeof vite.mergeConfig === "function");
+        // Hoisted OUT of the try: a resolveConfig throw mid-hook-run must not
+        // discard the sentinel's partial verdict or the raw snapshot.
+        let detect = null;
+        let rawSnapshot = null;
         try {
           let resolved;
-          let detect = null;
           if (singleEval) {
-            detect = detectionSentinel();
+            // The plain-data subtrees the emit reads from the RAW config
+            // (rawResolve, warnUnsupported), snapshotted BEFORE any hook runs:
+            // mergeConfig shares untouched subobjects with loaded.config, so a
+            // config hook that MUTATES the config in place (conditions.push)
+            // would otherwise write into the object later emitted as raw.
+            rawSnapshot = snapshotPlainData(loaded.config);
+            detect = detectionSentinel(loaded.config.build?.ssr);
             const inline = modeExplicit ? { root: appRoot, mode } : { root: appRoot };
             const merged = vite.mergeConfig(loaded.config, inline);
             merged.configFile = false;
+            // The file's build.ssr must not ride the inline config (isSsrBuild
+            // is computed from it; see detectionSentinel) — the sentinel's pre
+            // plugin reattaches the value at Vite's own post-load merge seam.
+            if (merged.build && merged.build.ssr !== undefined) {
+              merged.build = { ...merged.build };
+              delete merged.build.ssr;
+            }
             merged.plugins = [
+              detect.prePlugin,
               ...(Array.isArray(merged.plugins) ? merged.plugins : []),
               detect.plugin,
             ];
@@ -256,10 +342,11 @@ async function loadConfig() {
             // config carries Vite's defaults for every option (esbuild.jsxDev,
             // worker, ssr.resolve, cors.origin, terserOptions...), which are not
             // configuration oj is failing to honor.
-            const raw = loaded?.config ?? null;
+            const raw = rawSnapshot ?? loaded?.config ?? null;
             if (raw == null) {
               // Loud, never silent: with no raw config, runner-backed detection
-              // cannot run and the emit below withholds the resolved ssr sugar.
+              // cannot run and the emit below withholds the resolved ssr sugar
+              // and the resolved top-level conditions.
               warn(
                 `could not load the raw config from ${configPath}` +
                   `${loadErr ? ` (${(loadErr && loadErr.message) || loadErr})` : ""}; ` +
@@ -272,13 +359,33 @@ async function loadConfig() {
               deps: absDeps(singleEval ? loaded.dependencies : resolved.configFileDependencies),
               // Decided inside resolveConfig's own hook run; null when the
               // sentinel could not ride along (the caller falls back to
-              // detectSsrRunnerBacked on the raw config's fresh instances).
+              // detectSsrRunnerBacked on the raw config's plugin instances,
+              // whose hooks never ran in this process then).
               runnerBacked: detect ? detect.declared() : null,
               merge: typeof vite.mergeConfig === "function" ? vite.mergeConfig : null,
             };
           }
-        } catch {
-          // fall through to the raw loader below
+        } catch (e) {
+          if (detect && detect.started()) {
+            // resolveConfig threw AFTER plugin config hooks began running on
+            // these instances (a throwing configResolved, a mid-run hook
+            // failure). Re-running the hooks out of band would double every
+            // side effect (run-once guards break), so consume the sentinel's
+            // partial verdict instead — loudly, naming the failure.
+            warn(
+              `resolveConfig failed after plugin config hooks ran (${(e && e.message) || e}); ` +
+                "using the raw config and the partial runner-backed verdict",
+            );
+            return {
+              config: loaded.config,
+              raw: rawSnapshot ?? loaded.config,
+              deps: absDeps(loaded.dependencies),
+              runnerBacked: detect.declared(),
+              merge: typeof vite.mergeConfig === "function" ? vite.mergeConfig : null,
+            };
+          }
+          // No hook ran in this process: fall through to the raw loader below
+          // (detection there runs the hooks once, on instances still unrun).
         }
       }
       if (loaded && loaded.config) {
@@ -991,13 +1098,25 @@ try {
           merge ?? mergeConfigLite,
         );
   let ssr = extractSsr(c.ssr, c.environments?.ssr);
-  if (raw == null && ssr) {
+  let resolveOut = extractResolve(c.resolve);
+  if (raw == null) {
     // No raw config means detection could not run: the resolved ssr.resolve
     // conditions may describe a plugin's foreign runtime (workerd) that Node
     // consumers must never adopt undetected. Correctness over completeness:
     // withhold the sugar (loadConfig already warned) and let defaults stand.
-    delete ssr.resolve;
-    if (Object.keys(ssr).length === 0) ssr = null;
+    if (ssr) {
+      delete ssr.resolve;
+      if (Object.keys(ssr).length === 0) ssr = null;
+    }
+    // Same rule for the resolved TOP-LEVEL conditions: that list is Vite's
+    // client-environment fill (browser-bearing, possibly plugin-extended) and
+    // the Node consumers would adopt it with no detection to gate it — no
+    // foreign conditions may reach them undetected on this path either.
+    if (resolveOut) {
+      delete resolveOut.conditions;
+      delete resolveOut.externalConditions;
+      if (Object.keys(resolveOut).length === 0) resolveOut = null;
+    }
   }
   emitResult(
     JSON.stringify({
@@ -1028,7 +1147,7 @@ try {
       esbuild: extractEsbuild(c.esbuild),
       ssr: ssrRunnerBacked ? { ...(ssr ?? {}), runnerBacked: true } : ssr,
       mode: typeof c.mode === "string" ? c.mode : null,
-      resolve: extractResolve(c.resolve),
+      resolve: resolveOut,
       // The RAW config file's own top-level `resolve` block. The resolved
       // config's `resolve.conditions` is Vite's CLIENT environment list
       // (browser-bearing defaults) — never a server-side conditions source —
