@@ -184,16 +184,20 @@ pub async fn start_dev(
     // skips it iff the worker environments render (warming the runner is
     // wasted CPU then).
     type ServeInfoUpdates = tokio::sync::watch::Receiver<Option<oj_server::plugins::ServeInfo>>;
-    let (cf_tx, cf_rx) = tokio::sync::oneshot::channel::<Option<ServeInfoUpdates>>();
+    let (cf_tx, cf_rx) =
+        tokio::sync::oneshot::channel::<Option<(ServeInfoUpdates, tokio::time::Instant)>>();
     {
         let runner = Arc::clone(&runner);
         let reload_tx = reload_tx.clone();
         tokio::spawn(async move {
             if cf_hint {
-                if let Ok(Some(mut updates)) = cf_rx.await {
-                    // Bounded by the same knob that bounds the host's init
-                    // (OJ_PLUGIN_INIT_TIMEOUT), not a second magic number.
-                    let known = tokio::time::timeout(oj_server::plugins::plugin_init_timeout(), async {
+                if let Ok(Some((mut updates, init_deadline))) = cf_rx.await {
+                    // Anchored to the host's OWN init deadline (its spawn
+                    // instant + OJ_PLUGIN_INIT_TIMEOUT), not a fresh timeout
+                    // measured from here: this wait starts after the spawn, so
+                    // a second full period would have let a wedged host hold
+                    // the prewarm for up to twice the knob.
+                    let known = tokio::time::timeout_at(init_deadline, async {
                         loop {
                             if let Some(info) = *updates.borrow_and_update() {
                                 return info;
@@ -222,7 +226,12 @@ pub async fn start_dev(
     let (bundle_res, built_res) = tokio::join!(bundle, built_task);
     let pinned = bundle_res??;
     let built = built_res??;
-    let _ = cf_tx.send(built.plugin_host.as_ref().map(|h| h.serve_info_updates()));
+    let _ = cf_tx.send(
+        built
+            .plugin_host
+            .as_ref()
+            .map(|h| (h.serve_info_updates(), h.init_deadline_at())),
+    );
     oj_server::boot_phase("bundle+build joined");
     let css_host = if app_uses_tailwind(&root) {
         spawn_node_service(&root, &cache.join("css-host.mjs"), &mode)
