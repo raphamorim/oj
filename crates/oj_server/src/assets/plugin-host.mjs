@@ -1724,29 +1724,35 @@ async function setupConfigureServer() {
   // `config` hook returns `environments.<name>.dev.createEnvironment` and
   // resolveConfig merges that into the user config BEFORE default-filling
   // every environment's factory (runConfigHook, then
-  // resolveDevEnvironmentOptions). Extraction is the SINGLE detection
-  // authority: the config extractor ran that declaration mechanism before this
-  // host spawned, and its verdict arrives as `initial.runnerBacked` — the same
-  // value every Rust consumer reads — so the host and Rust can never disagree.
-  // The host's own declaration check (the raw user config, oj's initial
-  // config, and pluginConfigDelta — never the Vite-RESOLVED config, whose
-  // every environment carries a default factory) remains ONLY for callers
-  // whose payload predates the field. A declaring plugin whose config hook
-  // failed IN THIS HOST keeps the path: the extractor's independent run
-  // already decided, and buildEnvironments re-resolves on fresh instances
-  // where the hook may well succeed.
+  // resolveDevEnvironmentOptions). The config extractor ran that declaration
+  // mechanism before this host spawned, and its verdict arrives as
+  // `initial.runnerBacked`. Extraction TRUE is authoritative and sufficient —
+  // a declaring plugin whose config hook failed IN THIS HOST keeps the path:
+  // the extractor's independent run already decided, and buildEnvironments
+  // re-resolves on fresh instances where the hook may well succeed. Extraction
+  // FALSE or ABSENT is NOT final: it falls through to the host's own
+  // declaration check (the raw user config, oj's initial config, and
+  // pluginConfigDelta — never the Vite-RESOLVED config, whose every
+  // environment carries a default factory), so a missing or stale-false
+  // verdict (an extraction path that degraded, a cache that outlived a
+  // wrangler fix) can never silently disable the worker path when the host
+  // itself can see the declaration.
   const declaresRunnerEnvironment = (cfg) =>
     !!cfg &&
     typeof cfg === "object" &&
     Object.values(cfg.environments ?? {}).some(
       (e) => e && e.dev && typeof e.dev.createEnvironment === "function",
     );
-  const runnerBackedSource =
-    typeof initial.runnerBacked === "boolean" ? "config extraction" : "host declaration check";
-  const runnerDeclared =
-    typeof initial.runnerBacked === "boolean"
-      ? initial.runnerBacked
-      : [userViteConfig, initial.config, pluginConfigDelta].some(declaresRunnerEnvironment);
+  const extractionSaysBacked = initial.runnerBacked === true;
+  const hostSeesDeclaration =
+    !extractionSaysBacked &&
+    [userViteConfig, initial.config, pluginConfigDelta].some(declaresRunnerEnvironment);
+  const runnerDeclared = extractionSaysBacked || hostSeesDeclaration;
+  const runnerBackedSource = extractionSaysBacked
+    ? "config extraction"
+    : initial.runnerBacked === false
+      ? "host declaration check (extraction said no)"
+      : "host declaration check";
   if (runnerDeclared) {
     process.stderr.write(
       `${OJ} plugin host: a custom dev environment is declared (decided by ${runnerBackedSource})\n`,
