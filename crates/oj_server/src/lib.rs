@@ -766,14 +766,14 @@ impl DevServer {
             "ojStartMode": is_start,
         });
         if plugins_format == "vite" {
-            // Extraction is the single runner-backed detection authority: the
-            // extractor already evaluated the config (boot fails hard when a
-            // present vite.config does not extract), and the host's
-            // buildEnvironments gate consumes this instead of re-deciding from
-            // its own config-hook run — the host and every Rust consumer of
-            // `ssr.runnerBacked` then read the same verdict. Omitted for oj
-            // plugin files, where no extraction ran (the host falls back to
-            // its own declaration check).
+            // The extractor already evaluated the config (boot fails hard when
+            // a present vite.config does not extract); its verdict rides the
+            // spawn payload. The host treats TRUE as authoritative and
+            // sufficient (a host-side hook failure cannot lose the path), while
+            // FALSE falls through to the host's own declaration check — a
+            // degraded or stale verdict can then never silently disable the
+            // worker path the host itself can see declared. Omitted for oj
+            // plugin files, where no extraction ran.
             plugin_cfg["runnerBacked"] =
                 serde_json::json!(oj_config::ssr_runner_backed(&config));
         }

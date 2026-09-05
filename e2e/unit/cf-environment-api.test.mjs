@@ -668,10 +668,11 @@ test("invalidate dedup: content identity, atomic-save create, read errors", asyn
   }
 });
 
-// Extraction is the SINGLE runner-backed detection authority: the extractor's
-// verdict travels in the spawn payload as `initial.runnerBacked`, and the
-// gate consumes it as its primary source — the host's own declaration check
-// remains only for payloads that predate the field (the tests above).
+// The extractor's verdict travels in the spawn payload as `initial.runnerBacked`.
+// Trust shape: extraction TRUE is authoritative and sufficient; extraction
+// FALSE or ABSENT falls through to the host's own declaration check, so a
+// missing or stale-false verdict can never silently disable the worker path
+// when the host itself can see the declaration.
 test("initial.runnerBacked=true keeps the Environment-API path even when the declaring plugin's config hook throws in the host", async () => {
   const fx = tmpProject({ prefix: "oj-cf-extauth-" });
   fx.pkg("vite", "index.mjs", {
@@ -724,11 +725,25 @@ test("initial.runnerBacked=true keeps the Environment-API path even when the dec
   }
 });
 
-test("initial.runnerBacked=false is authoritative: the host's own declaration check is not consulted", async () => {
+test("initial.runnerBacked=false falls through to the host's own declaration check", async () => {
   const fx = tmpProject({ prefix: "oj-cf-extfalse-" });
-  // A declaring plugin whose hook SUCCEEDS in the host: without the field this
-  // would activate the path (see the first test); the extractor's false wins,
-  // so host and Rust consumers can never disagree.
+  fx.pkg("vite", "index.mjs", {
+    "index.mjs": `
+      export function resolveConfig(inline) {
+        const mkEnv = () => (name) => ({ name, init() {}, hot: { handleInvoke() {}, on() {} } });
+        return {
+          root: inline.root,
+          logger: { info() {}, warn() {}, warnOnce() {}, error() {} },
+          environments: { worker: { dev: { createEnvironment: mkEnv() } } },
+        };
+      }
+      export class DevEnvironment {}
+    `,
+  });
+  // A declaring plugin whose hook SUCCEEDS in the host while extraction said
+  // false (a degraded extraction path, a stale cached verdict): the false is
+  // NOT final — the host's own declaration check decides, and the worker path
+  // stays up instead of being silently disabled by a wrong verdict.
   fx.write(
     "oj.plugins.mjs",
     `export default [{
@@ -736,6 +751,37 @@ test("initial.runnerBacked=false is authoritative: the host's own declaration ch
        config: () => ({ environments: { worker: { dev: { createEnvironment: () => ({}) } } } }),
      }];\n`,
   );
+  const host = rpcSidecar("plugin-host.mjs", {
+    args: [
+      path.join(fx.root, "oj.plugins.mjs"),
+      JSON.stringify({
+        config: { root: fx.root },
+        env: { command: "serve", mode: "development" },
+        environment: { name: "client" },
+        ojStartMode: true,
+        runnerBacked: false,
+      }),
+    ],
+    env: { OJ_CACHE_ROOT: fx.root },
+    cwd: fx.root,
+  });
+  try {
+    const info = await host.serveInfo();
+    assert.equal(info.runnerEnvironments, true, "the host's own check overrides extraction's false");
+    assert.match(
+      host.stderr(),
+      /decided by host declaration check \(extraction said no\)/,
+      "the deciding source (and the disagreement) is logged",
+    );
+  } finally {
+    host.close();
+    fx.cleanup();
+  }
+});
+
+test("initial.runnerBacked=false with no host-visible declaration keeps the path off", async () => {
+  const fx = tmpProject({ prefix: "oj-cf-extfalse-plain-" });
+  fx.write("oj.plugins.mjs", 'export default [{ name: "inert" }];\n');
   const host = rpcSidecar("plugin-host.mjs", {
     args: [
       path.join(fx.root, "oj.plugins.mjs"),
@@ -753,7 +799,7 @@ test("initial.runnerBacked=false is authoritative: the host's own declaration ch
     const info = await host.serveInfo();
     assert.equal(info.runnerEnvironments, false);
     assert.doesNotMatch(host.stderr(), /custom dev environment is declared/);
-    assert.doesNotMatch(host.stderr(), /none came up/, "detection said false: nothing was expected to come up");
+    assert.doesNotMatch(host.stderr(), /none came up/, "nothing declared anywhere: nothing was expected to come up");
   } finally {
     host.close();
     fx.cleanup();
