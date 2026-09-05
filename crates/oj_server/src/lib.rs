@@ -485,9 +485,15 @@ fn spawn_late_plugin_serve(plugin_serve: Arc<PluginServe>, host: Arc<PluginHost>
                         "  plugin middleware: forwarding unmatched requests to :{p} (host came up after boot)"
                     );
                     // The catch-up: edits made while the path was down were
-                    // never invalidated into the worker environments.
-                    notify_plugin_mw_resync(p).await;
-                    println!("  plugin middleware: worker environments resynced (full reload)");
+                    // never invalidated into the worker environments. Claimed
+                    // only when the middleware actually ACKed it.
+                    if resync_plugin_mw_with_retry(p).await {
+                        println!("  plugin middleware: worker environments resynced (full reload)");
+                    } else {
+                        eprintln!(
+                            "oj: warning: the worker environment resync was not acknowledged; edits made while the plugin middleware was down may be stale until the next edit or a restart"
+                        );
+                    }
                 }
                 return;
             }
@@ -3090,15 +3096,41 @@ fn plugin_mw_client() -> &'static reqwest::Client {
 
 /// Tell the plugin middleware to resynchronize: invalidate every runner-backed
 /// DevEnvironment's whole module graph and send a full-reload, bypassing the
-/// per-change dedup. Sent once on late activation, covering every edit made
-/// while the middleware path was down (the watcher had no port to invalidate).
-pub async fn notify_plugin_mw_resync(port: u16) {
-    let _ = plugin_mw_client()
+/// per-change dedup. Sent on late activation, covering every edit made while
+/// the middleware path was down (the watcher had no port to invalidate).
+/// Returns whether the middleware acknowledged it (the host answers only after
+/// the invalidation ran) — the caller must not claim "resynced" otherwise.
+pub async fn notify_plugin_mw_resync(port: u16) -> bool {
+    match plugin_mw_client()
         .post(format!("http://127.0.0.1:{port}/__oj_invalidate"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(r#"{"resync":true}"#)
         .send()
-        .await;
+        .await
+    {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+/// [`notify_plugin_mw_resync`] with a few backed-off retries: the resync races
+/// the host's middleware server settling in, and a transient failure must not
+/// leave the degraded window's edits silently stale. `false` after the last
+/// attempt — the caller then warns instead of logging success.
+pub async fn resync_plugin_mw_with_retry(port: u16) -> bool {
+    for delay in [
+        std::time::Duration::ZERO,
+        std::time::Duration::from_millis(250),
+        std::time::Duration::from_millis(750),
+    ] {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        if notify_plugin_mw_resync(port).await {
+            return true;
+        }
+    }
+    false
 }
 
 // Method+body version of forward_get_to_plugin_mw, for the /_serverFn/ path so
@@ -8109,6 +8141,50 @@ async fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The late-activation resync is claimed only on an ACK: transient failures
+    // are retried with backoff, and a middleware that never acknowledges makes
+    // the helper report failure (the caller then warns about stale edits)
+    // instead of logging success over a resync that never happened.
+    #[tokio::test]
+    async fn resync_retries_until_the_middleware_acks() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut n = 0u32;
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                n += 1;
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                // The first two attempts fail; the third is the real ACK.
+                let resp = if n < 3 {
+                    "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n"
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        assert!(!notify_plugin_mw_resync(port).await, "a 500 is not an ACK");
+        assert!(
+            resync_plugin_mw_with_retry(port).await,
+            "the retry loop must reach the eventual ACK"
+        );
+    }
+
+    #[tokio::test]
+    async fn resync_reports_failure_when_nothing_acks() {
+        // A port with nothing listening: every attempt is refused.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        assert!(!resync_plugin_mw_with_retry(port).await);
+    }
 
     // One packed word: every reader sees (port, runner_environments) from the
     // same write, and a late activation runs the handler BEFORE the flip is
