@@ -214,7 +214,11 @@ async function runDev() {
     );
     const t1 = Date.now();
     let rapid = null;
-    for (let i = 0; i < 40; i++) {
+    // A generous deadline: the machine is saturated by the first edit's
+    // rebundle here, so a loaded box can take a while even though the prompt
+    // invalidate usually lands well under a second. The measured elapsed ms is
+    // printed below, so the fast path stays visible in the logs.
+    for (let i = 0; i < 300; i++) {
       const res = await get("/about");
       if (res.status === 200 && res.body.includes("about-page-rapid-marker")) {
         rapid = Date.now() - t1;
@@ -223,7 +227,7 @@ async function runDev() {
       await new Promise((r) => setTimeout(r, 50));
     }
     if (rapid == null) {
-      throw new Error(`/about still stale 2s after the rapid second edit; log tail:\n${log.slice(-4000)}`);
+      throw new Error(`/about still stale 15s after the rapid second edit; log tail:\n${log.slice(-4000)}`);
     }
 
     // The coalesced rebundle must not lose the first edit either.
@@ -237,8 +241,43 @@ async function runDev() {
       throw new Error(`/ never picked up the first rapid edit; log tail:\n${log.slice(-4000)}`);
     }
 
+    // A new route file: the run regenerates routeTree.gen.ts, and the worker
+    // environments must be invalidated for the regenerated output AFTER the
+    // regen (the watcher deliberately never forwards routeTree.gen events).
+    // This fixture's router is code-based (src/routeTree.ts), so the generated
+    // tree is never imported by the app and the new route cannot serve;
+    // instead assert through the logs that oj sent the post-regen invalidate
+    // and the plugin host received it (the graph not knowing routeTree.gen.ts
+    // makes the host log the unmatched change, which doubles as a receipt).
+    fs.writeFileSync(path.join(app, "src", "routes", "extra.tsx"), [
+      'import { createFileRoute } from "@tanstack/react-router";',
+      "",
+      'export const Route = createFileRoute("/extra")({',
+      "  component: () => <main>extra-page-marker</main>,",
+      "});",
+      "",
+    ].join("\n"));
+    let regenSent = false;
+    let regenReceived = false;
+    for (let i = 0; i < 300 && !(regenSent && regenReceived); i++) {
+      regenSent = /regen outputs changed \([^)]*routeTree\.gen\.ts/.test(log);
+      regenReceived = /routeTree\.gen\.ts matched no module/.test(log);
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (!regenSent) {
+      throw new Error(`no post-regen worker invalidate for routeTree.gen.ts within 30s of a new route file; log tail:\n${log.slice(-4000)}`);
+    }
+    if (!regenReceived) {
+      throw new Error(`the plugin host never received the routeTree.gen.ts invalidate; log tail:\n${log.slice(-4000)}`);
+    }
+    // The generator run must not have broken the app.
+    const after = await get("/");
+    if (after.status !== 200 || !after.body.includes("HOME-RAPID!")) {
+      throw new Error(`/ broken after the new-route regen (${after.status}); log tail:\n${log.slice(-4000)}`);
+    }
+
     console.log(
-      `start-cloudflare-dev: worker render + live-reload client + fresh document ${fresh}ms after the edit, ${rapid}ms after a rapid second edit`,
+      `start-cloudflare-dev: worker render + live-reload client + fresh document ${fresh}ms after the edit, ${rapid}ms after a rapid second edit, post-regen routeTree invalidate observed`,
     );
   } finally {
     stop();
