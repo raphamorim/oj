@@ -1129,8 +1129,10 @@ function wsConnection() {
 
 let middlewarePort = null;
 // Whether buildEnvironments produced real runner-backed Vite DevEnvironments
-// (today: the Cloudflare plugin's Environment-API path); reported through
-// getServeInfo, which Rust reads to gate its SSR-runner handling.
+// (the Environment-API path, activated by any plugin or config declaring an
+// `environments.<name>.dev.createEnvironment` factory, e.g. the Cloudflare
+// plugin); reported through getServeInfo, which Rust reads to gate its
+// SSR-runner handling.
 let runnerEnvironmentsBuilt = false;
 // The ViteDevServer stand-in handed to configureServer; hotUpdate/handleHotUpdate
 // contexts carry it as `server` (plugins call server.ws.send / moduleGraph on it).
@@ -1718,7 +1720,23 @@ async function setupConfigureServer() {
       throw new Error("oj: server.ssrLoadModule is not available in configureServer");
     },
   };
-  if (plugins.some((p) => p && p.name === "vite-plugin-cloudflare:dev")) {
+  // A plugin that drives its own dev runtime DECLARES it, Vite's way: its
+  // `config` hook returns `environments.<name>.dev.createEnvironment` and
+  // resolveConfig merges that into the user config BEFORE default-filling
+  // every environment's factory (runConfigHook, then
+  // resolveDevEnvironmentOptions). So the gate asks the host's own config-hook
+  // results — the raw user config, oj's initial config, and pluginConfigDelta
+  // (what the hooks returned) — never the Vite-RESOLVED config, whose every
+  // environment carries a default factory. Any declaring plugin activates the
+  // Environment-API path (the Cloudflare plugin is one such, not a special
+  // case).
+  const declaresRunnerEnvironment = (cfg) =>
+    !!cfg &&
+    typeof cfg === "object" &&
+    Object.values(cfg.environments ?? {}).some(
+      (e) => e && e.dev && typeof e.dev.createEnvironment === "function",
+    );
+  if ([userViteConfig, initial.config, pluginConfigDelta].some(declaresRunnerEnvironment)) {
     try {
       const built = await buildEnvironments(server);
       // Every createEnvironment/init can fail individually (workerd refused to
@@ -1732,13 +1750,13 @@ async function setupConfigureServer() {
     } catch (e) {
       process.stderr.write(`${OJ} plugin host: buildEnvironments failed: ${(e && e.message) || e}\n`);
     }
-    // The host, not a config-text heuristic, knows whether the Cloudflare dev
-    // plugin is active: when it is and no worker environment came up, say so
-    // instead of degrading to the Node SSR runner silently (the per-failure
-    // causes are on stderr above).
+    // The host, not a config-text heuristic, knows whether a runner-declaring
+    // plugin is active: when one is and no environment came up, say so instead
+    // of degrading to the Node SSR runner silently (the per-failure causes are
+    // on stderr above).
     if (!runnerEnvironmentsBuilt) {
       process.stderr.write(
-        `${OJ} warning: @cloudflare/vite-plugin is active but no worker environment came up; documents are served by the Node SSR runner\n`,
+        `${OJ} warning: a plugin declared a custom dev environment but none came up; documents are served by the Node SSR runner\n`,
       );
     }
   }

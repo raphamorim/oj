@@ -45,10 +45,12 @@ test("the extractor runs when its path reaches it through a symlink", () => {
   }
 });
 
-// End to end through the extractor entry: a config whose plugin list carries
-// the Cloudflare dev plugin marks the ssr environment runner-backed
-// (`ssr.runnerBacked`), and the RAW top-level `resolve` block travels as
-// `rawResolve` — the two inputs the Node SSR consumers select conditions from.
+// End to end through the extractor entry: a config whose plugin declares a
+// dev-runtime environment from its `config` hook (Vite's declaration
+// mechanism, as @cloudflare/vite-plugin does) marks the ssr environment
+// runner-backed (`ssr.runnerBacked`), and the RAW top-level `resolve` block
+// travels as `rawResolve` — the two inputs the Node SSR consumers select
+// conditions from.
 test("the extractor emits ssr.runnerBacked and rawResolve", () => {
   const base = mkdtempSync(join(tmpdir(), "oj-vite-extract-rb-"));
   try {
@@ -58,7 +60,11 @@ test("the extractor emits ssr.runnerBacked and rawResolve", () => {
     writeFileSync(
       join(base, "vite.config.mjs"),
       `export default {
-        plugins: [[{ name: "vite-plugin-cloudflare" }, { name: "vite-plugin-cloudflare:dev" }]],
+        plugins: [[
+          { name: "vite-plugin-cloudflare" },
+          { name: "vite-plugin-cloudflare:config",
+            config: () => ({ environments: { worker: { dev: { createEnvironment: () => ({}) } } } }) },
+        ]],
         resolve: { conditions: ["custom"], externalConditions: ["custom-ext"] },
         ssr: { target: "node" },
       };\n`,
