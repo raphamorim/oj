@@ -13,7 +13,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { asset } from "./harness.mjs";
@@ -40,6 +40,49 @@ test("the extractor runs when its path reaches it through a symlink", () => {
     // symlink it has to do the same rather than exit silently.
     assert.equal(runVia(real), "{}");
     assert.equal(runVia(join(base, "link")), "{}");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// End to end through the extractor entry: a config whose plugin list carries
+// the Cloudflare dev plugin marks the ssr environment runner-backed
+// (`ssr.runnerBacked`), and the RAW top-level `resolve` block travels as
+// `rawResolve` — the two inputs the Node SSR consumers select conditions from.
+test("the extractor emits ssr.runnerBacked and rawResolve", () => {
+  const base = mkdtempSync(join(tmpdir(), "oj-vite-extract-rb-"));
+  try {
+    copyFileSync(asset("vite-extract.mjs"), join(base, "vite-extract.mjs"));
+    writeFileSync(join(base, "package.json"), JSON.stringify({ name: "rb-app", type: "module" }));
+    // A raw plugin list nests, as a plugin factory's return does.
+    writeFileSync(
+      join(base, "vite.config.mjs"),
+      `export default {
+        plugins: [[{ name: "vite-plugin-cloudflare" }, { name: "vite-plugin-cloudflare:dev" }]],
+        resolve: { conditions: ["custom"], externalConditions: ["custom-ext"] },
+        ssr: { target: "node" },
+      };\n`,
+    );
+    const run = (config) => JSON.parse(execFileSync(
+      process.execPath,
+      [join(base, "vite-extract.mjs"), join(base, config), base],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    ));
+    const out = run("vite.config.mjs");
+    assert.equal(out.__ok, true);
+    assert.equal(out.ssr.runnerBacked, true);
+    assert.equal(out.ssr.target, "node");
+    assert.deepEqual(out.rawResolve, { conditions: ["custom"], externalConditions: ["custom-ext"] });
+
+    // Without the plugin (and no custom createEnvironment) nothing is marked.
+    writeFileSync(
+      join(base, "plain.config.mjs"),
+      'export default { plugins: [{ name: "react" }], ssr: { target: "node" } };\n',
+    );
+    const plain = run("plain.config.mjs");
+    assert.equal(plain.__ok, true);
+    assert.equal(plain.ssr.runnerBacked, undefined);
+    assert.equal(plain.rawResolve, null);
   } finally {
     rmSync(base, { recursive: true, force: true });
   }

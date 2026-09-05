@@ -658,31 +658,17 @@ function resolveDirEntry(dir) {
 
 const isRequire = (context) => context.conditions && context.conditions.includes("require");
 
-// This loader executes modules in Node: a `browser` conditional export matched
-// here runs DOM code server-side (`document is not defined`), and a non-Node
-// runtime condition (the Cloudflare plugin sets `browser` alongside `workerd`)
-// resolves builds written for that runtime, not Node. A list carrying any
-// non-Node runtime marker drops `browser` AND the markers themselves (a
-// workerd-only exports key must fall through to node/default); `worker` is
-// runtime-neutral by convention and kept. A list without a marker is honored
-// verbatim, as Vite honors user conditions. Byte-consistent with
-// oj_config::node_safe_conditions — the same strip in oj's env plumbing; this
-// is the last line of defense should such a list reach the loader through any
-// other path.
-const NON_NODE_RUNTIME_MARKERS = ["workerd", "edge-light", "deno", "bun", "react-native"];
-function nodeSafeConditions(list) {
-  if (!Array.isArray(list)) return null;
-  const out = list.filter((c) => typeof c === "string" && c);
-  return out.some((c) => NON_NODE_RUNTIME_MARKERS.includes(c))
-    ? out.filter((c) => c !== "browser" && !NON_NODE_RUNTIME_MARKERS.includes(c))
-    : out;
-}
-// The config's `resolve.conditions` (OJ_RESOLVE_CONDITIONS from oj), added to
+// The conditions oj selected for this loader (OJ_RESOLVE_CONDITIONS), added to
 // Node's export conditions for every resolution, as Vite's resolver honors a
 // user condition (`exports: { custom: ... }`) for the modules it resolves.
+// Applied verbatim: conditions never cross runtimes, and oj picks the source —
+// the ssr environment's own list when its code executes here, or Vite's Node
+// server defaults when the environment is runner-backed (a foreign runtime,
+// e.g. the Cloudflare plugin's workerd, whose list must not steer Node).
+const conditionList = (v) => (Array.isArray(v) ? v.filter((c) => typeof c === "string" && c) : null);
 const EXTRA_CONDITIONS = (() => {
   try {
-    return nodeSafeConditions(JSON.parse(process.env.OJ_RESOLVE_CONDITIONS || "null")) ?? [];
+    return conditionList(JSON.parse(process.env.OJ_RESOLVE_CONDITIONS || "null")) ?? [];
   } catch { return []; }
 })();
 function withUserConditions(context) {
@@ -699,7 +685,7 @@ function withUserConditions(context) {
 // OJ_EXTERNAL_CONDITIONS carries the config's `resolve.externalConditions`.
 const EXTERNAL_CONDITIONS = (() => {
   try {
-    const list = nodeSafeConditions(JSON.parse(process.env.OJ_EXTERNAL_CONDITIONS || "null"));
+    const list = conditionList(JSON.parse(process.env.OJ_EXTERNAL_CONDITIONS || "null"));
     if (list) return list;
   } catch {}
   return ["module-sync"];

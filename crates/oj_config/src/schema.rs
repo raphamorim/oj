@@ -18,6 +18,13 @@ pub struct OjConfig {
     pub public_dir: Option<BoolOrString>,
     pub server: Option<ServerConfig>,
     pub resolve: Option<ResolveConfig>,
+    /// The RAW config file's top-level `resolve` block (the extractor's
+    /// `rawResolve`). The extracted `resolve` above comes from Vite's RESOLVED
+    /// config, whose top-level conditions are the client environment's
+    /// (browser-bearing) list; this one is the user-authored, runtime-neutral
+    /// list the Node SSR consumers may add to their Node defaults when the ssr
+    /// environment is runner-backed. See `node_server_conditions`.
+    pub raw_resolve: Option<ResolveConfig>,
     pub css: Option<CssConfig>,
     pub define: Option<BTreeMap<String, serde_json::Value>>,
     pub env_prefix: Option<StringOrList>,

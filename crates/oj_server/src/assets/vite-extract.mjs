@@ -236,16 +236,12 @@ async function loadConfig() {
     } finally {
       try { unlinkSync(out); } catch {}
     }
-    return {
-      config: typeof m.default === "function" ? await m.default({ command, mode }) : m.default,
-      deps: absDeps(Object.keys(r.metafile?.inputs ?? {})),
-    };
+    const config = typeof m.default === "function" ? await m.default({ command, mode }) : m.default;
+    return { config, raw: config, deps: absDeps(Object.keys(r.metafile?.inputs ?? {})) };
   }
   const m = await import(pathToFileURL(configPath).href);
-  return {
-    config: typeof m.default === "function" ? await m.default({ command, mode }) : m.default,
-    deps: relativeImportDeps(configPath),
-  };
+  const config = typeof m.default === "function" ? await m.default({ command, mode }) : m.default;
+  return { config, raw: config, deps: relativeImportDeps(configPath) };
 }
 
 // A plain JS config loaded straight by Node has no bundler metafile to name its
@@ -495,6 +491,34 @@ function extractSsr(ssr, ssrEnvironment) {
   if (res) out.resolve = res;
   return Object.keys(out).length ? out : null;
 }
+// Whether the ssr environment is "runner-backed": its modules execute in a
+// plugin-driven runtime (today the Cloudflare plugin's workerd
+// DevEnvironments), not in oj's own Node SSR runner. Vite-shaped rule:
+// conditions never cross runtimes — the ssr environment's `resolve.conditions`
+// then describe THAT runtime and Node-executing consumers (the Start loader,
+// the unbundled SSR resolver) must take Vite's Node server defaults instead.
+//
+// The signal is structural, decided at config-extraction time (before the
+// plugin host is up, so oj can build the loader's env):
+// - the RAW config declares `environments.ssr.dev.createEnvironment` (a custom
+//   dev runtime factory). The RESOLVED config is useless here: Vite's
+//   resolveDevEnvironmentOptions fills every environment's
+//   `dev.createEnvironment` with its own default factory, so presence there
+//   says nothing about the user's or a plugin's choice.
+// - or the instantiated plugin list carries the Cloudflare dev plugin by its
+//   declared name — the exact gate plugin-host.mjs uses before
+//   buildEnvironments creates real runner-backed DevEnvironments. This matches
+//   the plugin object's `name`, not config text, so a commented-out import
+//   cannot false-positive.
+const CLOUDFLARE_DEV_PLUGIN = "vite-plugin-cloudflare:dev";
+function detectSsrRunnerBacked(raw, plugins) {
+  if (raw?.environments?.ssr?.dev?.createEnvironment) return true;
+  // Raw plugin lists nest (a plugin factory returns an array); resolved lists
+  // are already flat. Flatten either way.
+  const flat = Array.isArray(plugins) ? plugins.flat(Infinity) : [];
+  return flat.some((p) => p && p.name === CLOUDFLARE_DEV_PLUGIN);
+}
+
 function extractResolve(r) {
   if (!r || typeof r !== "object") return null;
   const out = {};
@@ -656,7 +680,7 @@ const isMainRun = (() => {
   };
   return real(self) === real(entry);
 })();
-export { extractAlias, extractOptimizeDeps, extractProxy, extractResolve, extractSsr, warnUnsupported };
+export { detectSsrRunnerBacked, extractAlias, extractOptimizeDeps, extractProxy, extractResolve, extractSsr, warnUnsupported };
 
 const emitResult = (json) => {
   if (resultPath) writeFileSync(resultPath, json);
@@ -667,6 +691,10 @@ if (isMainRun) try {
   const { config, raw, deps } = (await loadConfig()) ?? {};
   const c = config ?? {};
   warnUnsupported(raw ?? c);
+  // Prefer the resolved plugin list (flat, `apply`-filtered for this command);
+  // the raw list only stands in when Vite itself could not resolve the config.
+  const ssrRunnerBacked = detectSsrRunnerBacked(raw, Array.isArray(c.plugins) ? c.plugins : raw?.plugins);
+  const ssr = extractSsr(c.ssr, c.environments?.ssr);
   emitResult(
     JSON.stringify({
       __ok: true,
@@ -694,9 +722,15 @@ if (isMainRun) try {
       build: extractBuild(c.build),
       oxc: extractOxc(c.oxc),
       esbuild: extractEsbuild(c.esbuild),
-      ssr: extractSsr(c.ssr, c.environments?.ssr),
+      ssr: ssrRunnerBacked ? { ...(ssr ?? {}), runnerBacked: true } : ssr,
       mode: typeof c.mode === "string" ? c.mode : null,
       resolve: extractResolve(c.resolve),
+      // The RAW config file's own top-level `resolve` block. The resolved
+      // config's `resolve.conditions` is Vite's CLIENT environment list
+      // (browser-bearing defaults) — never a server-side conditions source —
+      // while this one is user-authored and runtime-neutral: the Node SSR
+      // consumers add it to their Node defaults when ssr is runner-backed.
+      rawResolve: extractResolve(raw?.resolve),
       serverFlags: extractServerFlags(c.server, c.legacy, c.appType),
       css: extractCss(c.css),
       envPrefix: extractEnvPrefix(c.envPrefix),

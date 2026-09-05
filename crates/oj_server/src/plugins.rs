@@ -239,6 +239,10 @@ pub struct ViteValues {
     pub mode: Option<String>,
     /// `resolve.{extensions,mainFields,conditions,preserveSymlinks}`.
     pub resolve: Option<serde_json::Value>,
+    /// The RAW config file's own top-level `resolve` block (the resolved one
+    /// above carries Vite's client-environment conditions); consulted by the
+    /// Node SSR consumers when the ssr environment is runner-backed.
+    pub raw_resolve: Option<serde_json::Value>,
     /// `server.{strictPort,open}` normalized to booleans (`cors` is its own field).
     pub server_flags: Option<serde_json::Value>,
     /// `css.preprocessorOptions.<lang>.additionalData` (string form).
@@ -489,6 +493,7 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
         ssr: json.get("ssr").filter(|v| !v.is_null()).cloned(),
         mode: json.get("mode").and_then(|v| v.as_str()).map(str::to_string),
         resolve: json.get("resolve").filter(|v| !v.is_null()).cloned(),
+        raw_resolve: json.get("rawResolve").filter(|v| !v.is_null()).cloned(),
         server_flags: json.get("serverFlags").filter(|v| !v.is_null()).cloned(),
         css: json.get("css").filter(|v| !v.is_null()).cloned(),
         env_prefix: json.get("envPrefix").and_then(|v| v.as_array()).map(|a| {
@@ -821,6 +826,11 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
         if rc.preserve_symlinks.is_none() {
             rc.preserve_symlinks = vr.get("preserveSymlinks").and_then(|b| b.as_bool());
         }
+    }
+    if config.raw_resolve.is_none() {
+        config.raw_resolve = v
+            .raw_resolve
+            .and_then(|r| serde_json::from_value::<oj_config::ResolveConfig>(r).ok());
     }
     if let Some(sf) = v.server_flags.as_ref().and_then(|s| s.as_object()) {
         if config.app_type.is_none() {
@@ -1903,6 +1913,7 @@ mod vite_values_tests {
             ssr: None,
             mode: None,
             resolve: None,
+            raw_resolve: None,
             server_flags: None,
             css: None,
             env_prefix: None,
@@ -1946,6 +1957,7 @@ mod vite_values_tests {
             ssr: None,
             mode: None,
             resolve: None,
+            raw_resolve: None,
             server_flags: None,
             css: None,
             env_prefix: None,
