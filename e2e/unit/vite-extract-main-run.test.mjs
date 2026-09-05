@@ -17,7 +17,7 @@ import fs from "node:fs";
 import { copyFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { asset } from "./harness.mjs";
+import { asset, repo } from "./harness.mjs";
 
 // argv[2] names a config that does not exist, so the run fails immediately --
 // what is under test is whether it runs at all, not what it extracts.
@@ -307,6 +307,7 @@ test("a failed raw load warns and withholds the resolved ssr.resolve sugar", () 
         return {
           base: "/resolved/",
           ssr: { target: "webworker", resolve: { conditions: ["workerd"], externalConditions: ["workerd"] } },
+          resolve: { conditions: ["workerd", "browser"], externalConditions: ["workerd"], extensions: [".mjs", ".js"] },
           configFileDependencies: [],
         };
       }\n`,
@@ -329,6 +330,185 @@ test("a failed raw load warns and withholds the resolved ssr.resolve sugar", () 
     assert.equal(out.ssr?.target, "webworker", "the rest of the ssr block still travels");
     assert.equal(out.ssr?.runnerBacked, undefined);
     assert.equal(out.rawResolve, null);
+    // The resolved TOP-LEVEL conditions are withheld on this path too — the
+    // whole point is that no foreign conditions reach Node consumers
+    // undetected; the condition-free resolve keys still travel.
+    assert.equal(out.resolve?.conditions, undefined, "resolved top-level conditions are withheld without detection");
+    assert.equal(out.resolve?.externalConditions, undefined);
+    assert.deepEqual(out.resolve?.extensions, [".mjs", ".js"], "condition-free resolve keys still travel");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Tests against the REAL vite installed in the start-app fixture: the
+// single-eval flow through vite's actual loadConfigFromFile/resolveConfig.
+const realViteSrc = join(repo, "e2e/fixtures/start-app/node_modules/vite");
+const hasRealVite = fs.existsSync(realViteSrc);
+const skipNoVite = hasRealVite ? false : "fixture vite not installed";
+
+function realViteDir(prefix) {
+  const base = mkdtempSync(join(tmpdir(), prefix));
+  copyFileSync(asset("vite-extract.mjs"), join(base, "vite-extract.mjs"));
+  writeFileSync(
+    join(base, "package.json"),
+    JSON.stringify({ name: "fx", type: "module", dependencies: { vite: "*" } }),
+  );
+  mkdirSync(join(base, "node_modules"));
+  // vite's own dependencies resolve from its realpath (the fixture's
+  // node_modules), so one symlink is a full install.
+  symlinkSync(realViteSrc, join(base, "node_modules", "vite"), "dir");
+  return base;
+}
+
+// The single-eval flow hands the FILE's config to resolveConfig as the inline
+// config, and Vite computes isSsrBuild from the inline config alone — so the
+// file's build.ssr must not ride it (hooks would see true where real Vite
+// gives false). The value re-enters the config at Vite's own post-load merge
+// seam (before user config hooks), and the emitted build block keeps it.
+test("real vite: hooks see isSsrBuild false while the file's build.ssr is preserved", { skip: skipNoVite }, () => {
+  const base = realViteDir("oj-vite-extract-realssr-");
+  try {
+    writeFileSync(
+      join(base, "vite.config.mjs"),
+      `import { writeFileSync } from "node:fs";
+      export default {
+        build: { ssr: "src/server.ts" },
+        plugins: [{
+          name: "env-probe",
+          config(conf, env) {
+            writeFileSync(
+              new URL("./probe.json", import.meta.url),
+              JSON.stringify({ isSsrBuild: env.isSsrBuild, buildSsr: conf.build?.ssr ?? null }),
+            );
+            return null;
+          },
+        }],
+      };\n`,
+    );
+    const out = JSON.parse(runExtractor(base, "vite.config.mjs", ["build", "production", "explicit"]));
+    assert.equal(out.__ok, true);
+    const probe = JSON.parse(fs.readFileSync(join(base, "probe.json"), "utf8"));
+    assert.equal(probe.isSsrBuild, false, "real Vite computes isSsrBuild from the inline config only");
+    assert.equal(
+      probe.buildSsr,
+      "src/server.ts",
+      "the file's build.ssr is back in the config before user hooks run, as under Vite's post-load merge",
+    );
+    assert.equal(out.build?.ssr, "src/server.ts", "the extracted build block keeps the file's build.ssr");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// resolveConfig can throw AFTER the plugin config hooks ran (a throwing
+// configResolved): the sentinel's partial verdict must survive the throw, and
+// the hooks must NOT re-run out of band on the same instances (double side
+// effects; run-once guards break). The failure is loud, naming the error.
+test("real vite: a throwing configResolved keeps the partial verdict and never re-runs config hooks", { skip: skipNoVite }, () => {
+  const base = realViteDir("oj-vite-extract-throwres-");
+  try {
+    writeFileSync(
+      join(base, "vite.config.mjs"),
+      `import { appendFileSync } from "node:fs";
+      export default {
+        base: "/partial/",
+        plugins: [
+          {
+            name: "declares",
+            config: () => {
+              appendFileSync(new URL("./hooks.log", import.meta.url), "config\\n");
+              return { environments: { worker: { dev: { createEnvironment: () => ({}) } } } };
+            },
+          },
+          { name: "boom", configResolved: () => { throw new Error("configResolved exploded"); } },
+        ],
+      };\n`,
+    );
+    const child = spawnSync(
+      process.execPath,
+      [join(base, "vite-extract.mjs"), join(base, "vite.config.mjs"), base],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30_000 },
+    );
+    assert.match(
+      child.stderr,
+      /resolveConfig failed after plugin config hooks ran.*configResolved exploded/s,
+      "the mid-run failure is loud and names the error",
+    );
+    const out = JSON.parse(child.stdout);
+    assert.equal(out.__ok, true);
+    assert.equal(out.base, "/partial/", "the raw config's values still travel");
+    assert.equal(out.ssr?.runnerBacked, true, "the sentinel's partial verdict survives the throw");
+    assert.equal(
+      fs.readFileSync(join(base, "hooks.log"), "utf8"),
+      "config\n",
+      "the declaring plugin's config hook ran exactly once — never re-run after the throw",
+    );
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// mergeConfig shares untouched subtrees with the loaded file config, so a
+// plugin config hook that MUTATES the config in place used to write into the
+// object later emitted as the RAW config: rawResolve must reflect the file,
+// not the hook's mutation.
+test("real vite: an in-place config mutation does not leak into rawResolve", { skip: skipNoVite }, () => {
+  const base = realViteDir("oj-vite-extract-mutate-");
+  try {
+    writeFileSync(
+      join(base, "vite.config.mjs"),
+      `export default {
+        resolve: { conditions: ["custom"] },
+        plugins: [{
+          name: "mutator",
+          config(conf) {
+            (conf.resolve.conditions ??= []).push("workerd-injected");
+            return null;
+          },
+        }],
+      };\n`,
+    );
+    const out = JSON.parse(runExtractor(base, "vite.config.mjs"));
+    assert.equal(out.__ok, true);
+    assert.deepEqual(
+      out.rawResolve,
+      { conditions: ["custom"] },
+      "rawResolve is the FILE's resolve block, snapshotted before any hook ran",
+    );
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// Vite sets NODE_ENV (when the environment leaves it unset) BEFORE the config
+// file's module evaluation, so a config branching on process.env.NODE_ENV at
+// module scope sees the mode's value; the extractor mirrors it on every
+// loader path, the vite-less plain import included.
+test("a config branching on NODE_ENV during module evaluation sees the mode's value", () => {
+  const base = mkdtempSync(join(tmpdir(), "oj-vite-extract-nodeenv-"));
+  try {
+    copyFileSync(asset("vite-extract.mjs"), join(base, "vite-extract.mjs"));
+    writeFileSync(join(base, "package.json"), JSON.stringify({ name: "fx", type: "module" }));
+    writeFileSync(
+      join(base, "vite.config.mjs"),
+      'export default { base: process.env.NODE_ENV === "production" ? "/prod/" : "/dev/" };\n',
+    );
+    const env = { ...process.env };
+    delete env.NODE_ENV;
+    const prod = JSON.parse(runExtractor(base, "vite.config.mjs", ["build", "production", "explicit"], { env }));
+    assert.equal(prod.__ok, true);
+    assert.equal(prod.base, "/prod/", "--mode production evaluates the config's prod branch");
+    const dev = JSON.parse(runExtractor(base, "vite.config.mjs", ["serve", "development", "default"], { env }));
+    assert.equal(dev.base, "/dev/");
+    // An environment that already names NODE_ENV wins, as under Vite.
+    const forced = JSON.parse(
+      runExtractor(base, "vite.config.mjs", ["build", "production", "explicit"], {
+        env: { ...env, NODE_ENV: "development" },
+      }),
+    );
+    assert.equal(forced.base, "/dev/", "a set NODE_ENV is never overridden");
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
