@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Raphael Amorim
 
 import http from "node:http";
-import { createReadStream, existsSync, fstatSync, openSync, statSync, unlinkSync, write as fsWrite, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, fstatSync, openSync, readFileSync, statSync, unlinkSync, write as fsWrite, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { readFile, stat as fsStat } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -1103,20 +1104,45 @@ const unmatchedChangeLogged = new Set();
 // oj sends each edit twice (an early pre-settle POST and the settled batch),
 // while Vite sees ONE chokidar event per FS change: replaying both would run
 // watcher.emit and the whole hotUpdate pipeline (hooks, targeted updates, the
-// runner's chain re-fetch) twice. Skip a change whose (type, mtime) matches
-// the last processed one within a short window; a write landing inside the
-// settle window moves the mtime, so genuinely-new content still processes.
-const INVALIDATE_DEDUP_MS = 2000;
-const lastProcessedChange = new Map(); // file -> { type, mtimeMs, at }
-const CHANGE_MTIME_NONE = -1; // deletes (and unstattable files) have no mtime
-function freshChange({ file, type }, now) {
-  let mtimeMs = CHANGE_MTIME_NONE;
+// runner's chain re-fetch) twice. Dedup by content identity: skip a change
+// whose type AND file content hash match the last processed one — consecutive
+// identical content is the same FS change (the early/settled pair), while a
+// write landing inside the settle window, a revert, or same-mtime distinct
+// writes all hash differently and process. A read error means the file's
+// state is unknown: process and forget the entry, never suppress on error.
+// Consecutive deletes dedup by type alone.
+const lastProcessedChange = new Map(); // file -> { type, contentHash }
+// Correctness never depends on an entry existing (a cleared entry only costs
+// one extra processing pass), so bound the map instead of growing forever.
+const LAST_PROCESSED_MAX = 5000;
+function freshChange({ file, type }) {
+  let contentHash = null;
   if (type !== "delete") {
-    try { mtimeMs = statSync(file).mtimeMs; } catch {}
+    try {
+      contentHash = createHash("sha256").update(readFileSync(file)).digest("hex");
+    } catch {
+      lastProcessedChange.delete(file);
+      return true;
+    }
   }
   const prev = lastProcessedChange.get(file);
-  lastProcessedChange.set(file, { type, mtimeMs, at: now });
-  return !(prev && prev.type === type && prev.mtimeMs === mtimeMs && now - prev.at < INVALIDATE_DEDUP_MS);
+  if (lastProcessedChange.size >= LAST_PROCESSED_MAX) lastProcessedChange.clear();
+  lastProcessedChange.set(file, { type, contentHash });
+  return !(prev && prev.type === type && prev.contentHash === contentHash);
+}
+// A "create" for a file some runner-backed module graph already knows is an
+// atomic save's recreate half (chokidar's atomic handling reports these as
+// change): reclassify to update, so the update-then-create pair dedups into
+// one pass and plugins never see a phantom watcher "add" for a live module.
+function graphKnowsFile(environments, file) {
+  for (const env of Object.values(environments || {})) {
+    if (!env || env.__ojStub) continue;
+    try {
+      const mods = env.moduleGraph?.getModulesByFile?.(file);
+      if (mods && mods.size > 0) return true;
+    } catch {}
+  }
+  return false;
 }
 let invalidateQueue = Promise.resolve();
 async function invalidateEnvironments(environments, watcher, changes) {
@@ -1124,14 +1150,15 @@ async function invalidateEnvironments(environments, watcher, changes) {
   // a raw event, and an atomic-save editor's momentary delete may have been
   // recreated by the time this runs; a stale "delete" would prune a live
   // module from the graph.
-  const now = Date.now();
   const normalized = changes
     .map(({ path: file, type }) => {
       let t = type || "update";
+      file = String(file).replace(/\\/g, "/");
       if (t === "delete" && existsSync(file)) t = "update";
-      return { file: String(file).replace(/\\/g, "/"), type: t };
+      if (t === "create" && graphKnowsFile(environments, file)) t = "update";
+      return { file, type: t };
     })
-    .filter((change) => freshChange(change, now));
+    .filter(freshChange);
   for (const { file, type } of normalized) {
     try { watcher.emit(WATCHER_EVENT[type], file); } catch {}
   }

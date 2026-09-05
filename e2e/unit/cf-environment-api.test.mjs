@@ -518,10 +518,11 @@ test("create retries failed resolutions, delete prunes, legacy hooks and hook er
   }
 });
 
-test("a repeated send with unchanged mtime processes once; a moved mtime processes again", async () => {
+test("invalidate dedup: content identity, atomic-save create, read errors", async () => {
   const fx = tmpProject({ prefix: "oj-cf-dedup-" });
-  // A real file, so the host's mtime-based dedup can stat it: the early
-  // (pre-settle) and settled sends for one write carry the same (path, type).
+  // A real file, so the host's content-identity dedup can read it: the early
+  // (pre-settle) and settled sends for one write carry the same (path, type)
+  // and the same bytes.
   fx.write("src/live.ts", "export const live = 1;\n");
 
   // Stub vite: a worker graph whose self-accepting entry imports live.ts, so
@@ -573,7 +574,8 @@ test("a repeated send with unchanged mtime processes once; a moved mtime process
        name: "vite-plugin-cloudflare:dev",
        configureServer(server) {
          const emits = [];
-         server.watcher.on("change", (f) => emits.push(f));
+         server.watcher.on("change", (f) => emits.push("change:" + f.split("/").pop()));
+         server.watcher.on("add", (f) => emits.push("add:" + f.split("/").pop()));
          server.middlewares.use("/__probe", (req, res) => {
            res.setHeader("content-type", "application/json");
            res.end(JSON.stringify({ workerSends: server.environments.worker.__sends, emits }));
@@ -601,33 +603,55 @@ test("a repeated send with unchanged mtime processes once; a moved mtime process
     assert.ok(port > 0, "middleware server is up");
 
     const file = path.join(fx.root, "src", "live.ts");
-    const invalidate = async () => {
+    const invalidate = async (p = file, type = "update") => {
       const res = await fetch(`http://127.0.0.1:${port}/__oj_invalidate`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ changes: [{ path: file, type: "update" }] }),
+        body: JSON.stringify({ changes: [{ path: p, type }] }),
       });
       assert.equal(res.status, 204);
     };
     const probe = async () => (await fetch(`http://127.0.0.1:${port}/__probe`)).json();
 
-    // The early and settled sends for one write: same (path, type), unchanged
-    // mtime. The second is skipped, so the hooks/update run once and the
+    // The early and settled sends for one write: same (path, type), same
+    // content. The second is skipped, so the hooks/update run once and the
     // watcher sees one event, as under Vite's single chokidar event.
+    const fixed = new Date("2026-01-01T00:00:00Z");
+    fs.utimesSync(file, fixed, fixed);
     await invalidate();
     await invalidate();
     let seen = await probe();
     assert.equal(seen.workerSends.length, 1, `one hot payload, got ${JSON.stringify(seen.workerSends)}`);
-    assert.equal(seen.emits.length, 1, "one watcher emit for the repeated identical send");
+    assert.deepEqual(seen.emits, ["change:live.ts"], "one watcher emit for the repeated identical send");
 
-    // A write landing inside the settle window moves the mtime: the settled
-    // send carries genuinely-new content and must process again.
-    const now = new Date();
-    fs.utimesSync(file, now, new Date(now.getTime() + 1500));
+    // DIFFERENT content under the SAME mtime (an mtime heuristic's blind spot:
+    // coarse timestamps, two writes in one tick): the hash differs, so the
+    // settled send carrying genuinely-new content must process again.
+    fs.writeFileSync(file, "export const live = 2;\n");
+    fs.utimesSync(file, fixed, fixed);
     await invalidate();
     seen = await probe();
-    assert.equal(seen.workerSends.length, 2, "a moved mtime processes again");
+    assert.equal(seen.workerSends.length, 2, "different content under the same mtime processes again");
     assert.equal(seen.emits.length, 2, "the watcher sees the second, changed write");
+
+    // An atomic save's recreate half: a "create" for a file the worker graph
+    // already knows is handled as an update (chokidar reports these as
+    // change), so update-then-create is one pass and no phantom "add" reaches
+    // plugin watchers.
+    fs.writeFileSync(file, "export const live = 3;\n");
+    await invalidate(file, "update");
+    await invalidate(file, "create");
+    seen = await probe();
+    assert.equal(seen.workerSends.length, 3, "update-then-create for known content is one pass");
+    assert.ok(!seen.emits.some((e) => e.startsWith("add:")), `no phantom add emit, got ${JSON.stringify(seen.emits)}`);
+
+    // A file that cannot be read (never suppress on error): both sends process.
+    const ghost = path.join(fx.root, "src", "ghost.ts");
+    await invalidate(ghost, "update");
+    await invalidate(ghost, "update");
+    seen = await probe();
+    const ghostEmits = seen.emits.filter((e) => e === "change:ghost.ts");
+    assert.equal(ghostEmits.length, 2, "a read error processes every time");
   } finally {
     host.close();
     fx.cleanup();
