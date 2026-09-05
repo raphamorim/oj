@@ -299,30 +299,63 @@ fn extraction_timeout_from(raw: Option<&str>) -> std::time::Duration {
 }
 
 /// `Command::output()` with a deadline: `Ok(None)` means the child ran past
-/// `timeout` and was killed (and reaped). Both pipes are drained on threads for
-/// the whole wait, so a chatty child can never deadlock on a full pipe.
+/// `timeout` and was killed (and reaped). Both pipes are drained on threads
+/// into shared buffers for the whole wait, so a chatty child can never
+/// deadlock on a full pipe — and once the child itself has exited (or been
+/// killed), the drain threads are given only a short grace to reach EOF before
+/// being DETACHED with whatever the buffers hold: a grandchild spawned with
+/// inherited stdio keeps the pipe write-ends open indefinitely, and joining
+/// unboundedly on its EOF was exactly the boot wedge `OJ_EXTRACT_TIMEOUT`
+/// exists to prevent.
 fn bounded_output(
     cmd: &mut std::process::Command,
     timeout: std::time::Duration,
 ) -> std::io::Result<Option<std::process::Output>> {
     use std::io::Read;
+    use std::sync::{Arc, Mutex};
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let mut out_pipe = child.stdout.take().expect("piped stdout");
-    let mut err_pipe = child.stderr.take().expect("piped stderr");
-    let out_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = out_pipe.read_to_end(&mut buf);
-        buf
-    });
-    let err_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = err_pipe.read_to_end(&mut buf);
-        buf
-    });
+    let out_pipe = child.stdout.take().expect("piped stdout");
+    let err_pipe = child.stderr.take().expect("piped stderr");
+    fn drain(mut pipe: impl Read + Send + 'static, buf: Arc<Mutex<Vec<u8>>>) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .extend_from_slice(&chunk[..n]),
+                }
+            }
+        })
+    }
+    let out_buf = Arc::new(Mutex::new(Vec::new()));
+    let err_buf = Arc::new(Mutex::new(Vec::new()));
+    let out_thread = drain(out_pipe, Arc::clone(&out_buf));
+    let err_thread = drain(err_pipe, Arc::clone(&err_buf));
+    // Join with a grace bound, then detach: after the child is gone, EOF on the
+    // pipes belongs to whoever else inherited them (a plugin's grandchild), and
+    // the caller must never wait on that. Detached threads exit on their own
+    // when the last writer closes; the snapshot below is what the caller gets.
+    let grace_join = |t: std::thread::JoinHandle<()>| {
+        let grace_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !t.is_finished() && std::time::Instant::now() < grace_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if t.is_finished() {
+            let _ = t.join();
+        }
+    };
+    let snapshot = |buf: &Arc<Mutex<Vec<u8>>>| -> Vec<u8> {
+        buf.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    };
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         if let Some(status) = child.try_wait()? {
@@ -331,15 +364,19 @@ fn bounded_output(
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = out_thread.join();
-            let _ = err_thread.join();
+            grace_join(out_thread);
+            grace_join(err_thread);
             return Ok(None);
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     };
-    let stdout = out_thread.join().unwrap_or_default();
-    let stderr = err_thread.join().unwrap_or_default();
-    Ok(Some(std::process::Output { status, stdout, stderr }))
+    grace_join(out_thread);
+    grace_join(err_thread);
+    Ok(Some(std::process::Output {
+        status,
+        stdout: snapshot(&out_buf),
+        stderr: snapshot(&err_buf),
+    }))
 }
 
 /// Evaluate the app's `vite.config` for `command` ("serve" | "build") and `mode`.
@@ -2010,6 +2047,51 @@ mod vite_values_tests {
         assert!(
             started.elapsed() < std::time::Duration::from_secs(20),
             "the wait must end at the deadline, not at the child's leisure"
+        );
+    }
+
+    // An inherited-stdio grandchild keeps the pipe write-ends open past the
+    // child's own exit (and past a kill): the drain threads then never see
+    // EOF, and joining them unboundedly wedged boot forever — the exact hole
+    // the extraction timeout exists to close. The wait must end within the
+    // timeout plus the short grace, with whatever output was captured.
+    #[test]
+    fn bounded_output_detaches_from_pipes_a_grandchild_holds_open() {
+        // The child prints, spawns a long-lived grandchild with stdio:
+        // "inherit", and exits immediately: its status is available at once,
+        // but pipe EOF is 600 s away.
+        let mut cmd = std::process::Command::new("node");
+        cmd.arg("-e").arg(
+            "process.stdout.write('partial');\
+             require('child_process').spawn('sleep', ['600'], { stdio: 'inherit', detached: true }).unref();",
+        );
+        let started = std::time::Instant::now();
+        let out = match bounded_output(&mut cmd, std::time::Duration::from_secs(10)) {
+            Ok(out) => out,
+            Err(_) => return, // no node on this machine
+        };
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(8),
+            "the exited child's output must be returned within the grace, not at the grandchild's EOF ({}s)",
+            started.elapsed().as_secs()
+        );
+        let out = out.expect("the child exited before the deadline: not a timeout");
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"partial", "output written before the exit is captured");
+
+        // The kill path: a HANGING child whose grandchild also holds the
+        // pipes must still come back as a timeout within timeout + grace.
+        let mut hung = std::process::Command::new("node");
+        hung.arg("-e").arg(
+            "require('child_process').spawn('sleep', ['600'], { stdio: 'inherit', detached: true }).unref();\
+             setInterval(() => {}, 1000);",
+        );
+        let started = std::time::Instant::now();
+        let out = bounded_output(&mut hung, std::time::Duration::from_millis(300)).unwrap();
+        assert!(out.is_none(), "a killed child is a timeout even with its pipes held open");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(8),
+            "the kill path must not block on the grandchild's EOF either"
         );
     }
 
