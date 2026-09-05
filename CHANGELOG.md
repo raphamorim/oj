@@ -5,6 +5,12 @@ All notable changes to oj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- The Node SSR loader could resolve a package's `browser` conditional export and execute DOM code server-side (`ReferenceError: document is not defined` at module scope, e.g. `decode-named-character-reference`'s `index.dom.js`, failing every SSR render). On an app whose ssr environment carries a workerd condition set (the Cloudflare plugin's `workerd, worker, module, browser`), `resolve.conditions` never saw it: the resolved ssr conditions travel on the extractor's `ssr.resolve` sugar, and the lookup fell through to the top-level `resolve.conditions` — which a resolved Vite config fills with the *client* defaults (`module, browser, development|production`), a browser-bearing, worker-less list that steered every noExternal/linked resolution in the Node loader into browser builds. `resolve.conditions` now falls back environment → `ssr.resolve` sugar → top level, exactly like `externalConditions` already did, so the ssr loader gets the workerd-shaped list and the existing browser strip applies (`worker`/`workerd` still match first, picking the Node-safe build). As a last line of defense the loader itself now drops `browser` from any workerd-shaped `OJ_RESOLVE_CONDITIONS`/`OJ_EXTERNAL_CONDITIONS` list; an explicit user `browser` condition without `workerd` stays honored, as Vite honors user conditions.
+- On a slow boot (a large plugin fleet, a Miniflare boot inside `configureServer`) the Cloudflare worker path silently never activated: the plugin host answers RPCs only after its top-level init completes, so oj's boot-time `getServeInfo` call hit the 20 s hook timeout, `plugin middleware: forwarding unmatched requests` never printed, and every document degraded to the Node SSR runner for the whole session. The host now pushes `{ ojServeInfo }` on stdout the moment its init completes (like its websocket pushes), and oj's middleware state is live: a late push flips the Start path to the plugin middleware + lazy runner whenever the host comes up, printing the forwarding line with a "host came up after boot" note. Fast boots are unchanged (the push also spares them the extra RPC round trip). When `@cloudflare/vite-plugin` is configured and the worker path is still down 120 s after boot, oj now says so with a warning instead of degrading silently.
+
 ## [0.1.18] - 2026-09-05
 
 ### Fixed
