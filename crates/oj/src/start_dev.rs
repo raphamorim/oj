@@ -398,13 +398,25 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
     let pending: Arc<std::sync::Mutex<Option<PendingRebundle>>> =
         Arc::new(std::sync::Mutex::new(None));
     let wake = Arc::new(tokio::sync::Notify::new());
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     rt.spawn(rebundle_worker(
         root.clone(),
         cache.clone(),
         Arc::clone(&state),
         Arc::clone(&pending),
         Arc::clone(&wake),
+        Arc::clone(&shutdown),
     ));
+    // Ends the rebundle worker on every watcher-thread exit path (watch error,
+    // channel disconnect), so it does not idle forever holding the state.
+    struct StopWorker(Arc<std::sync::atomic::AtomicBool>, Arc<tokio::sync::Notify>);
+    impl Drop for StopWorker {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.1.notify_one();
+        }
+    }
+    let stop_worker = StopWorker(Arc::clone(&shutdown), Arc::clone(&wake));
     // The watcher thread only receives, classifies, settles and hands batches
     // off; it never blocks on a rebundle or an HTTP send (Vite's chokidar
     // callbacks run per event too). A second edit landing while the first
@@ -414,6 +426,7 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
         use notify::{RecursiveMode, Watcher};
         use std::sync::mpsc::RecvTimeoutError;
 
+        let _stop_worker = stop_worker;
         let (tx, rx) = std::sync::mpsc::channel();
         let mut watcher = match notify::recommended_watcher(tx) {
             Ok(w) => w,
@@ -545,6 +558,7 @@ async fn rebundle_worker(
     state: Arc<StartState>,
     pending: Arc<std::sync::Mutex<Option<PendingRebundle>>>,
     wake: Arc<tokio::sync::Notify>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut prev_routes = list_route_files(&root);
     loop {
@@ -553,6 +567,11 @@ async fn rebundle_worker(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         let Some(run) = run else {
+            // A pending run left by the exiting watcher still completes; the
+            // worker ends only once the queue is drained.
+            if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
             wake.notified().await;
             continue;
         };
