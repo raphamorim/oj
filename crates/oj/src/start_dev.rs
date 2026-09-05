@@ -378,6 +378,7 @@ const RELOAD_CLIENT: &str = "<script type=\"module\" src=\"/@oj-start/live-reloa
 /// One rebundle run's inputs, handed from the watcher thread to the coalescing
 /// rebundle worker. Batches landing while a rebundle is in flight merge into
 /// the single pending run (paths union), so at most one run ever queues.
+#[derive(Default)]
 struct PendingRebundle {
     /// Every changed path of the merged batches (relevant and not): the HMR
     /// gate records the full set, exactly as the inline loop did.
@@ -388,9 +389,76 @@ struct PendingRebundle {
     invalidates: Vec<tokio::task::JoinHandle<()>>,
     /// The newest merged batch number: its done-frame clears the editor pill.
     batch: u64,
-    /// A non-lazy runner reloads once per run (a lazy one was dirty-marked at
-    /// hand-off time already).
-    reload_runner: bool,
+}
+
+/// Spawn one worker-environment invalidate for a batch's relevant paths, off
+/// the watcher thread. Returns the send's handle (None: no plugin middleware,
+/// or nothing relevant) so the settled call site can make the browser reload
+/// wait on it; the changed-paths Vec is only built once the port guard passed,
+/// so non-Cloudflare sessions pay nothing per event.
+fn spawn_mw_invalidate(
+    rt: &tokio::runtime::Handle,
+    state: &StartState,
+    paths: &std::collections::HashSet<PathBuf>,
+    created: &std::collections::HashSet<PathBuf>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let port = state.plugin_mw_port?;
+    let changed: Vec<(String, &'static str)> = paths
+        .iter()
+        .filter(|p| watch_relevant(p))
+        .map(|p| (p.to_string_lossy().into_owned(), change_type(p, created)))
+        .collect();
+    if changed.is_empty() {
+        return None;
+    }
+    Some(rt.spawn(async move {
+        oj_server::notify_plugin_mw_invalidate(port, &changed).await;
+    }))
+}
+
+/// The files the regen steps write, which the watcher deliberately never
+/// forwards: routeTree.gen events are filtered (`watch_relevant`) to stop
+/// generator-feedback rebuild loops, and the server-fn resolver lives in the
+/// cache dir the watcher does not even see. The rebundle worker snapshots
+/// their content hashes around a run and pushes the ones the run actually
+/// rewrote to the worker environments itself.
+fn regen_output_files(root: &Path, cache: &Path) -> [PathBuf; 2] {
+    // The generator honors tsr.config.json's `generatedRouteTree` (generate.mjs
+    // passes oj's default under the file, not over it): snapshot the tree the
+    // app actually configured, defaulting to src/routeTree.gen.ts.
+    let configured = std::fs::read_to_string(root.join("tsr.config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| {
+            let rel = v.get("generatedRouteTree")?.as_str()?.to_owned();
+            Some(root.join(rel.trim_start_matches("./")))
+        });
+    [
+        configured.unwrap_or_else(|| root.join("src").join("routeTree.gen.ts")),
+        cache.join("server-fn-resolver.mjs"),
+    ]
+}
+
+/// Content hash for regen-output change detection (None: missing/unreadable).
+fn file_content_hash(p: &Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let bytes = std::fs::read(p).ok()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    Some(h.finish())
+}
+
+/// The regen outputs whose content a run rewrote, as invalidate changes.
+fn changed_regen_outputs(
+    files: &[PathBuf],
+    before: &[Option<u64>],
+) -> Vec<(String, &'static str)> {
+    files
+        .iter()
+        .zip(before)
+        .filter(|(f, before)| file_content_hash(f) != **before)
+        .map(|(f, _)| (f.to_string_lossy().into_owned(), "update"))
+        .collect()
 }
 
 fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
@@ -461,21 +529,11 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             // worker environments on the first raw event, before the settle
             // window and the rebuild, so a fast follow-up document is not
             // rendered from stale modules. The settled batch is invalidated
-            // again below (a write landing inside the window changes content,
-            // so the repeat send is the safe side); the OS watcher's own
+            // again below; the host dedups by content identity, so the repeat
+            // send only costs work when a write landed inside the settle
+            // window and actually changed content. The OS watcher's own
             // delivery latency is the remaining, unclosable window.
-            if let Some(port) = state.plugin_mw_port {
-                let early: Vec<(String, &'static str)> = paths
-                    .iter()
-                    .filter(|p| watch_relevant(p))
-                    .map(|p| (p.to_string_lossy().into_owned(), change_type(p, &created)))
-                    .collect();
-                if !early.is_empty() {
-                    rt.spawn(async move {
-                        oj_server::notify_plugin_mw_invalidate(port, &early).await;
-                    });
-                }
-            }
+            let _ = spawn_mw_invalidate(&rt, &state, &paths, &created);
             loop {
                 match rx.recv_timeout(std::time::Duration::from_millis(50)) {
                     Ok(Ok(ev)) => {
@@ -512,16 +570,7 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             // app re-renders with the changed modules (not stale SSR). Spawned
             // promptly per settled batch, never behind an in-flight rebundle;
             // the rebundle worker awaits it before that run's browser reload.
-            let changed_paths: Vec<(String, &'static str)> = paths
-                .iter()
-                .filter(|p| watch_relevant(p))
-                .map(|p| (p.to_string_lossy().into_owned(), change_type(p, &created)))
-                .collect();
-            let invalidate = state.plugin_mw_port.map(|port| {
-                rt.spawn(async move {
-                    oj_server::notify_plugin_mw_invalidate(port, &changed_paths).await;
-                })
-            });
+            let invalidate = spawn_mw_invalidate(&rt, &state, &paths, &created);
             if state.lazy_runner {
                 state
                     .runner_dirty
@@ -531,16 +580,10 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
                 let mut slot = pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let run = slot.get_or_insert_with(|| PendingRebundle {
-                    paths: std::collections::HashSet::new(),
-                    invalidates: Vec::new(),
-                    batch,
-                    reload_runner: false,
-                });
+                let run = slot.get_or_insert_with(PendingRebundle::default);
                 run.paths.extend(paths.iter().cloned());
                 run.invalidates.extend(invalidate);
                 run.batch = batch;
-                run.reload_runner |= !state.lazy_runner;
             }
             wake.notify_one();
         }
@@ -576,6 +619,12 @@ async fn rebundle_worker(
             continue;
         };
         let paths: Vec<PathBuf> = run.paths.into_iter().collect();
+        // Snapshot the regen outputs before the run: the ones the run rewrites
+        // get their own worker invalidate below (the watcher never forwards
+        // them, see regen_output_files).
+        let regen_files = regen_output_files(&root, &cache);
+        let regen_before: Vec<Option<u64>> =
+            regen_files.iter().map(|p| file_content_hash(p)).collect();
         let client = {
             let (r, c, m) = (root.clone(), cache.clone(), state.mode.clone());
             let routes_prev = prev_routes.clone();
@@ -613,9 +662,6 @@ async fn rebundle_worker(
             for handle in run.invalidates {
                 let _ = handle.await;
             }
-            if run.reload_runner {
-                reload_runner(&state).await;
-            }
         };
         let (client, _) = tokio::join!(client, side);
         if let Ok((routes_now, pinned)) = client {
@@ -623,6 +669,37 @@ async fn rebundle_worker(
             if let Some(pinned) = pinned {
                 *state.bundle.write().unwrap() = Arc::new(pinned);
             }
+        }
+        // Regenerated outputs are edits the watcher never forwards: push the
+        // ones this run rewrote to the worker environments explicitly (the
+        // routeTree.gen filter only guards the rebuild loop, not worker
+        // invalidation), and re-arm the lazy runner — a fallback request that
+        // consumed the dirty flag mid-regen reloaded onto the old generated
+        // files. Both before this run's browser reload.
+        let regen_changed = changed_regen_outputs(&regen_files, &regen_before);
+        if !regen_changed.is_empty() {
+            if state.lazy_runner {
+                state
+                    .runner_dirty
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            if let Some(port) = state.plugin_mw_port {
+                let names: Vec<&str> = regen_changed
+                    .iter()
+                    .filter_map(|(p, _)| Path::new(p).file_name()?.to_str())
+                    .collect();
+                println!(
+                    "  oj start: regen outputs changed ({}), invalidating worker",
+                    names.join(", ")
+                );
+                oj_server::notify_plugin_mw_invalidate(port, &regen_changed).await;
+            }
+        }
+        // The non-lazy runner reloads strictly after the regen completed (its
+        // respawn must import the new generated files, as the inline loop
+        // guaranteed) and before the browser reload.
+        if !state.lazy_runner {
+            reload_runner(&state).await;
         }
         let held = state.gate.as_ref().is_some_and(|g| g.hold_reload(&paths));
         if !held {
@@ -1547,6 +1624,37 @@ mod tests {
             .uri(path)
             .body(axum::body::Body::empty())
             .unwrap()
+    }
+
+    // The rebundle worker snapshots the regen outputs around a run and pushes
+    // only the ones the run actually rewrote to the worker environments:
+    // rewritten content and a newly created file count, an untouched file (or
+    // one missing before and after) does not.
+    #[test]
+    fn changed_regen_outputs_detects_rewrites_and_creations() {
+        let dir = tmp("regen-outputs");
+        let tree = dir.join("routeTree.gen.ts");
+        let resolver = dir.join("server-fn-resolver.mjs");
+        let missing = dir.join("never-written.mjs");
+        std::fs::write(&tree, "tree v1").unwrap();
+        let files = [tree.clone(), resolver.clone(), missing.clone()];
+        let before: Vec<Option<u64>> = files.iter().map(|p| file_content_hash(p)).collect();
+
+        // Nothing rewritten: no changes, even for the still-missing files.
+        assert!(changed_regen_outputs(&files, &before).is_empty());
+
+        // A rewrite and a creation both count; the untouched missing file not.
+        std::fs::write(&tree, "tree v2").unwrap();
+        std::fs::write(&resolver, "resolver v1").unwrap();
+        let changed = changed_regen_outputs(&files, &before);
+        let paths: Vec<&str> = changed.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, vec![tree.to_str().unwrap(), resolver.to_str().unwrap()]);
+        assert!(changed.iter().all(|(_, t)| *t == "update"));
+
+        // Same content written again: hashes match, no change detected.
+        let before: Vec<Option<u64>> = files.iter().map(|p| file_content_hash(p)).collect();
+        std::fs::write(&tree, "tree v2").unwrap();
+        assert!(changed_regen_outputs(&files, &before).is_empty());
     }
 
     // Vite's loadEnv rule for the Start scripts: `.env.<mode>` vars with any
