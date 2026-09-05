@@ -1523,12 +1523,20 @@ fn rolldown_resolve(
     // dev and build. Same source selection as every other Node-executing
     // consumer: a runner-backed ssr environment's list describes the plugin's
     // runtime (workerd), and this generic server bundle executes under Node,
-    // so it takes Vite's Node server semantics instead of the foreign list.
-    let condition_names = Some(if env == "ssr" && oj_config::ssr_runner_backed(config) {
-        oj_config::node_server_conditions(config, false)
-    } else {
-        oj_config::resolve_conditions_for(config, env, false)
-    });
+    // so it takes Vite's Node server semantics instead of the foreign list —
+    // unless `ssr.target: "webworker"` says this ssr bundle itself targets a
+    // worker runtime: it never executes under Node then, and Node conditions
+    // would pick the wrong entries, so the environment's own list stands.
+    let condition_names = Some(
+        if env == "ssr"
+            && oj_config::ssr_runner_backed(config)
+            && !oj_config::ssr_externals(config).webworker()
+        {
+            oj_config::node_server_conditions(config, false)
+        } else {
+            oj_config::resolve_conditions_for(config, env, false)
+        },
+    );
     let symlinks = config
         .resolve
         .as_ref()
@@ -5585,6 +5593,26 @@ mod tests {
         let conditions = rolldown_resolve(root, &runner_backed, "client").unwrap().condition_names.unwrap();
         assert!(conditions.contains(&"browser".to_string()));
         assert!(!conditions.contains(&"node".to_string()));
+
+        // `ssr.target: "webworker"`: the ssr bundle itself targets a worker
+        // runtime and never executes under Node, so even runner-backed it
+        // keeps the environment's own conditions instead of the Node swap.
+        let worker_target = from(
+            r#"{ "ssr": { "runnerBacked": true, "target": "webworker", "resolve": {
+                "conditions": ["workerd", "worker", "module", "browser", "development|production"] } } }"#,
+        );
+        let conditions = rolldown_resolve(root, &worker_target, "ssr").unwrap().condition_names.unwrap();
+        assert!(conditions.contains(&"workerd".to_string()));
+        assert!(!conditions.contains(&"node".to_string()));
+
+        // ... and a node (default) target still swaps.
+        let node_target = from(
+            r#"{ "ssr": { "runnerBacked": true, "target": "node", "resolve": {
+                "conditions": ["workerd", "development|production"] } } }"#,
+        );
+        let conditions = rolldown_resolve(root, &node_target, "ssr").unwrap().condition_names.unwrap();
+        assert_eq!(conditions, oj_config::node_server_conditions(&node_target, false));
+        assert!(!conditions.contains(&"workerd".to_string()));
     }
 
     #[test]
