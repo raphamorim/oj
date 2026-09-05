@@ -11,6 +11,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import path from "node:path";
 import { rpcSidecar, tmpProject } from "./harness.mjs";
 
@@ -511,6 +512,122 @@ test("create retries failed resolutions, delete prunes, legacy hooks and hook er
     // only, as in Vite.
     assert.ok(seen.legacy.some((f) => f.endsWith("errfile.ts")), "legacy hook ran for the update");
     assert.ok(!seen.legacy.some((f) => f.endsWith("new.ts")), "legacy hook is not called for create events");
+  } finally {
+    host.close();
+    fx.cleanup();
+  }
+});
+
+test("a repeated send with unchanged mtime processes once; a moved mtime processes again", async () => {
+  const fx = tmpProject({ prefix: "oj-cf-dedup-" });
+  // A real file, so the host's mtime-based dedup can stat it: the early
+  // (pre-settle) and settled sends for one write carry the same (path, type).
+  fx.write("src/live.ts", "export const live = 1;\n");
+
+  // Stub vite: a worker graph whose self-accepting entry imports live.ts, so
+  // every processed change sends exactly one targeted update.
+  fx.pkg("vite", "index.mjs", {
+    "index.mjs": `
+      function node(id, url, file, extra) {
+        return { id, url, file, type: "js", importers: new Set(), acceptedHmrDeps: new Set(),
+                 acceptedHmrExports: null, isSelfAccepting: false, importedBindings: null,
+                 invalidations: [], ...extra };
+      }
+      export function resolveConfig(inline) {
+        const root = inline.root;
+        const entry = node("\\0virtual:worker-entry", "virtual:worker-entry", null, { isSelfAccepting: true });
+        const live = node(root + "/src/live.ts", "/src/live.ts", root + "/src/live.ts");
+        live.importers.add(entry);
+        const byFile = new Map([[live.file, new Set([live])]]);
+        return {
+          root,
+          logger: { info() {}, warn() {}, warnOnce() {}, error() {} },
+          environments: {
+            worker: {
+              dev: {
+                createEnvironment: (name) => {
+                  const env = {
+                    name, __sends: [],
+                    moduleGraph: {
+                      getModulesByFile(f) { return byFile.get(f); },
+                      onFileChange() {},
+                      invalidateModule() {},
+                    },
+                    hot: { send: (p) => env.__sends.push(p), on() {}, handleInvoke() {} },
+                    init() {},
+                  };
+                  return env;
+                },
+              },
+            },
+          },
+        };
+      }
+      export class DevEnvironment {}
+    `,
+  });
+
+  fx.write(
+    "oj.plugins.mjs",
+    `export default [{
+       name: "vite-plugin-cloudflare:dev",
+       configureServer(server) {
+         const emits = [];
+         server.watcher.on("change", (f) => emits.push(f));
+         server.middlewares.use("/__probe", (req, res) => {
+           res.setHeader("content-type", "application/json");
+           res.end(JSON.stringify({ workerSends: server.environments.worker.__sends, emits }));
+         });
+       },
+     }];\n`,
+  );
+
+  const host = rpcSidecar("plugin-host.mjs", {
+    args: [
+      path.join(fx.root, "oj.plugins.mjs"),
+      JSON.stringify({
+        config: { root: fx.root },
+        env: { command: "serve", mode: "development" },
+        environment: { name: "client" },
+      }),
+    ],
+    env: { OJ_CACHE_ROOT: fx.root },
+    cwd: fx.root,
+  });
+
+  try {
+    const info = JSON.parse((await host.send({ id: 1, hook: "getServeInfo" })).result);
+    const port = Number(info.middlewarePort);
+    assert.ok(port > 0, "middleware server is up");
+
+    const file = path.join(fx.root, "src", "live.ts");
+    const invalidate = async () => {
+      const res = await fetch(`http://127.0.0.1:${port}/__oj_invalidate`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ changes: [{ path: file, type: "update" }] }),
+      });
+      assert.equal(res.status, 204);
+    };
+    const probe = async () => (await fetch(`http://127.0.0.1:${port}/__probe`)).json();
+
+    // The early and settled sends for one write: same (path, type), unchanged
+    // mtime. The second is skipped, so the hooks/update run once and the
+    // watcher sees one event, as under Vite's single chokidar event.
+    await invalidate();
+    await invalidate();
+    let seen = await probe();
+    assert.equal(seen.workerSends.length, 1, `one hot payload, got ${JSON.stringify(seen.workerSends)}`);
+    assert.equal(seen.emits.length, 1, "one watcher emit for the repeated identical send");
+
+    // A write landing inside the settle window moves the mtime: the settled
+    // send carries genuinely-new content and must process again.
+    const now = new Date();
+    fs.utimesSync(file, now, new Date(now.getTime() + 1500));
+    await invalidate();
+    seen = await probe();
+    assert.equal(seen.workerSends.length, 2, "a moved mtime processes again");
+    assert.equal(seen.emits.length, 2, "the watcher sees the second, changed write");
   } finally {
     host.close();
     fx.cleanup();
