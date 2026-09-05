@@ -1724,19 +1724,33 @@ async function setupConfigureServer() {
   // `config` hook returns `environments.<name>.dev.createEnvironment` and
   // resolveConfig merges that into the user config BEFORE default-filling
   // every environment's factory (runConfigHook, then
-  // resolveDevEnvironmentOptions). So the gate asks the host's own config-hook
-  // results — the raw user config, oj's initial config, and pluginConfigDelta
-  // (what the hooks returned) — never the Vite-RESOLVED config, whose every
-  // environment carries a default factory. Any declaring plugin activates the
-  // Environment-API path (the Cloudflare plugin is one such, not a special
-  // case).
+  // resolveDevEnvironmentOptions). Extraction is the SINGLE detection
+  // authority: the config extractor ran that declaration mechanism before this
+  // host spawned, and its verdict arrives as `initial.runnerBacked` — the same
+  // value every Rust consumer reads — so the host and Rust can never disagree.
+  // The host's own declaration check (the raw user config, oj's initial
+  // config, and pluginConfigDelta — never the Vite-RESOLVED config, whose
+  // every environment carries a default factory) remains ONLY for callers
+  // whose payload predates the field. A declaring plugin whose config hook
+  // failed IN THIS HOST keeps the path: the extractor's independent run
+  // already decided, and buildEnvironments re-resolves on fresh instances
+  // where the hook may well succeed.
   const declaresRunnerEnvironment = (cfg) =>
     !!cfg &&
     typeof cfg === "object" &&
     Object.values(cfg.environments ?? {}).some(
       (e) => e && e.dev && typeof e.dev.createEnvironment === "function",
     );
-  if ([userViteConfig, initial.config, pluginConfigDelta].some(declaresRunnerEnvironment)) {
+  const runnerBackedSource =
+    typeof initial.runnerBacked === "boolean" ? "config extraction" : "host declaration check";
+  const runnerDeclared =
+    typeof initial.runnerBacked === "boolean"
+      ? initial.runnerBacked
+      : [userViteConfig, initial.config, pluginConfigDelta].some(declaresRunnerEnvironment);
+  if (runnerDeclared) {
+    process.stderr.write(
+      `${OJ} plugin host: a custom dev environment is declared (decided by ${runnerBackedSource})\n`,
+    );
     try {
       const built = await buildEnvironments(server);
       // Every createEnvironment/init can fail individually (workerd refused to
@@ -1750,15 +1764,16 @@ async function setupConfigureServer() {
     } catch (e) {
       process.stderr.write(`${OJ} plugin host: buildEnvironments failed: ${(e && e.message) || e}\n`);
     }
-    // The host, not a config-text heuristic, knows whether a runner-declaring
-    // plugin is active: when one is and no environment came up, say so instead
-    // of degrading to the Node SSR runner silently (the per-failure causes are
-    // on stderr above).
-    if (!runnerEnvironmentsBuilt) {
-      process.stderr.write(
-        `${OJ} warning: a plugin declared a custom dev environment but none came up; documents are served by the Node SSR runner\n`,
-      );
-    }
+  }
+  // Hoisted out of the gate block: whenever detection said true and no
+  // environment came up — whatever the reason (buildEnvironments threw, every
+  // factory failed, the app's Vite would not load) — say so instead of
+  // degrading to the Node SSR runner silently (the per-failure causes are on
+  // stderr above).
+  if (runnerDeclared && !runnerEnvironmentsBuilt) {
+    process.stderr.write(
+      `${OJ} warning: a plugin declared a custom dev environment but none came up; documents are served by the Node SSR runner\n`,
+    );
   }
   // Vite's createServer always exposes `server.environments` with at least
   // client and ssr (a DevEnvironment per config.environments entry, defaults

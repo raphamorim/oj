@@ -667,3 +667,128 @@ test("invalidate dedup: content identity, atomic-save create, read errors", asyn
     fx.cleanup();
   }
 });
+
+// Extraction is the SINGLE runner-backed detection authority: the extractor's
+// verdict travels in the spawn payload as `initial.runnerBacked`, and the
+// gate consumes it as its primary source — the host's own declaration check
+// remains only for payloads that predate the field (the tests above).
+test("initial.runnerBacked=true keeps the Environment-API path even when the declaring plugin's config hook throws in the host", async () => {
+  const fx = tmpProject({ prefix: "oj-cf-extauth-" });
+  fx.pkg("vite", "index.mjs", {
+    "index.mjs": `
+      export function resolveConfig(inline) {
+        const mkEnv = () => (name) => ({ name, init() {}, hot: { handleInvoke() {}, on() {} } });
+        return {
+          root: inline.root,
+          logger: { info() {}, warn() {}, warnOnce() {}, error() {} },
+          environments: { worker: { dev: { createEnvironment: mkEnv() } } },
+        };
+      }
+      export class DevEnvironment {}
+    `,
+  });
+  // The plugin's config hook throws IN THE HOST, so the host's own
+  // declaration sources (pluginConfigDelta) never see the declaration — the
+  // extractor's independent run already decided, and buildEnvironments
+  // re-resolves on fresh instances (the stub vite), where it succeeds.
+  fx.write(
+    "oj.plugins.mjs",
+    `export default [{
+       name: "acme-workerd:dev",
+       config: () => { throw new Error("hook exploded in the host"); },
+     }];\n`,
+  );
+  const host = rpcSidecar("plugin-host.mjs", {
+    args: [
+      path.join(fx.root, "oj.plugins.mjs"),
+      JSON.stringify({
+        config: { root: fx.root },
+        env: { command: "serve", mode: "development" },
+        environment: { name: "client" },
+        ojStartMode: true,
+        runnerBacked: true,
+      }),
+    ],
+    env: { OJ_CACHE_ROOT: fx.root },
+    cwd: fx.root,
+  });
+  try {
+    const info = await host.serveInfo();
+    assert.equal(info.runnerEnvironments, true, "environments built although the host-side hook threw");
+    assert.match(host.stderr(), /decided by config extraction/, "the deciding source is logged");
+    assert.match(host.stderr(), /config\(acme-workerd:dev\) skipped/, "the host-side hook failure is on stderr");
+    assert.doesNotMatch(host.stderr(), /none came up/);
+  } finally {
+    host.close();
+    fx.cleanup();
+  }
+});
+
+test("initial.runnerBacked=false is authoritative: the host's own declaration check is not consulted", async () => {
+  const fx = tmpProject({ prefix: "oj-cf-extfalse-" });
+  // A declaring plugin whose hook SUCCEEDS in the host: without the field this
+  // would activate the path (see the first test); the extractor's false wins,
+  // so host and Rust consumers can never disagree.
+  fx.write(
+    "oj.plugins.mjs",
+    `export default [{
+       name: "acme-workerd:dev",
+       config: () => ({ environments: { worker: { dev: { createEnvironment: () => ({}) } } } }),
+     }];\n`,
+  );
+  const host = rpcSidecar("plugin-host.mjs", {
+    args: [
+      path.join(fx.root, "oj.plugins.mjs"),
+      JSON.stringify({
+        config: { root: fx.root },
+        env: { command: "serve", mode: "development" },
+        environment: { name: "client" },
+        runnerBacked: false,
+      }),
+    ],
+    env: { OJ_CACHE_ROOT: fx.root },
+    cwd: fx.root,
+  });
+  try {
+    const info = await host.serveInfo();
+    assert.equal(info.runnerEnvironments, false);
+    assert.doesNotMatch(host.stderr(), /custom dev environment is declared/);
+    assert.doesNotMatch(host.stderr(), /none came up/, "detection said false: nothing was expected to come up");
+  } finally {
+    host.close();
+    fx.cleanup();
+  }
+});
+
+// The "declared but none came up" warning is hoisted out of the build block:
+// it fires whenever detection said true and no environment exists afterwards,
+// whatever failed in between (here the app has no vite at all to build with).
+test("detection true with nothing built prints the none-came-up warning, whatever the failure", async () => {
+  const fx = tmpProject({ prefix: "oj-cf-nonecameup-" });
+  fx.write("oj.plugins.mjs", 'export default [{ name: "inert" }];\n');
+  const host = rpcSidecar("plugin-host.mjs", {
+    args: [
+      path.join(fx.root, "oj.plugins.mjs"),
+      JSON.stringify({
+        config: { root: fx.root },
+        env: { command: "serve", mode: "development" },
+        environment: { name: "client" },
+        runnerBacked: true,
+      }),
+    ],
+    env: { OJ_CACHE_ROOT: fx.root },
+    cwd: fx.root,
+  });
+  try {
+    const info = await host.serveInfo();
+    assert.equal(info.runnerEnvironments, false);
+    assert.match(
+      host.stderr(),
+      /a plugin declared a custom dev environment but none came up/,
+      "silent degradation to the Node SSR runner is never acceptable",
+    );
+  } finally {
+    host.close();
+    fx.cleanup();
+  }
+});
