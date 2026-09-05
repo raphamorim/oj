@@ -284,14 +284,17 @@ async function runDev() {
   }
 }
 
-// Slow-boot regression: a plugin host whose init outlives the boot-time RPC
-// deadline (74-plugin fleets, a Miniflare boot inside configureServer) used to
-// leave the worker path silently inactive — no "plugin middleware: forwarding"
-// line, every document degraded to the Node SSR runner. The host now pushes its
-// serve info on stdout when ready and oj activates the middleware late. This
-// simulates the slow boot with a configureServer that sleeps past the (shrunk
-// via OJ_PLUGIN_TIMEOUT) RPC deadline, and requires the late activation line
-// plus a worker-rendered document.
+// Slow-boot phases: a plugin host whose top-level init is slow (74-plugin
+// fleets, a Miniflare boot inside configureServer) used to burn every boot RPC's
+// own timeout and leave the worker path silently inactive — no "plugin
+// middleware: forwarding" line, every document degraded to the Node SSR runner
+// for the whole session. Two fixes, each with its own phase below:
+//   1. RPC sends are init-gated (bounded by OJ_PLUGIN_INIT_TIMEOUT, default
+//      generous): a slow boot now blocks briefly-but-correctly, so the
+//      forwarding line prints normally, with no late-activation note.
+//   2. Should the init deadline still pass (a genuinely wedged-looking boot),
+//      the host's { ojServeInfo } push activates the middleware late, with a
+//      catch-up resync so edits from the degraded window are not lost.
 function addSlowBootPlugin() {
   const cfg = path.join(app, "vite.config.ts");
   const original = fs.readFileSync(cfg, "utf8");
@@ -303,13 +306,8 @@ function addSlowBootPlugin() {
   fs.writeFileSync(cfg, patched);
 }
 
-// Its own port: the first phase's server may still be tearing down on PORT and
-// oj would silently bind PORT+1, leaving the probes pointed at a dead socket.
-const SLOW_PORT = PORT + 3;
-
-async function runSlowBootDev() {
-  let log = "";
-  const srv = spawn(oj, ["dev", app, "--port", String(SLOW_PORT)], {
+function spawnSlowDev(port, extraEnv) {
+  const srv = spawn(oj, ["dev", app, "--port", String(port)], {
     cwd: app,
     detached: true,
     stdio: ["ignore", "pipe", "pipe"],
@@ -319,56 +317,118 @@ async function runSlowBootDev() {
       CI: "1",
       NO_COLOR: "1",
       FORCE_COLOR: "0",
-      // Shrink the plugin RPC deadline so the 8s configureServer sleep reliably
-      // outlives it, the way a heavy real boot outlives the default 20s.
-      OJ_PLUGIN_TIMEOUT: "2",
+      ...extraEnv,
     },
   });
-  srv.stdout.on("data", (d) => (log += d));
-  srv.stderr.on("data", (d) => (log += d));
-  const stop = () => {
+  const state = { log: "" };
+  srv.stdout.on("data", (d) => (state.log += d));
+  srv.stderr.on("data", (d) => (state.log += d));
+  const stop = async () => {
     try { process.kill(-srv.pid, "SIGTERM"); } catch {}
     setTimeout(() => { try { process.kill(-srv.pid, "SIGKILL"); } catch {} }, 2000).unref();
+    // Let the SIGTERM land before the next phase (or cleanup) touches the tree.
+    await new Promise((r) => setTimeout(r, 500));
   };
-  try {
-    // The middleware must activate late: the boot-time serve-info RPC timed
-    // out, and the host's ojServeInfo push flips the path once init completes.
-    const lateLine = /forwarding unmatched requests to :\d+ \(host came up after boot\)/;
-    let activated = false;
-    for (let i = 0; i < 240 && !activated; i++) {
+  const waitForLog = async (re, what, tries = 240) => {
+    for (let i = 0; i < tries; i++) {
+      if (re.test(state.log)) return;
       if (srv.exitCode != null) break;
-      activated = lateLine.test(log);
-      if (!activated) await new Promise((r) => setTimeout(r, 500));
+      await new Promise((r) => setTimeout(r, 500));
     }
-    if (!activated) {
-      throw new Error(`the worker path never activated after the slow boot; log tail:\n${log.slice(-4000)}`);
-    }
-
-    // And the documents must then render in the worker (wrangler var proves it),
-    // with the live-reload client injected like any worker-served document.
-    let home = null;
-    for (let i = 0; i < 120; i++) {
+    throw new Error(`${what}; log tail:\n${state.log.slice(-4000)}`);
+  };
+  const waitForDoc = async (route, marker, what, tries = 120) => {
+    for (let i = 0; i < tries; i++) {
       try {
-        const res = await fetch(`http://127.0.0.1:${SLOW_PORT}/`);
+        const res = await fetch(`http://127.0.0.1:${port}${route}`);
         const body = await res.text();
-        if (res.status === 200 && body.includes("fixture-edition")) {
-          home = { status: res.status, body };
-          break;
-        }
+        if (res.status === 200 && body.includes(marker)) return body;
       } catch {}
       await new Promise((r) => setTimeout(r, 500));
     }
-    if (!home) {
-      throw new Error(`no worker-rendered document after late activation; log tail:\n${log.slice(-4000)}`);
+    throw new Error(`${what}; log tail:\n${state.log.slice(-4000)}`);
+  };
+  return { srv, state, stop, waitForLog, waitForDoc };
+}
+
+// Their own ports: the previous phase's server may still be tearing down and
+// oj would silently bind PORT+1, leaving the probes pointed at a dead socket.
+const GATED_PORT = PORT + 3;
+const DEGRADED_PORT = PORT + 4;
+
+// Phase 1: the default init deadline. Boot blocks on the 8s init instead of
+// racing per-RPC timeouts against it: the forwarding line prints WITHOUT the
+// late-activation note, and the worker renders — no degradation at all.
+async function runSlowBootGatedDev() {
+  const { state, stop, waitForLog, waitForDoc } = spawnSlowDev(GATED_PORT, {});
+  try {
+    await waitForLog(
+      /forwarding unmatched requests to :\d+/,
+      "the forwarding line never printed on the init-gated slow boot",
+    );
+    if (/host came up after boot/.test(state.log)) {
+      throw new Error(`init gating must make the slow boot block, not activate late; log tail:\n${state.log.slice(-4000)}`);
     }
-    if (!home.body.includes("/@oj-start/live-reload.js")) {
+    if (/still initializing after \d+s running/.test(state.log)) {
+      throw new Error(`boot RPCs must not blow their deadline under init gating; log tail:\n${state.log.slice(-4000)}`);
+    }
+    const home = await waitForDoc("/", "fixture-edition", "no worker-rendered document after the init-gated slow boot");
+    if (!home.includes("/@oj-start/live-reload.js")) {
+      throw new Error("worker document lacks the live-reload client after the init-gated slow boot");
+    }
+    console.log("start-cloudflare-dev: slow boot (init-gated) — boot blocked correctly, no degradation");
+  } finally {
+    await stop();
+  }
+}
+
+// Phase 2: the init deadline shrunk under the 8s init, forcing the degraded
+// window. The middleware must activate late off the push, resync the worker
+// environments, and an edit made DURING the window must be reflected after.
+async function runSlowBootDegradedDev() {
+  const { state, stop, waitForLog, waitForDoc } = spawnSlowDev(DEGRADED_PORT, {
+    // Shrink the init deadline so the 8s configureServer sleep reliably
+    // outlives it, the way a wedged boot outlives the default.
+    OJ_PLUGIN_INIT_TIMEOUT: "2",
+  });
+  try {
+    // The degraded window opened: oj said so out loud (finding-6 semantics —
+    // the warning keys off the host never initializing, not config text).
+    await waitForLog(
+      /plugin host did not finish initializing within 2s/,
+      "the init-deadline warning never printed",
+    );
+
+    // An edit DURING the degraded window: no middleware port exists yet, so no
+    // invalidate can be sent — the post-activation resync must cover it.
+    const target = path.join(app, "src", "routes", "about.tsx");
+    fs.writeFileSync(
+      target,
+      fs.readFileSync(target, "utf8").replace("about-page-rapid-marker", "about-page-lateboot-marker"),
+    );
+
+    // The middleware activates late off the host's ojServeInfo push, and the
+    // catch-up resync full-reloads the worker environments.
+    await waitForLog(
+      /forwarding unmatched requests to :\d+ \(host came up after boot\)/,
+      "the worker path never activated after the degraded slow boot",
+    );
+    await waitForLog(/worker environments resynced/, "no catch-up resync after late activation");
+
+    // The documents must then render in the worker (wrangler var proves it),
+    // with the live-reload client, and reflect the degraded-window edit.
+    const home = await waitForDoc("/", "fixture-edition", "no worker-rendered document after late activation");
+    if (!home.includes("/@oj-start/live-reload.js")) {
       throw new Error("late-activated worker document lacks the live-reload client");
     }
-    console.log("start-cloudflare-dev: slow boot — worker path activated late and served the document");
+    await waitForDoc(
+      "/about",
+      "about-page-lateboot-marker",
+      "the degraded-window edit never reached the worker after the resync",
+    );
+    console.log("start-cloudflare-dev: slow boot (degraded) — late activation + resync, degraded-window edit fresh");
   } finally {
-    stop();
-    // Let the SIGTERM land before the next phase (or cleanup) touches the tree.
-    await new Promise((r) => setTimeout(r, 500));
+    await stop();
   }
 }
 
@@ -377,7 +437,8 @@ try {
   makeApp();
   await runDev();
   addSlowBootPlugin();
-  await runSlowBootDev();
+  await runSlowBootGatedDev();
+  await runSlowBootDegradedDev();
   cleanup();
 } catch (e) {
   console.error(e?.stack || e);

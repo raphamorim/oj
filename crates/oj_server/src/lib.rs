@@ -363,15 +363,31 @@ struct ServerState {
 /// Live view of how the plugin host serves requests: the configureServer
 /// middleware port and whether runner-backed Vite DevEnvironments serve the
 /// documents. Boot fills it from the host's initial serve info; a host whose
-/// init outlives the boot-time RPC deadline (many plugins, Miniflare) fills it
-/// late — the host pushes `{ ojServeInfo }` on stdout when ready and a
-/// background task flips these — so the request paths read it per request
-/// instead of snapshotting it at boot.
-#[derive(Debug, Default)]
+/// init outlives the boot deadlines fills it late — the host pushes
+/// `{ ojServeInfo }` when ready and [`spawn_late_plugin_serve`] flips this —
+/// so the request paths read it per request instead of snapshotting it at boot.
+#[derive(Default)]
 pub struct PluginServe {
-    /// The middleware's loopback port; 0 = none (yet).
-    port: std::sync::atomic::AtomicU32,
-    runner_environments: std::sync::atomic::AtomicBool,
+    /// One packed snapshot, so every reader gets (port, runner_environments)
+    /// from the same write: low 16 bits = the middleware's loopback port
+    /// (0 = none yet), bit 16 = runner environments serve the documents.
+    state: std::sync::atomic::AtomicU32,
+    /// The activation handler: runs synchronously inside `set` BEFORE a late
+    /// activation becomes visible to readers (start_dev marks its fallback
+    /// runner dirty here), so no request can observe the flipped mode while
+    /// the catch-up is still unarmed.
+    on_activate: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+}
+
+const RUNNER_ENVS_BIT: u32 = 1 << 16;
+
+impl std::fmt::Debug for PluginServe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginServe")
+            .field("mw_port", &self.mw_port())
+            .field("runner_environments", &self.runner_environments())
+            .finish()
+    }
 }
 
 impl PluginServe {
@@ -381,19 +397,38 @@ impl PluginServe {
         s
     }
     fn set(&self, info: &plugins::ServeInfo) {
-        // The flag first: a reader that sees the port must not miss the mode.
-        self.runner_environments.store(
-            info.middleware_port.is_some() && info.runner_environments,
-            std::sync::atomic::Ordering::SeqCst,
-        );
-        self.port.store(
-            info.middleware_port.map(u32::from).unwrap_or(0),
-            std::sync::atomic::Ordering::SeqCst,
-        );
+        let port = info.middleware_port.map(u32::from).unwrap_or(0);
+        let packed = if port != 0 && info.runner_environments {
+            port | RUNNER_ENVS_BIT
+        } else {
+            port
+        };
+        // A late activation (no middleware -> middleware up) runs the handler
+        // first: a reader that sees the new mode finds the catch-up armed.
+        if port != 0 && self.mw_port().is_none() {
+            if let Some(hook) = self
+                .on_activate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+            {
+                hook();
+            }
+        }
+        self.state.store(packed, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// Register the activation handler (see `on_activate`). At most one; a
+    /// registration after activation is never called, so callers registering
+    /// late must check the current state themselves.
+    pub fn set_on_activate(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        *self
+            .on_activate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
     }
     /// The configureServer middleware's loopback port, when it is up.
     pub fn mw_port(&self) -> Option<u16> {
-        match self.port.load(std::sync::atomic::Ordering::SeqCst) {
+        match self.state.load(std::sync::atomic::Ordering::SeqCst) & 0xFFFF {
             0 => None,
             p => u16::try_from(p).ok(),
         }
@@ -402,52 +437,39 @@ impl PluginServe {
     /// Environment-API path, today the Cloudflare plugin): the Start path may
     /// keep its SSR runner cold.
     pub fn runner_environments(&self) -> bool {
-        self.runner_environments
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.state.load(std::sync::atomic::Ordering::SeqCst) & RUNNER_ENVS_BIT != 0
     }
 }
 
-/// The config statically names @cloudflare/vite-plugin, so the app expects the
-/// plugin's worker environments to serve its documents.
-fn config_expects_worker_environments(root: &Path) -> bool {
-    plugins::vite_config_file(root)
-        .and_then(|f| std::fs::read_to_string(f).ok())
-        .is_some_and(|s| s.contains("@cloudflare/vite-plugin"))
-}
-
-/// How long a Cloudflare app's worker path may stay down after boot before oj
-/// says so out loud.
-const PLUGIN_SERVE_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
-
 /// Waits for the plugin host's late `{ ojServeInfo }` push and flips the shared
-/// [`PluginServe`] when it arrives, so a host whose init outlives the boot-time
-/// RPC deadline still activates the middleware path. When the app expects
-/// worker environments (Cloudflare) and none are up by the deadline, prints a
+/// [`PluginServe`] when it arrives, so a host whose init outlives the boot
+/// deadlines still activates the middleware path. Activation is a transition,
+/// not just a flag flip: `PluginServe::set` runs the registered activation
+/// handler first (start_dev re-arms its fallback runner there), and this task
+/// then sends one catch-up resync that full-reloads every runner-backed
+/// environment — covering all edits missed while the path was down. A host
+/// that never finishes initializing within the init deadline gets a loud
 /// warning instead of degrading silently.
-fn spawn_late_plugin_serve(
-    plugin_serve: Arc<PluginServe>,
-    mut updates: tokio::sync::watch::Receiver<Option<plugins::ServeInfo>>,
-    expects_worker: bool,
-) {
+fn spawn_late_plugin_serve(plugin_serve: Arc<PluginServe>, host: Arc<PluginHost>) {
     tokio::spawn(async move {
-        let warn_at = tokio::time::Instant::now() + PLUGIN_SERVE_WARN_AFTER;
+        let mut updates = host.serve_info_updates();
         let mut warned = false;
         loop {
             let info = *updates.borrow_and_update();
             if let Some(info) = info {
                 plugin_serve.set(&info);
-                match plugin_serve.mw_port() {
-                    Some(p) => println!(
+                if let Some(p) = plugin_serve.mw_port() {
+                    println!(
                         "  plugin middleware: forwarding unmatched requests to :{p} (host came up after boot)"
-                    ),
-                    None if expects_worker => eprintln!(
-                        "oj: warning: @cloudflare/vite-plugin is configured but its middleware never came up; documents are served by the Node SSR runner"
-                    ),
-                    None => {}
+                    );
+                    // The catch-up: edits made while the path was down were
+                    // never invalidated into the worker environments.
+                    notify_plugin_mw_resync(p).await;
+                    println!("  plugin middleware: worker environments resynced (full reload)");
                 }
                 return;
             }
-            if warned || !expects_worker {
+            if warned {
                 // Wait for the push alone; the host dropping ends the task.
                 if updates.changed().await.is_err() {
                     return;
@@ -459,11 +481,13 @@ fn spawn_late_plugin_serve(
                             return;
                         }
                     }
-                    _ = tokio::time::sleep_until(warn_at) => {
-                        eprintln!(
-                            "oj: warning: @cloudflare/vite-plugin is configured but the plugin middleware is still not up {}s after boot; documents are served by the Node SSR runner until it arrives",
-                            PLUGIN_SERVE_WARN_AFTER.as_secs()
-                        );
+                    _ = tokio::time::sleep_until(host.init_deadline_at()) => {
+                        if !host.is_initialized() {
+                            eprintln!(
+                                "oj: warning: the plugin host did not finish initializing within {}s; plugin-served routes are inactive until it does",
+                                plugins::plugin_init_timeout().as_secs()
+                            );
+                        }
                         warned = true;
                     }
                 }
@@ -760,16 +784,12 @@ impl DevServer {
             println!("  plugin middleware: forwarding unmatched requests to :{p}");
         } else if let Some(host) = &plugin_host {
             // No middleware port yet: either no plugin registered one, or the
-            // host's init outlived the boot-time RPC deadline (many plugins,
-            // Miniflare inside configureServer). The host pushes its serve info
-            // on stdout when ready — activate the middleware path then, and
-            // never degrade silently: a Cloudflare app whose worker path stays
-            // down past a deadline gets a loud warning.
-            spawn_late_plugin_serve(
-                Arc::clone(&plugin_serve),
-                host.serve_info_updates(),
-                config_expects_worker_environments(&root),
-            );
+            // host's init outlived the boot deadlines (many plugins, Miniflare
+            // inside configureServer). The host pushes its serve info when its
+            // init completes — activate the middleware path then, catch the
+            // worker environments up, and never degrade silently: a host that
+            // never finishes initializing gets a loud warning.
+            spawn_late_plugin_serve(Arc::clone(&plugin_serve), Arc::clone(host));
         }
         if let Some(host) = &plugin_host {
             // Fold config()-hook env mutations (e.g. a plugin flipping a VITE_*
@@ -2985,16 +3005,7 @@ async fn forward_to_plugin_middleware(
 // HMR updates (the Cloudflare-plugin HMR path). Each change carries Vite's
 // watcher event type: "update" | "create" | "delete". Fire-and-forget.
 pub async fn notify_plugin_mw_invalidate(port: u16, changes: &[(String, &'static str)]) {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    // The endpoint answers only after the plugin hotUpdate hooks ran, and the
-    // settled-batch call blocks the watcher thread: a hung hook must not
-    // freeze rebuilds for the session, so the request is bounded.
-    let client = CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .unwrap_or_default()
-    });
+    let client = plugin_mw_client();
     let changes: Vec<serde_json::Value> = changes
         .iter()
         .map(|(path, kind)| serde_json::json!({ "path": path, "type": kind }))
@@ -3004,6 +3015,32 @@ pub async fn notify_plugin_mw_invalidate(port: u16, changes: &[(String, &'static
         .post(format!("http://127.0.0.1:{port}/__oj_invalidate"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(body)
+        .send()
+        .await;
+}
+
+fn plugin_mw_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    // The endpoint answers only after the plugin hotUpdate hooks ran, and the
+    // settled-batch call blocks the watcher thread: a hung hook must not
+    // freeze rebuilds for the session, so the request is bounded.
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default()
+    })
+}
+
+/// Tell the plugin middleware to resynchronize: invalidate every runner-backed
+/// DevEnvironment's whole module graph and send a full-reload, bypassing the
+/// per-change dedup. Sent once on late activation, covering every edit made
+/// while the middleware path was down (the watcher had no port to invalidate).
+pub async fn notify_plugin_mw_resync(port: u16) {
+    let _ = plugin_mw_client()
+        .post(format!("http://127.0.0.1:{port}/__oj_invalidate"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(r#"{"resync":true}"#)
         .send()
         .await;
 }
@@ -8016,6 +8053,52 @@ async fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // One packed word: every reader sees (port, runner_environments) from the
+    // same write, and a late activation runs the handler BEFORE the flip is
+    // visible — no reader can observe the new mode with the catch-up unarmed.
+    #[test]
+    fn plugin_serve_packs_one_snapshot_and_arms_before_the_flip() {
+        let info = |port: Option<u16>, runner: bool| plugins::ServeInfo {
+            middleware_port: port,
+            runner_environments: runner,
+        };
+        let serve = PluginServe::default();
+        assert_eq!(serve.mw_port(), None);
+        assert!(!serve.runner_environments());
+
+        // The handler observes the pre-flip state: set() runs it first.
+        let seen = Arc::new(Mutex::new(None::<(Option<u16>, bool)>));
+        {
+            let serve = Arc::new(PluginServe::default());
+            let inner = Arc::clone(&serve);
+            let sink = Arc::clone(&seen);
+            serve.set_on_activate(Box::new(move || {
+                *sink.lock().unwrap() =
+                    Some((inner.mw_port(), inner.runner_environments()));
+            }));
+            serve.set(&info(Some(4001), true));
+            assert_eq!(
+                *seen.lock().unwrap(),
+                Some((None, false)),
+                "the activation handler must run before readers can see the flip"
+            );
+            assert_eq!(serve.mw_port(), Some(4001));
+            assert!(serve.runner_environments());
+            // A repeat set with the same info is not a second activation.
+            *seen.lock().unwrap() = None;
+            serve.set(&info(Some(4001), true));
+            assert_eq!(*seen.lock().unwrap(), None);
+        }
+
+        // runner_environments only counts with a middleware port.
+        let no_port = PluginServe::from_info(&info(None, true));
+        assert_eq!(no_port.mw_port(), None);
+        assert!(!no_port.runner_environments());
+        let no_runner = PluginServe::from_info(&info(Some(4002), false));
+        assert_eq!(no_runner.mw_port(), Some(4002));
+        assert!(!no_runner.runner_environments());
+    }
 
     #[test]
     fn dep_transform_gate_matches_only_marker_sources() {
