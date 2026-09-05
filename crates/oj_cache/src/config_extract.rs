@@ -152,6 +152,18 @@ fn env_epoch(root: &Path) -> String {
         ".env.local",
         ".env.development",
         ".env.development.local",
+        // Files a plugin's `config` hook reads outside the config-import graph:
+        // @cloudflare/vite-plugin resolves the Worker config from
+        // wrangler.jsonc/.json/.toml (wrangler.unstable_readConfig) while the
+        // hooks run, so its verdict — runner-backed detection included — can
+        // flip on a wrangler edit with no vite.config change. Absence is a
+        // state too: a present file feeds name+content, an absent one feeds
+        // nothing, so create/delete transitions change the epoch. (.dev.vars
+        // is NOT here: the plugin reads it at preview/build-output time, not
+        // in its config hook.)
+        "wrangler.jsonc",
+        "wrangler.json",
+        "wrangler.toml",
     ] {
         if let Ok(bytes) = fs::read(root.join(name)) {
             hasher.update(name.as_bytes());
@@ -240,6 +252,37 @@ mod tests {
         store.store(&config, "serve", "development", &[], "{}", "");
         assert!(store.lookup(&config, "serve", "development").is_some());
         fs::write(root.join(".env.local"), "VITE_X=1").unwrap();
+        assert!(store.lookup(&config, "serve", "development").is_none());
+    }
+
+    // A wrangler config is read by the Cloudflare plugin's config hook, not
+    // imported by vite.config: without it in the key, a verdict computed under
+    // a broken wrangler.jsonc survived the wrangler fix (the worker path
+    // stayed off until vite.config itself was touched). Every transition —
+    // create, edit, delete — must be a miss.
+    #[test]
+    fn wrangler_config_changes_invalidate() {
+        let root = temp_root("wrangler");
+        let config = root.join("vite.config.ts");
+        fs::write(&config, "a").unwrap();
+        let store = ConfigExtractStore::new(&root, "s1");
+        store.store(&config, "serve", "development", &[], "{}", "");
+        assert!(store.lookup(&config, "serve", "development").is_some());
+        // Absent -> present.
+        fs::write(root.join("wrangler.jsonc"), r#"{ "name": "app" }"#).unwrap();
+        assert!(store.lookup(&config, "serve", "development").is_none());
+        store.store(&config, "serve", "development", &[], "{}", "");
+        assert!(store.lookup(&config, "serve", "development").is_some());
+        // Content change (the broken-wrangler-then-fixed shape).
+        fs::write(root.join("wrangler.jsonc"), r#"{ "name": "app", "main": "w.ts" }"#).unwrap();
+        assert!(store.lookup(&config, "serve", "development").is_none());
+        store.store(&config, "serve", "development", &[], "{}", "");
+        // Present -> absent.
+        fs::remove_file(root.join("wrangler.jsonc")).unwrap();
+        assert!(store.lookup(&config, "serve", "development").is_none());
+        store.store(&config, "serve", "development", &[], "{}", "");
+        // The .toml spelling counts too.
+        fs::write(root.join("wrangler.toml"), "name = \"app\"").unwrap();
         assert!(store.lookup(&config, "serve", "development").is_none());
     }
 
