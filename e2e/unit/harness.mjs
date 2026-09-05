@@ -93,8 +93,23 @@ export function rpcSidecar(sidecarRel, { args = [], env, cwd } = {}) {
   });
   const frames = [];
   let waiter = null;
+  // The plugin host pushes `{ ojServeInfo }` once its top-level init completes
+  // (the Rust reader consumes it out-of-band the same way); it is not a reply
+  // to anything, so it never enters the frame queue. Tests that care read it
+  // via `serveInfo()` / `serveInfoPushed()`.
+  let serveInfoPushed;
+  let serveInfoResolve;
+  const serveInfoArrived = new Promise((r) => (serveInfoResolve = r));
   readline.createInterface({ input: child.stdout }).on("line", (line) => {
     if (!line.trim()) return;
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed && typeof parsed === "object" && "ojServeInfo" in parsed) {
+        serveInfoPushed = parsed.ojServeInfo;
+        serveInfoResolve(parsed.ojServeInfo);
+        return;
+      }
+    } catch {}
     if (waiter) {
       const w = waiter;
       waiter = null;
@@ -124,6 +139,10 @@ export function rpcSidecar(sidecarRel, { args = [], env, cwd } = {}) {
   return {
     child,
     stderr: () => stderr,
+    // The host's serve-info push: awaits it (`serveInfo()`), or peeks at what
+    // has arrived so far (`serveInfoPushed()`, undefined until the push lands).
+    serveInfo: () => serveInfoArrived,
+    serveInfoPushed: () => serveInfoPushed,
     async nextFrame(ms = 10_000) {
       return JSON.parse(await nextLine(ms));
     },
