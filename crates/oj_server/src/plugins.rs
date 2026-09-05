@@ -25,6 +25,23 @@ pub struct ServeInfo {
     pub runner_environments: bool,
 }
 
+impl ServeInfo {
+    /// The `{ middlewarePort, runnerEnvironments }` shape, shared by the host's
+    /// `getServeInfo` RPC reply and its `{ ojServeInfo: ... }` stdout push.
+    fn from_json(v: &serde_json::Value) -> ServeInfo {
+        ServeInfo {
+            middleware_port: v
+                .get("middlewarePort")
+                .and_then(|p| p.as_u64())
+                .and_then(|p| u16::try_from(p).ok()),
+            runner_environments: v
+                .get("runnerEnvironments")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct EmittedFile {
     pub file_name: String,
@@ -879,6 +896,12 @@ pub struct PluginHost {
     // In an Option so it can be taken + killed explicitly (the reader task holds
     // an Arc clone, so dropping the caller's Arc alone never triggers kill_on_drop).
     child: Mutex<Option<tokio::process::Child>>,
+    /// The host's `{ ojServeInfo: ... }` stdout push: None until the host's
+    /// top-level init completes. On a slow boot (many plugins, Miniflare) the
+    /// boot-time `getServeInfo` RPC times out; subscribers of this channel see
+    /// the info whenever the host eventually comes up and can activate the
+    /// middleware path late instead of silently degrading to the SSR runner.
+    serve_info_push: tokio::sync::watch::Sender<Option<ServeInfo>>,
 }
 
 async fn handle_ctx_rpc(
@@ -1005,6 +1028,7 @@ impl PluginHost {
             ws_out: Mutex::new(None),
             server_events: Mutex::new(None),
             child: Mutex::new(Some(child)),
+            serve_info_push: tokio::sync::watch::channel(None).0,
         });
 
         let resolver = std::sync::Arc::new(OjResolver::new(root));
@@ -1021,6 +1045,12 @@ impl PluginHost {
                     let args = msg["args"].as_array().cloned().unwrap_or_default();
                     handle_ctx_rpc(rpc, &method, &args, &resolver, &root_buf, &reader_ref.stdin)
                         .await;
+                    continue;
+                }
+                if let Some(info) = msg.get("ojServeInfo") {
+                    reader_ref
+                        .serve_info_push
+                        .send_replace(Some(ServeInfo::from_json(info)));
                     continue;
                 }
                 if let Some(ev) = msg.get("ojServer") {
@@ -1282,9 +1312,16 @@ impl PluginHost {
     /// How the host serves requests: the loopback port of its configureServer
     /// middleware stack (when any plugin registered one), and whether it built
     /// real runner-backed Vite DevEnvironments (documents are then served by
-    /// the plugin middleware, not the Node SSR runner). Defaults on RPC
-    /// failure, so an uncertain host keeps the runner eagerly warm.
+    /// the plugin middleware, not the Node SSR runner). The host pushes this on
+    /// stdout the moment its init completes, so a value that already arrived is
+    /// returned without an RPC round trip; otherwise the RPC is tried and, on
+    /// failure (a slow host still mid-init), the default is returned — the
+    /// caller can then watch `serve_info_updates` for the late push instead of
+    /// degrading silently.
     pub async fn serve_info(&self) -> ServeInfo {
+        if let Some(info) = *self.serve_info_push.borrow() {
+            return info;
+        }
         let Some(v) = self
             .call("getServeInfo", &[])
             .await
@@ -1294,16 +1331,15 @@ impl PluginHost {
         else {
             return ServeInfo::default();
         };
-        ServeInfo {
-            middleware_port: v
-                .get("middlewarePort")
-                .and_then(|p| p.as_u64())
-                .and_then(|p| u16::try_from(p).ok()),
-            runner_environments: v
-                .get("runnerEnvironments")
-                .and_then(|b| b.as_bool())
-                .unwrap_or(false),
-        }
+        ServeInfo::from_json(&v)
+    }
+
+    /// Subscribe to the host's `{ ojServeInfo }` push: `None` until the host's
+    /// top-level init completes, then the definitive `ServeInfo` — however slow
+    /// the boot. Lets the caller activate the plugin-middleware path late when
+    /// the boot-time `serve_info` timed out.
+    pub fn serve_info_updates(&self) -> tokio::sync::watch::Receiver<Option<ServeInfo>> {
+        self.serve_info_push.subscribe()
     }
 
     /// Number of plugins still active after oj filters out the ones it

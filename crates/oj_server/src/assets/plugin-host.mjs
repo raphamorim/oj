@@ -1777,7 +1777,17 @@ async function setupConfigureServer() {
   middlewarePort = srv.address().port;
   process.stderr.write(`${OJ} plugin host: configureServer middleware on :${middlewarePort}\n`);
 }
-if (env.command !== "build") await setupConfigureServer();
+if (env.command !== "build") {
+  await setupConfigureServer();
+  // Push the serve info the moment it exists (like the {ojWs} pushes): the RPC
+  // listener below only registers after every top-level await, so on a slow
+  // boot (many plugins, Miniflare) Rust's getServeInfo RPC times out and the
+  // worker path would silently never activate. The push reaches Rust whenever
+  // the host comes up, however late, and Rust flips to the middleware then.
+  process.stdout.write(JSON.stringify({
+    ojServeInfo: { middlewarePort, runnerEnvironments: runnerEnvironmentsBuilt },
+  }) + "\n");
+}
 
 if (ssrBridgeDir) {
   (async () => {
