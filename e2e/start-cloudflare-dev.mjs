@@ -19,7 +19,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.join(here, "..");
 const fixture = path.join(here, "fixtures", "start-app");
 const oj = path.join(repo, "target", "debug", "oj");
-const PORT = 6835;
+const PORT = 6840;
 
 const installed =
   fs.existsSync(path.join(fixture, "node_modules", "@tanstack", "react-start")) &&
@@ -198,7 +198,48 @@ async function runDev() {
       throw new Error(`/about still stale 20s after the edit; log tail:\n${log.slice(-4000)}`);
     }
 
-    console.log(`start-cloudflare-dev: worker render + live-reload client + fresh document ${fresh}ms after the edit`);
+    // Rapid edits: a second edit landing while the first edit's client
+    // rebundle is in flight must not queue behind it. Its worker invalidate
+    // fires promptly, so the next document is fresh well under the ~4.6s the
+    // old serialized loop took.
+    const indexTarget = path.join(app, "src", "routes", "index.tsx");
+    fs.writeFileSync(
+      indexTarget,
+      fs.readFileSync(indexTarget, "utf8").replace('shout("home")', 'shout("home-rapid")'),
+    );
+    await new Promise((r) => setTimeout(r, 300));
+    fs.writeFileSync(
+      target,
+      fs.readFileSync(target, "utf8").replace("about-page-edited-marker", "about-page-rapid-marker"),
+    );
+    const t1 = Date.now();
+    let rapid = null;
+    for (let i = 0; i < 40; i++) {
+      const res = await get("/about");
+      if (res.status === 200 && res.body.includes("about-page-rapid-marker")) {
+        rapid = Date.now() - t1;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    if (rapid == null) {
+      throw new Error(`/about still stale 2s after the rapid second edit; log tail:\n${log.slice(-4000)}`);
+    }
+
+    // The coalesced rebundle must not lose the first edit either.
+    let firstEditFresh = false;
+    for (let i = 0; i < 100 && !firstEditFresh; i++) {
+      const res = await get("/");
+      firstEditFresh = res.status === 200 && res.body.includes("HOME-RAPID!");
+      if (!firstEditFresh) await new Promise((r) => setTimeout(r, 100));
+    }
+    if (!firstEditFresh) {
+      throw new Error(`/ never picked up the first rapid edit; log tail:\n${log.slice(-4000)}`);
+    }
+
+    console.log(
+      `start-cloudflare-dev: worker render + live-reload client + fresh document ${fresh}ms after the edit, ${rapid}ms after a rapid second edit`,
+    );
   } finally {
     stop();
   }

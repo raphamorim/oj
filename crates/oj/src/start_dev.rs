@@ -375,8 +375,41 @@ fn asset_mime(ext: &str) -> &'static str {
 
 const RELOAD_CLIENT: &str = "<script type=\"module\" src=\"/@oj-start/live-reload.js\"></script>";
 
+/// One rebundle run's inputs, handed from the watcher thread to the coalescing
+/// rebundle worker. Batches landing while a rebundle is in flight merge into
+/// the single pending run (paths union), so at most one run ever queues.
+struct PendingRebundle {
+    /// Every changed path of the merged batches (relevant and not): the HMR
+    /// gate records the full set, exactly as the inline loop did.
+    paths: std::collections::HashSet<PathBuf>,
+    /// The settled worker-invalidate sends already in flight for the merged
+    /// batches: this run's browser reload waits for them, so a reload never
+    /// lands while the worker environments still hold stale modules.
+    invalidates: Vec<tokio::task::JoinHandle<()>>,
+    /// The newest merged batch number: its done-frame clears the editor pill.
+    batch: u64,
+    /// A non-lazy runner reloads once per run (a lazy one was dirty-marked at
+    /// hand-off time already).
+    reload_runner: bool,
+}
+
 fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
     let rt = tokio::runtime::Handle::current();
+    let pending: Arc<std::sync::Mutex<Option<PendingRebundle>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let wake = Arc::new(tokio::sync::Notify::new());
+    rt.spawn(rebundle_worker(
+        root.clone(),
+        cache.clone(),
+        Arc::clone(&state),
+        Arc::clone(&pending),
+        Arc::clone(&wake),
+    ));
+    // The watcher thread only receives, classifies, settles and hands batches
+    // off; it never blocks on a rebundle or an HTTP send (Vite's chokidar
+    // callbacks run per event too). A second edit landing while the first
+    // edit's rebundle is in flight is invalidated promptly instead of queueing
+    // behind the bundler.
     std::thread::spawn(move || {
         use notify::{RecursiveMode, Watcher};
         use std::sync::mpsc::RecvTimeoutError;
@@ -394,7 +427,6 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             eprintln!("oj start: cannot watch {}: {e}", src.display());
             return;
         }
-        let mut prev_routes = list_route_files(&root);
         let mut batch = 0u64;
         // Attribute-only events (the atime update a read causes on Linux) are
         // not changes: the client rebundle reads every source file, which
@@ -456,83 +488,142 @@ fn spawn_start_watcher(root: PathBuf, cache: PathBuf, state: Arc<StartState>) {
             if !relevant {
                 continue;
             }
-            let routes_now = list_route_files(&root);
-            let routes_changed = routes_now != prev_routes;
-            if routes_changed {
-                let _ = generate_route_tree(&root, &cache, &state.mode);
-                prev_routes = routes_now;
-            }
-            let server_fn_changed = paths.iter().any(|p| {
-                let is_ts = p.extension().is_some_and(|e| e == "ts" || e == "tsx");
-                is_ts
-                    && (!p.exists()
-                        || std::fs::read_to_string(p).is_ok_and(|s| s.contains("createServerFn")))
-            });
-            if routes_changed || server_fn_changed {
-                let _ = generate_server_fn_resolver(&root, &cache, &state.mode);
-            }
             // Narrate the compile batch to the editor: "Applying changes…" while
-            // it rebuilds, then done so the pill clears.
+            // it rebuilds; the rebundle worker sends the done-frame so the pill
+            // clears.
             batch += 1;
             let _ = state.ws_tx.send(oj_server::update_progress_frame(
                 batch, "watch", 0, 0, None, false,
             ));
+            // Invalidate the plugin's worker DevEnvironments so a Cloudflare
+            // app re-renders with the changed modules (not stale SSR). Spawned
+            // promptly per settled batch, never behind an in-flight rebundle;
+            // the rebundle worker awaits it before that run's browser reload.
             let changed_paths: Vec<(String, &'static str)> = paths
                 .iter()
                 .filter(|p| watch_relevant(p))
                 .map(|p| (p.to_string_lossy().into_owned(), change_type(p, &created)))
                 .collect();
-            rt.block_on(async {
-                let (r, c, m) = (root.clone(), cache.clone(), state.mode.clone());
-                let client = tokio::task::spawn_blocking(move || {
-                    if bundle_client_entry(&r, &c, &m).is_err() {
-                        return None;
-                    }
+            let invalidate = state.plugin_mw_port.map(|port| {
+                rt.spawn(async move {
+                    oj_server::notify_plugin_mw_invalidate(port, &changed_paths).await;
+                })
+            });
+            if state.lazy_runner {
+                state
+                    .runner_dirty
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            {
+                let mut slot = pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let run = slot.get_or_insert_with(|| PendingRebundle {
+                    paths: std::collections::HashSet::new(),
+                    invalidates: Vec::new(),
+                    batch,
+                    reload_runner: false,
+                });
+                run.paths.extend(paths.iter().cloned());
+                run.invalidates.extend(invalidate);
+                run.batch = batch;
+                run.reload_runner |= !state.lazy_runner;
+            }
+            wake.notify_one();
+        }
+    });
+}
+
+/// The coalescing rebundle worker: route-tree/server-fn regeneration and the
+/// client rebundle run here, off the watcher thread. Batches landing mid-run
+/// merge into the one pending run that starts when the current one finishes
+/// (never more than one queued); the browser reload still fires once per
+/// completed rebundle, after that run's settled invalidates, as before.
+async fn rebundle_worker(
+    root: PathBuf,
+    cache: PathBuf,
+    state: Arc<StartState>,
+    pending: Arc<std::sync::Mutex<Option<PendingRebundle>>>,
+    wake: Arc<tokio::sync::Notify>,
+) {
+    let mut prev_routes = list_route_files(&root);
+    loop {
+        let run = pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(run) = run else {
+            wake.notified().await;
+            continue;
+        };
+        let paths: Vec<PathBuf> = run.paths.into_iter().collect();
+        let client = {
+            let (r, c, m) = (root.clone(), cache.clone(), state.mode.clone());
+            let routes_prev = prev_routes.clone();
+            let changed: Vec<PathBuf> = paths.clone();
+            tokio::task::spawn_blocking(move || {
+                let routes_now = list_route_files(&r);
+                let routes_changed = routes_now != routes_prev;
+                if routes_changed {
+                    let _ = generate_route_tree(&r, &c, &m);
+                }
+                let server_fn_changed = changed.iter().any(|p| {
+                    let is_ts = p.extension().is_some_and(|e| e == "ts" || e == "tsx");
+                    is_ts
+                        && (!p.exists()
+                            || std::fs::read_to_string(p)
+                                .is_ok_and(|s| s.contains("createServerFn")))
+                });
+                if routes_changed || server_fn_changed {
+                    let _ = generate_server_fn_resolver(&r, &c, &m);
+                }
+                let pinned = if bundle_client_entry(&r, &c, &m).is_err() {
+                    None
+                } else {
                     match start_bundle_store(&r, &m).persist(&c) {
                         Some((_, pinned)) => Some(pinned),
                         None => oj_cache::start_bundle::PinnedBundle::from_build_dir(&c),
                     }
-                });
-                // Invalidate the plugin's worker DevEnvironments so a Cloudflare
-                // app re-renders with the changed modules (not stale SSR).
-                if let Some(port) = state.plugin_mw_port {
-                    oj_server::notify_plugin_mw_invalidate(port, &changed_paths).await;
-                }
-                let reload = async {
-                    if state.lazy_runner {
-                        state
-                            .runner_dirty
-                            .store(true, std::sync::atomic::Ordering::SeqCst);
-                    } else {
-                        reload_runner(&state).await;
-                    }
                 };
-                let (pinned, _) = tokio::join!(client, reload);
-                if let Ok(Some(pinned)) = pinned {
-                    *state.bundle.write().unwrap() = Arc::new(pinned);
-                }
-            });
-            let path_list: Vec<PathBuf> = paths.iter().cloned().collect();
-            let held = state.gate.as_ref().is_some_and(|g| g.hold_reload(&path_list));
-            if !held {
-                let _ = state.reload_tx.send(());
+                (routes_now, pinned)
+            })
+        };
+        let side = async {
+            // A reload onto stale worker modules would re-render old content:
+            // this run's settled invalidates complete before the signal.
+            for handle in run.invalidates {
+                let _ = handle.await;
             }
-            let modules = client_module_count(&cache);
-            let _ = state.ws_tx.send(oj_server::update_progress_frame(
-                batch,
-                "watch",
-                0,
-                modules,
-                Some(0),
-                true,
-            ));
-            if held {
-                println!("  oj start: rebuilt, reload held for the editor's flush");
-            } else {
-                println!("  oj start: rebuilt, reloading");
+            if run.reload_runner {
+                reload_runner(&state).await;
+            }
+        };
+        let (client, _) = tokio::join!(client, side);
+        if let Ok((routes_now, pinned)) = client {
+            prev_routes = routes_now;
+            if let Some(pinned) = pinned {
+                *state.bundle.write().unwrap() = Arc::new(pinned);
             }
         }
-    });
+        let held = state.gate.as_ref().is_some_and(|g| g.hold_reload(&paths));
+        if !held {
+            let _ = state.reload_tx.send(());
+        }
+        let modules = client_module_count(&cache);
+        let _ = state.ws_tx.send(oj_server::update_progress_frame(
+            run.batch,
+            "watch",
+            0,
+            modules,
+            Some(0),
+            true,
+        ));
+        if held {
+            println!("  oj start: rebuilt, reload held for the editor's flush");
+        } else {
+            println!("  oj start: rebuilt, reloading");
+        }
+    }
 }
 
 /// Environment handed to the Start node scripts: the mode's `.env` vars with an
