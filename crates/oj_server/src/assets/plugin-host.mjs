@@ -1100,17 +1100,38 @@ function userSetPreTransformRequests(name) {
 // file watcher. Runner-sent vite:invalidate is handled by the DevEnvironment.)
 const WATCHER_EVENT = { update: "change", create: "add", delete: "unlink" };
 const unmatchedChangeLogged = new Set();
+// oj sends each edit twice (an early pre-settle POST and the settled batch),
+// while Vite sees ONE chokidar event per FS change: replaying both would run
+// watcher.emit and the whole hotUpdate pipeline (hooks, targeted updates, the
+// runner's chain re-fetch) twice. Skip a change whose (type, mtime) matches
+// the last processed one within a short window; a write landing inside the
+// settle window moves the mtime, so genuinely-new content still processes.
+const INVALIDATE_DEDUP_MS = 2000;
+const lastProcessedChange = new Map(); // file -> { type, mtimeMs, at }
+const CHANGE_MTIME_NONE = -1; // deletes (and unstattable files) have no mtime
+function freshChange({ file, type }, now) {
+  let mtimeMs = CHANGE_MTIME_NONE;
+  if (type !== "delete") {
+    try { mtimeMs = statSync(file).mtimeMs; } catch {}
+  }
+  const prev = lastProcessedChange.get(file);
+  lastProcessedChange.set(file, { type, mtimeMs, at: now });
+  return !(prev && prev.type === type && prev.mtimeMs === mtimeMs && now - prev.at < INVALIDATE_DEDUP_MS);
+}
 let invalidateQueue = Promise.resolve();
 async function invalidateEnvironments(environments, watcher, changes) {
   // Re-classify at handling time: the early (pre-settle) send classifies from
   // a raw event, and an atomic-save editor's momentary delete may have been
   // recreated by the time this runs; a stale "delete" would prune a live
   // module from the graph.
-  const normalized = changes.map(({ path: file, type }) => {
-    let t = type || "update";
-    if (t === "delete" && existsSync(file)) t = "update";
-    return { file: String(file).replace(/\\/g, "/"), type: t };
-  });
+  const now = Date.now();
+  const normalized = changes
+    .map(({ path: file, type }) => {
+      let t = type || "update";
+      if (t === "delete" && existsSync(file)) t = "update";
+      return { file: String(file).replace(/\\/g, "/"), type: t };
+    })
+    .filter((change) => freshChange(change, now));
   for (const { file, type } of normalized) {
     try { watcher.emit(WATCHER_EVENT[type], file); } catch {}
   }
