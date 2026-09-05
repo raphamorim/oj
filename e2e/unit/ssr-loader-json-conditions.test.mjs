@@ -155,3 +155,66 @@ test("SSR loader: linked (workspace) packages take the environment's conditions,
     rmSync(app, { recursive: true, force: true });
   }
 });
+
+// This loader executes modules in Node: a workerd-shaped condition list (the
+// Cloudflare plugin sets `browser` alongside `workerd`/`worker` for its own
+// runtime) must never let `browser` win here — a browser conditional export
+// runs DOM code at module scope (`document is not defined`). The package
+// mirrors decode-named-character-reference, browser-first so only the strip
+// (not condition order) saves it.
+test("SSR loader: a workerd-shaped condition list never matches browser builds in Node", () => {
+  const app = realpathSync(mkdtempSync(join(tmpdir(), "oj-ssr-workerd-cond-")));
+  const source = join(app, "src");
+  const dompkg = join(app, "node_modules", "dompkg");
+  const rolldown = join(app, "node_modules", "rolldown");
+  for (const directory of [source, dompkg, rolldown]) mkdirSync(directory, { recursive: true });
+
+  writeFileSync(join(app, "package.json"), JSON.stringify({ name: "synthetic-workerd-cond-app", type: "module" }));
+  writeFileSync(join(rolldown, "package.json"), JSON.stringify({
+    name: "rolldown", type: "module", exports: { "./experimental": "./experimental.mjs" },
+  }));
+  writeFileSync(join(rolldown, "experimental.mjs"), "export const transformSync = (_path, code) => ({ code });\n");
+  writeFileSync(join(dompkg, "package.json"), JSON.stringify({
+    name: "dompkg", type: "module",
+    exports: { ".": { browser: "./index.dom.js", worker: "./index.js", default: "./index.js" } },
+  }));
+  writeFileSync(join(dompkg, "index.js"), 'export const build = "node-safe";\n');
+  writeFileSync(join(dompkg, "index.dom.js"), 'document.createElement("i");\nexport const build = "browser";\n');
+
+  const entry = join(source, "entry.ts");
+  writeFileSync(entry, ['import { build } from "dompkg";', "export default { build };"].join("\n"));
+
+  const runner = [
+    'import { registerHooks } from "node:module";',
+    `const loader = await import(${JSON.stringify(pathToFileURL(loader).href)});`,
+    "registerHooks({ resolve: loader.resolve, load: loader.load });",
+    `process.stdout.write(JSON.stringify((await import(${JSON.stringify(pathToFileURL(entry).href)})).default));`,
+  ].join("\n");
+  const run = (extraEnv) => spawnSync(process.execPath, ["--input-type=module", "--eval", runner], {
+    encoding: "utf8",
+    timeout: 10_000,
+    env: { ...process.env, OJ_APP_ROOT: app, OJ_CACHE_ROOT: join(app, "cache"), OJ_SSR_LOADER_CACHE: "off", ...extraEnv },
+  });
+  const workerdList = JSON.stringify(["workerd", "worker", "module", "browser", "development"]);
+  // The Cloudflare ssr environment sets `resolve.noExternal: true`, so every
+  // bare import takes the environment's conditions.
+  const noExternalAll = JSON.stringify({ noExternalAll: true });
+  try {
+    // Environment conditions path (noExternal): browser is stripped, worker wins.
+    const viaConditions = run({ OJ_RESOLVE_CONDITIONS: workerdList, OJ_SSR_EXTERNALS: noExternalAll });
+    assert.equal(viaConditions.status, 0, viaConditions.stderr || viaConditions.error?.message);
+    assert.equal(JSON.parse(viaConditions.stdout).build, "node-safe");
+
+    // Externalized path: a workerd-shaped externalConditions list is stripped too.
+    const viaExternal = run({ OJ_EXTERNAL_CONDITIONS: workerdList });
+    assert.equal(viaExternal.status, 0, viaExternal.stderr || viaExternal.error?.message);
+    assert.equal(JSON.parse(viaExternal.stdout).build, "node-safe");
+
+    // A browser list without workerd stays honored (Vite honors user conditions).
+    const honored = run({ OJ_RESOLVE_CONDITIONS: JSON.stringify(["browser"]), OJ_SSR_EXTERNALS: noExternalAll });
+    assert.equal(honored.status, 1, "a plain browser user condition still picks the browser build");
+    assert.match(honored.stderr ?? "", /document is not defined/);
+  } finally {
+    rmSync(app, { recursive: true, force: true });
+  }
+});

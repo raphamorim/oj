@@ -658,13 +658,24 @@ function resolveDirEntry(dir) {
 
 const isRequire = (context) => context.conditions && context.conditions.includes("require");
 
+// This loader executes modules in Node: a `browser` conditional export matched
+// here runs DOM code server-side (`document is not defined`). A workerd-shaped
+// list (the Cloudflare plugin sets `browser` alongside `workerd` for its own
+// runtime, where `worker` wins first) drops `browser`; a list without `workerd`
+// is honored verbatim, as Vite honors user conditions. Mirrors the same strip
+// in oj's start_dev env plumbing — this is the last line of defense should a
+// workerd-shaped list reach the loader through any other path.
+function nodeSafeConditions(list) {
+  if (!Array.isArray(list)) return null;
+  const out = list.filter((c) => typeof c === "string" && c);
+  return out.includes("workerd") ? out.filter((c) => c !== "browser") : out;
+}
 // The config's `resolve.conditions` (OJ_RESOLVE_CONDITIONS from oj), added to
 // Node's export conditions for every resolution, as Vite's resolver honors a
 // user condition (`exports: { custom: ... }`) for the modules it resolves.
 const EXTRA_CONDITIONS = (() => {
   try {
-    const list = JSON.parse(process.env.OJ_RESOLVE_CONDITIONS || "null");
-    return Array.isArray(list) ? list.filter((c) => typeof c === "string" && c) : [];
+    return nodeSafeConditions(JSON.parse(process.env.OJ_RESOLVE_CONDITIONS || "null")) ?? [];
   } catch { return []; }
 })();
 function withUserConditions(context) {
@@ -681,8 +692,8 @@ function withUserConditions(context) {
 // OJ_EXTERNAL_CONDITIONS carries the config's `resolve.externalConditions`.
 const EXTERNAL_CONDITIONS = (() => {
   try {
-    const list = JSON.parse(process.env.OJ_EXTERNAL_CONDITIONS || "null");
-    if (Array.isArray(list)) return list.filter((c) => typeof c === "string" && c);
+    const list = nodeSafeConditions(JSON.parse(process.env.OJ_EXTERNAL_CONDITIONS || "null"));
+    if (list) return list;
   } catch {}
   return ["module-sync"];
 })();
