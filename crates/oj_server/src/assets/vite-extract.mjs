@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-import { createRequire } from "node:module";
+import { createRequire, isBuiltin } from "node:module";
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { writeFileSync, readFileSync, realpathSync, existsSync, unlinkSync } from "node:fs";
 
 const configPath = process.argv[2];
@@ -46,6 +46,54 @@ function resolvePkg(spec) {
 
 const absDeps = (deps) =>
   (deps ?? []).filter((d) => typeof d === "string").map((d) => resolve(appRoot, d));
+
+// Vite's `externalize-deps` config-bundling plugin, mirrored. `packages:
+// "external"` kept bare specifiers bare, so the bundle -- imported from the
+// cache dir -- re-resolved them from there at import time. A config that
+// relatively imports a sibling workspace package's source (a monorepo shape)
+// inlines that source, whose bare deps live under the sibling's own
+// node_modules, unreachable from the cache dir. Resolve every bare import from
+// its importer at bundle time and externalize the resolved absolute path
+// instead: a file:// URL for import kinds, the plain path for require; a .json
+// resolution is bundled (Vite does the same -- an externalized ESM .json import
+// would need an import attribute).
+function externalizeDepsPlugin() {
+  const resolving = Symbol("oj-externalize-deps");
+  return {
+    name: "externalize-deps",
+    setup(build) {
+      build.onResolve({ filter: /^[^./#]/ }, async (args) => {
+        // Re-entrant call from build.resolve below: let esbuild resolve it.
+        if (args.pluginData === resolving) return null;
+        const { path: id, importer, kind } = args;
+        if (!importer || isAbsolute(id)) return null;
+        if (id.startsWith("node:") || isBuiltin(id)) return { path: id, external: true };
+        let resolved = null;
+        try {
+          resolved = await build.resolve(id, {
+            importer,
+            resolveDir: dirname(importer),
+            kind,
+            pluginData: resolving,
+          });
+        } catch {}
+        if (!resolved || resolved.errors.length > 0 || !resolved.path) {
+          // Unresolvable here; keep the bare id external (the old behavior) --
+          // it may still resolve at import time, and failing the bundle would
+          // regress configs that load today.
+          return { path: id, external: true };
+        }
+        if (resolved.external) return { path: resolved.path, external: true };
+        if (resolved.path.endsWith(".json")) return { path: resolved.path };
+        const isImport = kind !== "require-call" && kind !== "require-resolve";
+        return {
+          path: isImport ? pathToFileURL(resolved.path).href : resolved.path,
+          external: true,
+        };
+      });
+    },
+  };
+}
 
 async function loadConfig() {
   let viteErr = null;
@@ -94,7 +142,8 @@ async function loadConfig() {
     const esbuild = await import(pathToFileURL(esbuildPath).href);
     const r = await esbuild.build({
       entryPoints: [configPath], bundle: true, platform: "node", format: "esm",
-      packages: "external", write: false, logLevel: "silent", absWorkingDir: appRoot,
+      plugins: [externalizeDepsPlugin()],
+      write: false, logLevel: "silent", absWorkingDir: appRoot,
       metafile: true,
       define: {
         __dirname: JSON.stringify(dirname(configPath)),
