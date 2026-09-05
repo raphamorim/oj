@@ -284,10 +284,100 @@ async function runDev() {
   }
 }
 
+// Slow-boot regression: a plugin host whose init outlives the boot-time RPC
+// deadline (74-plugin fleets, a Miniflare boot inside configureServer) used to
+// leave the worker path silently inactive — no "plugin middleware: forwarding"
+// line, every document degraded to the Node SSR runner. The host now pushes its
+// serve info on stdout when ready and oj activates the middleware late. This
+// simulates the slow boot with a configureServer that sleeps past the (shrunk
+// via OJ_PLUGIN_TIMEOUT) RPC deadline, and requires the late activation line
+// plus a worker-rendered document.
+function addSlowBootPlugin() {
+  const cfg = path.join(app, "vite.config.ts");
+  const original = fs.readFileSync(cfg, "utf8");
+  const patched = original.replace(
+    /^(\s*)cloudflare\(/m,
+    '$1{ name: "slow-boot-probe", async configureServer() { await new Promise((r) => setTimeout(r, 8000)); } },\n$1cloudflare(',
+  );
+  if (patched === original) throw new Error("vite.config.ts changed shape; update this script");
+  fs.writeFileSync(cfg, patched);
+}
+
+// Its own port: the first phase's server may still be tearing down on PORT and
+// oj would silently bind PORT+1, leaving the probes pointed at a dead socket.
+const SLOW_PORT = PORT + 3;
+
+async function runSlowBootDev() {
+  let log = "";
+  const srv = spawn(oj, ["dev", app, "--port", String(SLOW_PORT)], {
+    cwd: app,
+    detached: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      WRANGLER_SEND_METRICS: "false",
+      CI: "1",
+      NO_COLOR: "1",
+      FORCE_COLOR: "0",
+      // Shrink the plugin RPC deadline so the 8s configureServer sleep reliably
+      // outlives it, the way a heavy real boot outlives the default 20s.
+      OJ_PLUGIN_TIMEOUT: "2",
+    },
+  });
+  srv.stdout.on("data", (d) => (log += d));
+  srv.stderr.on("data", (d) => (log += d));
+  const stop = () => {
+    try { process.kill(-srv.pid, "SIGTERM"); } catch {}
+    setTimeout(() => { try { process.kill(-srv.pid, "SIGKILL"); } catch {} }, 2000).unref();
+  };
+  try {
+    // The middleware must activate late: the boot-time serve-info RPC timed
+    // out, and the host's ojServeInfo push flips the path once init completes.
+    const lateLine = /forwarding unmatched requests to :\d+ \(host came up after boot\)/;
+    let activated = false;
+    for (let i = 0; i < 240 && !activated; i++) {
+      if (srv.exitCode != null) break;
+      activated = lateLine.test(log);
+      if (!activated) await new Promise((r) => setTimeout(r, 500));
+    }
+    if (!activated) {
+      throw new Error(`the worker path never activated after the slow boot; log tail:\n${log.slice(-4000)}`);
+    }
+
+    // And the documents must then render in the worker (wrangler var proves it),
+    // with the live-reload client injected like any worker-served document.
+    let home = null;
+    for (let i = 0; i < 120; i++) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${SLOW_PORT}/`);
+        const body = await res.text();
+        if (res.status === 200 && body.includes("fixture-edition")) {
+          home = { status: res.status, body };
+          break;
+        }
+      } catch {}
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    if (!home) {
+      throw new Error(`no worker-rendered document after late activation; log tail:\n${log.slice(-4000)}`);
+    }
+    if (!home.body.includes("/@oj-start/live-reload.js")) {
+      throw new Error("late-activated worker document lacks the live-reload client");
+    }
+    console.log("start-cloudflare-dev: slow boot — worker path activated late and served the document");
+  } finally {
+    stop();
+    // Let the SIGTERM land before the next phase (or cleanup) touches the tree.
+    await new Promise((r) => setTimeout(r, 500));
+  }
+}
+
 try {
   installCloudflareDeps();
   makeApp();
   await runDev();
+  addSlowBootPlugin();
+  await runSlowBootDev();
   cleanup();
 } catch (e) {
   console.error(e?.stack || e);
