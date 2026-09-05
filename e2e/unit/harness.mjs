@@ -110,6 +110,12 @@ export function rpcSidecar(sidecarRel, { args = [], env, cwd, controlToken } = {
   let serveInfoPushCount = 0;
   let serveInfoResolve;
   const serveInfoArrived = new Promise((r) => (serveInfoResolve = r));
+  // The host's unconditional init-complete signal ({ ojInit: true }, sent in
+  // BOTH modes; build mode has no ojServeInfo push). Out-of-band like the
+  // serve info: it must never be consumed as an RPC reply.
+  let initPushed = false;
+  let initResolve;
+  const initArrived = new Promise((r) => (initResolve = r));
   readline.createInterface({ input: child.stdout }).on("line", (line) => {
     if (!line.trim()) return;
     if (controlToken) {
@@ -122,6 +128,11 @@ export function rpcSidecar(sidecarRel, { args = [], env, cwd, controlToken } = {
         serveInfoPushed = parsed.ojServeInfo;
         serveInfoPushCount += 1;
         serveInfoResolve(parsed.ojServeInfo);
+        return;
+      }
+      if (parsed && typeof parsed === "object" && "ojInit" in parsed) {
+        initPushed = true;
+        initResolve();
         return;
       }
     } catch {}
@@ -159,6 +170,10 @@ export function rpcSidecar(sidecarRel, { args = [], env, cwd, controlToken } = {
     serveInfo: () => serveInfoArrived,
     serveInfoPushed: () => serveInfoPushed,
     serveInfoPushCount: () => serveInfoPushCount,
+    // The init-complete signal: awaits it (`initSignal()`), or peeks
+    // (`initPushed()`, false until it lands).
+    initSignal: () => initArrived,
+    initPushed: () => initPushed,
     ackServeInfo() {
       child.stdin.write('{"ojServeInfoAck":true}\n');
     },

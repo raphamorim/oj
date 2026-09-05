@@ -917,11 +917,21 @@ pub struct PluginHost {
     /// sends are gated on this — see `call`.
     initialized: tokio::sync::watch::Sender<bool>,
     /// The host's stdout closed (the process exited): fail calls fast instead
-    /// of waiting out the init deadline or the per-call timeout.
-    host_gone: std::sync::atomic::AtomicBool,
+    /// of waiting out the init deadline or the per-call timeout. A watch so a
+    /// waiter (`host_gone_wait`) can select on the death instead of polling.
+    host_gone: tokio::sync::watch::Sender<bool>,
     /// When the host was spawned; the init deadline is measured from here, so
     /// boot RPCs share one deadline instead of stacking a fresh one each.
     spawned: tokio::time::Instant,
+    /// Per-spawn init-wait policy: how long a call may wait for the host's
+    /// top-level init. The boot/serve host takes the long init deadline (boot
+    /// correctness depends on its snapshot RPCs); a lazily spawned host (the
+    /// SSR environment host, spawned on the first SSR request) takes the short
+    /// per-call bound, so a wedged init degrades like a slow hook instead of
+    /// freezing the watcher thread and browser-facing SSR transforms.
+    init_wait: std::time::Duration,
+    /// The env knob named when the init wait elapses (matches `init_wait`).
+    init_knob: &'static str,
     /// Last "still initializing" progress line, so concurrent init-gated calls
     /// print one line per interval, not one each.
     init_progress: Mutex<std::time::Instant>,
@@ -1034,11 +1044,46 @@ impl std::fmt::Debug for PluginHost {
     }
 }
 
+/// The init-wait policy per spawn kind (see `PluginHost::init_wait`): a boot
+/// host gets the long init deadline, a lazily spawned host the short per-call
+/// bound — each named after the env knob that adjusts it.
+fn init_wait_policy(lazy: bool) -> (std::time::Duration, &'static str) {
+    if lazy {
+        (plugin_rpc_timeout(), "OJ_PLUGIN_TIMEOUT")
+    } else {
+        (plugin_init_timeout(), "OJ_PLUGIN_INIT_TIMEOUT")
+    }
+}
+
 impl PluginHost {
+    /// Spawn a boot-time host: calls wait out the full init deadline
+    /// (`OJ_PLUGIN_INIT_TIMEOUT`), because boot correctness depends on its
+    /// snapshot RPCs (config defines, hook gates, serve info).
     pub async fn spawn(
         root: &Path,
         plugins_file: &Path,
         config_json: &str,
+    ) -> anyhow::Result<std::sync::Arc<PluginHost>> {
+        Self::spawn_with_policy(root, plugins_file, config_json, false).await
+    }
+
+    /// Spawn a lazily created host (the SSR environment host, created on the
+    /// first SSR request): calls bound their init wait by the ordinary per-call
+    /// timeout (`OJ_PLUGIN_TIMEOUT`), so a wedged init cannot freeze the single
+    /// watcher thread or browser-facing SSR transforms for the long deadline.
+    pub async fn spawn_lazy(
+        root: &Path,
+        plugins_file: &Path,
+        config_json: &str,
+    ) -> anyhow::Result<std::sync::Arc<PluginHost>> {
+        Self::spawn_with_policy(root, plugins_file, config_json, true).await
+    }
+
+    async fn spawn_with_policy(
+        root: &Path,
+        plugins_file: &Path,
+        config_json: &str,
+        lazy: bool,
     ) -> anyhow::Result<std::sync::Arc<PluginHost>> {
         let script = oj_cache::cache_root(root).join("plugin-host.mjs");
         if let Some(parent) = script.parent() {
@@ -1069,6 +1114,7 @@ impl PluginHost {
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
 
+        let (init_wait, init_knob) = init_wait_policy(lazy);
         let host = std::sync::Arc::new(PluginHost {
             stdin: tokio::sync::Mutex::new(stdin),
             pending: Mutex::new(HashMap::new()),
@@ -1078,8 +1124,10 @@ impl PluginHost {
             child: Mutex::new(Some(child)),
             serve_info_push: tokio::sync::watch::channel(None).0,
             initialized: tokio::sync::watch::channel(false).0,
-            host_gone: std::sync::atomic::AtomicBool::new(false),
+            host_gone: tokio::sync::watch::channel(false).0,
             spawned: tokio::time::Instant::now(),
+            init_wait,
+            init_knob,
             init_progress: Mutex::new(std::time::Instant::now()),
         });
 
@@ -1114,6 +1162,15 @@ impl PluginHost {
                     // partial write may have spliced).
                     let mut stdin = reader_ref.stdin.lock().await;
                     let _ = stdin.write_all(b"{\"ojServeInfoAck\":true}\n").await;
+                    continue;
+                }
+                if msg.get("ojInit").is_some() {
+                    // The host's unconditional init-complete signal, sent in
+                    // BOTH modes: build mode has no ojServeInfo push, so
+                    // without this the gate would only release on the first
+                    // reply — a hanging first hook would wait out the whole
+                    // init deadline blamed on initialization.
+                    let _ = reader_ref.initialized.send_replace(true);
                     continue;
                 }
                 if let Some(ev) = msg.get("ojServer") {
@@ -1166,9 +1223,7 @@ impl PluginHost {
             // stdout closed: the host exited. Fail everything pending now, and
             // every future call fast, instead of letting an init-gated call
             // wait out the whole init deadline on a dead process.
-            reader_ref
-                .host_gone
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = reader_ref.host_gone.send_replace(true);
             let drained: Vec<_> = reader_ref
                 .pending
                 .lock()
@@ -1184,7 +1239,7 @@ impl PluginHost {
     }
 
     async fn call(&self, hook: &str, args: &[&str]) -> Result<Option<String>, String> {
-        if self.host_gone.load(std::sync::atomic::Ordering::SeqCst) {
+        if *self.host_gone.borrow() {
             return Err("plugin host exited".into());
         }
         let req_id = self.counter.fetch_add(1, Ordering::Relaxed);
@@ -1205,11 +1260,13 @@ impl PluginHost {
         let mut rx = rx;
         // The host answers RPCs only after its top-level init completes (the
         // listener registers after every top-level await), so a call during a
-        // slow boot must wait for init — bounded by the generous init deadline,
-        // shared across calls and measured from spawn — instead of racing its
-        // own per-call timeout against the boot and permanently snapshotting
-        // wrong defaults. Fast boots are untouched: initialized flips with the
-        // serve-info push or the first reply, both preceding any wait here.
+        // slow boot must wait for init — bounded by this spawn's init-wait
+        // policy (the long deadline on a boot host, the short per-call bound
+        // on a lazy one), shared across calls and measured from spawn —
+        // instead of racing its own per-call timeout against the boot and
+        // permanently snapshotting wrong defaults. Fast boots are untouched:
+        // initialized flips with the serve-info push, the ojInit signal, or
+        // the first reply, all preceding any wait here.
         let mut init_rx = self.initialized.subscribe();
         if !*init_rx.borrow_and_update() {
             let deadline = self.init_deadline_at();
@@ -1219,6 +1276,9 @@ impl PluginHost {
             );
             loop {
                 tokio::select! {
+                    // Deterministic when arms are simultaneously ready: a reply
+                    // (or the init flip) racing an elapsed deadline must win.
+                    biased;
                     res = &mut rx => {
                         // The reply itself proves init completed.
                         return match res {
@@ -1231,6 +1291,14 @@ impl PluginHost {
                             break;
                         }
                     }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        self.pending.lock().unwrap().remove(&req_id);
+                        return Err(format!(
+                            "plugin host still initializing after {}s running {hook} (raise {} for slower boots)",
+                            self.init_wait.as_secs(),
+                            self.init_knob,
+                        ));
+                    }
                     _ = progress.tick() => {
                         // One line per interval across concurrent waiters.
                         let elapsed = self.spawned.elapsed().as_secs();
@@ -1242,13 +1310,6 @@ impl PluginHost {
                             *last = std::time::Instant::now();
                             eprintln!("oj: plugin host still initializing ({elapsed}s)…");
                         }
-                    }
-                    _ = tokio::time::sleep_until(deadline) => {
-                        self.pending.lock().unwrap().remove(&req_id);
-                        return Err(format!(
-                            "plugin host still initializing after {}s running {hook} (raise OJ_PLUGIN_INIT_TIMEOUT for slower boots)",
-                            plugin_init_timeout().as_secs()
-                        ));
                     }
                 }
             }
@@ -1269,9 +1330,23 @@ impl PluginHost {
         *self.initialized.borrow()
     }
 
-    /// The shared init deadline, measured from the host's spawn.
+    /// The shared init deadline, measured from the host's spawn (this host's
+    /// init-wait policy, so a lazily spawned host reports its short bound).
     pub(crate) fn init_deadline_at(&self) -> tokio::time::Instant {
-        self.spawned + plugin_init_timeout()
+        self.spawned + self.init_wait
+    }
+
+    /// Resolves when the host process has exited (its stdout closed). Lets a
+    /// task holding an `Arc<PluginHost>` — which keeps every channel sender
+    /// alive, so `changed().is_err()` can never observe the death — wait on
+    /// the host dying instead of pinning it forever.
+    pub(crate) async fn host_gone_wait(&self) {
+        let mut rx = self.host_gone.subscribe();
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     pub async fn transform(
@@ -1806,6 +1881,20 @@ mod vite_values_tests {
         assert_eq!(plugin_init_timeout_from(Some("2")).as_secs(), 2);
         assert_eq!(plugin_init_timeout_from(Some("soon")).as_secs(), 300);
         assert_eq!(plugin_init_timeout_from(Some("0")).as_secs(), 300);
+    }
+
+    // The per-spawn init-wait policy: a boot host waits out the long init
+    // deadline (boot correctness depends on its snapshot RPCs), a lazily
+    // spawned host (the SSR environment host) only the short per-call bound,
+    // so a wedged init cannot freeze the watcher thread for the long deadline.
+    #[test]
+    fn init_wait_policy_is_long_for_boot_hosts_and_short_for_lazy_ones() {
+        let (boot_wait, boot_knob) = init_wait_policy(false);
+        assert_eq!(boot_wait, plugin_init_timeout());
+        assert_eq!(boot_knob, "OJ_PLUGIN_INIT_TIMEOUT");
+        let (lazy_wait, lazy_knob) = init_wait_policy(true);
+        assert_eq!(lazy_wait, plugin_rpc_timeout());
+        assert_eq!(lazy_knob, "OJ_PLUGIN_TIMEOUT");
     }
 
     #[test]

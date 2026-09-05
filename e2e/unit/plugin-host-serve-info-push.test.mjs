@@ -130,3 +130,52 @@ test("with no middleware registered the push still arrives, with a null port", a
     fx.cleanup();
   }
 });
+
+// The unconditional init-complete signal ({ ojInit: true }): sent in BOTH
+// modes once the RPC listener is registered. Build mode has no ojServeInfo
+// push at all, so without it Rust's init gate only released on the first
+// reply — a hanging first hook waited out the whole init deadline blamed on
+// initialization instead of failing on the per-call timeout.
+test("build mode sends the ojInit signal (no serve-info push exists there)", async () => {
+  const fx = tmpProject({ prefix: "oj-init-build-" });
+  fx.write(
+    "oj.plugins.mjs",
+    `export default [{ name: "build-only", transform: (code) => null }];\n`,
+  );
+  const host = rpcSidecar("plugin-host.mjs", {
+    args: [
+      path.join(fx.root, "oj.plugins.mjs"),
+      JSON.stringify({ root: fx.root, env: { command: "build" } }),
+    ],
+    env: { OJ_CACHE_ROOT: fx.root },
+    cwd: fx.root,
+  });
+  try {
+    await host.initSignal();
+    assert.equal(host.serveInfoPushed(), undefined, "build mode must not push serve info");
+  } finally {
+    host.close();
+    fx.cleanup();
+  }
+});
+
+test("serve mode sends ojInit too, before any RPC reply", async () => {
+  const fx = tmpProject({ prefix: "oj-init-serve-" });
+  fx.write(
+    "oj.plugins.mjs",
+    `export default [{ name: "plain", transform: (code) => null }];\n`,
+  );
+  const host = rpcSidecar("plugin-host.mjs", {
+    args: [path.join(fx.root, "oj.plugins.mjs"), JSON.stringify({ root: fx.root })],
+    env: { OJ_CACHE_ROOT: fx.root },
+    cwd: fx.root,
+  });
+  try {
+    const reply = await host.send({ id: 1, hook: "getPluginCount" }, 20_000);
+    assert.equal(reply.id, 1);
+    assert.ok(host.initPushed(), "ojInit must precede the first RPC reply");
+  } finally {
+    host.close();
+    fx.cleanup();
+  }
+});
