@@ -191,7 +191,9 @@ pub async fn start_dev(
         tokio::spawn(async move {
             if cf_hint {
                 if let Ok(Some(mut updates)) = cf_rx.await {
-                    let known = tokio::time::timeout(std::time::Duration::from_secs(180), async {
+                    // Bounded by the same knob that bounds the host's init
+                    // (OJ_PLUGIN_INIT_TIMEOUT), not a second magic number.
+                    let known = tokio::time::timeout(oj_server::plugins::plugin_init_timeout(), async {
                         loop {
                             if let Some(info) = *updates.borrow_and_update() {
                                 return info;
@@ -259,6 +261,18 @@ pub async fn start_dev(
         state.plugin_serve.set_on_activate(Box::new(move || {
             runner_dirty.store(true, std::sync::atomic::Ordering::SeqCst);
         }));
+        // The hook registers after DevServer::build returned, and the
+        // late-activation task is already running: an activation landing in
+        // that window ran with the hook unarmed. The documented current-state
+        // check re-arms once inline — only the dirty flag needs this catch-up,
+        // the worker resync fires from the late-activation task itself,
+        // independent of the hook. A normal boot-time fill is not "late" and
+        // never triggers a spurious runner reload here.
+        if state.plugin_serve.activated_late() {
+            state
+                .runner_dirty
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     // A gate flush (the editor's POST /__hmr_flush, or the hold cap) releases
