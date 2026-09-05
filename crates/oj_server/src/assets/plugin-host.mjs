@@ -2559,3 +2559,12 @@ rl.on("line", async (line) => {
     ctl({ id, error: String((e && e.stack) || e) });
   }
 });
+
+// The unconditional init-complete signal, in BOTH modes: the RPC listener above
+// is registered, so from here every hang is a hook's, not initialization's.
+// Serve mode also pushes { ojServeInfo } (state-bearing, ACKed and re-pushed);
+// build mode has no push at all, so without this a hanging first hook would
+// wait out Rust's whole init deadline blamed on initialization instead of
+// failing on the per-call timeout. Rust treats ojInit, ojServeInfo, or the
+// first reply — whichever lands first — as initialized.
+ctl({ ojInit: true });
