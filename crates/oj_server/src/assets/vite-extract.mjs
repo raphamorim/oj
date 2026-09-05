@@ -47,18 +47,24 @@ function resolvePkg(spec) {
 const absDeps = (deps) =>
   (deps ?? []).filter((d) => typeof d === "string").map((d) => resolve(appRoot, d));
 
-// Vite's `externalize-deps` config-bundling plugin, mirrored. `packages:
-// "external"` kept bare specifiers bare, so the bundle -- imported from the
-// cache dir -- re-resolved them from there at import time. A config that
-// relatively imports a sibling workspace package's source (a monorepo shape)
-// inlines that source, whose bare deps live under the sibling's own
+// Vite's `externalize-deps` config-bundling plugin, mirrored (one copy lives
+// in vite-extract.mjs, its twin in plugin-host.mjs; both assets are
+// deliberately self-contained -- keep the two copies byte-identical).
+// `packages: "external"` kept bare specifiers bare, so the bundle -- imported
+// from the cache dir -- re-resolved them from there at import time. A config
+// that relatively imports a sibling workspace package's source (a monorepo
+// shape) inlines that source, whose bare deps live under the sibling's own
 // node_modules, unreachable from the cache dir. Resolve every bare import from
-// its importer at bundle time and externalize the resolved absolute path
-// instead: a file:// URL for import kinds, the plain path for require; a .json
-// resolution is bundled (Vite does the same -- an externalized ESM .json import
-// would need an import attribute).
+// its importer at bundle time and externalize the resolved absolute path as a
+// file:// URL instead (the output is always ESM, so an external require()
+// would only reach esbuild's throwing __require shim). First-party
+// resolutions -- TS/TSX sources, which Node cannot import, and anything
+// outside node_modules, e.g. a tsconfig-paths alias -- are bundled like
+// relative imports, as is .json (an externalized ESM .json import would need
+// an import attribute).
 function externalizeDepsPlugin() {
   const resolving = Symbol("oj-externalize-deps");
+  const warned = new Set();
   return {
     name: "externalize-deps",
     setup(build) {
@@ -67,7 +73,14 @@ function externalizeDepsPlugin() {
         if (args.pluginData === resolving) return null;
         const { path: id, importer, kind } = args;
         if (!importer || isAbsolute(id)) return null;
-        if (id.startsWith("node:") || isBuiltin(id)) return { path: id, external: true };
+        if (id.startsWith("node:") || id.startsWith("bun:") || isBuiltin(id)) {
+          return { path: id, external: true };
+        }
+        // npm: specifiers stay bare-external (Vite keeps them bare too); any
+        // other scheme-shaped id (data:, ...) is esbuild's to handle natively
+        // -- pathToFileURL on those would produce garbage.
+        if (id.startsWith("npm:")) return { path: id, external: true };
+        if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(id)) return null;
         let resolved = null;
         try {
           resolved = await build.resolve(id, {
@@ -80,16 +93,74 @@ function externalizeDepsPlugin() {
         if (!resolved || resolved.errors.length > 0 || !resolved.path) {
           // Unresolvable here; keep the bare id external (the old behavior) --
           // it may still resolve at import time, and failing the bundle would
-          // regress configs that load today.
+          // regress configs that load today. Say so once per id: if it does
+          // fail at import time, that error names a deleted tmp bundle, not
+          // the file that wrote the import.
+          if (!warned.has(id)) {
+            warned.add(id);
+            const detail = resolved?.errors?.[0]?.text ? ` (${resolved.errors[0].text})` : "";
+            process.stderr.write(
+              `oj: vite.config: could not resolve "${id}" imported from ${importer}${detail}; kept as a bare import that must resolve when the bundled config loads\n`,
+            );
+          }
           return { path: id, external: true };
         }
         if (resolved.external) return { path: resolved.path, external: true };
-        if (resolved.path.endsWith(".json")) return { path: resolved.path };
-        const isImport = kind !== "require-call" && kind !== "require-resolve";
-        return {
-          path: isImport ? pathToFileURL(resolved.path).href : resolved.path,
-          external: true,
-        };
+        // Another resolver's non-file namespace is not ours to externalize.
+        if (resolved.namespace && resolved.namespace !== "file") return null;
+        if (
+          /\.(?:ts|tsx|mts|cts)$/.test(resolved.path) ||
+          !/[\\/]node_modules[\\/]/.test(resolved.path) ||
+          resolved.path.endsWith(".json")
+        ) {
+          return { path: resolved.path };
+        }
+        return { path: pathToFileURL(resolved.path).href, external: true };
+      });
+    },
+  };
+}
+
+// Vite's `inject-file-scope-variables` config-bundling plugin, mirrored (same
+// two byte-identical copies as externalizeDepsPlugin above). The build defines
+// `__dirname` / `__filename` / `import.meta.url` (and `import.meta.dirname` /
+// `.filename`) as `__vite_injected_original_*` identifiers, and this onLoad
+// prepends per-file consts carrying THAT file's real location, so a bundle
+// imported from the cache dir still sees the original paths -- for every
+// inlined file, not just the config entry. esbuild scopes and renames the
+// consts per module, so each file keeps its own values.
+const CONFIG_BUNDLE_DEFINES = {
+  __dirname: "__vite_injected_original_dirname",
+  __filename: "__vite_injected_original_filename",
+  "import.meta.url": "__vite_injected_original_import_meta_url",
+  "import.meta.dirname": "__vite_injected_original_dirname",
+  "import.meta.filename": "__vite_injected_original_filename",
+};
+function injectFileScopeVariablesPlugin() {
+  return {
+    name: "inject-file-scope-variables",
+    setup(build) {
+      build.onLoad({ filter: /\.[cm]?[jt]sx?$/, namespace: "file" }, (args) => {
+        const contents = readFileSync(args.path, "utf8");
+        const inject =
+          `const __vite_injected_original_dirname = ${JSON.stringify(dirname(args.path))};` +
+          `const __vite_injected_original_filename = ${JSON.stringify(args.path)};` +
+          `const __vite_injected_original_import_meta_url = ${JSON.stringify(pathToFileURL(args.path).href)};`;
+        let code;
+        if (contents.startsWith("#!")) {
+          const nl = contents.indexOf("\n");
+          code = nl === -1 ? contents + "\n" + inject : contents.slice(0, nl + 1) + inject + contents.slice(nl + 1);
+        } else {
+          code = inject + contents;
+        }
+        const loader = args.path.endsWith(".tsx")
+          ? "tsx"
+          : /\.(?:ts|mts|cts)$/.test(args.path)
+            ? "ts"
+            : args.path.endsWith(".jsx")
+              ? "jsx"
+              : "js";
+        return { contents: code, loader };
       });
     },
   };
@@ -142,13 +213,14 @@ async function loadConfig() {
     const esbuild = await import(pathToFileURL(esbuildPath).href);
     const r = await esbuild.build({
       entryPoints: [configPath], bundle: true, platform: "node", format: "esm",
-      plugins: [externalizeDepsPlugin()],
+      // Node's resolver, not esbuild's bundler defaults: `conditions` pins
+      // "node" (import/require still apply per kind) and drops esbuild's
+      // implicit "module" condition; `mainFields` skips "module" as Node does.
+      conditions: ["node"], mainFields: ["main"],
+      plugins: [externalizeDepsPlugin(), injectFileScopeVariablesPlugin()],
       write: false, logLevel: "silent", absWorkingDir: appRoot,
       metafile: true,
-      define: {
-        __dirname: JSON.stringify(dirname(configPath)),
-        __filename: JSON.stringify(configPath),
-      },
+      define: CONFIG_BUNDLE_DEFINES,
     });
     // A unique path per process: the plugin host bundles the same config into
     // this directory concurrently at boot, and two writers on one filename made
