@@ -591,12 +591,16 @@ fn start_script_env(root: &Path, command: &str, mode: &str) -> anyhow::Result<Ve
     // Node's export conditions by the SSR loader the way Vite's resolver honors
     // them; the `development|production` placeholder is the dev one here.
     if let Some(user) = oj_config::user_resolve_conditions(&config, "ssr") {
-        // Drop `browser`: plugins targeting workerd SSR (e.g. @cloudflare/vite-plugin)
-        // set it, but this loader runs in Node — a browser conditional export there
-        // executes DOM code server-side (`document is not defined`).
+        // Drop `browser` only from a workerd-shaped list: @cloudflare/vite-plugin
+        // sets it alongside `workerd` for its own runtime, but this loader runs
+        // in Node — a browser conditional export there executes DOM code
+        // server-side (`document is not defined`). A user list without `workerd`
+        // is honored verbatim, as Vite honors user conditions (it only omits
+        // `browser` from its own server defaults).
+        let workerd_shaped = user.iter().any(|c| c == "workerd");
         let conditions: Vec<String> = user
             .into_iter()
-            .filter(|c| c != "browser")
+            .filter(|c| !workerd_shaped || c != "browser")
             .map(|c| if c == "development|production" { "development".to_string() } else { c })
             .collect();
         if !conditions.is_empty() {
@@ -1469,14 +1473,15 @@ mod tests {
         assert_eq!(get("OJ_DEFINE_CLIENT").as_deref(), Some(r#"{"__SIDE__":"\"client\""}"#));
         assert_eq!(get("OJ_RESOLVE_CONDITIONS").as_deref(), Some(r#"["custom","development"]"#));
 
-        // `browser` never reaches the Node SSR loader (Vite parity:
-        // DEFAULT_SERVER_CONDITIONS excludes it) — workerd-targeting plugins
-        // set it and a browser conditional export would run DOM code in Node.
+        // `browser` is stripped from a workerd-shaped list only (the Cloudflare
+        // plugin sets both for its own runtime; in Node a browser conditional
+        // export would run DOM code). A user list without `workerd` is honored
+        // verbatim, as Vite honors user conditions.
         {
             let browser_root = tmp("script-env-browser-cond");
             std::fs::write(
                 browser_root.join("oj.config.json"),
-                r#"{ "environments": { "ssr": { "resolve": { "conditions": ["module", "browser", "development|production"], "externalConditions": ["custom-ext", "development|production"] } } } }"#,
+                r#"{ "environments": { "ssr": { "resolve": { "conditions": ["workerd", "module", "browser", "development|production"], "externalConditions": ["custom-ext", "development|production"] } } } }"#,
             )
             .unwrap();
             let vars = start_script_env(&browser_root, "serve", "development").unwrap();
@@ -1485,13 +1490,30 @@ mod tests {
             };
             assert_eq!(
                 var("OJ_RESOLVE_CONDITIONS").as_deref(),
-                Some(r#"["module","development"]"#),
-                "browser must be stripped from Node SSR conditions"
+                Some(r#"["workerd","module","development"]"#),
+                "browser must be stripped from a workerd-shaped condition list"
             );
             assert_eq!(
                 var("OJ_EXTERNAL_CONDITIONS").as_deref(),
                 Some(r#"["custom-ext","development"]"#),
                 "externalConditions pass through with dev/prod mapped"
+            );
+
+            let plain_browser = tmp("script-env-browser-honored");
+            std::fs::write(
+                plain_browser.join("oj.config.json"),
+                r#"{ "environments": { "ssr": { "resolve": { "conditions": ["browser", "module"] } } } }"#,
+            )
+            .unwrap();
+            let vars = start_script_env(&plain_browser, "serve", "development").unwrap();
+            let cond = vars
+                .iter()
+                .find(|(n, _)| n == "OJ_RESOLVE_CONDITIONS")
+                .map(|(_, v)| v.clone());
+            assert_eq!(
+                cond.as_deref(),
+                Some(r#"["browser","module"]"#),
+                "a user browser condition without workerd is honored"
             );
         }
         let ssr: serde_json::Value = serde_json::from_str(&get("OJ_DEFINE_SSR").unwrap()).unwrap();

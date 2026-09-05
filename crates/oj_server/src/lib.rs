@@ -7308,7 +7308,13 @@ impl ContentChanges {
         };
         match self.mtimes.insert(p.to_path_buf(), mtime) {
             Some(prev) => prev != mtime,
-            None => false,
+            // No baseline to compare against (there is no initial scan): a
+            // fresh mtime is a touch/utimes change that must count once, an old
+            // one is the relatime atime noise this filter exists to ignore.
+            None => mtime
+                .elapsed()
+                .map(|age| age < std::time::Duration::from_secs(10))
+                .unwrap_or(true),
         }
     }
 }
@@ -9197,10 +9203,20 @@ mod adapter_tests {
         let meta = || notify::Event::new(notify::EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any))).add_path(file.clone());
         let data = || notify::Event::new(notify::EventKind::Modify(ModifyKind::Data(DataChange::Content))).add_path(file.clone());
         let access = || notify::Event::new(notify::EventKind::Access(AccessKind::Read)).add_path(file.clone());
+        // A never-seen file with an OLD mtime: the relatime atime storm shape.
+        let old_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(old_mtime).unwrap();
         let mut changes = ContentChanges::new();
-        assert!(changes.changed_paths(&meta()).is_empty(), "an atime update on a never-seen file is not a change");
+        assert!(changes.changed_paths(&meta()).is_empty(), "an atime update on a never-seen old file is not a change");
         assert!(changes.changed_paths(&meta()).is_empty(), "nor is a repeat with the same mtime");
         assert!(changes.changed_paths(&access()).is_empty());
+        // A never-seen file whose mtime is fresh: a touch, which must count once.
+        let touched = dir.join("touched.ts");
+        std::fs::write(&touched, "export const t = 1;").unwrap();
+        let meta_touched = notify::Event::new(notify::EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any))).add_path(touched.clone());
+        assert_eq!(changes.changed_paths(&meta_touched), vec![touched.clone()], "a touch on a never-seen file is a change");
+        let meta_touched = notify::Event::new(notify::EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any))).add_path(touched.clone());
+        assert!(changes.changed_paths(&meta_touched).is_empty(), "and is then the baseline");
         assert_eq!(changes.changed_paths(&data()), vec![file.clone()], "a data change always counts");
         assert!(changes.changed_paths(&meta()).is_empty(), "the mtime the data change recorded has not moved");
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);

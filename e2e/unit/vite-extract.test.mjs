@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { extractAlias, extractOptimizeDeps, extractProxy, warnUnsupported } from "../../crates/oj_server/src/assets/vite-extract.mjs";
+import { extractAlias, extractOptimizeDeps, extractProxy, extractResolve, extractSsr, warnUnsupported } from "../../crates/oj_server/src/assets/vite-extract.mjs";
 
 test("optimizeDeps carries needsInterop and force alongside the lists", () => {
   const out = extractOptimizeDeps({
@@ -136,4 +136,27 @@ test("warnUnsupported reports only options the user's config sets", () => {
   assert.match(userSets, /worker config is not applied/);
   assert.match(userSets, /esbuild options charset are not applied/);
   assert.match(userSets, /build.terserOptions is not applied/);
+});
+
+test("resolve.externalConditions is extracted, top-level and through the ssr sugar", () => {
+  assert.deepEqual(
+    extractResolve({ conditions: ["custom"], externalConditions: ["custom-ext"] }),
+    { conditions: ["custom"], externalConditions: ["custom-ext"] },
+  );
+
+  // Vite's `ssr.resolve` sugar carries it too.
+  const viaSsr = extractSsr({ noExternal: ["dep"], resolve: { externalConditions: ["workerd-ext"] } });
+  assert.deepEqual(viaSsr.resolve, { externalConditions: ["workerd-ext"] });
+  assert.deepEqual(viaSsr.noExternal, ["dep"]);
+
+  // The environments.ssr spelling wins over ssr.resolve where both are set.
+  const viaEnv = extractSsr(
+    { resolve: { externalConditions: ["old"] } },
+    { resolve: { externalConditions: ["env-ext"], conditions: ["workerd"] } },
+  );
+  assert.deepEqual(viaEnv.resolve, { conditions: ["workerd"], externalConditions: ["env-ext"] });
+
+  // An environments-only config still produces the ssr resolve block.
+  const envOnly = extractSsr(undefined, { resolve: { externalConditions: ["only-env"] } });
+  assert.deepEqual(envOnly.resolve, { externalConditions: ["only-env"] });
 });
