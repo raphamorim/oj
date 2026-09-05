@@ -5,6 +5,11 @@ All notable changes to oj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- A TypeScript `vite.config` that relatively imports a sibling workspace package's source (a monorepo shape) failed to load ("failed to load config", `Cannot find package '...' imported from .../oj-vite-config-....tmp.mjs`) when it was bundled by oj's own esbuild fallback: `packages: "external"` kept bare specifiers bare, so the bundle -- imported from the cache dir -- re-resolved the inlined sibling source's dependencies from the cache dir instead of from the sibling's `node_modules`. Both config bundlers (the extractor and the plugin host) now mirror Vite's `externalize-deps` plugin: every bare import is resolved from its importer at bundle time and externalized as the resolved absolute path (a `file://` URL for import kinds), with node builtins kept bare and an unresolvable specifier left bare as before.
+
 ## [0.1.17] - 2026-09-05
 
 ### Changed
