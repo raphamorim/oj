@@ -1282,6 +1282,20 @@ function graphKnowsFile(environments, file) {
   return false;
 }
 let invalidateQueue = Promise.resolve();
+// The catch-up for a late middleware activation ({resync:true} on
+// /__oj_invalidate): edits made while oj had no port to invalidate never
+// reached these graphs, and init-time pre-transforms (preTransformRequests)
+// may hold their stale results. Invalidate every runner-backed environment's
+// whole graph and full-reload, bypassing the per-change dedup (its identity
+// map is cleared so nothing is suppressed against pre-resync state).
+function resyncEnvironments(environments) {
+  lastProcessedChange.clear();
+  for (const env of Object.values(environments || {})) {
+    if (!env || env.__ojStub) continue;
+    try { env.moduleGraph?.invalidateAll?.(); } catch {}
+    hotSend(env, { type: "full-reload", path: "*" });
+  }
+}
 async function invalidateEnvironments(environments, watcher, changes) {
   // Re-classify at handling time: the early (pre-settle) send classifies from
   // a raw event, and an atomic-save editor's momentary delete may have been
@@ -1718,6 +1732,15 @@ async function setupConfigureServer() {
     } catch (e) {
       process.stderr.write(`${OJ} plugin host: buildEnvironments failed: ${(e && e.message) || e}\n`);
     }
+    // The host, not a config-text heuristic, knows whether the Cloudflare dev
+    // plugin is active: when it is and no worker environment came up, say so
+    // instead of degrading to the Node SSR runner silently (the per-failure
+    // causes are on stderr above).
+    if (!runnerEnvironmentsBuilt) {
+      process.stderr.write(
+        `${OJ} warning: @cloudflare/vite-plugin is active but no worker environment came up; documents are served by the Node SSR runner\n`,
+      );
+    }
   }
   // Vite's createServer always exposes `server.environments` with at least
   // client and ssr (a DevEnvironment per config.environments entry, defaults
@@ -1769,8 +1792,10 @@ async function setupConfigureServer() {
       req.on("data", (c) => (body += c));
       req.on("end", async () => {
         let changes = [];
+        let resync = false;
         try {
           const parsed = JSON.parse(body || "{}");
+          resync = parsed.resync === true;
           changes = parsed.changes
             || (parsed.paths || []).map((p) => ({ path: p, type: "update" }));
         } catch {}
@@ -1779,7 +1804,11 @@ async function setupConfigureServer() {
         // Serialized: the early (pre-settle) and settled sends for one edit
         // batch must not interleave their module-graph walks.
         invalidateQueue = invalidateQueue
-          .then(() => invalidateEnvironments(server.environments, fileWatcher, changes))
+          .then(() =>
+            resync
+              ? resyncEnvironments(server.environments)
+              : invalidateEnvironments(server.environments, fileWatcher, changes),
+          )
           .catch(() => {});
         await invalidateQueue;
         res.statusCode = 204;

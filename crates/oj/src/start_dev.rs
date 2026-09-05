@@ -51,7 +51,12 @@ struct StartState {
     /// Set on a source change while the runner is lazy (worker environments
     /// serve the documents; the runner is only a fallback, kept cold); the next
     /// request that can reach the runner reloads it first (`ensure_runner_fresh`).
-    runner_dirty: std::sync::atomic::AtomicBool,
+    /// Also set by the plugin-serve activation handler when the middleware comes
+    /// up after boot, so edits from the degraded window (which reloaded the
+    /// runner eagerly, or raced the flip and took neither path) never leave a
+    /// stale fallback. In an Arc so the handler closure captures only the flag,
+    /// not the whole state (PluginServe is state-held: that would cycle).
+    runner_dirty: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl StartState {
@@ -63,10 +68,6 @@ impl StartState {
     }
 }
 
-// Static hint that the app uses @cloudflare/vite-plugin, readable before the
-// plugin host boots (the definitive flag is BuiltApp::runner_environments). A plain
-// text search of the config file: false for every non-Cloudflare app, so their
-// boot path is untouched.
 // What the watcher forwards and rebuilds on: not the generated route tree (its
 // writes would loop the generator) and not bare directory events (Linux inotify
 // emits a parent-dir event alongside the file write; Vite never hands
@@ -89,6 +90,11 @@ fn change_type(p: &Path, created: &std::collections::HashSet<PathBuf>) -> &'stat
     }
 }
 
+// Static hint that the app uses @cloudflare/vite-plugin, readable before the
+// plugin host boots (the definitive flag is the host's serve info, live on
+// BuiltApp::plugin_serve). A plain text search of the config file: false for
+// every non-Cloudflare app, so their boot path is untouched. Used only to gate
+// the prewarm decision below.
 fn config_mentions_cloudflare_plugin(root: &Path, config: &Option<PathBuf>) -> bool {
     let file = config
         .clone()
@@ -169,19 +175,39 @@ pub async fn start_dev(
     ));
     oj_server::boot_phase("runner spawned");
     let (reload_tx, _) = broadcast::channel::<()>(16);
-    // Whether the plugin's worker environments serve the documents is known only
-    // once the plugin host is up (BuiltApp::runner_environments); the cf_hint keeps
-    // the non-Cloudflare prewarm overlapping the build exactly as before, while
-    // a Cloudflare config holds the prewarm until the flag arrives (and skips
-    // it: warming the runner is wasted CPU when the worker renders).
-    let (cf_tx, cf_rx) = tokio::sync::oneshot::channel::<bool>();
+    // Whether the plugin's worker environments serve the documents is known
+    // only once the plugin host announces its serve info (the `{ ojServeInfo }`
+    // push, mirrored on the host's watch channel); the cf_hint keeps the
+    // non-Cloudflare prewarm overlapping the build exactly as before, while a
+    // Cloudflare config holds the prewarm until the serve info is KNOWN —
+    // bounded, so a host that never comes up still gets a warm runner — and
+    // skips it iff the worker environments render (warming the runner is
+    // wasted CPU then).
+    type ServeInfoUpdates = tokio::sync::watch::Receiver<Option<oj_server::plugins::ServeInfo>>;
+    let (cf_tx, cf_rx) = tokio::sync::oneshot::channel::<Option<ServeInfoUpdates>>();
     {
         let runner = Arc::clone(&runner);
         let reload_tx = reload_tx.clone();
         tokio::spawn(async move {
-            if cf_hint && cf_rx.await.unwrap_or(false) {
-                oj_server::boot_phase("prewarm skipped (worker environments)");
-                return;
+            if cf_hint {
+                if let Ok(Some(mut updates)) = cf_rx.await {
+                    let known = tokio::time::timeout(std::time::Duration::from_secs(180), async {
+                        loop {
+                            if let Some(info) = *updates.borrow_and_update() {
+                                return info;
+                            }
+                            if updates.changed().await.is_err() {
+                                return oj_server::plugins::ServeInfo::default();
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap_or_default();
+                    if known.middleware_port.is_some() && known.runner_environments {
+                        oj_server::boot_phase("prewarm skipped (worker environments)");
+                        return;
+                    }
+                }
             }
             let _ = forward(&runner, "GET".into(), "/".into(), &header::HeaderMap::new(), None).await;
             oj_server::boot_phase("prewarm complete");
@@ -194,7 +220,7 @@ pub async fn start_dev(
     let (bundle_res, built_res) = tokio::join!(bundle, built_task);
     let pinned = bundle_res??;
     let built = built_res??;
-    let _ = cf_tx.send(built.plugin_serve.runner_environments());
+    let _ = cf_tx.send(built.plugin_host.as_ref().map(|h| h.serve_info_updates()));
     oj_server::boot_phase("bundle+build joined");
     let css_host = if app_uses_tailwind(&root) {
         spawn_node_service(&root, &cache.join("css-host.mjs"), &mode)
@@ -217,8 +243,23 @@ pub async fn start_dev(
         gate: built.hmr_gate.clone(),
         css_host,
         mode: mode.clone(),
-        runner_dirty: std::sync::atomic::AtomicBool::new(false),
+        runner_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
+
+    // The activation handler: when the plugin middleware comes up after boot,
+    // PluginServe::set runs this synchronously BEFORE readers can observe the
+    // flipped mode, marking the fallback runner dirty. That closes the
+    // two-time-read window (watcher stores runner_dirty only when lazy, the
+    // rebundle worker reloads eagerly only when not lazy: an edit racing the
+    // flip could take neither path) — the next request through the fallback
+    // reloads the runner first. The worker environments get their own catch-up
+    // (the full-reload resync) from oj_server's late-activation task.
+    {
+        let runner_dirty = Arc::clone(&state.runner_dirty);
+        state.plugin_serve.set_on_activate(Box::new(move || {
+            runner_dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+    }
 
     // A gate flush (the editor's POST /__hmr_flush, or the hold cap) releases
     // the reload the watcher held; the rebuild itself already happened.
