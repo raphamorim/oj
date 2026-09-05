@@ -218,3 +218,78 @@ test("SSR loader: a workerd-shaped condition list never matches browser builds i
     rmSync(app, { recursive: true, force: true });
   }
 });
+
+// The runtime markers themselves are stripped too, not just `browser`: Node
+// activating `workerd` resolves a workerd-only exports key to code written for
+// that runtime; it must fall through to node/default instead. And any non-Node
+// runtime marker (edge-light here) marks the list, not workerd alone.
+test("SSR loader: runtime markers are stripped — workerd-only keys fall through, edge-light lists lose browser", () => {
+  const app = realpathSync(mkdtempSync(join(tmpdir(), "oj-ssr-marker-cond-")));
+  const source = join(app, "src");
+  const cfonly = join(app, "node_modules", "cfonly");
+  const dompkg = join(app, "node_modules", "dompkg");
+  const rolldown = join(app, "node_modules", "rolldown");
+  for (const directory of [source, cfonly, dompkg, rolldown]) mkdirSync(directory, { recursive: true });
+
+  writeFileSync(join(app, "package.json"), JSON.stringify({ name: "synthetic-marker-cond-app", type: "module" }));
+  writeFileSync(join(rolldown, "package.json"), JSON.stringify({
+    name: "rolldown", type: "module", exports: { "./experimental": "./experimental.mjs" },
+  }));
+  writeFileSync(join(rolldown, "experimental.mjs"), "export const transformSync = (_path, code) => ({ code });\n");
+  // A workerd-only conditional export ahead of default (no worker/node key).
+  writeFileSync(join(cfonly, "package.json"), JSON.stringify({
+    name: "cfonly", type: "module",
+    exports: { ".": { workerd: "./workerd.js", default: "./index.js" } },
+  }));
+  writeFileSync(join(cfonly, "index.js"), 'export const build = "node-safe";\n');
+  writeFileSync(join(cfonly, "workerd.js"), 'throw new Error("workerd-only build executed in Node");\n');
+  // Browser-first alongside worker/default, as in the workerd-shaped test.
+  writeFileSync(join(dompkg, "package.json"), JSON.stringify({
+    name: "dompkg", type: "module",
+    exports: { ".": { browser: "./index.dom.js", worker: "./index.js", default: "./index.js" } },
+  }));
+  writeFileSync(join(dompkg, "index.js"), 'export const build = "node-safe";\n');
+  writeFileSync(join(dompkg, "index.dom.js"), 'document.createElement("i");\nexport const build = "browser";\n');
+
+  const entry = join(source, "entry.ts");
+  writeFileSync(entry, [
+    'import { build as cf } from "cfonly";',
+    'import { build as dom } from "dompkg";',
+    "export default { cf, dom };",
+  ].join("\n"));
+
+  const runner = [
+    'import { registerHooks } from "node:module";',
+    `const loader = await import(${JSON.stringify(pathToFileURL(loader).href)});`,
+    "registerHooks({ resolve: loader.resolve, load: loader.load });",
+    `process.stdout.write(JSON.stringify((await import(${JSON.stringify(pathToFileURL(entry).href)})).default));`,
+  ].join("\n");
+  const run = (extraEnv) => spawnSync(process.execPath, ["--input-type=module", "--eval", runner], {
+    encoding: "utf8",
+    timeout: 10_000,
+    env: { ...process.env, OJ_APP_ROOT: app, OJ_CACHE_ROOT: join(app, "cache"), OJ_SSR_LOADER_CACHE: "off", ...extraEnv },
+  });
+  const noExternalAll = JSON.stringify({ noExternalAll: true });
+  try {
+    // A workerd-shaped list: the workerd marker itself is stripped, so the
+    // workerd-only key falls through to default (environment conditions path).
+    const workerdList = JSON.stringify(["workerd", "worker", "module", "browser", "development"]);
+    const viaConditions = run({ OJ_RESOLVE_CONDITIONS: workerdList, OJ_SSR_EXTERNALS: noExternalAll });
+    assert.equal(viaConditions.status, 0, viaConditions.stderr || viaConditions.error?.message);
+    assert.deepEqual(JSON.parse(viaConditions.stdout), { cf: "node-safe", dom: "node-safe" });
+
+    // Externalized path too.
+    const viaExternal = run({ OJ_EXTERNAL_CONDITIONS: workerdList });
+    assert.equal(viaExternal.status, 0, viaExternal.stderr || viaExternal.error?.message);
+    assert.deepEqual(JSON.parse(viaExternal.stdout), { cf: "node-safe", dom: "node-safe" });
+
+    // edge-light marks the list like workerd does: browser is stripped, worker
+    // (runtime-neutral) is kept and wins over the browser build.
+    const edgeList = JSON.stringify(["edge-light", "worker", "module", "browser"]);
+    const viaEdge = run({ OJ_RESOLVE_CONDITIONS: edgeList, OJ_SSR_EXTERNALS: noExternalAll });
+    assert.equal(viaEdge.status, 0, viaEdge.stderr || viaEdge.error?.message);
+    assert.equal(JSON.parse(viaEdge.stdout).dom, "node-safe");
+  } finally {
+    rmSync(app, { recursive: true, force: true });
+  }
+});
