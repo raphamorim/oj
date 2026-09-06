@@ -83,6 +83,9 @@ jobs:
       - name: server.proxy regex (^) contexts match path plus query
         if: matrix.mode == 'unbundled'
         run: node e2e/proxy-regex-context.mjs
+      - name: server.proxy URL/object targets and a bypass string served locally
+        if: matrix.mode == 'unbundled'
+        run: node e2e/proxy-target-forms.mjs
       - name: request paths (encoded filenames, traversal containment)
         if: matrix.mode == 'unbundled'
         run: node e2e/awkward-paths.mjs
