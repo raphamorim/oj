@@ -308,6 +308,16 @@ struct ServerState {
     plugins: Option<std::sync::Arc<PluginHost>>,
     plugin_serve: Arc<PluginServe>,
     plugins_ssr: tokio::sync::OnceCell<Option<std::sync::Arc<PluginHost>>>,
+    /// Watcher events (file, change type) the lazily spawned SSR host could
+    /// not take yet: the watcher fast-skips a pre-init host — dispatching
+    /// would serially burn a full per-call init window per hook per save on a
+    /// wedged init — and queues the event here for a watchChange catch-up
+    /// replay at the host's init (see `spawn_ssr_watch_catch_up`). Deduped by
+    /// file (the latest change type wins), so it is bounded by the files
+    /// edited during the window.
+    ssr_watch_backlog: Arc<Mutex<Vec<(String, String)>>>,
+    /// One line for the first skip, not one per save.
+    ssr_watch_skip_logged: std::sync::atomic::AtomicBool,
     ssr_plugin_config: String,
     plugin_watched: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
     plugins_use_module_parsed: bool,
@@ -496,6 +506,7 @@ fn spawn_late_plugin_serve(plugin_serve: Arc<PluginServe>, host: Arc<PluginHost>
                     if resync_plugin_mw_with_retry(p).await {
                         println!("  plugin middleware: worker environment resync enqueued");
                         let bound = plugins::plugin_rpc_timeout();
+                        let enqueued_at = std::time::Instant::now();
                         if await_resync_completion(&mut done, baseline, bound).await {
                             println!(
                                 "  plugin middleware: worker environments resynced (full reload)"
@@ -505,6 +516,30 @@ fn spawn_late_plugin_serve(plugin_serve: Arc<PluginServe>, host: Arc<PluginHost>
                                 "oj: warning: the worker environment resync was enqueued but did not complete within {}s (invalidate queue stuck?); edits made while the plugin middleware was down may be stale until the next edit or a restart",
                                 bound.as_secs()
                             );
+                            // The warning is bounded, the queue is not: keep
+                            // the receiver alive so a resync that drains LATE
+                            // is reported with its true delay instead of the
+                            // warning reading as permanent staleness. The
+                            // host dying ends the wait (this task's Arc pins
+                            // the sender, so changed() alone can never see
+                            // the death).
+                            let host = std::sync::Arc::clone(&host);
+                            tokio::spawn(async move {
+                                let mut done = done;
+                                loop {
+                                    if *done.borrow_and_update() > baseline {
+                                        println!(
+                                            "  plugin middleware: worker environments resynced late, {}s after the enqueue (full reload)",
+                                            enqueued_at.elapsed().as_secs()
+                                        );
+                                        return;
+                                    }
+                                    tokio::select! {
+                                        changed = done.changed() => { if changed.is_err() { return; } }
+                                        _ = host.host_gone_wait() => return,
+                                    }
+                                }
+                            });
                         }
                     } else {
                         eprintln!(
@@ -1150,6 +1185,8 @@ impl DevServer {
             plugins: plugin_host.clone(),
             plugin_serve: Arc::clone(&plugin_serve),
             plugins_ssr: tokio::sync::OnceCell::new(),
+            ssr_watch_backlog: Arc::new(Mutex::new(Vec::new())),
+            ssr_watch_skip_logged: std::sync::atomic::AtomicBool::new(false),
             ssr_plugin_config,
             plugin_watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             plugins_use_module_parsed,
@@ -1692,6 +1729,13 @@ async fn ssr_plugin_host(state: &Arc<ServerState>) -> Option<std::sync::Arc<Plug
             match PluginHost::spawn_lazy(&state.root, &file, &state.ssr_plugin_config).await {
                 Ok(host) => {
                     eprintln!("oj ssr: plugins (ssr environment) from {}", file.display());
+                    // The catch-up half of the watcher's pre-init fast-skip:
+                    // events skipped while this host initializes replay at
+                    // its init (see ssr_watch_backlog).
+                    spawn_ssr_watch_catch_up(
+                        std::sync::Arc::clone(&host),
+                        Arc::clone(&state.ssr_watch_backlog),
+                    );
                     Some(host)
                 }
                 Err(e) => {
@@ -1702,6 +1746,81 @@ async fn ssr_plugin_host(state: &Arc<ServerState>) -> Option<std::sync::Arc<Plug
         })
         .await
         .clone()
+}
+
+/// Records a watcher event the pre-init lazy SSR host cannot take yet (the
+/// watcher's fast-skip; see `ServerState::ssr_watch_backlog`): deduped by
+/// file, the latest change type winning — a delete after an update is what
+/// the replay must report.
+fn note_ssr_watch_skip(
+    backlog: &Mutex<Vec<(String, String)>>,
+    logged: &std::sync::atomic::AtomicBool,
+    file: &str,
+    change_type: &str,
+) {
+    {
+        let mut b = backlog.lock().unwrap();
+        if let Some(entry) = b.iter_mut().find(|(f, _)| f == file) {
+            entry.1 = change_type.to_string();
+        } else {
+            b.push((file.to_string(), change_type.to_string()));
+        }
+    }
+    if !logged.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        println!(
+            "oj: ssr plugin host still initializing; queuing file changes for a catch-up replay at its init"
+        );
+    }
+}
+
+/// Replays the skipped events as `watchChange` toward the (now initialized)
+/// SSR host — the invalidation notice its plugins missed while pre-init; the
+/// late hotUpdate half is deliberately not replayed (its result steers no
+/// client update on the ssr environment, and the client updates already
+/// happened through oj's own pipeline). Loops: a skip racing the drain lands
+/// in a later batch instead of being lost.
+async fn replay_ssr_watch_backlog(host: &PluginHost, backlog: &Mutex<Vec<(String, String)>>) {
+    loop {
+        let batch: Vec<(String, String)> = {
+            let mut b = backlog.lock().unwrap();
+            b.drain(..).collect()
+        };
+        if batch.is_empty() {
+            return;
+        }
+        println!(
+            "oj: ssr plugin host caught up: replaying {} file change(s) missed during its init",
+            batch.len()
+        );
+        for (file, ev) in batch {
+            if let Err(e) = host.watch_change(&file, &ev).await {
+                eprintln!("oj: watchChange (ssr catch-up) failed for {file}: {e}");
+            }
+        }
+    }
+}
+
+/// Waits for the lazy SSR host's init and replays the watcher backlog then; a
+/// host that dies pre-init releases the wait (its backlog stays for a
+/// respawn, which never happens today — the OnceCell holds one spawn — so
+/// the queue simply dies with the session).
+fn spawn_ssr_watch_catch_up(
+    host: std::sync::Arc<PluginHost>,
+    backlog: Arc<Mutex<Vec<(String, String)>>>,
+) {
+    tokio::spawn(async move {
+        let mut init = host.initialized_updates();
+        loop {
+            if *init.borrow_and_update() {
+                break;
+            }
+            tokio::select! {
+                changed = init.changed() => { if changed.is_err() { return; } }
+                _ = host.host_gone_wait() => return,
+            }
+        }
+        replay_ssr_watch_backlog(&host, &backlog).await;
+    });
 }
 
 fn sass_additional_data_for(state: &ServerState, url: &str) -> Option<String> {
@@ -7978,6 +8097,33 @@ async fn decide(
             // The ssr environment's plugin instances (Vite dispatches hotUpdate
             // and watchChange to every environment) when that host is up.
             let ssr_host = state.plugins_ssr.get().and_then(|h| h.clone());
+            // Pre-init fast-skip: this dispatch path is serial, and each hook
+            // toward a still-initializing lazy host would await a full
+            // per-call init window — on a wedged init that froze every save's
+            // HMR for 2× the window, forever. Skip both hooks and queue a
+            // watchChange catch-up instead (replayed at the host's init by
+            // spawn_ssr_watch_catch_up); a healthy slow boot still gets
+            // post-init events normally. The re-check after queuing closes
+            // the race where init lands between the decision and the push —
+            // the catch-up task may have already drained.
+            let ssr_host = match ssr_host {
+                Some(ssr)
+                    if !ssr.is_initialized()
+                        && (state.plugins_watch_change || state.plugins_hot_update) =>
+                {
+                    note_ssr_watch_skip(
+                        &state.ssr_watch_backlog,
+                        &state.ssr_watch_skip_logged,
+                        &file,
+                        change_type,
+                    );
+                    if ssr.is_initialized() {
+                        replay_ssr_watch_backlog(&ssr, &state.ssr_watch_backlog).await;
+                    }
+                    None
+                }
+                other => other,
+            };
             if state.plugins_watch_change {
                 if let Err(e) = host.watch_change(&file, change_type).await {
                     eprintln!("oj: watchChange failed for {file}: {e}");
@@ -8206,6 +8352,95 @@ async fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The watcher's pre-init fast-skip toward the lazy SSR host: recording a
+    // skipped event is instant (the watcher path makes NO RPC toward a
+    // still-initializing host — dispatching used to serially burn a full
+    // per-call init window per hook per save on a wedged init), the backlog
+    // dedups by file keeping the latest change type, and once the host
+    // initializes the catch-up task replays the backlog as watchChange.
+    #[tokio::test]
+    async fn ssr_watch_skip_is_instant_and_replays_at_the_hosts_init() {
+        let root = std::env::temp_dir().join(format!("oj-ssr-watch-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let config = serde_json::json!({
+            "config": { "root": root.display().to_string() },
+            "env": { "command": "serve", "mode": "development" },
+        })
+        .to_string();
+
+        // A wedged lazy host: skips must complete in milliseconds anyway.
+        let plugins = root.join("oj.plugins.mjs");
+        std::fs::write(
+            &plugins,
+            "setInterval(() => {}, 1000);\nawait new Promise(() => {});\nexport default [];\n",
+        )
+        .unwrap();
+        let wedged = match plugins::PluginHost::spawn_lazy_with_wait(
+            &root,
+            &plugins,
+            &config,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        {
+            Ok(h) => h,
+            Err(_) => return, // no node on this machine
+        };
+        let backlog = Arc::new(Mutex::new(Vec::new()));
+        let logged = std::sync::atomic::AtomicBool::new(false);
+        assert!(!wedged.is_initialized());
+        let t0 = std::time::Instant::now();
+        // What decide() does per save while the host is pre-init.
+        note_ssr_watch_skip(&backlog, &logged, "/app/a.ts", "update");
+        note_ssr_watch_skip(&backlog, &logged, "/app/a.ts", "delete");
+        note_ssr_watch_skip(&backlog, &logged, "/app/b.ts", "update");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(200),
+            "a skipped dispatch never waits on the host: {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(
+            *backlog.lock().unwrap(),
+            vec![
+                ("/app/a.ts".to_string(), "delete".to_string()),
+                ("/app/b.ts".to_string(), "update".to_string()),
+            ],
+            "deduped by file, latest change type wins"
+        );
+        wedged.shutdown();
+
+        // A healthy slow host: the catch-up task replays the backlog at init.
+        std::fs::write(
+            &plugins,
+            "await new Promise((r) => setTimeout(r, 1000));\nexport default [];\n",
+        )
+        .unwrap();
+        let host = match plugins::PluginHost::spawn_lazy_with_wait(
+            &root,
+            &plugins,
+            &config,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        spawn_ssr_watch_catch_up(std::sync::Arc::clone(&host), Arc::clone(&backlog));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !backlog.lock().unwrap().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the backlog must drain once the host initializes"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(host.is_initialized(), "the replay only runs post-init");
+        host.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     // The late-activation resync ENQUEUE is confirmed only on an ACK:
     // transient failures are retried with backoff, and a middleware that never
