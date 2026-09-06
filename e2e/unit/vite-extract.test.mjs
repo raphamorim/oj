@@ -103,8 +103,10 @@ test("function-valued proxy options: the extracted entry drops them, but rewrite
   // A function rewrite is honored by the plugin host's single proxy, so the
   // extractor no longer warns that it is dropped.
   assert.doesNotMatch(err, /rewrite is a function/);
-  assert.match(err, /server\.proxy\["\/api"\]\.configure is a function; applied by the plugin host/);
-  assert.match(err, /server\.proxy\["\/api"\]\.bypass is a function; applied by the plugin host/);
+  // configure needs http-proxy (bundled into Vite); the warning is honest that
+  // it applies only when http-proxy is resolvable. bypass runs on the host proxy.
+  assert.match(err, /server\.proxy\["\/api"\]\.configure is a function; applied only when http-proxy is resolvable/);
+  assert.match(err, /server\.proxy\["\/api"\]\.bypass is a function; applied by the plugin host proxy/);
 });
 
 

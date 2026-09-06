@@ -660,12 +660,14 @@ function extractProxy(proxy) {
       // `server.proxy` from the app's real (un-serialized) config, where the
       // function is intact, for both the browser and the worker's outbound
       // fetch. Only a plain app with no plugin host still falls back to the
-      // {from,to} form. `configure`/`bypass` only reach the plugin host proxy;
-      // warn that the extracted (Rust-fallback) config cannot carry them.
-      for (const fn of ["configure", "bypass"]) {
-        if (typeof v[fn] === "function") {
-          warn(`server.proxy["${ctx}"].${fn} is a function; applied by the plugin host, not the built-in fallback proxy`);
-        }
+      // {from,to} form. `bypass` runs on the plugin host proxy; `configure`
+      // needs http-proxy (bundled into Vite, usually not resolvable), so be
+      // honest that it applies only when http-proxy is available.
+      if (typeof v.bypass === "function") {
+        warn(`server.proxy["${ctx}"].bypass is a function; applied by the plugin host proxy, not the built-in fallback proxy`);
+      }
+      if (typeof v.configure === "function") {
+        warn(`server.proxy["${ctx}"].configure is a function; applied only when http-proxy is resolvable (the built-in fallback proxy cannot run it)`);
       }
       out[ctx] = entry;
     }
