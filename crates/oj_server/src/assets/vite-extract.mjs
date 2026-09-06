@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-import { createRequire, isBuiltin } from "node:module";
+import { createRequire, isBuiltin, syncBuiltinESMExports } from "node:module";
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { dirname, isAbsolute, resolve } from "node:path";
-import { writeFileSync, readFileSync, realpathSync, existsSync, unlinkSync, writeSync } from "node:fs";
+import { basename, dirname, isAbsolute, resolve, sep } from "node:path";
+import fs, { writeFileSync, readFileSync, realpathSync, existsSync, unlinkSync, writeSync } from "node:fs";
 
 const configPath = process.argv[2];
 const appRoot = process.argv[3];
@@ -20,15 +20,66 @@ const resultPath = process.argv[7] || null;
 
 process.env.VITE_CONFIG_NATIVE_IGNORE_WARNING ??= "true";
 
+// Vite's defaultNodeEnv follows the COMMAND, never the mode: serve resolves
+// with resolveConfig(inline, "serve") (defaultNodeEnv "development"), build
+// with resolveConfig(inline, "build", "production", "production") — so
+// `build --mode staging` still sees NODE_ENV=production/isProduction=true and
+// `serve --mode staging` sees development.
+const defaultNodeEnv = command === "build" ? "production" : "development";
 // Vite sets NODE_ENV before the config file's module evaluation when the
 // environment leaves it unset or empty (node.js resolveConfig:
 // `if (!isNodeEnvSet) process.env.NODE_ENV = defaultNodeEnv` runs BEFORE
 // loadConfigFromFile). The extractor loads the file itself, so without this a
 // config branching on process.env.NODE_ENV at module scope saw `undefined`
-// where Vite shows a value. oj hands `mode` to resolveConfig as defaultNodeEnv
-// (NODE_ENV follows the mode), so the pre-load value is the same one
-// resolveConfig would set.
-if (!process.env.NODE_ENV) process.env.NODE_ENV = mode;
+// where Vite shows a value. The pre-load value is the same command-based
+// default resolveConfig would set — and it is UNSET again right before
+// resolveConfig runs (unsetOjNodeEnvForResolve): the pre-set must not make
+// resolveConfig compute isNodeEnvSet=true, which would disable Vite's
+// VITE_USER_NODE_ENV handling; resolveConfig then re-sets the identical
+// default itself from the defaultNodeEnv oj passes.
+const nodeEnvWasSet = !!process.env.NODE_ENV;
+if (!nodeEnvWasSet) process.env.NODE_ENV = defaultNodeEnv;
+const unsetOjNodeEnvForResolve = () => {
+  if (!nodeEnvWasSet) delete process.env.NODE_ENV;
+};
+
+// Wrangler config files the config evaluation touched. The Cloudflare plugin's
+// `config` hook reads the Worker config (wrangler.unstable_readConfig) from
+// wherever `cloudflare({ configPath })` and `auxiliaryWorkers[].configPath`
+// point — files the root-level cache epoch (wrangler.* in the app root) cannot
+// see. Recording the actual reads is the honest signal (no config-shape
+// heuristics): every observed path joins `__deps`, so the Rust extraction
+// cache stamps it like a config import. Attempted reads and existence probes
+// of MISSING wrangler files are recorded too — the absent state is stamped, so
+// creating the file later is a cache miss.
+const observedWranglerReads = new Set();
+function installWranglerReadRecorder() {
+  const WRANGLER_FILE = /^wrangler\.(?:json|jsonc|toml)$/;
+  const record = (p) => {
+    try {
+      const s = typeof p === "string" ? p : p instanceof URL ? fileURLToPath(p) : null;
+      if (s && WRANGLER_FILE.test(basename(s)) && !s.split(sep).includes("node_modules")) {
+        observedWranglerReads.add(resolve(appRoot, s));
+      }
+    } catch {}
+  };
+  const wrap = (obj, name) => {
+    const orig = obj[name];
+    if (typeof orig !== "function") return;
+    obj[name] = function (p, ...rest) {
+      record(p);
+      return orig.call(this, p, ...rest);
+    };
+  };
+  // The core fs singleton: patched before any plugin code loads, so CJS
+  // require("fs") consumers (wrangler) and ESM default-import consumers see
+  // the wrappers; syncBuiltinESMExports refreshes the node:fs facade's named
+  // bindings too, covering `import { readFileSync } from "node:fs"`.
+  for (const name of ["readFileSync", "readFile", "existsSync", "statSync"]) wrap(fs, name);
+  wrap(fs.promises, "readFile");
+  wrap(fs.promises, "stat");
+  syncBuiltinESMExports();
+}
 
 const appRequire = createRequire(pathToFileURL(appRoot + "/package.json").href);
 let directDeps = [];
@@ -331,11 +382,13 @@ async function loadConfig() {
               ...(Array.isArray(merged.plugins) ? merged.plugins : []),
               detect.plugin,
             ];
-            resolved = await vite.resolveConfig(merged, command, mode, mode);
+            unsetOjNodeEnvForResolve();
+            resolved = await vite.resolveConfig(merged, command, mode, defaultNodeEnv);
           } else {
             const inline = { root: appRoot, configFile: configPath };
             if (modeExplicit) inline.mode = mode;
-            resolved = await vite.resolveConfig(inline, command, mode, mode);
+            unsetOjNodeEnvForResolve();
+            resolved = await vite.resolveConfig(inline, command, mode, defaultNodeEnv);
           }
           if (resolved) {
             // The raw user file, for the "not applied" warnings: the resolved
@@ -380,7 +433,13 @@ async function loadConfig() {
               config: loaded.config,
               raw: rawSnapshot ?? loaded.config,
               deps: absDeps(loaded.dependencies),
-              runnerBacked: detect.declared(),
+              // The sentinel's verdict is partial: a hook throwing BEFORE the
+              // post-ordered sniff ran leaves declared() false even when the
+              // raw config itself declares a runner environment (the CF shape:
+              // environments.<name>.dev.createEnvironment in the file). OR in
+              // the shape-only raw check — it runs no hook, so no side effect
+              // doubles — instead of emitting a bare false negative.
+              runnerBacked: detect.declared() || declaresRunnerEnvironment(loaded.config),
               merge: typeof vite.mergeConfig === "function" ? vite.mergeConfig : null,
             };
           }
@@ -400,6 +459,9 @@ async function loadConfig() {
       viteErr = e;
     }
   }
+  // The fallback loaders evaluate the config in THIS process: re-assert the
+  // pre-load NODE_ENV (a resolveConfig attempt above may have unset it).
+  if (!process.env.NODE_ENV) process.env.NODE_ENV = defaultNodeEnv;
   if (/\.(ts|tsx|mts|cts)$/.test(configPath)) {
     const esbuildPath = resolvePkg("esbuild");
     if (!esbuildPath) {
@@ -855,12 +917,16 @@ async function detectSsrRunnerBacked(raw, configEnv, merge = mergeConfigLite) {
   return declaresRunnerEnvironment({ environments });
 }
 
-// The slice of Vite's mergeConfigRecursively this detection needs: null and
-// undefined override values are skipped, arrays concatenate, plain objects
-// merge recursively, scalars and functions take the later value — and a `true`
-// on either side of ssr/resolve `noExternal`/`external` wins over lists
-// (mergeConfigRecursively's special case). The fallback when the app's own
-// vite.mergeConfig is unavailable (the esbuild and plain-import loaders).
+// Here: the fallback merge when the app's own vite.mergeConfig is unavailable
+// (the esbuild and plain-import loaders).
+//
+// The slice of Vite's mergeConfigRecursively these assets need (twin copies:
+// one in vite-extract.mjs, one in plugin-host.mjs — keep them byte-identical):
+// null and undefined override values are skipped (a `key: null` override must
+// not clobber a set value), arrays concatenate, plain objects merge
+// recursively, scalars and functions take the later value — and a `true` on
+// either side of ssr/resolve `noExternal`/`external` wins over lists
+// (mergeConfigRecursively's special case).
 const environmentPathRE = /^environments\.[^.]+$/;
 function mergeConfigLite(defaults, overrides, rootPath = "") {
   const merged = { ...defaults };
@@ -1071,6 +1137,7 @@ const emitResult = (json) => {
 
 if (isMainRun) {
 try {
+  installWranglerReadRecorder();
   const { config, raw, deps, runnerBacked, merge } = (await loadConfig()) ?? {};
   const c = config ?? {};
   warnUnsupported(raw ?? c);
@@ -1121,7 +1188,9 @@ try {
   emitResult(
     JSON.stringify({
       __ok: true,
-      __deps: deps ?? [],
+      // Config imports plus the wrangler configs the evaluation read (or
+      // probed): both invalidate the extraction cache when they change.
+      __deps: [...new Set([...(deps ?? []), ...observedWranglerReads])],
       base: typeof c.base === "string" ? c.base : null,
       publicDir: typeof c.publicDir === "string" ? c.publicDir : c.publicDir === false ? false : null,
       port: typeof c.server?.port === "number" ? c.server.port : null,
