@@ -5,6 +5,7 @@ import { spawn, execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertHydrates, parseBoundPort } from "./lib/hydration.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.join(here, "..");
@@ -110,15 +111,66 @@ async function assertApp(port, label) {
   console.log(`${label}: ${want.length} features + /about + publicDir + css-in-head ok`);
 }
 
+async function loadPlaywright() {
+  try {
+    return (await import("playwright")).chromium;
+  } catch {
+    return null;
+  }
+}
+
+// The broad "TanStack Start under `oj dev` actually hydrates" gate: not just SSR
+// HTML, but the client graph serving and the runtime coming alive. `/` carries
+// the fixture's client-only probe + counter; `/about` is static, so it is gated
+// for a clean load (module graph 200, no hydration-mismatch errors).
+async function assertDevHydration(port) {
+  const chromium = await loadPlaywright();
+  if (!chromium) {
+    console.log("start-dev: playwright not installed locally; skipped the browser hydration pass (CI runs it)");
+    return;
+  }
+  const base = `http://localhost:${port}`;
+  const whitelist = [/favicon\.ico/];
+  const browser = await chromium.launch();
+  try {
+    await assertHydrates(browser, `${base}/`, {
+      ssrMarker: "HOME!",
+      clientMarker: '[data-testid="client-mounted"]',
+      clientMarkerText: "client-mounted-ok",
+      interaction: { click: '[data-testid="counter"]', expect: { selector: '[data-testid="counter"]', text: "count: 1" } },
+      whitelist,
+    });
+    await assertHydrates(browser, `${base}/about`, {
+      ssrMarker: "about-page-marker",
+      whitelist,
+    });
+    console.log("start-dev: browser hydration ok (/ mounts + counter interaction, /about clean client graph)");
+  } finally {
+    await browser.close();
+  }
+}
+
 async function devPhase() {
   rm(path.join(app, ".oj-cache"));
-  const port = 3097;
-  const srv = spawn(oj, ["dev", app, "--port", String(port)], { stdio: "ignore" });
+  const reqPort = 3097;
+  let log = "";
+  const srv = spawn(oj, ["dev", app, "--port", String(reqPort)], { stdio: ["ignore", "pipe", "pipe"] });
+  srv.stdout.on("data", (d) => (log += d));
+  srv.stderr.on("data", (d) => (log += d));
   try {
+    // oj may increment off a busy port; use the port it actually bound.
+    let port = reqPort;
+    for (let i = 0; i < 240; i++) {
+      if (srv.exitCode != null) break;
+      const bound = parseBoundPort(log);
+      if (bound) { port = bound; break; }
+      await new Promise((r) => setTimeout(r, 250));
+    }
     await waitUp(port);
     await assertApp(port, "start-dev");
     await assertDevRouting(port);
     assertInlineSourceMaps();
+    await assertDevHydration(port);
   } finally {
     srv.kill("SIGKILL");
   }
