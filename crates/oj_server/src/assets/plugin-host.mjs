@@ -1782,23 +1782,34 @@ async function createProxyMiddleware(proxyConfig, appRoot) {
   }
   if (contexts.length === 0) return null;
 
-  // Prefer the app's http-proxy (what Vite uses). It is usually bundled into
-  // Vite and not resolvable on its own, so the node pipe below is the common
-  // path; when http-proxy IS resolvable, use it and honour `configure`.
+  // Vite forwards through `http-proxy-3` (its own dependency). Resolve it the
+  // way Vite's own module graph would: from the app's `vite` package first,
+  // then the app root, then the plugin host itself. In practice Vite BUNDLES
+  // http-proxy-3 into its dist, so it is usually not resolvable as a module and
+  // the faithful node pipe below is the real path; when http-proxy IS
+  // resolvable, it is the single forward and `configure` is honoured.
   let httpProxyLib = null;
-  try {
-    const req = createRequire(appRoot + "/package.json");
-    for (const name of ["http-proxy", "http-proxy-3"]) {
+  const requirers = [];
+  try { requirers.push(createRequire(createRequire(appRoot + "/package.json").resolve("vite"))); } catch {}
+  try { requirers.push(createRequire(appRoot + "/package.json")); } catch {}
+  try { requirers.push(createRequire(import.meta.url)); } catch {}
+  for (const req of requirers) {
+    for (const name of ["http-proxy-3", "http-proxy"]) {
       try {
         const mod = await import(pathToFileURL(req.resolve(name)).href);
-        httpProxyLib = mod.default ?? mod;
-        break;
+        const lib = mod.default ?? mod;
+        if (lib && typeof lib.createProxyServer === "function") { httpProxyLib = lib; break; }
       } catch {}
     }
-  } catch {}
+    if (httpProxyLib) break;
+  }
 
+  // ONE ProxyServer per entry, built once at setup and reused across requests,
+  // with `configure(proxy, opts)` invoked ONCE with the instance and the error
+  // handler wired so a proxy error ENDS the response instead of hanging —
+  // mirroring Vite's proxyMiddleware setup (dist node.js:19156-19191).
   const proxies = new Map();
-  if (httpProxyLib && typeof httpProxyLib.createProxyServer === "function") {
+  if (httpProxyLib) {
     for (const [context, opts] of contexts) {
       const proxy = httpProxyLib.createProxyServer(opts);
       if (typeof opts.configure === "function") {
@@ -1806,16 +1817,33 @@ async function createProxyMiddleware(proxyConfig, appRoot) {
           process.stderr.write(`${OJ} plugin host: server.proxy["${context}"].configure threw: ${(e && e.message) || e}\n`);
         }
       }
+      // Vite dist node.js:19167-19187: distinguish a web response (`"req" in
+      // res`) — 502 + end when nothing was sent yet — from a ws socket (end).
       proxy.on("error", (err, _req, res) => {
-        if (res && !res.headersSent && typeof res.writeHead === "function") {
-          try { res.writeHead(502, { "content-type": "text/plain" }); } catch {}
+        process.stderr.write(`${OJ} plugin host: http proxy error: ${(err && (err.stack || err.message)) || err}\n`);
+        if (res && "req" in res) {
+          if (!res.headersSent && !res.writableEnded) {
+            try { res.writeHead(502, { "Content-Type": "text/plain" }).end(); } catch {}
+          }
+        } else if (res && typeof res.end === "function") {
+          res.end();
         }
-        if (res && typeof res.end === "function") res.end(`oj proxy error: ${(err && err.message) || err}`);
       });
       proxies.set(context, proxy);
     }
     process.stderr.write(`${OJ} plugin host: server.proxy active (${contexts.length} route(s), via http-proxy)\n`);
   } else {
+    // The node pipe honours the common options faithfully (target,
+    // changeOrigin, secure, rewrite, header + body streaming). Be HONEST about
+    // the http-proxy-only options it cannot apply without the proxy instance —
+    // warn once per entry instead of silently ignoring them.
+    const PIPE_UNSUPPORTED = ["configure", "xfwd", "cookieDomainRewrite", "cookiePathRewrite", "followRedirects", "autoRewrite", "protocolRewrite", "hostRewrite"];
+    for (const [context, opts] of contexts) {
+      const present = PIPE_UNSUPPORTED.filter((k) => opts[k] != null && opts[k] !== false);
+      if (present.length) {
+        process.stderr.write(`${OJ} plugin host: server.proxy["${context}"] ${present.join(", ")} need http-proxy (bundled into Vite, not resolvable here); the built-in proxy does not apply them\n`);
+      }
+    }
     process.stderr.write(`${OJ} plugin host: server.proxy active (${contexts.length} route(s))\n`);
   }
 
@@ -1849,6 +1877,8 @@ async function createProxyMiddleware(proxyConfig, appRoot) {
     // http-proxy's secure:false accepts self-signed dev certificates.
     if (isHttps && opts.secure === false) options.rejectUnauthorized = false;
     const upstream = lib.request(options, (r) => {
+      // Pass the upstream status and ALL headers straight through (Set-Cookie,
+      // Location, content-type … untouched), as http-proxy does by default.
       res.writeHead(r.statusCode || 502, r.headers);
       r.pipe(res);
     });
@@ -1860,6 +1890,12 @@ async function createProxyMiddleware(proxyConfig, appRoot) {
     });
     // Stream the request body through (uploads are never buffered whole).
     req.pipe(upstream);
+  };
+
+  const forward = (opts, context, req, res) => {
+    const proxy = proxies.get(context);
+    if (proxy) proxy.web(req, res, {});
+    else pipeForward(opts, req, res);
   };
 
   return async function ojProxyMiddleware(req, res, next) {
@@ -1882,10 +1918,18 @@ async function createProxyMiddleware(proxyConfig, appRoot) {
           return next(e);
         }
       }
-      if (rewriteFn) req.url = rewriteFn(req.url);
-      const proxy = proxies.get(context);
-      if (proxy) proxy.web(req, res, {});
-      else pipeForward(opts, req, res);
+      // A user rewrite (or the {from,to} regex) is guarded: a throw becomes
+      // next(e) (an error the connect stack handles) instead of an
+      // unhandledRejection that would hang the request and could tear the host
+      // down. Vite calls `opts.rewrite(req.url)` bare; oj wraps it.
+      if (rewriteFn) {
+        try {
+          req.url = rewriteFn(req.url);
+        } catch (e) {
+          return next(e);
+        }
+      }
+      forward(opts, context, req, res);
       return;
     }
     next();
