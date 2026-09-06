@@ -1172,8 +1172,7 @@ impl DevServer {
                         force: oj_config::optimize_deps_force(&config),
                         bundler_options: oj_config::optimize_deps_bundler_options(&config),
                         conditions: oj_config::resolve_conditions(&config, "client"),
-                        main_fields: oj_config::resolve_main_fields(&config)
-                            .unwrap_or_else(oj_resolver::default_main_fields),
+                        main_fields: optimize::optimizer_main_fields(&config),
                         extensions: oj_config::resolve_extensions(&config)
                             .unwrap_or_else(oj_resolver::default_extensions),
                         preserve_symlinks: oj_config::resolve_preserve_symlinks(&config),
