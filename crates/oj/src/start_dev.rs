@@ -192,12 +192,22 @@ pub async fn start_dev(
         tokio::spawn(async move {
             if cf_hint {
                 if let Ok(Some((mut updates, init_deadline))) = cf_rx.await {
-                    // Anchored to the host's OWN init deadline (its spawn
-                    // instant + OJ_PLUGIN_INIT_TIMEOUT), not a fresh timeout
-                    // measured from here: this wait starts after the spawn, so
-                    // a second full period would have let a wedged host hold
-                    // the prewarm for up to twice the knob.
-                    let known = tokio::time::timeout_at(init_deadline, async {
+                    // Bounded twice over: never past the host's OWN init
+                    // deadline (its spawn instant + OJ_PLUGIN_INIT_TIMEOUT —
+                    // a fresh full period measured from here could double the
+                    // knob), and never longer than one RPC-timeout window
+                    // from now — a host that never pushes must not hold the
+                    // fallback runner cold for the whole 300 s init deadline.
+                    // On that wedged path the runner is prewarmed anyway; a
+                    // LATE serve-info activation still supersedes (prewarming
+                    // and then discovering worker environments render is only
+                    // the pre-PR waste).
+                    let hold = prewarm_hold_deadline(
+                        init_deadline,
+                        tokio::time::Instant::now(),
+                        oj_server::plugins::plugin_rpc_timeout(),
+                    );
+                    let known = tokio::time::timeout_at(hold, async {
                         loop {
                             if let Some(info) = *updates.borrow_and_update() {
                                 return info;
@@ -1676,6 +1686,21 @@ fn inject_reload_client(resp: Response) -> Response {
     Response::from_parts(parts, axum::body::Body::from_stream(stream))
 }
 
+/// How long the Cloudflare prewarm hold may wait for the plugin host's serve
+/// info: the EARLIER of the host's own init deadline (spawn +
+/// `OJ_PLUGIN_INIT_TIMEOUT`) and one RPC-timeout window
+/// (`OJ_PLUGIN_TIMEOUT`) from the wait's own start. A wedged host that never
+/// pushes must not hold the fallback runner cold for the whole init deadline
+/// (300 s of cold-runner documents); past this bound the runner is prewarmed
+/// anyway, and a late serve-info activation still supersedes.
+fn prewarm_hold_deadline(
+    init_deadline: tokio::time::Instant,
+    now: tokio::time::Instant,
+    rpc_timeout: std::time::Duration,
+) -> tokio::time::Instant {
+    init_deadline.min(now + rpc_timeout)
+}
+
 #[cfg(test)]
 fn collect_headers(headers: &header::HeaderMap) -> Vec<(String, String)> {
     headers
@@ -1701,6 +1726,24 @@ mod tests {
             .uri(path)
             .body(axum::body::Body::empty())
             .unwrap()
+    }
+
+    // The prewarm hold is bounded at the RPC-timeout scale: a wedged host that
+    // never pushes serve info releases the prewarm after one OJ_PLUGIN_TIMEOUT
+    // window, never the whole 300 s init deadline — while a host whose init
+    // deadline is nearer still bounds the hold to that.
+    #[test]
+    fn prewarm_hold_is_bounded_by_the_rpc_timeout_scale() {
+        let now = tokio::time::Instant::now();
+        let rpc = std::time::Duration::from_secs(20);
+        // A fresh boot host: its init deadline (300 s out) must NOT govern the
+        // hold — the RPC-timeout window does.
+        let far = now + std::time::Duration::from_secs(300);
+        assert_eq!(prewarm_hold_deadline(far, now, rpc), now + rpc);
+        // A host most of the way through its init deadline: the nearer init
+        // deadline still wins (the hold never outlives it).
+        let near = now + std::time::Duration::from_secs(5);
+        assert_eq!(prewarm_hold_deadline(near, now, rpc), near);
     }
 
     // The rebundle worker snapshots the regen outputs around a run and pushes
