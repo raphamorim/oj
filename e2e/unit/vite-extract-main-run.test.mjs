@@ -482,11 +482,92 @@ test("real vite: an in-place config mutation does not leak into rawResolve", { s
   }
 });
 
+// The partial verdict must not false-negative a RAW declaration: when a config
+// hook throws BEFORE the sentinel's post-ordered sniff ran, declared() is
+// false even though the config FILE itself declares a runner environment (the
+// CF shape). The emit ORs in the shape-only raw check — no hook re-runs.
+test("real vite: a mid-run hook throw keeps a raw runner declaration visible in the partial verdict", { skip: skipNoVite }, () => {
+  const base = realViteDir("oj-vite-extract-partialraw-");
+  try {
+    const rawDeclaring = (boomHook) =>
+      `export default {
+        base: "/partial-raw/",
+        environments: { worker: { dev: { createEnvironment: () => ({}) } } },
+        plugins: [{ name: "boom", ${boomHook} }],
+      };\n`;
+    // A throwing config hook: it aborts resolveConfig before the sentinel's
+    // post sniff ever ran (started=true via the pre plugin, declared=false).
+    writeFileSync(join(base, "vite.config.mjs"), rawDeclaring('config: () => { throw new Error("config exploded"); }'));
+    const run = () =>
+      spawnSync(
+        process.execPath,
+        [join(base, "vite-extract.mjs"), join(base, "vite.config.mjs"), base],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30_000 },
+      );
+    let child = run();
+    assert.match(child.stderr, /resolveConfig failed after plugin config hooks ran.*config exploded/s);
+    let out = JSON.parse(child.stdout);
+    assert.equal(out.__ok, true);
+    assert.equal(out.base, "/partial-raw/");
+    assert.equal(out.ssr?.runnerBacked, true, "the raw declaration survives a pre-sniff hook throw");
+    // The configResolved variant (hooks all ran, resolveConfig still threw):
+    // the sentinel decided true and the OR keeps it.
+    writeFileSync(join(base, "vite.config.mjs"), rawDeclaring('configResolved: () => { throw new Error("configResolved exploded"); }'));
+    child = run();
+    out = JSON.parse(child.stdout);
+    assert.equal(out.__ok, true);
+    assert.equal(out.ssr?.runnerBacked, true, "a configResolved throw keeps the verdict too");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// A `cloudflare({ configPath })`-relocated wrangler config lives outside the
+// app root, where the cache's root-level epoch (wrangler.* in the root) cannot
+// see it. The extractor records the wrangler files the config evaluation
+// actually reads — existence probes of missing ones included — and folds them
+// into __deps, so the Rust extraction cache stamps them like config imports
+// (an edit, create or delete is then a cache miss).
+test("wrangler configs the evaluation reads travel in __deps, missing probes included", () => {
+  const base = mkdtempSync(join(tmpdir(), "oj-vite-extract-wrangler-"));
+  try {
+    copyFileSync(asset("vite-extract.mjs"), join(base, "vite-extract.mjs"));
+    writeFileSync(join(base, "package.json"), JSON.stringify({ name: "fx", type: "module" }));
+    mkdirSync(join(base, "config"));
+    writeFileSync(join(base, "config", "wrangler.jsonc"), JSON.stringify({ base: "/from-wrangler/" }));
+    writeFileSync(
+      join(base, "vite.config.mjs"),
+      `import fs from "node:fs";
+      const w = JSON.parse(fs.readFileSync(new URL("./config/wrangler.jsonc", import.meta.url), "utf8"));
+      fs.existsSync(new URL("./aux/wrangler.toml", import.meta.url));
+      export default { base: w.base };\n`,
+    );
+    const out = JSON.parse(runExtractor(base, "vite.config.mjs"));
+    assert.equal(out.__ok, true);
+    assert.equal(out.base, "/from-wrangler/", "the relocated wrangler config was read");
+    // The config module's import.meta.url is symlink-free (Node's ESM loader
+    // realpaths module locations), so the recorded paths are too.
+    const real = fs.realpathSync(base);
+    assert.ok(
+      out.__deps.includes(join(real, "config", "wrangler.jsonc")),
+      `the read wrangler config is a stamped dep: ${JSON.stringify(out.__deps)}`,
+    );
+    assert.ok(
+      out.__deps.includes(join(real, "aux", "wrangler.toml")),
+      "a probed-but-missing wrangler config is stamped too (creating it must invalidate)",
+    );
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
 // Vite sets NODE_ENV (when the environment leaves it unset) BEFORE the config
 // file's module evaluation, so a config branching on process.env.NODE_ENV at
-// module scope sees the mode's value; the extractor mirrors it on every
-// loader path, the vite-less plain import included.
-test("a config branching on NODE_ENV during module evaluation sees the mode's value", () => {
+// module scope sees a value; the extractor mirrors it on every loader path,
+// the vite-less plain import included. The default follows the COMMAND, never
+// the mode (Vite: serve resolves with defaultNodeEnv "development", build with
+// "production") — a custom `--mode staging` changes neither.
+test("a config branching on NODE_ENV during module evaluation sees the command's default", () => {
   const base = mkdtempSync(join(tmpdir(), "oj-vite-extract-nodeenv-"));
   try {
     copyFileSync(asset("vite-extract.mjs"), join(base, "vite-extract.mjs"));
@@ -499,9 +580,14 @@ test("a config branching on NODE_ENV during module evaluation sees the mode's va
     delete env.NODE_ENV;
     const prod = JSON.parse(runExtractor(base, "vite.config.mjs", ["build", "production", "explicit"], { env }));
     assert.equal(prod.__ok, true);
-    assert.equal(prod.base, "/prod/", "--mode production evaluates the config's prod branch");
+    assert.equal(prod.base, "/prod/", "build evaluates the config's prod branch");
     const dev = JSON.parse(runExtractor(base, "vite.config.mjs", ["serve", "development", "default"], { env }));
     assert.equal(dev.base, "/dev/");
+    // A CUSTOM mode changes nothing: NODE_ENV derives from the command.
+    const buildStaging = JSON.parse(runExtractor(base, "vite.config.mjs", ["build", "staging", "explicit"], { env }));
+    assert.equal(buildStaging.base, "/prod/", "build --mode staging still sees NODE_ENV=production");
+    const serveStaging = JSON.parse(runExtractor(base, "vite.config.mjs", ["serve", "staging", "explicit"], { env }));
+    assert.equal(serveStaging.base, "/dev/", "serve --mode staging still sees NODE_ENV=development");
     // An environment that already names NODE_ENV wins, as under Vite.
     const forced = JSON.parse(
       runExtractor(base, "vite.config.mjs", ["build", "production", "explicit"], {
@@ -509,6 +595,55 @@ test("a config branching on NODE_ENV during module evaluation sees the mode's va
       }),
     );
     assert.equal(forced.base, "/dev/", "a set NODE_ENV is never overridden");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// Same rule through the real-vite single-eval flow, observed where it matters:
+// resolveConfig's own isProduction. The extractor pre-sets NODE_ENV for the
+// config file's module evaluation but UN-sets it again before resolveConfig,
+// so Vite still computes isNodeEnvSet=false — its VITE_USER_NODE_ENV handling
+// (a `.env` file's NODE_ENV=development under build) stays live instead of
+// being disabled by the pre-set.
+test("real vite: NODE_ENV follows the command under a custom mode and VITE_USER_NODE_ENV stays live", { skip: skipNoVite }, () => {
+  const base = realViteDir("oj-vite-extract-nodeenv-cmd-");
+  try {
+    writeFileSync(
+      join(base, "vite.config.mjs"),
+      `import { writeFileSync } from "node:fs";
+      export default {
+        plugins: [{
+          name: "prod-probe",
+          configResolved(config) {
+            writeFileSync(
+              new URL("./prod.json", import.meta.url),
+              JSON.stringify({ isProduction: config.isProduction, nodeEnv: process.env.NODE_ENV }),
+            );
+          },
+        }],
+      };\n`,
+    );
+    const env = { ...process.env };
+    delete env.NODE_ENV;
+    const readProbe = () => JSON.parse(fs.readFileSync(join(base, "prod.json"), "utf8"));
+    let out = JSON.parse(runExtractor(base, "vite.config.mjs", ["build", "staging", "explicit"], { env }));
+    assert.equal(out.__ok, true);
+    assert.deepEqual(readProbe(), { isProduction: true, nodeEnv: "production" }, "build --mode staging is a production build");
+    out = JSON.parse(runExtractor(base, "vite.config.mjs", ["serve", "staging", "explicit"], { env }));
+    assert.equal(out.__ok, true);
+    assert.deepEqual(readProbe(), { isProduction: false, nodeEnv: "development" }, "serve --mode staging stays development");
+    // The .env file's NODE_ENV=development (Vite's VITE_USER_NODE_ENV) must
+    // still win under build: the extractor's pre-set NODE_ENV is unset before
+    // resolveConfig, so Vite sees isNodeEnvSet=false and honors it.
+    writeFileSync(join(base, ".env"), "NODE_ENV=development\n");
+    out = JSON.parse(runExtractor(base, "vite.config.mjs", ["build", "production", "explicit"], { env }));
+    assert.equal(out.__ok, true);
+    assert.deepEqual(
+      readProbe(),
+      { isProduction: false, nodeEnv: "development" },
+      "a .env NODE_ENV=development still makes a development build (VITE_USER_NODE_ENV handling not disabled)",
+    );
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
