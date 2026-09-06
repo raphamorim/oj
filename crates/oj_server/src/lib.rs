@@ -485,10 +485,27 @@ fn spawn_late_plugin_serve(plugin_serve: Arc<PluginServe>, host: Arc<PluginHost>
                         "  plugin middleware: forwarding unmatched requests to :{p} (host came up after boot)"
                     );
                     // The catch-up: edits made while the path was down were
-                    // never invalidated into the worker environments. Claimed
-                    // only when the middleware actually ACKed it.
+                    // never invalidated into the worker environments. The ack
+                    // means only "enqueued" (the host answers on enqueue so a
+                    // busy queue can't time the client out); "resynced" is
+                    // claimed only on the host's completion push — baseline
+                    // snapshotted BEFORE the enqueue so a fast completion is
+                    // never missed.
+                    let mut done = host.resync_done_updates();
+                    let baseline = *done.borrow_and_update();
                     if resync_plugin_mw_with_retry(p).await {
-                        println!("  plugin middleware: worker environments resynced (full reload)");
+                        println!("  plugin middleware: worker environment resync enqueued");
+                        let bound = plugins::plugin_rpc_timeout();
+                        if await_resync_completion(&mut done, baseline, bound).await {
+                            println!(
+                                "  plugin middleware: worker environments resynced (full reload)"
+                            );
+                        } else {
+                            eprintln!(
+                                "oj: warning: the worker environment resync was enqueued but did not complete within {}s (invalidate queue stuck?); edits made while the plugin middleware was down may be stale until the next edit or a restart",
+                                bound.as_secs()
+                            );
+                        }
                     } else {
                         eprintln!(
                             "oj: warning: the worker environment resync was not acknowledged; edits made while the plugin middleware was down may be stale until the next edit or a restart"
@@ -3100,7 +3117,11 @@ fn plugin_mw_client() -> &'static reqwest::Client {
 /// Returns whether the middleware acknowledged the ENQUEUE: the host answers
 /// the moment the resync is on its serialized invalidate queue (guaranteed to
 /// run after everything already queued), so the ACK is fast even behind a
-/// slow queue — the caller must not claim "resynced" without it.
+/// slow queue. 202-style semantics: the ACK means only "enqueued", never
+/// "ran" — the host pushes `{ ojResyncDone }` when the resync EXECUTES, and
+/// the caller claims "resynced" only on that completion signal
+/// ([`await_resync_completion`]); a queue that never drains warns instead of
+/// logging success.
 pub async fn notify_plugin_mw_resync(port: u16) -> bool {
     match plugin_mw_client()
         .post(format!("http://127.0.0.1:{port}/__oj_invalidate"))
@@ -3135,6 +3156,31 @@ pub async fn resync_plugin_mw_with_retry(port: u16) -> bool {
         }
     }
     false
+}
+
+/// Waits for the host's resync-executed signal — the `{ ojResyncDone }`
+/// counter moving past the `baseline` snapshotted BEFORE the enqueue (so a
+/// completion racing ahead of this wait is never missed, and one push may
+/// answer several coalesced enqueues) — bounded, so a stuck invalidate queue
+/// turns into a caller warning rather than an eternal wait or a false
+/// "resynced" claim off the enqueue ack.
+pub async fn await_resync_completion(
+    done: &mut tokio::sync::watch::Receiver<u64>,
+    baseline: u64,
+    bound: std::time::Duration,
+) -> bool {
+    tokio::time::timeout(bound, async {
+        loop {
+            if *done.borrow_and_update() > baseline {
+                return true;
+            }
+            if done.changed().await.is_err() {
+                return false;
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 // Method+body version of forward_get_to_plugin_mw, for the /_serverFn/ path so
@@ -8161,10 +8207,12 @@ async fn decide(
 mod tests {
     use super::*;
 
-    // The late-activation resync is claimed only on an ACK: transient failures
-    // are retried with backoff, and a middleware that never acknowledges makes
-    // the helper report failure (the caller then warns about stale edits)
-    // instead of logging success over a resync that never happened.
+    // The late-activation resync ENQUEUE is confirmed only on an ACK:
+    // transient failures are retried with backoff, and a middleware that never
+    // acknowledges makes the helper report failure (the caller then warns
+    // about stale edits) instead of logging progress over a resync that never
+    // reached the queue. (Execution is a separate signal — see
+    // resync_completion_is_claimed_on_the_done_signal_never_on_the_ack.)
     #[tokio::test]
     async fn resync_retries_until_the_middleware_acks() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -8203,6 +8251,46 @@ mod tests {
             l.local_addr().unwrap().port()
         };
         assert!(!resync_plugin_mw_with_retry(port).await);
+    }
+
+    // The ack is 202-style ("enqueued"); "resynced" is claimed only when the
+    // host's { ojResyncDone } completion signal moves the counter past the
+    // pre-enqueue baseline. A busy queue completes late (still claimed), a
+    // completion racing ahead of the wait is not missed (baseline semantics),
+    // and a stuck queue times out into the caller's warning path.
+    #[tokio::test]
+    async fn resync_completion_is_claimed_on_the_done_signal_never_on_the_ack() {
+        let (tx, mut rx) = tokio::sync::watch::channel(0u64);
+        // Busy queue: the completion lands after the wait began.
+        let baseline = *rx.borrow_and_update();
+        let signal = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tx.send_modify(|c| *c += 1);
+            tx
+        });
+        assert!(
+            await_resync_completion(&mut rx, baseline, std::time::Duration::from_secs(5)).await,
+            "a late completion is still claimed"
+        );
+        let tx = signal.await.unwrap();
+
+        // Fast queue: the completion already landed before the wait started —
+        // the pre-enqueue baseline catches it.
+        let baseline = *rx.borrow_and_update();
+        tx.send_modify(|c| *c += 1);
+        assert!(
+            await_resync_completion(&mut rx, baseline, std::time::Duration::from_secs(5)).await,
+            "a completion racing ahead of the wait is never missed"
+        );
+
+        // Stuck queue: no signal within the bound — the caller warns instead
+        // of logging success off the enqueue ack.
+        let baseline = *rx.borrow_and_update();
+        assert!(
+            !await_resync_completion(&mut rx, baseline, std::time::Duration::from_millis(50))
+                .await,
+            "a stuck queue must not be reported as resynced"
+        );
     }
 
     // One packed word: every reader sees (port, runner_environments) from the

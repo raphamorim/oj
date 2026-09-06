@@ -179,3 +179,45 @@ test("serve mode sends ojInit too, before any RPC reply", async () => {
     fx.cleanup();
   }
 });
+
+// The resync ack is 202-style: /__oj_invalidate {"resync":true} answers 204 on
+// ENQUEUE, and a separate control-plane { ojResyncDone } push tells the Rust
+// side when the resync actually EXECUTED (the invalidate queue drained to it).
+// Duplicates coalesce into the pending resync — retries never stack
+// full-reloads — and the done push still arrives.
+test("a resync is ACKed on enqueue and signals ojResyncDone when it executes", async () => {
+  const fx = tmpProject({ prefix: "oj-resync-done-" });
+  fx.write(
+    "oj.plugins.mjs",
+    `export default [{
+       name: "with-middleware",
+       configureServer(server) {
+         server.middlewares.use((req, res, next) => next());
+       },
+     }];\n`,
+  );
+  const host = rpcSidecar("plugin-host.mjs", {
+    args: [path.join(fx.root, "oj.plugins.mjs"), JSON.stringify({ root: fx.root })],
+    env: { OJ_CACHE_ROOT: fx.root },
+    cwd: fx.root,
+  });
+  try {
+    const pushed = await host.serveInfo();
+    assert.equal(typeof pushed.middlewarePort, "number");
+    const post = () =>
+      fetch(`http://127.0.0.1:${pushed.middlewarePort}/__oj_invalidate`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: '{"resync":true}',
+      });
+    // Two enqueues back to back: the second coalesces into the pending one.
+    const [a, b] = await Promise.all([post(), post()]);
+    assert.equal(a.status, 204, "the ack answers on enqueue");
+    assert.equal(b.status, 204, "a coalesced duplicate is ACKed too");
+    const frame = await host.nextFrame(10_000);
+    assert.deepEqual(frame, { ojResyncDone: true }, "the completion push follows the execution");
+  } finally {
+    host.close();
+    fx.cleanup();
+  }
+});

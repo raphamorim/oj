@@ -1148,6 +1148,13 @@ pub struct PluginHost {
     init_failed: tokio::sync::watch::Sender<bool>,
     /// The env knob named when the init wait elapses (matches `init_wait`).
     init_knob: &'static str,
+    /// Count of `{ ojResyncDone }` pushes: the host sends one when an enqueued
+    /// worker-environment resync actually EXECUTES (its /__oj_invalidate ack
+    /// only means "enqueued"). A counter, not a flag: a waiter compares
+    /// against the value it saw before enqueueing, so a completion landing
+    /// before the wait starts is never missed, and one push may answer
+    /// several coalesced enqueues.
+    resync_done: tokio::sync::watch::Sender<u64>,
     /// Last "still initializing" progress line, so concurrent init-gated calls
     /// print one line per interval, not one each.
     init_progress: Mutex<std::time::Instant>,
@@ -1379,6 +1386,7 @@ impl PluginHost {
             lazy,
             init_failed: tokio::sync::watch::channel(false).0,
             init_knob,
+            resync_done: tokio::sync::watch::channel(0).0,
             init_progress: Mutex::new(std::time::Instant::now()),
         });
 
@@ -1424,6 +1432,12 @@ impl PluginHost {
                     // init deadline blamed on initialization.
                     let _ = reader_ref.initialized.send_replace(true);
                     let _ = reader_ref.init_failed.send_replace(false);
+                    continue;
+                }
+                if msg.get("ojResyncDone").is_some() {
+                    // An enqueued worker-environment resync actually ran (the
+                    // invalidate queue drained to it); see resync_done.
+                    reader_ref.resync_done.send_modify(|c| *c += 1);
                     continue;
                 }
                 if let Some(ev) = msg.get("ojServer") {
@@ -1644,6 +1658,15 @@ impl PluginHost {
     /// healthy slow boot would trip) — never a per-call gate.
     pub fn init_failure_updates(&self) -> tokio::sync::watch::Receiver<bool> {
         self.init_failed.subscribe()
+    }
+
+    /// Live updates of the resync-executed counter (`{ ojResyncDone }` pushes).
+    /// A caller enqueueing a resync snapshots the value FIRST, then waits for
+    /// it to move past that baseline: the /__oj_invalidate ack only means
+    /// "enqueued", and claiming "resynced" off the ack would log success over
+    /// a queue that never drained.
+    pub fn resync_done_updates(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.resync_done.subscribe()
     }
 
     /// Resolves when the host process has exited (its stdout closed). Lets a
