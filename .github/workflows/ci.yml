@@ -146,6 +146,9 @@ jobs:
       - name: start dev for @cloudflare/vite-plugin serves from the worker; an edit yields a fresh document
         if: matrix.mode == 'unbundled'
         run: node e2e/start-cloudflare-dev.mjs
+      - name: server.proxy covers the worker's outbound fetch (one proxy in the middleware stack), function rewrite applied
+        if: matrix.mode == 'unbundled'
+        run: node e2e/proxy-worker-fetch.mjs
       - name: transformIndexHtml ctx (path, filename, server, bundle, chunk) and hook errors fail
         if: matrix.mode == 'unbundled'
         run: node e2e/plugin-html-ctx.mjs
