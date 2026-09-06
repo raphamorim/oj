@@ -137,6 +137,11 @@ const OJ = _ojTTY ? "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m" : 
 let _bundledDevWarned = false;
 function coerceBundledDevOff(cfg) {
   if (!cfg || typeof cfg !== "object") return false;
+  // bundledDev is Vite's serve-only bundled-client mode; only serve derives
+  // `environments.*.isBundled` from it. During a build Vite sets `isBundled`
+  // true on every environment regardless (the normal production state), so
+  // clearing it there is wrong and would emit a dev-worded warning on a build.
+  if (command !== "serve") return false;
   let flipped = false;
   if (cfg.experimental && cfg.experimental.bundledDev) {
     cfg.experimental.bundledDev = false;
