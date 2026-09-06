@@ -838,3 +838,126 @@ test("detection true with nothing built prints the none-came-up warning, whateve
     fx.cleanup();
   }
 });
+
+// The `{resync:true}` catch-up is ACKed on ENQUEUE and coalesced: the
+// invalidate queue is serialized, so a resync stuck behind a slow hotUpdate
+// used to hold the caller's POST past its client timeout — the retry then
+// stacked a SECOND full-reload and the caller logged a false "edits may be
+// stale" warning. Now the ACK returns the moment the resync is queued (fast
+// even behind a slow queue), and a pending resync absorbs duplicates: however
+// many retries land, exactly one full-reload reaches each environment.
+test("resync acks on enqueue and duplicates coalesce behind a slow invalidate queue", async () => {
+  const fx = tmpProject({ prefix: "oj-cf-resync-" });
+  fx.write("src/live.ts", "export const live = 1;\n");
+  fx.pkg("vite", "index.mjs", {
+    "index.mjs": `
+      function node(id, url, file, extra) {
+        return { id, url, file, type: "js", importers: new Set(), acceptedHmrDeps: new Set(),
+                 acceptedHmrExports: null, isSelfAccepting: false, importedBindings: null,
+                 invalidations: [], ...extra };
+      }
+      export function resolveConfig(inline) {
+        const root = inline.root;
+        const entry = node("\\0virtual:worker-entry", "virtual:worker-entry", null, { isSelfAccepting: true });
+        const live = node(root + "/src/live.ts", "/src/live.ts", root + "/src/live.ts");
+        live.importers.add(entry);
+        const byFile = new Map([[live.file, new Set([live])]]);
+        return {
+          root,
+          logger: { info() {}, warn() {}, warnOnce() {}, error() {} },
+          environments: {
+            worker: {
+              dev: {
+                createEnvironment: (name) => {
+                  const env = {
+                    name, __sends: [],
+                    // A slow hotUpdate hook: one change invalidation occupies
+                    // the serialized queue for ~700 ms.
+                    plugins: [{ name: "slow", hotUpdate: () => new Promise((r) => setTimeout(r, 700)) }],
+                    moduleGraph: {
+                      getModulesByFile(f) { return byFile.get(f); },
+                      onFileChange() {},
+                      invalidateAll() { env.__sends.push({ type: "__invalidateAll" }); },
+                      invalidateModule() {},
+                    },
+                    hot: { send: (p) => env.__sends.push(p), on() {}, handleInvoke() {} },
+                    init() {},
+                  };
+                  return env;
+                },
+              },
+            },
+          },
+        };
+      }
+      export class DevEnvironment {}
+    `,
+  });
+  fx.write(
+    "oj.plugins.mjs",
+    `export default [{
+       name: "vite-plugin-cloudflare:dev",
+       config: () => ({ environments: { worker: { dev: { createEnvironment: () => ({}) } } } }),
+       configureServer(server) {
+         server.middlewares.use("/__probe", (req, res) => {
+           res.setHeader("content-type", "application/json");
+           res.end(JSON.stringify({ workerSends: server.environments.worker.__sends }));
+         });
+       },
+     }];\n`,
+  );
+  const host = rpcSidecar("plugin-host.mjs", {
+    args: [
+      path.join(fx.root, "oj.plugins.mjs"),
+      JSON.stringify({
+        config: { root: fx.root },
+        env: { command: "serve", mode: "development" },
+        environment: { name: "client" },
+      }),
+    ],
+    env: { OJ_CACHE_ROOT: fx.root },
+    cwd: fx.root,
+  });
+  try {
+    const info = JSON.parse((await host.send({ id: 1, hook: "getServeInfo" })).result);
+    const port = Number(info.middlewarePort);
+    assert.ok(port > 0, "middleware server is up");
+    const post = (body) =>
+      fetch(`http://127.0.0.1:${port}/__oj_invalidate`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+    // Occupy the queue with a slow change invalidation (answered on drain).
+    const slow = post({ changes: [{ path: path.join(fx.root, "src", "live.ts"), type: "update" }] });
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Two resyncs behind it: both ACK fast (enqueue, not drain).
+    const t0 = Date.now();
+    const [r1, r2] = await Promise.all([post({ resync: true }), post({ resync: true })]);
+    assert.equal(r1.status, 204);
+    assert.equal(r2.status, 204);
+    assert.ok(Date.now() - t0 < 500, `resync ACKs on enqueue, took ${Date.now() - t0}ms behind a 700ms queue`);
+
+    assert.equal((await slow).status, 204, "the change invalidation still answers on completion");
+    await new Promise((r) => setTimeout(r, 300));
+    const seen = await (await fetch(`http://127.0.0.1:${port}/__probe`)).json();
+    const reloads = seen.workerSends.filter((p) => p.type === "full-reload");
+    assert.equal(reloads.length, 1, `duplicates coalesce into ONE full-reload: ${JSON.stringify(seen.workerSends)}`);
+    assert.equal(
+      seen.workerSends.filter((p) => p.type === "__invalidateAll").length,
+      1,
+      "and one whole-graph invalidation",
+    );
+
+    // A resync AFTER the pending one ran is a fresh one, not absorbed forever.
+    await post({ resync: true });
+    await new Promise((r) => setTimeout(r, 200));
+    const again = await (await fetch(`http://127.0.0.1:${port}/__probe`)).json();
+    assert.equal(again.workerSends.filter((p) => p.type === "full-reload").length, 2);
+  } finally {
+    host.close();
+    fx.cleanup();
+  }
+});
