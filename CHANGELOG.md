@@ -5,6 +5,11 @@ All notable changes to oj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- `server.proxy` is now a single proxy hosted inside the plugin host's connect middleware stack (where Vite keeps it), so it covers BOTH request origins with one implementation: the browser AND a worker's OUTBOUND fetch. Under `@cloudflare/vite-plugin` an SSR `fetch("/api/…")` originates inside workerd and the plugin routes the worker's outbound fetch back through `server.middlewares`; oj previously proxied only on its own inbound listener, so that worker-originated request had no proxy, fell through to the Cloudflare catch-all, and was dispatched back into the worker — the SSR stream never closed and the route wedged. The proxy is registered after the `configureServer` pre-hooks and before the post-hooks, exactly as Vite orders it, so it precedes a plugin's catch-all. It is a faithful `viteProxyMiddleware` (context match, `bypass`, a FUNCTION `rewrite`, `configure`), forwarding through the app's `http-proxy` when resolvable and otherwise a streaming node http/https pipe (SSE, long-poll and uploads stream through; `changeOrigin` and `secure:false` honored). The Rust inbound proxy now DELEGATES matched prefixes to this one proxy whenever a plugin host is running, so a browser-originated proxied request also gets the app's real config — including a function `rewrite` the JSON config bridge used to drop (an unstripped path formerly reached the target). WebSocket upgrades stay on the inbound proxy, and a plain `oj dev` app with `server.proxy` but no plugin host keeps the built-in proxy (the `{from,to}` rewrite form) as the fallback.
+
 ## [0.1.19] - 2026-09-06
 
 ### Changed

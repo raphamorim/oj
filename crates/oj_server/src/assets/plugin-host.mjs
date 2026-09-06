@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Raphael Amorim
 
 import http from "node:http";
+import https from "node:https";
 import { createReadStream, existsSync, fstatSync, openSync, readFileSync, statSync, unlinkSync, write as fsWrite, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { readFile, stat as fsStat } from "node:fs/promises";
@@ -1733,6 +1734,148 @@ function stubEnvironment(name, server) {
   };
 }
 
+// Vite's `doesProxyContextMatchUrl` (dist server/middlewares/proxy): a `^`
+// context is a regex tested against the request url, any other is a prefix.
+function doesProxyContextMatchUrl(context, url) {
+  return (context[0] === "^" && new RegExp(context).test(url)) || url.startsWith(context);
+}
+
+// The single `server.proxy`, hosted in the connect stack the way Vite hosts it
+// inside `server.middlewares`. This covers BOTH request origins with one proxy:
+// the browser (Rust delegates matched prefixes here) and the worker's OUTBOUND
+// fetch, which @cloudflare/vite-plugin routes back through these middlewares.
+// It is a faithful `viteProxyMiddleware` (dist 19224): context match, `bypass`,
+// a FUNCTION `rewrite` (dropped by the config bridge, but intact here in the
+// app's real config), then forward. Vite forwards through its bundled
+// http-proxy; oj prefers the app's http-proxy when it happens to be resolvable
+// (giving streaming/ws/changeOrigin/secure/header handling and `configure` for
+// free) and otherwise pipes through a faithful node http/https request — which
+// preserves streaming bodies (SSE, long-poll, uploads), `changeOrigin` and
+// `secure:false`. WebSocket upgrades are NOT handled here: the Rust inbound
+// proxy owns them (its listener receives the browser upgrade), and the worker's
+// outbound fetch is never a ws upgrade, so nothing regresses.
+async function createProxyMiddleware(proxyConfig, appRoot) {
+  const contexts = [];
+  for (const context of Object.keys(proxyConfig)) {
+    let opts = proxyConfig[context];
+    if (!opts) continue;
+    // Vite: a string is shorthand for { target, changeOrigin: true }.
+    if (typeof opts === "string") opts = { target: opts, changeOrigin: true };
+    if (!opts || typeof opts.target !== "string") continue;
+    contexts.push([context, opts]);
+  }
+  if (contexts.length === 0) return null;
+
+  // Prefer the app's http-proxy (what Vite uses). It is usually bundled into
+  // Vite and not resolvable on its own, so the node pipe below is the common
+  // path; when http-proxy IS resolvable, use it and honour `configure`.
+  let httpProxyLib = null;
+  try {
+    const req = createRequire(appRoot + "/package.json");
+    for (const name of ["http-proxy", "http-proxy-3"]) {
+      try {
+        const mod = await import(pathToFileURL(req.resolve(name)).href);
+        httpProxyLib = mod.default ?? mod;
+        break;
+      } catch {}
+    }
+  } catch {}
+
+  const proxies = new Map();
+  if (httpProxyLib && typeof httpProxyLib.createProxyServer === "function") {
+    for (const [context, opts] of contexts) {
+      const proxy = httpProxyLib.createProxyServer(opts);
+      if (typeof opts.configure === "function") {
+        try { opts.configure(proxy, opts); } catch (e) {
+          process.stderr.write(`${OJ} plugin host: server.proxy["${context}"].configure threw: ${(e && e.message) || e}\n`);
+        }
+      }
+      proxy.on("error", (err, _req, res) => {
+        if (res && !res.headersSent && typeof res.writeHead === "function") {
+          try { res.writeHead(502, { "content-type": "text/plain" }); } catch {}
+        }
+        if (res && typeof res.end === "function") res.end(`oj proxy error: ${(err && err.message) || err}`);
+      });
+      proxies.set(context, proxy);
+    }
+    process.stderr.write(`${OJ} plugin host: server.proxy active (${contexts.length} route(s), via http-proxy)\n`);
+  } else {
+    process.stderr.write(`${OJ} plugin host: server.proxy active (${contexts.length} route(s))\n`);
+  }
+
+  // Faithful node http/https pipe (used when http-proxy is not resolvable).
+  const pipeForward = (opts, req, res) => {
+    let target;
+    try {
+      target = new URL(opts.target);
+    } catch {
+      res.statusCode = 502;
+      res.end(`oj proxy: invalid target ${opts.target}`);
+      return;
+    }
+    const isHttps = target.protocol === "https:";
+    const lib = isHttps ? https : http;
+    const headers = { ...req.headers };
+    // http-proxy's changeOrigin: send the target's host, not the dev server's
+    // (otherwise the browser's Host is forwarded unchanged, as http-proxy does).
+    if (opts.changeOrigin) headers.host = target.host;
+    // Prepend a target base path (http-proxy prependPath) to the (already
+    // rewritten) request url.
+    const base = target.pathname && target.pathname !== "/" ? target.pathname.replace(/\/$/, "") : "";
+    const options = {
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port || (isHttps ? 443 : 80),
+      method: req.method,
+      path: base + req.url,
+      headers,
+    };
+    // http-proxy's secure:false accepts self-signed dev certificates.
+    if (isHttps && opts.secure === false) options.rejectUnauthorized = false;
+    const upstream = lib.request(options, (r) => {
+      res.writeHead(r.statusCode || 502, r.headers);
+      r.pipe(res);
+    });
+    upstream.on("error", (e) => {
+      if (!res.headersSent) {
+        try { res.writeHead(502, { "content-type": "text/plain; charset=utf-8" }); } catch {}
+      }
+      res.end(`oj proxy: ${opts.target} unreachable: ${e.message}`);
+    });
+    // Stream the request body through (uploads are never buffered whole).
+    req.pipe(upstream);
+  };
+
+  return async function ojProxyMiddleware(req, res, next) {
+    const url = req.url;
+    for (const [context, opts] of contexts) {
+      if (!doesProxyContextMatchUrl(context, url)) continue;
+      if (typeof opts.bypass === "function") {
+        try {
+          const bypassResult = await opts.bypass(req, res, opts);
+          if (typeof bypassResult === "string") {
+            req.url = bypassResult;
+            if (res.writableEnded) return;
+            return next();
+          }
+          if (bypassResult === false) {
+            res.statusCode = 404;
+            return res.end();
+          }
+        } catch (e) {
+          return next(e);
+        }
+      }
+      if (typeof opts.rewrite === "function") req.url = opts.rewrite(req.url);
+      const proxy = proxies.get(context);
+      if (proxy) proxy.web(req, res, {});
+      else pipeForward(opts, req, res);
+      return;
+    }
+    next();
+  };
+}
+
 async function setupConfigureServer() {
   const stack = [];
   function runStack(req, res, done) {
@@ -1905,6 +2048,23 @@ async function setupConfigureServer() {
       continue;
     }
     if (typeof r === "function") post.push(r);
+  }
+  // Register `server.proxy` here — after the configureServer PRE hooks, before
+  // the POST hooks — exactly as Vite orders it (dist: proxyMiddleware is added
+  // right before postHooks run). This places the single proxy BEFORE a plugin's
+  // catch-all (the Cloudflare worker dispatch, registered in a returned POST
+  // hook), so a matched request (browser-delegated or the worker's own outbound
+  // fetch) is proxied instead of falling through into the worker. The app's
+  // real config is read straight from the loaded vite config, so a FUNCTION
+  // rewrite / configure / bypass survive (the JSON config bridge drops them).
+  const proxyConfig = userViteConfig?.server?.proxy ?? resolvedConfig?.server?.proxy;
+  if (proxyConfig && typeof proxyConfig === "object") {
+    try {
+      const proxyMw = await createProxyMiddleware(proxyConfig, initial.config?.root ?? process.cwd());
+      if (proxyMw) middlewares.use(proxyMw);
+    } catch (e) {
+      process.stderr.write(`${OJ} plugin host: failed to set up server.proxy: ${(e && e.stack) || e}\n`);
+    }
   }
   for (const fn of post) {
     try {
