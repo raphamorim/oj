@@ -537,16 +537,33 @@ fn extract_vite_values_with(
         })
         .unwrap_or_default();
     let _ = CONFIG_DEPS.set(deps.clone());
-    store.store(
-        &vite,
-        command,
-        mode_key,
-        &deps,
-        &String::from_utf8_lossy(&raw),
-        &stderr,
-    );
+    if extraction_deps_truncated(&json) {
+        // The read recorder hit its cap: `__deps` is an incomplete stamp of
+        // the evaluation's inputs, so a cached entry could survive an edit to
+        // an unrecorded file. Serve the result, never cache it.
+        eprintln!(
+            "oj: extracting {}: the config evaluation read more config-shaped files than the recorder tracks; result not cached",
+            vite.display()
+        );
+    } else {
+        store.store(
+            &vite,
+            command,
+            mode_key,
+            &deps,
+            &String::from_utf8_lossy(&raw),
+            &stderr,
+        );
+    }
     crate::boot_phase("vite-extract cache miss (subprocess ran)");
     Some(parse_vite_values(&json))
+}
+
+/// Whether the extractor's read recorder overflowed (`__depsTruncated`): the
+/// dep list is then honest-but-incomplete and the extraction must not be
+/// cached under it.
+fn extraction_deps_truncated(json: &serde_json::Value) -> bool {
+    json.get("__depsTruncated").and_then(|v| v.as_bool()) == Some(true)
 }
 
 /// What the config extractor wrote to stderr (Vite's own notices and oj's
@@ -1139,8 +1156,10 @@ pub struct PluginHost {
     /// so it never fails a later call early (see `call`).
     lazy: bool,
     /// Wedge EVIDENCE, not a call gate: flips true when a pre-init call's
-    /// full init window elapsed with init still pending, and back false the
-    /// moment init progresses (any `initialized` flip). Calls never consult
+    /// full init window elapsed with init still pending, or when the stall
+    /// monitor saw a full RPC-scale window pass with no init milestone (see
+    /// `init_progress_seen`), and back false the moment init progresses (an
+    /// `initialized` flip or a milestone). Calls never consult
     /// it — time alone must not fail a call that a landing init would have
     /// served — but waiters gating separate work on the host's health (the
     /// Start prewarm hold) select on it, alongside `host_gone`, instead of
@@ -1155,6 +1174,19 @@ pub struct PluginHost {
     /// before the wait starts is never missed, and one push may answer
     /// several coalesced enqueues.
     resync_done: tokio::sync::watch::Sender<u64>,
+    /// Count of `{ ojInitProgress }` pushes: the host reports real milestones
+    /// through its top-level init (script start, plugins loaded, each
+    /// config-phase hook). The stall monitor (see `spawn_with_policy`)
+    /// measures its wedge window from the LAST milestone, so a healthy slow
+    /// boot that keeps progressing is never called wedged, while a host gone
+    /// silent for a full RPC-scale window pre-init is — evidence a caller's
+    /// own window cannot provide on the boot host, whose per-call windows
+    /// equal the whole init deadline.
+    init_progress_seen: tokio::sync::watch::Sender<u64>,
+    /// The per-call RPC timeout, snapshotted at spawn (`plugin_rpc_timeout`;
+    /// the env knob cannot change mid-process). Tests override it to exercise
+    /// the transport belts without racing the env other tests read.
+    rpc_wait: std::time::Duration,
     /// Last "still initializing" progress line, so concurrent init-gated calls
     /// print one line per interval, not one each.
     init_progress: Mutex<std::time::Instant>,
@@ -1166,7 +1198,7 @@ async fn handle_ctx_rpc(
     args: &[serde_json::Value],
     resolver: &OjResolver,
     root: &Path,
-    stdin: &tokio::sync::Mutex<tokio::process::ChildStdin>,
+    host: &PluginHost,
 ) {
     let reply = match method {
         "resolve" => {
@@ -1223,8 +1255,16 @@ async fn handle_ctx_rpc(
             serde_json::json!({ "rpcReply": rpc, "error": format!("unknown ctx method: {other}") })
         }
     };
-    let mut stdin = stdin.lock().await;
-    let _ = stdin.write_all(format!("{reply}\n").as_bytes()).await;
+    // Bounded like every other protocol write (see `write_bounded_at`): this
+    // runs ON the reader task, and an unbounded write_all into a pipe the
+    // host stopped draining would wedge reply processing forever while
+    // holding the stdin mutex.
+    let _ = host
+        .write_bounded(
+            &format!("a ctx-RPC ({method}) reply"),
+            format!("{reply}\n").as_bytes(),
+        )
+        .await;
 }
 
 /// How long one plugin hook may run before oj gives up on it. Vite has no
@@ -1295,6 +1335,18 @@ fn init_wait_policy(lazy: bool) -> (std::time::Duration, &'static str) {
     }
 }
 
+/// Per-spawn timeout overrides, for tests that must exercise the init-wait,
+/// stall-monitor and transport-belt semantics without racing the env-var
+/// knobs other tests read. Production spawns pass the default (env-derived).
+#[derive(Default)]
+struct SpawnTimeouts {
+    init_wait: Option<std::time::Duration>,
+    /// The stall monitor's no-progress window (defaults to the RPC timeout).
+    stall: Option<std::time::Duration>,
+    /// The per-call RPC timeout (`PluginHost::rpc_wait`).
+    rpc: Option<std::time::Duration>,
+}
+
 impl PluginHost {
     /// Spawn a boot-time host: calls wait out the full init deadline
     /// (`OJ_PLUGIN_INIT_TIMEOUT`), because boot correctness depends on its
@@ -1304,7 +1356,8 @@ impl PluginHost {
         plugins_file: &Path,
         config_json: &str,
     ) -> anyhow::Result<std::sync::Arc<PluginHost>> {
-        Self::spawn_with_policy(root, plugins_file, config_json, false, None).await
+        Self::spawn_with_policy(root, plugins_file, config_json, false, SpawnTimeouts::default())
+            .await
     }
 
     /// Spawn a lazily created host (the SSR environment host, created on the
@@ -1316,19 +1369,42 @@ impl PluginHost {
         plugins_file: &Path,
         config_json: &str,
     ) -> anyhow::Result<std::sync::Arc<PluginHost>> {
-        Self::spawn_with_policy(root, plugins_file, config_json, true, None).await
+        Self::spawn_with_policy(root, plugins_file, config_json, true, SpawnTimeouts::default())
+            .await
     }
 
     /// Test-only lazy spawn with an explicit init wait, so the latch semantics
     /// can be exercised without racing the env-var knobs other tests read.
     #[cfg(test)]
-    async fn spawn_lazy_with_wait(
+    pub(crate) async fn spawn_lazy_with_wait(
         root: &Path,
         plugins_file: &Path,
         config_json: &str,
         init_wait: std::time::Duration,
     ) -> anyhow::Result<std::sync::Arc<PluginHost>> {
-        Self::spawn_with_policy(root, plugins_file, config_json, true, Some(init_wait)).await
+        Self::spawn_with_policy(
+            root,
+            plugins_file,
+            config_json,
+            true,
+            SpawnTimeouts {
+                init_wait: Some(init_wait),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Test-only spawn with every timeout explicit (see `SpawnTimeouts`).
+    #[cfg(test)]
+    async fn spawn_with_timeouts(
+        root: &Path,
+        plugins_file: &Path,
+        config_json: &str,
+        lazy: bool,
+        timeouts: SpawnTimeouts,
+    ) -> anyhow::Result<std::sync::Arc<PluginHost>> {
+        Self::spawn_with_policy(root, plugins_file, config_json, lazy, timeouts).await
     }
 
     async fn spawn_with_policy(
@@ -1336,7 +1412,7 @@ impl PluginHost {
         plugins_file: &Path,
         config_json: &str,
         lazy: bool,
-        init_wait_override: Option<std::time::Duration>,
+        timeouts: SpawnTimeouts,
     ) -> anyhow::Result<std::sync::Arc<PluginHost>> {
         let script = oj_cache::cache_root(root).join("plugin-host.mjs");
         if let Some(parent) = script.parent() {
@@ -1368,9 +1444,11 @@ impl PluginHost {
         let stdout = child.stdout.take().expect("piped stdout");
 
         let (mut init_wait, init_knob) = init_wait_policy(lazy);
-        if let Some(w) = init_wait_override {
+        if let Some(w) = timeouts.init_wait {
             init_wait = w;
         }
+        let rpc_wait = timeouts.rpc.unwrap_or_else(plugin_rpc_timeout);
+        let stall_wait = timeouts.stall.unwrap_or(rpc_wait);
         let host = std::sync::Arc::new(PluginHost {
             stdin: tokio::sync::Mutex::new(stdin),
             pending: Mutex::new(HashMap::new()),
@@ -1387,6 +1465,8 @@ impl PluginHost {
             init_failed: tokio::sync::watch::channel(false).0,
             init_knob,
             resync_done: tokio::sync::watch::channel(0).0,
+            init_progress_seen: tokio::sync::watch::channel(0).0,
+            rpc_wait,
             init_progress: Mutex::new(std::time::Instant::now()),
         });
 
@@ -1407,8 +1487,7 @@ impl PluginHost {
                 if let Some(rpc) = msg["rpc"].as_u64() {
                     let method = msg["method"].as_str().unwrap_or("").to_string();
                     let args = msg["args"].as_array().cloned().unwrap_or_default();
-                    handle_ctx_rpc(rpc, &method, &args, &resolver, &root_buf, &reader_ref.stdin)
-                        .await;
+                    handle_ctx_rpc(rpc, &method, &args, &resolver, &root_buf, &reader_ref).await;
                     continue;
                 }
                 if let Some(info) = msg.get("ojServeInfo") {
@@ -1419,9 +1498,11 @@ impl PluginHost {
                     let _ = reader_ref.init_failed.send_replace(false);
                     // ACK so the host stops re-pushing (it re-sends until
                     // acknowledged, healing a copy a plugin's unterminated
-                    // partial write may have spliced).
-                    let mut stdin = reader_ref.stdin.lock().await;
-                    let _ = stdin.write_all(b"{\"ojServeInfoAck\":true}\n").await;
+                    // partial write may have spliced). Bounded like every
+                    // protocol write: this is the reader task.
+                    let _ = reader_ref
+                        .write_bounded("the ojServeInfo ACK", b"{\"ojServeInfoAck\":true}\n")
+                        .await;
                     continue;
                 }
                 if msg.get("ojInit").is_some() {
@@ -1438,6 +1519,14 @@ impl PluginHost {
                     // An enqueued worker-environment resync actually ran (the
                     // invalidate queue drained to it); see resync_done.
                     reader_ref.resync_done.send_modify(|c| *c += 1);
+                    continue;
+                }
+                if msg.get("ojInitProgress").is_some() {
+                    // A real top-level init milestone: the boot is
+                    // progressing, so standing wedge evidence is stale and
+                    // the stall monitor re-arms (see init_progress_seen).
+                    reader_ref.init_progress_seen.send_modify(|c| *c += 1);
+                    let _ = reader_ref.init_failed.send_replace(false);
                     continue;
                 }
                 if let Some(ev) = msg.get("ojServer") {
@@ -1503,6 +1592,61 @@ impl PluginHost {
                 let _ = tx.send(Err("plugin host exited".into()));
             }
         });
+
+        // The init STALL MONITOR: wedge evidence independent of any caller's
+        // window. The boot host's per-call init windows equal the whole init
+        // deadline, so no call ever burns an RPC-scale window on it — without
+        // this, a wedged-but-alive host held evidence-gated waiters (the
+        // Start prewarm hold) for the full deadline. The host reports real
+        // milestones (`{ ojInitProgress }`) through its top-level init; a
+        // full RPC-scale window with NO milestone and init still pending
+        // flips `init_failed`, and any progress — a milestone, or init
+        // itself — clears it. A healthy slow boot that keeps hitting
+        // milestones therefore holds waiters however long it takes, while a
+        // host gone silent releases them at the ~RPC scale. Evidence only:
+        // calls never consult it (see `call`).
+        let monitor_ref = std::sync::Arc::clone(&host);
+        tokio::spawn(async move {
+            let mut init_rx = monitor_ref.initialized.subscribe();
+            let mut gone_rx = monitor_ref.host_gone.subscribe();
+            let mut prog_rx = monitor_ref.init_progress_seen.subscribe();
+            loop {
+                if *init_rx.borrow_and_update() || *gone_rx.borrow_and_update() {
+                    return;
+                }
+                let _ = prog_rx.borrow_and_update();
+                let deadline = tokio::time::Instant::now() + stall_wait;
+                let mut stalled = false;
+                tokio::select! {
+                    biased;
+                    changed = init_rx.changed() => { if changed.is_err() { return; } }
+                    changed = gone_rx.changed() => { if changed.is_err() { return; } }
+                    changed = prog_rx.changed() => { if changed.is_err() { return; } }
+                    _ = tokio::time::sleep_until(deadline) => { stalled = true; }
+                }
+                if stalled {
+                    let _ = monitor_ref.init_failed.send_replace(true);
+                    // The window is spent: re-arm only on new progress (or
+                    // exit on init/death) instead of spinning on a past
+                    // deadline. The reader clears the evidence on progress.
+                    loop {
+                        tokio::select! {
+                            biased;
+                            changed = init_rx.changed() => {
+                                if changed.is_err() || *init_rx.borrow() { return; }
+                            }
+                            changed = gone_rx.changed() => {
+                                if changed.is_err() || *gone_rx.borrow() { return; }
+                            }
+                            changed = prog_rx.changed() => {
+                                if changed.is_err() { return; }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
         Ok(host)
     }
 
@@ -1547,6 +1691,12 @@ impl PluginHost {
                 tokio::time::Instant::now(),
             );
             let mut host_gone_rx = self.host_gone.subscribe();
+            // A death flipped between the top-of-call check and this
+            // subscribe is already "seen" by the receiver (changed() would
+            // never fire for it): consult the value once after subscribing.
+            if *host_gone_rx.borrow_and_update() {
+                return Err("plugin host exited".into());
+            }
             let mut progress = tokio::time::interval_at(
                 tokio::time::Instant::now() + std::time::Duration::from_secs(30),
                 std::time::Duration::from_secs(30),
@@ -1593,38 +1743,98 @@ impl PluginHost {
             }
         }
         // Initialized: the host is reading stdin. Register the reply slot
-        // before writing (a fast reply must find it), then write — with the
-        // per-call timeout as a belt even here, so a pipe that somehow fills
-        // post-init degrades into a timed-out hook instead of a held mutex.
+        // before writing (a fast reply must find it), then write — bounded,
+        // so a pipe that somehow fills post-init degrades instead of holding
+        // the stdin mutex forever. Write and reply share ONE per-call
+        // deadline: a slow write must not add a second full window on top of
+        // the hook's budget. A write that times out leaves a dangling partial
+        // frame in the pipe, which would splice into the NEXT call's frame —
+        // but `write_bounded_at` declares the host gone (kill + host_gone) on
+        // that path, so no next call ever writes to this stream.
+        let deadline = tokio::time::Instant::now() + self.rpc_wait;
         let req_id = self.counter.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(req_id, tx);
         let request = serde_json::json!({ "id": req_id, "hook": hook, "args": args });
-        let write = async {
-            let mut stdin = self.stdin.lock().await;
-            stdin.write_all(format!("{request}\n").as_bytes()).await
-        };
-        match tokio::time::timeout(plugin_rpc_timeout(), write).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => {
-                self.pending.lock().unwrap().remove(&req_id);
-                return Err("plugin host died".into());
-            }
-            Err(_) => {
-                self.pending.lock().unwrap().remove(&req_id);
-                return Err(format!(
-                    "plugin host stdin blocked for {}s writing {hook} (the host stopped reading)",
-                    plugin_rpc_timeout().as_secs()
-                ));
-            }
+        if let Err(e) = self
+            .write_bounded_at(hook, format!("{request}\n").as_bytes(), deadline)
+            .await
+        {
+            self.pending.lock().unwrap().remove(&req_id);
+            return Err(e);
         }
-        // The ordinary per-call timeout applies unchanged.
-        match tokio::time::timeout(plugin_rpc_timeout(), rx).await {
+        // The ordinary per-call timeout applies unchanged (shared deadline).
+        match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(result)) => result,
             _ => Err(format!(
                 "plugin host timed out after {}s running {hook} (raise OJ_PLUGIN_TIMEOUT for slow plugins)",
-                plugin_rpc_timeout().as_secs()
+                self.rpc_wait.as_secs()
             )),
+        }
+    }
+
+    /// One protocol write to the host's stdin, bounded by `deadline`. A host
+    /// that stops draining its pipe for a full RPC-scale window is not
+    /// healthy — the readline interface is installed for the host's whole
+    /// life — so a timed-out (or failed) write declares the host GONE
+    /// (`declare_gone`: kill, host_gone, pending drained) instead of leaving
+    /// a half-written frame for the next call to splice into and a wedged
+    /// process everyone keeps talking to.
+    async fn write_bounded_at(
+        &self,
+        what: &str,
+        line: &[u8],
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
+        let write = async {
+            let mut stdin = self.stdin.lock().await;
+            stdin.write_all(line).await
+        };
+        match tokio::time::timeout_at(deadline, write).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                // The pipe is closed: the process is dead or dying (the
+                // reader's EOF usually reports it first; this is the belt).
+                self.declare_gone(&format!("stdin write failed writing {what}: {e}"));
+                Err("plugin host died".into())
+            }
+            Err(_) => {
+                let msg = format!(
+                    "plugin host stdin blocked for {}s writing {what} (the host stopped reading)",
+                    self.rpc_wait.as_secs()
+                );
+                self.declare_gone(&msg);
+                Err(msg)
+            }
+        }
+    }
+
+    /// [`write_bounded_at`] with a fresh full per-call window (the reader
+    /// task's ctx-RPC replies and control ACKs).
+    async fn write_bounded(&self, what: &str, line: &[u8]) -> Result<(), String> {
+        self.write_bounded_at(what, line, tokio::time::Instant::now() + self.rpc_wait)
+            .await
+    }
+
+    /// Treat the host as dead NOW (a wedged stdin, a broken pipe): kill the
+    /// process, flip `host_gone` so every future call fails fast, and fail
+    /// everything pending — the same terminal state the reader's EOF path
+    /// reaches, just initiated from the writing side.
+    fn declare_gone(&self, why: &str) {
+        eprintln!("oj: {why}; treating the plugin host as gone");
+        if let Some(mut child) = self.child.lock().unwrap().take() {
+            let _ = child.start_kill();
+        }
+        let _ = self.host_gone.send_replace(true);
+        let drained: Vec<_> = self
+            .pending
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, tx)| tx)
+            .collect();
+        for tx in drained {
+            let _ = tx.send(Err("plugin host exited".into()));
         }
     }
 
@@ -1632,6 +1842,12 @@ impl PluginHost {
     /// any RPC reply, whichever came first).
     pub fn is_initialized(&self) -> bool {
         *self.initialized.borrow()
+    }
+
+    /// Live updates of the initialized flag, for waiters keyed on the init
+    /// transition itself (the watcher's SSR catch-up replay).
+    pub fn initialized_updates(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.initialized.subscribe()
     }
 
     /// The shared init deadline, measured from the host's spawn (this host's
@@ -2579,6 +2795,214 @@ mod vite_values_tests {
             "concurrent windows, not serialized blocked writes: {elapsed:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The stall monitor is the REAL evidence flip site for the boot host: its
+    // per-call init windows equal the whole init deadline, so no call ever
+    // burns an RPC-scale window on it. A wedged host (milestones stop, init
+    // never lands) must flip the init-failure evidence at the stall window —
+    // with NO call in flight — and a merely slow host must flip it and then
+    // have init clear it, so evidence-gated waiters (the Start prewarm hold)
+    // release on wedges at the ~RPC scale while healthy boots re-hold.
+    #[tokio::test]
+    async fn boot_host_stall_monitor_flips_evidence_without_a_call_and_init_clears_it() {
+        let root = std::env::temp_dir().join(format!("oj-boot-stall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let config = serde_json::json!({
+            "config": { "root": root.display().to_string() },
+            "env": { "command": "serve", "mode": "development" },
+        })
+        .to_string();
+
+        // A host that wedges forever during its plugins-module evaluation:
+        // after the "start" milestone, no progress ever again.
+        let plugins = root.join("oj.plugins.mjs");
+        std::fs::write(
+            &plugins,
+            "setInterval(() => {}, 1000);\nawait new Promise(() => {});\nexport default [];\n",
+        )
+        .unwrap();
+        let host = match PluginHost::spawn_with_timeouts(
+            &root,
+            &plugins,
+            &config,
+            false,
+            SpawnTimeouts {
+                init_wait: Some(std::time::Duration::from_secs(120)),
+                stall: Some(std::time::Duration::from_secs(1)),
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Ok(h) => h,
+            Err(_) => return, // no node on this machine
+        };
+        let mut evidence = host.init_failure_updates();
+        let flipped = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            evidence.wait_for(|v| *v),
+        )
+        .await;
+        assert!(
+            flipped.is_ok() && flipped.unwrap().is_ok(),
+            "the stall monitor flips the evidence at the ~RPC scale, no call needed"
+        );
+        assert!(!host.is_initialized(), "the wedge never initialized");
+        host.shutdown();
+
+        // A merely SLOW boot: the stall flips the evidence (its one silent
+        // stage outlives the window), then init lands and clears it.
+        std::fs::write(
+            &plugins,
+            "await new Promise((r) => setTimeout(r, 2000));\nexport default [];\n",
+        )
+        .unwrap();
+        let host = match PluginHost::spawn_with_timeouts(
+            &root,
+            &plugins,
+            &config,
+            false,
+            SpawnTimeouts {
+                init_wait: Some(std::time::Duration::from_secs(120)),
+                stall: Some(std::time::Duration::from_millis(500)),
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let mut evidence = host.init_failure_updates();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            evidence.wait_for(|v| *v),
+        )
+        .await
+        .is_ok_and(|r| r.is_ok()));
+        // Init progressing clears the evidence (a milestone or init itself).
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                evidence.wait_for(|v| !*v),
+            )
+            .await
+            .is_ok_and(|r| r.is_ok()),
+            "init progress clears stall evidence"
+        );
+        let mut init = host.initialized_updates();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            init.wait_for(|v| *v),
+        )
+        .await
+        .is_ok_and(|r| r.is_ok()));
+        host.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The transport belt on post-init writes: a host that stops draining its
+    // stdin (a plugin hook blocking the event loop while the pipe is full) is
+    // declared GONE at the write timeout — killed, pending failed — so the
+    // dangling half-written frame can never splice into a next call, and
+    // later calls fail fast instead of each burning a window on a wedged
+    // process.
+    #[tokio::test]
+    async fn blocked_stdin_write_declares_the_host_gone_and_later_calls_fail_fast() {
+        let root = std::env::temp_dir().join(format!("oj-wedged-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // Healthy init; the load hook blocks the event loop forever on demand
+        // (Atomics.wait is allowed on Node's main thread), after which the
+        // host reads nothing more from stdin.
+        let plugins = root.join("oj.plugins.mjs");
+        std::fs::write(
+            &plugins,
+            r#"export default [{
+  name: "blocker",
+  load(id) {
+    if (id.includes("__block__")) {
+      const b = new Int32Array(new SharedArrayBuffer(4));
+      Atomics.wait(b, 0, 0);
+    }
+    return null;
+  },
+}];
+"#,
+        )
+        .unwrap();
+        let config = serde_json::json!({
+            "config": { "root": root.display().to_string() },
+            "env": { "command": "serve", "mode": "development" },
+        })
+        .to_string();
+        let host = match PluginHost::spawn_with_timeouts(
+            &root,
+            &plugins,
+            &config,
+            true,
+            SpawnTimeouts {
+                init_wait: Some(std::time::Duration::from_secs(30)),
+                rpc: Some(std::time::Duration::from_secs(2)),
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Ok(h) => h,
+            Err(_) => return, // no node on this machine
+        };
+        // Prove init landed (post-init transport is what is under test).
+        host.load("warmup").await.expect("healthy host answers");
+
+        // Wedge the host's event loop, give the call time to reach the hook,
+        // then fill the pipe: the write must time out, not block forever.
+        let wedger = std::sync::Arc::clone(&host);
+        let wedge_call = tokio::spawn(async move { wedger.load("__block__").await });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let big = "x".repeat(8 * 1024 * 1024);
+        let t0 = std::time::Instant::now();
+        let err = host
+            .load(&big)
+            .await
+            .expect_err("a write into a full pipe must fail at the belt");
+        assert!(
+            err.contains("stopped reading") || err.contains("exited") || err.contains("died"),
+            "the belt names the wedge: {err}"
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "bounded, not a blocked write: {:?}",
+            t0.elapsed()
+        );
+        // The host is gone now: the wedged call was failed (never left
+        // pending forever) and a fresh call fails fast without a window.
+        let wedged = tokio::time::timeout(std::time::Duration::from_secs(5), wedge_call)
+            .await
+            .expect("the in-flight call is failed when the host is declared gone")
+            .unwrap();
+        assert!(wedged.is_err());
+        let t1 = std::time::Instant::now();
+        let err = host.load("after").await.expect_err("host is gone");
+        assert!(err.contains("exited"), "{err}");
+        assert!(
+            t1.elapsed() < std::time::Duration::from_millis(500),
+            "fail-fast on a declared-gone host: {:?}",
+            t1.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn extraction_deps_truncated_gates_only_on_the_flag() {
+        let t = serde_json::json!({ "__ok": true, "__depsTruncated": true });
+        assert!(extraction_deps_truncated(&t));
+        assert!(!extraction_deps_truncated(&serde_json::json!({ "__ok": true })));
+        assert!(!extraction_deps_truncated(
+            &serde_json::json!({ "__depsTruncated": "yes" })
+        ));
     }
 
     #[test]

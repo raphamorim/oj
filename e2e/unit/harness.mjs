@@ -116,6 +116,8 @@ export function rpcSidecar(sidecarRel, { args = [], env, cwd, controlToken } = {
   let initPushed = false;
   let initResolve;
   const initArrived = new Promise((r) => (initResolve = r));
+  // The host's init milestones ({ ojInitProgress }), in arrival order.
+  const initStages = [];
   readline.createInterface({ input: child.stdout }).on("line", (line) => {
     if (!line.trim()) return;
     if (controlToken) {
@@ -133,6 +135,13 @@ export function rpcSidecar(sidecarRel, { args = [], env, cwd, controlToken } = {
       if (parsed && typeof parsed === "object" && "ojInit" in parsed) {
         initPushed = true;
         initResolve();
+        return;
+      }
+      // Init milestones ({ ojInitProgress }) are out-of-band control pushes
+      // like the two above (the Rust reader consumes them for its stall
+      // monitor): they must never be handed to a send() as its reply.
+      if (parsed && typeof parsed === "object" && "ojInitProgress" in parsed) {
+        initStages.push(parsed.ojInitProgress);
         return;
       }
     } catch {}
@@ -174,6 +183,7 @@ export function rpcSidecar(sidecarRel, { args = [], env, cwd, controlToken } = {
     // (`initPushed()`, false until it lands).
     initSignal: () => initArrived,
     initPushed: () => initPushed,
+    initStages: () => [...initStages],
     ackServeInfo() {
       child.stdin.write('{"ojServeInfoAck":true}\n');
     },
