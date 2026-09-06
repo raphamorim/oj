@@ -187,9 +187,19 @@ export async function assertHydrates(browser, url, opts = {}) {
     // "selector never appeared" timeout.
     const badModules = diag.badResponses.filter((r) => !whitelisted(r.url));
     if (badModules.length) {
-      failures.push(
-        "client module graph served >= 400:\n" + badModules.map((r) => `  ${r.status} ${r.url}`).join("\n"),
-      );
+      // Re-fetch each failing module to surface the server's error body (the
+      // browser-observed response only carried a status), so a 500 names its
+      // compile/resolve cause instead of a bare status line.
+      const lines = [];
+      for (const r of badModules) {
+        let detail = "";
+        try {
+          const again = await page.request.get(r.url);
+          detail = (await again.text()).replace(/\s+/g, " ").trim().slice(0, 400);
+        } catch {}
+        lines.push(`  ${r.status} ${r.url}${detail ? `\n    :: ${detail}` : ""}`);
+      }
+      failures.push("client module graph served >= 400:\n" + lines.join("\n"));
     }
 
     if (clientMarker && !mounted) {
