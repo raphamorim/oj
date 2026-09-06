@@ -1679,8 +1679,10 @@ struct PrewarmHold {
 /// Holds the Cloudflare prewarm until the plugin host's serve info is KNOWN,
 /// releasing early only on wedge EVIDENCE: (a) the info arriving decides
 /// (worker environments render → skip the prewarm; none → prewarm), (b) the
-/// host dying (`host_gone`) or a pre-init RPC having burned a full init
-/// window (the init-failure evidence watch) releases immediately, and (c) the
+/// host dying (`host_gone`) or the init-failure evidence watch — the host's
+/// stall monitor flipping it when a full RPC-scale window passed with no init
+/// milestone, or a pre-init RPC having burned its full init window —
+/// releases immediately, and (c) the
 /// host's OWN init deadline (spawn + `OJ_PLUGIN_INIT_TIMEOUT` — never a fresh
 /// full period measured from here) is the outer bound. A merely slow, healthy
 /// boot — elapsed time short of that deadline, with no evidence — keeps

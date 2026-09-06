@@ -70,16 +70,24 @@ const env = { command: "serve", mode: "development", ...(initial.env ?? {}) };
 env.isSsrBuild = env.isSsrBuild ?? (env.command === "build" && hostEnvName !== "client");
 env.isPreview = env.isPreview ?? false;
 
-// Vite's defaultNodeEnv follows the COMMAND, never the mode (config.ts: serve
-// resolves with defaultNodeEnv "development", build with "production"), so
-// `build --mode staging` still sees NODE_ENV=production/isProduction=true.
-// Pre-set before any plugin or config code evaluates, as resolveConfig sets it
-// before loadConfigFromFile — the synthesized-config path has no resolveConfig
-// of its own to do it. Mirrors vite-extract.mjs, the guarded unset before a
-// real vite.resolveConfig run included: the untouched pre-set must not make
-// Vite compute isNodeEnvSet=true (its VITE_USER_NODE_ENV handling stays live),
-// while a config-module NODE_ENV assignment survives.
-const defaultNodeEnv = env.command === "build" ? "production" : "development";
+// The twin NODE_ENV block below reads the command through this alias (the
+// host gets it from the ConfigEnv; the extractor from argv).
+const command = env.command;
+// Vite's defaultNodeEnv follows the COMMAND, never the mode (node.js
+// resolveConfig: serve resolves with defaultNodeEnv "development", build with
+// "production"), so `build --mode staging` still sees NODE_ENV=production and
+// isProduction=true. Pre-set before any plugin or config code evaluates, as
+// resolveConfig sets it before loadConfigFromFile (`if (!isNodeEnvSet)
+// process.env.NODE_ENV = defaultNodeEnv`). The untouched pre-set is UNSET
+// again right before a real vite.resolveConfig run (unsetOjNodeEnvForResolve):
+// it must not make Vite compute isNodeEnvSet=true — its VITE_USER_NODE_ENV
+// handling stays live — while a config module that ASSIGNED
+// process.env.NODE_ENV at module scope keeps its value through resolveConfig
+// (Vite snapshots isNodeEnvSet before the load); resolveConfig then re-sets
+// the identical default itself from the defaultNodeEnv oj passes. (Twin
+// copies: one in vite-extract.mjs, one in plugin-host.mjs — keep them
+// byte-identical.)
+const defaultNodeEnv = command === "build" ? "production" : "development";
 const nodeEnvWasSet = !!process.env.NODE_ENV;
 if (!nodeEnvWasSet) process.env.NODE_ENV = defaultNodeEnv;
 const unsetOjNodeEnvForResolve = () => {
@@ -134,6 +142,21 @@ const CONTROL_TOKEN = process.env.OJ_CONTROL_TOKEN || "";
 function ctl(obj) {
   process.stdout.write("\n" + CONTROL_TOKEN + JSON.stringify(obj) + "\n");
 }
+
+// Top-level init MILESTONES ({ ojInitProgress }), pushed at each real step of
+// the boot (script start, plugins loaded, every config-phase hook). Rust's
+// stall monitor measures its wedge window from the last one: a healthy slow
+// boot that keeps hitting milestones is never declared wedged however long
+// it takes, while a host gone silent for a full RPC-scale window pre-init
+// flips the wedge evidence (releasing e.g. the Start prewarm hold) — the
+// last stage's name doubles as the diagnosis of WHERE the boot hangs. Not
+// timer-driven on purpose: a heartbeat would keep ticking through a hang
+// that leaves the event loop alive and defeat the evidence.
+let ojInitDone = false;
+const initStage = (stage) => {
+  if (!ojInitDone) ctl({ ojInitProgress: stage });
+};
+initStage("start");
 
 let ssrBridgeDir = null;
 let ssrContainer = null;
@@ -648,6 +671,7 @@ try {
 } catch (e) {
   process.stderr.write(`${OJ} plugin host: failed to load ${pluginsPath}: ${(e && e.stack) || e}\n`);
 }
+initStage("plugins-loaded");
 
 let rpcCounter = 1;
 const rpcPending = new Map();
@@ -911,6 +935,7 @@ function ctxFor(p) {
 let pluginConfigDelta = {};
 async function runConfigHooks() {
   userResolvedViteConfig = await loadUserResolvedViteConfig();
+  initStage("user-config-resolved");
   let config = initial.config ?? {};
   if (userResolvedViteConfig) {
     // The user's resolved config is the base; oj's own values (root, base,
@@ -935,6 +960,7 @@ async function runConfigHooks() {
   }
   config.plugins = configPlugins;
   for (const { p, fn } of pluginsWithHook("config")) {
+    initStage(`config:${p.name ?? "?"}`);
     try {
       const partial = await fn.call(ctxFor(p), config, env);
       if (partial) {
@@ -967,6 +993,7 @@ async function runConfigHooks() {
         isSsrTargetWebworker: false,
       };
       for (const { p, fn } of configEnvHooks) {
+        initStage(`configEnvironment:${p.name ?? "?"}`);
         try {
           const r = await fn.call(ctx, name, config.environments[name], opts);
           if (r) config.environments[name] = mergeConfigLite(config.environments[name], r);
@@ -980,6 +1007,7 @@ async function runConfigHooks() {
   resolvedConfig = withResolvedDefaults(config);
   resolvedConfig.plugins = configPlugins;
   for (const { p, fn } of pluginsWithHook("configResolved")) {
+    initStage(`configResolved:${p.name ?? "?"}`);
     try {
       await fn.call(ctx, resolvedConfig);
     } catch (e) {
@@ -989,6 +1017,7 @@ async function runConfigHooks() {
   }
 }
 await runConfigHooks();
+initStage("config-hooks-done");
 // Vite's environment carries the resolved config (per-environment overrides
 // merged), its logger and getTopLevelConfig(); applyToEnvironment and every
 // hook's this.environment read them.
@@ -1013,6 +1042,7 @@ environment.getTopLevelConfig = () => resolvedConfig;
       continue;
     }
     let applied;
+    initStage(`applyToEnvironment:${p.name ?? "?"}`);
     try {
       applied = await p.applyToEnvironment(environment);
     } catch (e) {
@@ -1231,8 +1261,10 @@ async function buildEnvironments(server) {
     // environments bind to these fresh instances; oj drives its own instances
     // in configureServer, and the two agree because both resolve from `root`.
     hostPhase("cf: resolveConfig begin");
+    initStage("cf:resolveConfig");
     rc = await vite.resolveConfig({ root, configFile: undefined, mode: environment.mode }, "serve", "development", "development");
     hostPhase("cf: resolveConfig done");
+    initStage("cf:resolveConfig-done");
   } catch (e) {
     process.stderr.write(`${OJ} plugin host: vite.resolveConfig failed: ${(e && e.message) || e}\n`);
     return undefined;
@@ -1260,6 +1292,7 @@ async function buildEnvironments(server) {
         ? await factory(name, rc, { ws: server.ws })
         : new vite.DevEnvironment(name, rc, { hot: true, transport: server.ws });
       hostPhase(`cf: createEnvironment(${name}) done`);
+      initStage(`cf:createEnvironment:${name}`);
     } catch (e) {
       process.stderr.write(`${OJ} plugin host: createEnvironment(${name}) failed: ${(e && e.message) || e}\n`);
       return;
@@ -1269,6 +1302,7 @@ async function buildEnvironments(server) {
       if (ei && typeof ei.init === "function") {
         await ei.init({ watcher: server.watcher });
         hostPhase(`cf: init(${name}) done`);
+        initStage(`cf:init:${name}`);
       }
     } catch (e) {
       process.stderr.write(`${OJ} plugin host: env.init(${name}) failed: ${(e && e.message) || e}\n`);
@@ -1862,6 +1896,7 @@ async function setupConfigureServer() {
   const post = [];
   for (const { p, fn } of pluginsWithHook("configureServer")) {
     let r;
+    initStage(`configureServer:${p.name ?? "?"}`);
     try {
       r = await fn.call(ctxFor(p), server);
     } catch (e) {
@@ -2697,4 +2732,5 @@ rl.on("line", async (line) => {
 // wait out Rust's whole init deadline blamed on initialization instead of
 // failing on the per-call timeout. Rust treats ojInit, ojServeInfo, or the
 // first reply — whichever lands first — as initialized.
+ojInitDone = true;
 ctl({ ojInit: true });
