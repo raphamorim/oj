@@ -5,6 +5,11 @@ All notable changes to oj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- `experimental.bundledDev` (Vite's Rolldown bundled client dev mode) is now coerced off in the config oj drives, with a one-time warning, instead of silently breaking the page. oj bundles the client itself, so bundledDev is redundant under it and unimplemented: left on, an app's TanStack Start manifest emits a `/assets/index.js` client script that oj never builds nor serves (it 404s, or on Vite hangs on the app's own bundled-dev entry hold) and `/bundledDevClient.mjs` 404s, so no client JS runs and React never hydrates — the SSR shell paints but every client-rendered element stays dead. The plugin host now clears `experimental.bundledDev` (and the `environments.client.isBundled` Vite derives from it) before the `configResolved` pass, so the manifest plugin emits the standard dev client entry (`virtual:tanstack-start-dev-client-entry`) oj already serves, and again on the freshly resolved config `buildEnvironments` builds the real Vite `DevEnvironment`s from, so the client environment is not constructed in bundled mode. A one-line stderr notice (`experimental.bundledDev is not supported; using the standard dev client entry instead`) prints once per session when the flag was actually set.
+
 ## [0.1.20] - 2026-09-06
 
 ### Fixed
