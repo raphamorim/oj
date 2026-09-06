@@ -648,3 +648,41 @@ test("real vite: NODE_ENV follows the command under a custom mode and VITE_USER_
     rmSync(base, { recursive: true, force: true });
   }
 });
+
+// The pre-set is unset before resolveConfig ONLY while NODE_ENV still equals
+// it: a config module ASSIGNING process.env.NODE_ENV at module scope keeps its
+// value through the hooks — Vite snapshots isNodeEnvSet BEFORE the load, so
+// the assignment reaches resolveConfig's own isProduction — instead of being
+// deleted along with oj's untouched pre-set.
+test("real vite: a config-module NODE_ENV assignment survives into resolveConfig", { skip: skipNoVite }, () => {
+  const base = realViteDir("oj-vite-extract-nodeenv-assign-");
+  try {
+    writeFileSync(
+      join(base, "vite.config.mjs"),
+      `import { writeFileSync } from "node:fs";
+      process.env.NODE_ENV = "test";
+      export default {
+        plugins: [{
+          name: "prod-probe",
+          configResolved(config) {
+            writeFileSync(
+              new URL("./prod.json", import.meta.url),
+              JSON.stringify({ isProduction: config.isProduction, nodeEnv: process.env.NODE_ENV }),
+            );
+          },
+        }],
+      };\n`,
+    );
+    const env = { ...process.env };
+    delete env.NODE_ENV;
+    const out = JSON.parse(runExtractor(base, "vite.config.mjs", ["build", "production", "explicit"], { env }));
+    assert.equal(out.__ok, true);
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(join(base, "prod.json"), "utf8")),
+      { isProduction: false, nodeEnv: "test" },
+      "the module-scope NODE_ENV=test assignment survives the pre-set unset and steers isProduction",
+    );
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});

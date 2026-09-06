@@ -84,8 +84,14 @@ const defaultNodeEnv = command === "build" ? "production" : "development";
 // default itself from the defaultNodeEnv oj passes.
 const nodeEnvWasSet = !!process.env.NODE_ENV;
 if (!nodeEnvWasSet) process.env.NODE_ENV = defaultNodeEnv;
+// Unset ONLY while NODE_ENV still equals the untouched pre-set: a config
+// module that ASSIGNED process.env.NODE_ENV at module scope must keep its
+// value through resolveConfig (Vite snapshots isNodeEnvSet before the load,
+// so a config-module assignment survives into its isProduction), while the
+// untouched pre-set is removed so Vite computes isNodeEnvSet=false and its
+// VITE_USER_NODE_ENV handling stays live.
 const unsetOjNodeEnvForResolve = () => {
-  if (!nodeEnvWasSet) delete process.env.NODE_ENV;
+  if (!nodeEnvWasSet && process.env.NODE_ENV === defaultNodeEnv) delete process.env.NODE_ENV;
 };
 
 // Wrangler config files the config evaluation touched. The Cloudflare plugin's
