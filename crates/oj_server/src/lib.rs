@@ -285,12 +285,6 @@ struct ServerState {
     /// Per `proxy` entry: the compiled pattern of a `^` (regex) context, `None`
     /// for a plain prefix. Built once so request matching does not recompile.
     proxy_regex: Vec<Option<regex::Regex>>,
-    /// Literal path prefixes of `^` contexts oj's regex engine could NOT compile
-    /// (JS RegExp lookaround/backreference). Empty in the common case. Used to
-    /// narrow the "delegate an unmatched request to the Node proxy so its JS
-    /// RegExp decides" path to plausible candidates, so normal traffic never
-    /// takes the Node hop.
-    proxy_uncompilable_prefixes: Vec<String>,
     http: reqwest::Client,
     /// For `server.proxy` entries with `secure: false`: accepts any certificate.
     /// Built on first use, so projects that never opt in pay nothing.
@@ -779,12 +773,6 @@ impl DevServer {
             .collect();
         let proxy_regex: Vec<Option<regex::Regex>> =
             proxy.iter().map(|(ctx, _)| proxy_context_regex(ctx)).collect();
-        let proxy_uncompilable_prefixes: Vec<String> = proxy
-            .iter()
-            .zip(&proxy_regex)
-            .filter(|((ctx, _), re)| ctx.starts_with('^') && re.is_none())
-            .map(|((ctx, _), _)| regex_literal_prefix(ctx))
-            .collect();
 
         // TanStack Start owns its module graph and SSR; oj runs the plugin host
         // only to host configureServer middleware (the editor dev-server bridge),
@@ -1191,7 +1179,6 @@ impl DevServer {
             preload_snapshot: load_graph_snapshot(&root),
             proxy,
             proxy_regex,
-            proxy_uncompilable_prefixes,
             http: reqwest::Client::new(),
             http_insecure: std::sync::OnceLock::new(),
             proxy_tls: [std::sync::OnceLock::new(), std::sync::OnceLock::new()],
@@ -2584,22 +2571,6 @@ async fn apply_dev_headers(
 /// (rewritten) request path and the original query. Applies the `{from,to}`
 /// string rewrite form only; the FUNCTION rewrite form is honored by the Node
 /// proxy (the browser path delegates there when a plugin host is running).
-/// The literal path prefix of a `^`-anchored context, up to the first regex
-/// metacharacter: `^/api(?=/)` -> `/api`. A cheap over-approximation used only
-/// to decide whether an unmatched request could plausibly hit an uncompilable
-/// context (and so is worth delegating to Node's JS RegExp).
-fn regex_literal_prefix(context: &str) -> String {
-    let s = context.strip_prefix('^').unwrap_or(context);
-    let mut out = String::new();
-    for c in s.chars() {
-        if "\\.^$*+?()[]{}|".contains(c) {
-            break;
-        }
-        out.push(c);
-    }
-    out
-}
-
 /// Delegate a request to the single Vite-shaped proxy in the plugin host's
 /// middleware stack: stream the body there, stream the reply back. If the host's
 /// proxy declined (`x-oj-fallthrough` — a `bypass` that returned a string and
@@ -2624,10 +2595,15 @@ async fn delegate_to_node_proxy(
         Ok(resp) => {
             if resp.headers().contains_key("x-oj-fallthrough") {
                 let mut parts = parts;
+                // Re-route only to an origin-form path (starts with a single
+                // `/`): a `bypass` returning an absolute or protocol-relative
+                // URL must never be fed to native routing — treat that as
+                // no-rewrite and serve the original path.
                 if let Some(uri) = resp
                     .headers()
                     .get("x-oj-rewritten-url")
                     .and_then(|v| v.to_str().ok())
+                    .filter(|s| s.starts_with('/') && !s.starts_with("//"))
                     .and_then(|s| s.parse::<Uri>().ok())
                 {
                     parts.uri = uri;
@@ -2674,26 +2650,13 @@ async fn proxy_middleware(
     };
     let matched = select_proxy(&state.proxy, &state.proxy_regex, &url);
     let Some((prefix, entry)) = matched else {
-        // A proxy context oj's regex engine cannot compile (a JS RegExp with
-        // lookaround/backreference) is left unmatched by select_proxy, so oj
-        // would serve the path as a route. When a plugin host runs, the Node
-        // proxy has the SAME contexts but a full JS RegExp, so let IT decide —
-        // but only for a request whose path could plausibly hit such a context
-        // (its cheap literal prefix), so normal traffic never takes the hop and
-        // no body is buffered on the hot path. The body streams through and a
-        // JS-RegExp non-match falls back to native routing. (A `ws: true`
-        // uncompilable context still can't upgrade through this path — a known
-        // harder gap.)
-        if !state.proxy_uncompilable_prefixes.is_empty()
-            && state
-                .proxy_uncompilable_prefixes
-                .iter()
-                .any(|p| path.starts_with(p.as_str()))
-        {
-            if let Some(port) = state.plugin_serve.mw_port() {
-                return delegate_to_node_proxy(next, port, req).await;
-            }
-        }
+        // No context matched. A `^`-context oj's regex engine could not compile
+        // (a JS RegExp using lookaround/backreference/alternation) never matches
+        // on this browser-facing path and is served natively — oj's pre-existing
+        // behavior, with a loud one-time warning at startup (proxy_context_regex).
+        // The worker path still proxies such a context (the Node proxy holds the
+        // full JS RegExp); full JS-regex-context support for the browser path is
+        // a deferred follow-up rather than an unsound approximation here.
         return next.run(req).await;
     };
     let prefix = prefix.to_string();
@@ -2799,7 +2762,12 @@ fn proxy_context_regex(context: &str) -> Option<regex::Regex> {
     match regex::Regex::new(context) {
         Ok(re) => Some(re),
         Err(err) => {
-            eprintln!("oj: server.proxy context {context:?} is not a valid regex: {err}");
+            eprintln!(
+                "oj: warning: server.proxy context {context:?} uses a regex oj cannot compile \
+                 ({err}) — likely a JS RegExp lookahead/backreference/alternation. Browser \
+                 requests to it are matched by literal prefix and may not proxy (the worker path \
+                 still proxies it); please file an issue if you need full JS-regex proxy contexts."
+            );
             None
         }
     }
