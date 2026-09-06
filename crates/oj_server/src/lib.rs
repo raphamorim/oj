@@ -2549,6 +2549,25 @@ async fn apply_dev_headers(
     resp
 }
 
+/// The upstream url for a matched proxy entry: the target joined with the
+/// (rewritten) request path and the original query. Applies the `{from,to}`
+/// string rewrite form only; the FUNCTION rewrite form is honored by the Node
+/// proxy (the browser path delegates there when a plugin host is running).
+fn proxy_target(entry: &oj_config::ProxyEntry, path: &str, query: Option<&str>) -> String {
+    let mut fwd_path = path.to_string();
+    if let Some((from, to)) = entry.rewrite() {
+        if let Some(stripped) = from.strip_prefix('^') {
+            if let Some(rest) = fwd_path.strip_prefix(stripped) {
+                fwd_path = format!("{to}{rest}");
+            }
+        } else {
+            fwd_path = fwd_path.replacen(from, to, 1);
+        }
+    }
+    let query = query.map(|q| format!("?{q}")).unwrap_or_default();
+    format!("{}{}{}", entry.target().trim_end_matches('/'), fwd_path, query)
+}
+
 async fn proxy_middleware(
     State(state): State<Arc<ServerState>>,
     req: axum::extract::Request,
@@ -2565,35 +2584,47 @@ async fn proxy_middleware(
     let Some((prefix, entry)) = matched else {
         return next.run(req).await;
     };
+    let prefix = prefix.to_string();
+    let entry = entry.clone();
 
-    let mut fwd_path = path.clone();
-    if let Some((from, to)) = entry.rewrite() {
-        if let Some(stripped) = from.strip_prefix('^') {
-            if let Some(rest) = fwd_path.strip_prefix(stripped) {
-                fwd_path = format!("{to}{rest}");
-            }
-        } else {
-            fwd_path = fwd_path.replacen(from, to, 1);
-        }
-    }
-    let query = req
-        .uri()
-        .query()
-        .map(|q| format!("?{q}"))
-        .unwrap_or_default();
-    let target = format!(
-        "{}{}{}",
-        entry.target().trim_end_matches('/'),
-        fwd_path,
-        query
-    );
-
-    // A WebSocket upgrade on a `ws: true` entry is tunneled message by message.
+    // A WebSocket upgrade on a `ws: true` entry is tunneled message by message
+    // by the Rust proxy: the inbound listener owns the browser's upgrade, and
+    // the worker's outbound fetch is never a ws upgrade, so the single Node
+    // proxy need not handle upgrades — nothing regresses.
     if entry.ws() && is_websocket_upgrade(req.headers()) {
-        let entry = entry.clone();
+        let target = proxy_target(&entry, &path, req.uri().query());
         return proxy_websocket(state, req, &entry, &target).await;
     }
 
+    // The single, Vite-shaped proxy lives in the plugin host's middleware stack.
+    // Whenever a plugin host is running, delegate the matched request there so
+    // the browser path and the worker's outbound fetch share ONE proxy, with the
+    // app's real config (function `rewrite`, `configure`, `bypass`) intact. The
+    // ORIGINAL unstripped path is forwarded; the Node proxy re-matches and
+    // rewrites it. The request body streams through, so uploads are not capped.
+    if let Some(port) = state.plugin_serve.mw_port() {
+        let method = req.method().as_str().to_string();
+        let pq = req
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| path.clone());
+        let headers = req.headers().clone();
+        let body = req.into_body();
+        return match proxy_to_loopback_streaming(port, &method, &pq, &headers, Some(body)).await {
+            Ok(resp) => resp,
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                format!("oj proxy delegation to plugin host failed: {e}"),
+            )
+                .into_response(),
+        };
+    }
+
+    // Fallback: no plugin host (a plain `oj dev` app with `server.proxy`, or the
+    // brief boot window before the middleware port is known). The Rust proxy
+    // forwards directly, applying the `{from,to}` string rewrite form.
+    let target = proxy_target(&entry, &path, req.uri().query());
     let method = req.method().clone();
     let req_headers = req.headers().clone();
     // Small bodies are buffered so their Content-Length is preserved; a chunked
