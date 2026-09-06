@@ -312,6 +312,7 @@ fn bounded_output(
     timeout: std::time::Duration,
 ) -> std::io::Result<Option<std::process::Output>> {
     use std::io::Read;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     let mut child = cmd
         .stdin(Stdio::null())
@@ -320,35 +321,57 @@ fn bounded_output(
         .spawn()?;
     let out_pipe = child.stdout.take().expect("piped stdout");
     let err_pipe = child.stderr.take().expect("piped stderr");
-    fn drain(mut pipe: impl Read + Send + 'static, buf: Arc<Mutex<Vec<u8>>>) -> std::thread::JoinHandle<()> {
+    fn drain(
+        mut pipe: impl Read + Send + 'static,
+        buf: Arc<Mutex<Vec<u8>>>,
+        discard: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let mut chunk = [0u8; 8192];
             loop {
                 match pipe.read(&mut chunk) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => buf
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .extend_from_slice(&chunk[..n]),
+                    // Once detached (the caller snapshotted and moved on),
+                    // keep reading to EOF — a still-writing grandchild must
+                    // not block on a full pipe — but discard: nobody will
+                    // ever read the buffer again, and a chatty grandchild
+                    // could otherwise grow it for as long as it lives.
+                    Ok(_) if discard.load(Ordering::Relaxed) => {}
+                    Ok(n) => append_capped(
+                        &mut buf
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        &chunk[..n],
+                        DRAIN_BUF_CAP,
+                    ),
                 }
             }
         })
     }
     let out_buf = Arc::new(Mutex::new(Vec::new()));
     let err_buf = Arc::new(Mutex::new(Vec::new()));
-    let out_thread = drain(out_pipe, Arc::clone(&out_buf));
-    let err_thread = drain(err_pipe, Arc::clone(&err_buf));
+    // One flag for both drains: detachment is a property of the call ending,
+    // not of one pipe.
+    let discard = Arc::new(AtomicBool::new(false));
+    let out_thread = drain(out_pipe, Arc::clone(&out_buf), Arc::clone(&discard));
+    let err_thread = drain(err_pipe, Arc::clone(&err_buf), Arc::clone(&discard));
     // Join with a grace bound, then detach: after the child is gone, EOF on the
     // pipes belongs to whoever else inherited them (a plugin's grandchild), and
-    // the caller must never wait on that. Detached threads exit on their own
-    // when the last writer closes; the snapshot below is what the caller gets.
-    let grace_join = |t: std::thread::JoinHandle<()>| {
+    // the caller must never wait on that. One SHARED deadline covers both joins
+    // (sequential per-join graces cost double on the wedged path); a thread
+    // still running past it is flipped to discard mode and left to exit when
+    // the last writer closes. The snapshot below is what the caller gets.
+    let grace_join = |threads: [std::thread::JoinHandle<()>; 2]| {
         let grace_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !t.is_finished() && std::time::Instant::now() < grace_deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        if t.is_finished() {
-            let _ = t.join();
+        for t in threads {
+            while !t.is_finished() && std::time::Instant::now() < grace_deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+            } else {
+                discard.store(true, Ordering::Relaxed);
+            }
         }
     };
     let snapshot = |buf: &Arc<Mutex<Vec<u8>>>| -> Vec<u8> {
@@ -364,19 +387,33 @@ fn bounded_output(
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            grace_join(out_thread);
-            grace_join(err_thread);
+            grace_join([out_thread, err_thread]);
             return Ok(None);
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     };
-    grace_join(out_thread);
-    grace_join(err_thread);
+    grace_join([out_thread, err_thread]);
     Ok(Some(std::process::Output {
         status,
         stdout: snapshot(&out_buf),
         stderr: snapshot(&err_buf),
     }))
+}
+
+/// The most an extraction pipe capture may hold. The drain threads can outlive
+/// the caller detached (a grandchild holding the pipe open), and even attached
+/// output is only diagnostics past a point: cap the buffer instead of letting
+/// a chatty child grow it without bound.
+const DRAIN_BUF_CAP: usize = 4 * 1024 * 1024;
+
+/// Append `chunk` to `buf`, never growing it past `cap`: bytes past the cap
+/// are dropped (the capture keeps its head, where the JSON result and the
+/// first errors live).
+fn append_capped(buf: &mut Vec<u8>, chunk: &[u8], cap: usize) {
+    let room = cap.saturating_sub(buf.len());
+    if room > 0 {
+        buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
+    }
 }
 
 /// Evaluate the app's `vite.config` for `command` ("serve" | "build") and `mode`.
@@ -913,14 +950,46 @@ fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
     // The ssr block merges PER-KEY, not whole-block: an oj.config.json that
     // sets one ssr key (say noExternal) must not drop the extractor's other
     // keys — above all `runnerBacked`, which ONLY extraction produces and every
-    // consumer of the worker path reads, so it is always adopted.
+    // consumer of the worker path reads, so it is always adopted. `resolve`
+    // recurses ONE level deeper for the same reason: an oj-side
+    // `ssr.resolve.externalConditions` must not drop the extractor's other
+    // resolve sub-keys (the workerd sugar's `conditions` above all).
     match (config.ssr.as_mut(), v.ssr) {
         (None, vssr) => config.ssr = vssr,
         (Some(existing), Some(vssr)) => {
-            if let (Some(obj), Some(vobj)) = (existing.as_object_mut(), vssr.as_object()) {
+            if !existing.is_object() {
+                // The oj-side ssr value is not an object: there is nothing to
+                // merge per-key into, and dropping the extractor block here
+                // would break the "runnerBacked is always adopted" contract.
+                eprintln!(
+                    "oj: config: the ssr block in oj's config is not an object; the vite.config ssr block is used"
+                );
+                *existing = vssr;
+            } else if let (Some(obj), Some(vobj)) = (existing.as_object_mut(), vssr.as_object()) {
                 for (k, val) in vobj {
                     if k == "runnerBacked" || !obj.contains_key(k) {
                         obj.insert(k.clone(), val.clone());
+                    } else if k == "resolve" {
+                        let Some(vsub) = val.as_object() else { continue };
+                        if obj.get(k).is_some_and(serde_json::Value::is_object) {
+                            let eobj = obj
+                                .get_mut(k)
+                                .and_then(serde_json::Value::as_object_mut)
+                                .expect("checked is_object above");
+                            for (sk, sval) in vsub {
+                                if !eobj.contains_key(sk) {
+                                    eobj.insert(sk.clone(), sval.clone());
+                                }
+                            }
+                        } else {
+                            // Nothing to merge into: adopting the extractor's
+                            // block beats silently dropping the sugar's
+                            // conditions.
+                            eprintln!(
+                                "oj: config: ssr.resolve in oj's config is not an object; the vite.config ssr.resolve block is used"
+                            );
+                            obj.insert(k.clone(), val.clone());
+                        }
                     }
                 }
             }
@@ -1065,8 +1134,20 @@ pub struct PluginHost {
     /// spawn-anchored short bound gave calls arriving after `spawn +
     /// init_wait` during a still-pending init a zero-length window (instant
     /// failure), where pre-init-gate semantics gave every call its own
-    /// per-call timeout.
+    /// per-call timeout. Per-call windows apply only while init is still
+    /// plausibly live: once ONE call's window elapses with init pending,
+    /// `init_failed` latches and later calls fail fast (see below).
     lazy: bool,
+    /// Lazy-host init-failure latch: set when a per-call init window elapsed
+    /// with init still pending. From then on, pre-init calls fail immediately
+    /// instead of each burning a full window against a host already known
+    /// wedged (serially freezing every consumer for `init_wait` apiece). A
+    /// LATE init still clears it: the latch is consulted only while
+    /// `initialized` is false, so a host that recovers (its serve-info push,
+    /// ojInit signal, or first reply lands after the latch) serves calls
+    /// normally again. Boot hosts don't need it — their deadline is shared
+    /// and spawn-anchored, so it is already in the past for every later call.
+    init_failed: std::sync::atomic::AtomicBool,
     /// The env knob named when the init wait elapses (matches `init_wait`).
     init_knob: &'static str,
     /// Last "still initializing" progress line, so concurrent init-gated calls
@@ -1218,7 +1299,7 @@ impl PluginHost {
         plugins_file: &Path,
         config_json: &str,
     ) -> anyhow::Result<std::sync::Arc<PluginHost>> {
-        Self::spawn_with_policy(root, plugins_file, config_json, false).await
+        Self::spawn_with_policy(root, plugins_file, config_json, false, None).await
     }
 
     /// Spawn a lazily created host (the SSR environment host, created on the
@@ -1230,7 +1311,19 @@ impl PluginHost {
         plugins_file: &Path,
         config_json: &str,
     ) -> anyhow::Result<std::sync::Arc<PluginHost>> {
-        Self::spawn_with_policy(root, plugins_file, config_json, true).await
+        Self::spawn_with_policy(root, plugins_file, config_json, true, None).await
+    }
+
+    /// Test-only lazy spawn with an explicit init wait, so the latch semantics
+    /// can be exercised without racing the env-var knobs other tests read.
+    #[cfg(test)]
+    async fn spawn_lazy_with_wait(
+        root: &Path,
+        plugins_file: &Path,
+        config_json: &str,
+        init_wait: std::time::Duration,
+    ) -> anyhow::Result<std::sync::Arc<PluginHost>> {
+        Self::spawn_with_policy(root, plugins_file, config_json, true, Some(init_wait)).await
     }
 
     async fn spawn_with_policy(
@@ -1238,6 +1331,7 @@ impl PluginHost {
         plugins_file: &Path,
         config_json: &str,
         lazy: bool,
+        init_wait_override: Option<std::time::Duration>,
     ) -> anyhow::Result<std::sync::Arc<PluginHost>> {
         let script = oj_cache::cache_root(root).join("plugin-host.mjs");
         if let Some(parent) = script.parent() {
@@ -1268,7 +1362,10 @@ impl PluginHost {
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
 
-        let (init_wait, init_knob) = init_wait_policy(lazy);
+        let (mut init_wait, init_knob) = init_wait_policy(lazy);
+        if let Some(w) = init_wait_override {
+            init_wait = w;
+        }
         let host = std::sync::Arc::new(PluginHost {
             stdin: tokio::sync::Mutex::new(stdin),
             pending: Mutex::new(HashMap::new()),
@@ -1282,6 +1379,7 @@ impl PluginHost {
             spawned: tokio::time::Instant::now(),
             init_wait,
             lazy,
+            init_failed: std::sync::atomic::AtomicBool::new(false),
             init_knob,
             init_progress: Mutex::new(std::time::Instant::now()),
         });
@@ -1424,12 +1522,30 @@ impl PluginHost {
         // the first reply, all preceding any wait here.
         let mut init_rx = self.initialized.subscribe();
         if !*init_rx.borrow_and_update() {
+            // The latch: a lazy host whose init already outlived one call's
+            // full window is known wedged — fail fast instead of burning a
+            // fresh window per call. Cleared by recovery implicitly: once
+            // `initialized` flips (a late init push, or any reply), this
+            // branch is never taken again.
+            if self.lazy
+                && self
+                    .init_failed
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                self.pending.lock().unwrap().remove(&req_id);
+                return Err(format!(
+                    "plugin host init already timed out after {}s; failing {hook} fast until init completes (raise {} for slower boots)",
+                    self.init_wait.as_secs(),
+                    self.init_knob,
+                ));
+            }
             // A boot host's deadline is shared and spawn-anchored (boot RPCs
             // ride one deadline instead of stacking). A lazy host's is
             // per-call: each call gets its own full `init_wait` window from
             // its own start — spawn-anchoring the short bound made every call
             // arriving after `spawn + init_wait` (with init still pending)
-            // fail instantly instead of degrading like a slow hook.
+            // fail instantly instead of degrading like a slow hook — but only
+            // while no window has elapsed yet (see the latch above).
             let deadline = call_init_deadline(
                 self.lazy,
                 self.spawned,
@@ -1458,6 +1574,12 @@ impl PluginHost {
                         }
                     }
                     _ = tokio::time::sleep_until(deadline) => {
+                        // A full window elapsed with init still pending: latch
+                        // (lazy hosts), so later pre-init calls fail fast.
+                        if self.lazy {
+                            self.init_failed
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
                         self.pending.lock().unwrap().remove(&req_id);
                         return Err(format!(
                             "plugin host still initializing after {}s running {hook} (raise {} for slower boots)",
@@ -2197,6 +2319,161 @@ mod vite_values_tests {
         };
         merge_vite_values(&mut config, v);
         assert!(oj_config::ssr_runner_backed(&config));
+    }
+
+    // The ssr merge recurses one level into `resolve`: an oj-side
+    // ssr.resolve.externalConditions must not drop the extractor's other
+    // resolve sub-keys (the workerd sugar's `conditions` above all).
+    #[test]
+    fn merge_recurses_one_level_into_ssr_resolve() {
+        let mut config = oj_config::OjConfig::default();
+        config.ssr = Some(serde_json::json!({ "resolve": { "externalConditions": ["oj-ext"] } }));
+        let v = ViteValues {
+            ssr: Some(serde_json::json!({
+                "runnerBacked": true,
+                "resolve": { "conditions": ["workerd"], "externalConditions": ["never-adopted"] }
+            })),
+            ..Default::default()
+        };
+        merge_vite_values(&mut config, v);
+        let ssr = config.ssr.as_ref().unwrap();
+        assert_eq!(
+            ssr["resolve"]["externalConditions"],
+            serde_json::json!(["oj-ext"]),
+            "the oj config's sub-key wins"
+        );
+        assert_eq!(
+            ssr["resolve"]["conditions"],
+            serde_json::json!(["workerd"]),
+            "the extractor's other resolve sub-keys fill in"
+        );
+        assert!(oj_config::ssr_runner_backed(&config));
+    }
+
+    // A non-object oj-side ssr value (or ssr.resolve) cannot be merged
+    // per-key: the extractor block is adopted (with a warning) so the
+    // "runnerBacked is always adopted" contract holds.
+    #[test]
+    fn merge_adopts_extractor_ssr_when_the_oj_side_is_not_an_object() {
+        let mut config = oj_config::OjConfig::default();
+        config.ssr = Some(serde_json::json!("bogus"));
+        let v = ViteValues {
+            ssr: Some(serde_json::json!({ "runnerBacked": true, "target": "webworker" })),
+            ..Default::default()
+        };
+        merge_vite_values(&mut config, v);
+        assert!(
+            oj_config::ssr_runner_backed(&config),
+            "the contract holds against a non-object oj-side ssr"
+        );
+        assert_eq!(config.ssr.as_ref().unwrap()["target"], "webworker");
+
+        // Same one level down: a non-object ssr.resolve adopts the
+        // extractor's resolve block instead of silently dropping the sugar.
+        let mut config = oj_config::OjConfig::default();
+        config.ssr = Some(serde_json::json!({ "resolve": "bogus" }));
+        let v = ViteValues {
+            ssr: Some(serde_json::json!({
+                "runnerBacked": true,
+                "resolve": { "conditions": ["workerd"] }
+            })),
+            ..Default::default()
+        };
+        merge_vite_values(&mut config, v);
+        let ssr = config.ssr.as_ref().unwrap();
+        assert_eq!(ssr["resolve"]["conditions"], serde_json::json!(["workerd"]));
+        assert!(oj_config::ssr_runner_backed(&config));
+    }
+
+    // The pipe capture is bounded: bytes past the cap are dropped, keeping the
+    // head (where the JSON result and the first errors live).
+    #[test]
+    fn append_capped_never_grows_past_the_cap() {
+        let mut buf = Vec::new();
+        append_capped(&mut buf, &[1u8; 6], 10);
+        assert_eq!(buf.len(), 6);
+        append_capped(&mut buf, &[2u8; 6], 10);
+        assert_eq!(buf.len(), 10, "the append is truncated at the cap");
+        assert_eq!(&buf[..6], &[1u8; 6], "the head is kept");
+        assert_eq!(&buf[6..], &[2u8; 4]);
+        append_capped(&mut buf, &[3u8; 100], 10);
+        assert_eq!(buf.len(), 10, "appends past the cap are dropped entirely");
+    }
+
+    // The lazy-host init-failure latch: the FIRST pre-init call waits out its
+    // own full window; once that window elapsed with init still pending, later
+    // pre-init calls fail fast instead of each burning a window — and a LATE
+    // init clears the fail-fast (the latch is consulted only pre-init).
+    #[tokio::test]
+    async fn lazy_host_latches_init_failure_and_a_late_init_clears_it() {
+        let root = std::env::temp_dir().join(format!("oj-lazy-latch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // A plugins file that wedges the host's top-level init (a top-level
+        // await), then recovers.
+        let plugins = root.join("oj.plugins.mjs");
+        std::fs::write(
+            &plugins,
+            "await new Promise((r) => setTimeout(r, 2500));\nexport default [];\n",
+        )
+        .unwrap();
+        let config = serde_json::json!({
+            "config": { "root": root.display().to_string() },
+            "env": { "command": "serve", "mode": "development" },
+        })
+        .to_string();
+        let host = match PluginHost::spawn_lazy_with_wait(
+            &root,
+            &plugins,
+            &config,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        {
+            Ok(h) => h,
+            Err(_) => return, // no node on this machine
+        };
+
+        // First call: waits its full per-call window (init is live), then
+        // fails on the window and latches.
+        let t0 = std::time::Instant::now();
+        let first = host.resolve_id("x", "").await;
+        let first_err = first.expect_err("init is wedged: the first call fails at its window");
+        assert!(first_err.contains("still initializing"), "{first_err}");
+        assert!(
+            t0.elapsed() >= std::time::Duration::from_millis(900),
+            "the first call waits its full window, got {:?}",
+            t0.elapsed()
+        );
+
+        // Second call: fails fast off the latch, never a second full window.
+        let t1 = std::time::Instant::now();
+        let second_err = host
+            .resolve_id("x", "")
+            .await
+            .expect_err("the latch fails pre-init calls");
+        assert!(second_err.contains("already timed out"), "{second_err}");
+        assert!(
+            t1.elapsed() < std::time::Duration::from_millis(500),
+            "the latched call fails fast, got {:?}",
+            t1.elapsed()
+        );
+
+        // The host recovers (init completes): calls flow again.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            match host.resolve_id("x", "").await {
+                Ok(_) => break,
+                Err(e) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "a late init never cleared the fail-fast: {e}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
