@@ -805,7 +805,12 @@ impl DevServer {
                 "mode": dev_mode,
                 "command": "serve",
                 "define": config.define,
-                "server": { "port": port, "host": server_cfg.host },
+                // `proxy` too: for an oj-config-format app (no vite.config the
+                // host can load) this is the only place the host learns the
+                // app's `server.proxy`, so the single Node proxy can cover it.
+                // The {from,to} rewrite form crosses fine; a FUNCTION rewrite
+                // (vite-format only) rides the host's own loaded config instead.
+                "server": { "port": port, "host": server_cfg.host, "proxy": server_cfg.proxy },
                 // `{}` rather than null when the config has none: the host deep-merges
                 // this over the user's Vite-resolved config, and a null would erase
                 // its environments (and their per-environment `define`).

@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -273,7 +273,10 @@ pub struct FsConfig {
     pub deny: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+// Serialize too: an oj-config-format app's `server.proxy` is forwarded to the
+// plugin host (which hosts the single proxy) in the spawn payload; only a
+// FUNCTION rewrite cannot cross, and the {from,to} form here does.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ProxyEntry {
     Target(String),
@@ -310,22 +313,27 @@ impl ProxyEntry {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyOptions {
     pub target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub change_origin: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ws: Option<bool>,
     /// Verify the target's TLS certificate (http-proxy's `secure`, default true);
     /// `false` accepts a self-signed dev backend.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub secure: Option<bool>,
     /// Vite's `rewriteWsOrigin`: on a WebSocket upgrade, replace the browser's
     /// `Origin` with the target's origin (for servers that check it).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rewrite_ws_origin: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rewrite: Option<ProxyRewrite>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProxyRewrite {
     pub from: String,
     pub to: String,

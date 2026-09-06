@@ -1762,7 +1762,23 @@ async function createProxyMiddleware(proxyConfig, appRoot) {
     // Vite: a string is shorthand for { target, changeOrigin: true }.
     if (typeof opts === "string") opts = { target: opts, changeOrigin: true };
     if (!opts || typeof opts.target !== "string") continue;
-    contexts.push([context, opts]);
+    // Normalize `rewrite` to a function. Three forms reach here: a FUNCTION
+    // (vite-format, called as-is like Vite's `opts.rewrite(req.url)`); a
+    // {from,to} OBJECT (oj-format over the JSON bridge — `from` is a regex
+    // source, applied as `url.replace(new RegExp(from), to)`, so an anchored
+    // `^/api` strips the prefix exactly like the Rust `proxy_target`); and none.
+    let rewriteFn = null;
+    if (typeof opts.rewrite === "function") {
+      rewriteFn = opts.rewrite;
+    } else if (opts.rewrite && typeof opts.rewrite === "object" && typeof opts.rewrite.from === "string") {
+      const to = typeof opts.rewrite.to === "string" ? opts.rewrite.to : "";
+      let re = null;
+      try { re = new RegExp(opts.rewrite.from); } catch (e) {
+        process.stderr.write(`${OJ} plugin host: server.proxy["${context}"].rewrite.from is not a valid regex: ${(e && e.message) || e}\n`);
+      }
+      if (re) rewriteFn = (url) => url.replace(re, to);
+    }
+    contexts.push([context, opts, rewriteFn]);
   }
   if (contexts.length === 0) return null;
 
@@ -1848,7 +1864,7 @@ async function createProxyMiddleware(proxyConfig, appRoot) {
 
   return async function ojProxyMiddleware(req, res, next) {
     const url = req.url;
-    for (const [context, opts] of contexts) {
+    for (const [context, opts, rewriteFn] of contexts) {
       if (!doesProxyContextMatchUrl(context, url)) continue;
       if (typeof opts.bypass === "function") {
         try {
@@ -1866,7 +1882,7 @@ async function createProxyMiddleware(proxyConfig, appRoot) {
           return next(e);
         }
       }
-      if (typeof opts.rewrite === "function") req.url = opts.rewrite(req.url);
+      if (rewriteFn) req.url = rewriteFn(req.url);
       const proxy = proxies.get(context);
       if (proxy) proxy.web(req, res, {});
       else pipeForward(opts, req, res);
@@ -2054,10 +2070,13 @@ async function setupConfigureServer() {
   // right before postHooks run). This places the single proxy BEFORE a plugin's
   // catch-all (the Cloudflare worker dispatch, registered in a returned POST
   // hook), so a matched request (browser-delegated or the worker's own outbound
-  // fetch) is proxied instead of falling through into the worker. The app's
-  // real config is read straight from the loaded vite config, so a FUNCTION
-  // rewrite / configure / bypass survive (the JSON config bridge drops them).
-  const proxyConfig = userViteConfig?.server?.proxy ?? resolvedConfig?.server?.proxy;
+  // fetch) is proxied instead of falling through into the worker. A vite-format
+  // app's proxy is read straight from the loaded vite config, so a FUNCTION
+  // rewrite / configure / bypass survive; an oj-config-format app has no
+  // loadable vite config, so its `server.proxy` (with a {from,to} rewrite that
+  // DOES cross the JSON bridge) arrives in the spawn payload's `initial.config`.
+  const proxyConfig =
+    userViteConfig?.server?.proxy ?? initial.config?.server?.proxy ?? resolvedConfig?.server?.proxy;
   if (proxyConfig && typeof proxyConfig === "object") {
     try {
       const proxyMw = await createProxyMiddleware(proxyConfig, initial.config?.root ?? process.cwd());
