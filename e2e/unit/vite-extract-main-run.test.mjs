@@ -522,23 +522,32 @@ test("real vite: a mid-run hook throw keeps a raw runner declaration visible in 
   }
 });
 
-// A `cloudflare({ configPath })`-relocated wrangler config lives outside the
-// app root, where the cache's root-level epoch (wrangler.* in the root) cannot
-// see it. The extractor records the wrangler files the config evaluation
-// actually reads — existence probes of missing ones included — and folds them
-// into __deps, so the Rust extraction cache stamps them like config imports
-// (an edit, create or delete is then a cache miss).
-test("wrangler configs the evaluation reads travel in __deps, missing probes included", () => {
+// A `cloudflare({ configPath })`-relocated Worker config can carry ANY name
+// and live anywhere (a custom worker.jsonc, a
+// CLOUDFLARE_VITE_WRANGLER_CONFIG_PATH override, a .wrangler/deploy/config.json
+// redirect) — places the cache's root-level epoch (wrangler.* in the root)
+// cannot see. The extractor records every .json/.jsonc/.toml file the config
+// evaluation READS — the read is the signal, not a filename list — existence
+// probes of missing ones included, node_modules excluded, and folds them into
+// __deps, so the Rust extraction cache stamps them like config imports (an
+// edit, create or delete is then a cache miss).
+test("config-shaped files the evaluation reads travel in __deps, custom names and missing probes included", () => {
   const base = mkdtempSync(join(tmpdir(), "oj-vite-extract-wrangler-"));
   try {
     copyFileSync(asset("vite-extract.mjs"), join(base, "vite-extract.mjs"));
     writeFileSync(join(base, "package.json"), JSON.stringify({ name: "fx", type: "module" }));
     mkdirSync(join(base, "config"));
+    mkdirSync(join(base, "node_modules"));
     writeFileSync(join(base, "config", "wrangler.jsonc"), JSON.stringify({ base: "/from-wrangler/" }));
+    // A custom-named Worker config (cloudflare({ configPath: "./config/worker.jsonc" })).
+    writeFileSync(join(base, "config", "worker.jsonc"), JSON.stringify({ name: "custom" }));
+    writeFileSync(join(base, "node_modules", "dep-meta.json"), "{}");
     writeFileSync(
       join(base, "vite.config.mjs"),
       `import fs from "node:fs";
       const w = JSON.parse(fs.readFileSync(new URL("./config/wrangler.jsonc", import.meta.url), "utf8"));
+      fs.readFileSync(new URL("./config/worker.jsonc", import.meta.url), "utf8");
+      fs.readFileSync(new URL("./node_modules/dep-meta.json", import.meta.url), "utf8");
       fs.existsSync(new URL("./aux/wrangler.toml", import.meta.url));
       export default { base: w.base };\n`,
     );
@@ -553,8 +562,16 @@ test("wrangler configs the evaluation reads travel in __deps, missing probes inc
       `the read wrangler config is a stamped dep: ${JSON.stringify(out.__deps)}`,
     );
     assert.ok(
+      out.__deps.includes(join(real, "config", "worker.jsonc")),
+      "a custom-named .jsonc read via configPath is stamped — the read is the signal",
+    );
+    assert.ok(
       out.__deps.includes(join(real, "aux", "wrangler.toml")),
-      "a probed-but-missing wrangler config is stamped too (creating it must invalidate)",
+      "a probed-but-missing config file is stamped too (creating it must invalidate)",
+    );
+    assert.ok(
+      !out.__deps.some((d) => d.split("/").includes("node_modules")),
+      `node_modules reads never join __deps: ${JSON.stringify(out.__deps)}`,
     );
   } finally {
     rmSync(base, { recursive: true, force: true });
