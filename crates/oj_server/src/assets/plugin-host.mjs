@@ -16,11 +16,15 @@ import { EventEmitter } from "node:events";
 // The slice of Vite's mergeConfigRecursively these assets need (twin copies:
 // one in vite-extract.mjs, one in plugin-host.mjs — keep them byte-identical):
 // null and undefined override values are skipped (a `key: null` override must
-// not clobber a set value), arrays concatenate, plain objects merge
-// recursively, scalars and functions take the later value — and a `true` on
-// either side of ssr/resolve `noExternal`/`external` wins over lists
-// (mergeConfigRecursively's special case).
+// not clobber a set value), arrays concatenate, PLAIN objects (Vite's
+// isObject: `Object.prototype.toString === "[object Object]"`) merge
+// recursively — a class instance or RegExp is a value, so a later one
+// replaces the earlier instead of being spread into a bare `{}` — scalars and
+// functions take the later value, and a `true` on either side of ssr/resolve
+// `noExternal`/`external` wins over lists (mergeConfigRecursively's special
+// case).
 const environmentPathRE = /^environments\.[^.]+$/;
+const isPlainObject = (value) => Object.prototype.toString.call(value) === "[object Object]";
 function mergeConfigLite(defaults, overrides, rootPath = "") {
   const merged = { ...defaults };
   for (const key of Object.keys(overrides ?? {})) {
@@ -41,7 +45,7 @@ function mergeConfigLite(defaults, overrides, rootPath = "") {
         ...(Array.isArray(existing) ? existing : [existing]),
         ...(Array.isArray(value) ? value : [value]),
       ];
-    } else if (typeof existing === "object" && typeof value === "object") {
+    } else if (isPlainObject(existing) && isPlainObject(value)) {
       // As in Vite: an `environments.<name>` node restarts path tracking, so
       // `environments.ssr.resolve.noExternal` merges like `resolve.noExternal`.
       merged[key] = mergeConfigLite(

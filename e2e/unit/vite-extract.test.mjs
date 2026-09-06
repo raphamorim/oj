@@ -2,6 +2,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import { asset } from "./harness.mjs";
 import { detectSsrRunnerBacked, extractAlias, extractOptimizeDeps, extractProxy, extractResolve, extractSsr, mergeConfigLite, warnUnsupported } from "../../crates/oj_server/src/assets/vite-extract.mjs";
 
 test("optimizeDeps carries needsInterop and force alongside the lists", () => {
@@ -398,4 +400,52 @@ test("mergeConfigLite: ssr/resolve noExternal|external true wins over lists", ()
   assert.deepEqual(mergeConfigLite({ other: { external: ["a"] } }, { other: { external: true } }), {
     other: { external: ["a", true] },
   });
+});
+
+// The recursion guard is Vite's isObject (Object.prototype.toString ===
+// "[object Object]", mirrored exactly), not a bare typeof check: a non-plain
+// object (a RegExp, a Date) on both sides must take the later VALUE, not be
+// spread key-by-key into a plain `{}` (a RegExp has no own enumerable keys —
+// the old guard merged two noExternal RegExps into an empty object).
+test("mergeConfigLite: non-plain objects like RegExps replace, never spread", () => {
+  const later = /later/;
+  const merged = mergeConfigLite({ ssr: { noExternal: /early/ } }, { ssr: { noExternal: later } });
+  assert.equal(merged.ssr.noExternal, later, "the later RegExp wins as a value");
+  assert.ok(merged.ssr.noExternal instanceof RegExp, "still a RegExp, not {}");
+  const date = new Date(0);
+  assert.equal(
+    mergeConfigLite({ stamp: new Date() }, { stamp: date }).stamp,
+    date,
+    "a Date replaces instead of merging into a plain object",
+  );
+  // An array side still concatenates a RegExp value, as in Vite.
+  assert.deepEqual(
+    mergeConfigLite({ other: { list: ["a"] } }, { other: { list: later } }),
+    { other: { list: ["a", later] } },
+  );
+  // Plain objects still merge recursively.
+  assert.deepEqual(
+    mergeConfigLite({ resolve: { dedupe: ["a"] } }, { resolve: { conditions: ["c"] } }),
+    { resolve: { dedupe: ["a"], conditions: ["c"] } },
+  );
+});
+
+// The twins ship in two self-contained assets; drift between them is a bug
+// class of its own (a fix landing in one file only). Assert byte-identity of
+// the whole mergeConfigLite block (environmentPathRE + isPlainObject +
+// function) so drift fails CI instead of shipping.
+test("mergeConfigLite twins are byte-identical across the two shipped assets", () => {
+  const block = (rel) => {
+    const src = fs.readFileSync(asset(rel), "utf8");
+    const m = src.match(
+      /const environmentPathRE = [\s\S]*?\nfunction mergeConfigLite\(defaults, overrides, rootPath = ""\) \{[\s\S]*?\n\}\n/,
+    );
+    assert.ok(m, `${rel}: mergeConfigLite block not found`);
+    return m[0];
+  };
+  assert.equal(
+    block("vite-extract.mjs"),
+    block("plugin-host.mjs"),
+    "the two mergeConfigLite copies drifted — keep them byte-identical",
+  );
 });
