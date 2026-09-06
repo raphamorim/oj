@@ -586,8 +586,8 @@ mod tests {
     // Vite's resolvePackageEntry always falls back to `pkg.main` after the
     // mainFields walk, so its DEFAULT_MAIN_FIELDS list omits "main" entirely.
     // Adopting that list verbatim into oxc_resolver (no such fallback) made a
-    // package whose ONLY entry is `main` unresolvable — the lovable/web shape:
-    // a linked workspace package with `"main": "src/x.ts"` and no index file.
+    // package whose ONLY entry is `main` unresolvable — e.g. a linked
+    // workspace package with `"main": "src/x.ts"` and no index file.
     #[test]
     fn a_vite_shaped_main_fields_list_still_falls_back_to_main() {
         let tmp = tempfile::tempdir().unwrap();
