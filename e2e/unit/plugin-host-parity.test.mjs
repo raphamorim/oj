@@ -361,3 +361,49 @@ test("buildEnd receives the build error and closeBundle runs once per build", as
     fx.cleanup();
   }
 });
+
+// The host's config merge is Vite's mergeConfigRecursively slice
+// (mergeConfigLite, twin of vite-extract.mjs's): a hook returning `key: null`
+// must not clobber a set value, and `true` on either side of
+// ssr `noExternal`/`external` wins over lists — later hooks (and the resolved
+// config plugins read) see the true, never a `[list, true]` concat.
+test("config-hook merges skip null overrides and apply the ssr noExternal true-wins rule", async () => {
+  const fx = tmpProject({ prefix: "oj-parity-merge-" });
+  fx.write(
+    "oj.plugins.mjs",
+    `const seen = {};
+     export default [
+       {
+         name: "gives-true",
+         config: () => ({ base: null, ssr: { noExternal: true }, resolve: { dedupe: ["react"] } }),
+       },
+       {
+         name: "gives-list-after-true",
+         config: () => ({ ssr: { noExternal: ["late-list"] } }),
+       },
+       {
+         name: "observer",
+         config(conf) {
+           seen.base = conf.base;
+           seen.noExternal = conf.ssr && conf.ssr.noExternal;
+           seen.dedupe = conf.resolve && conf.resolve.dedupe;
+         },
+         configResolved(config) {
+           seen.resolvedNoExternal = config.ssr && config.ssr.noExternal;
+         },
+         transform(code, id) { return id.endsWith("probe.js") ? JSON.stringify(seen) : null; },
+       },
+     ];\n`,
+  );
+  const host = spawnHost(fx, { config: { root: fx.root, base: "/keep/", ssr: { noExternal: ["from-config"] } } });
+  try {
+    const seen = await probe(host, fx);
+    assert.equal(seen.base, "/keep/", "a null override must not clobber a set value");
+    assert.equal(seen.noExternal, true, "true wins over the list (Vite's ssr noExternal special case)");
+    assert.equal(seen.resolvedNoExternal, true, "and a later hook's list does not demote it");
+    assert.deepEqual(seen.dedupe, ["react"], "ordinary keys still merge");
+  } finally {
+    host.close();
+    fx.cleanup();
+  }
+});
