@@ -1747,10 +1747,12 @@ impl PluginHost {
         // so a pipe that somehow fills post-init degrades instead of holding
         // the stdin mutex forever. Write and reply share ONE per-call
         // deadline: a slow write must not add a second full window on top of
-        // the hook's budget. A write that times out leaves a dangling partial
-        // frame in the pipe, which would splice into the NEXT call's frame —
-        // but `write_bounded_at` declares the host gone (kill + host_gone) on
-        // that path, so no next call ever writes to this stream.
+        // the hook's budget. A write that times out MID-FRAME leaves a
+        // dangling partial frame in the pipe, which would splice into the
+        // NEXT call's frame — but `write_bounded_at` declares the host gone
+        // (kill + host_gone) on that path, so no next call ever writes to
+        // this stream; a timeout still WAITING on the stdin mutex wrote
+        // nothing and fails only this call.
         let deadline = tokio::time::Instant::now() + self.rpc_wait;
         let req_id = self.counter.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
@@ -1776,18 +1778,25 @@ impl PluginHost {
     /// One protocol write to the host's stdin, bounded by `deadline`. A host
     /// that stops draining its pipe for a full RPC-scale window is not
     /// healthy — the readline interface is installed for the host's whole
-    /// life — so a timed-out (or failed) write declares the host GONE
+    /// life — so a write that timed out MID-FRAME declares the host GONE
     /// (`declare_gone`: kill, host_gone, pending drained) instead of leaving
     /// a half-written frame for the next call to splice into and a wedged
-    /// process everyone keeps talking to.
+    /// process everyone keeps talking to. A timeout that elapsed while still
+    /// WAITING ON THE STDIN MUTEX is different evidence: zero bytes of this
+    /// frame reached the pipe (nothing dangles), and the mutex holder is a
+    /// concurrent bounded write against a possibly healthy-but-busy pipe —
+    /// only THIS call fails then; a truly wedged holder is declared gone by
+    /// its own deadline.
     async fn write_bounded_at(
         &self,
         what: &str,
         line: &[u8],
         deadline: tokio::time::Instant,
     ) -> Result<(), String> {
+        let started = std::sync::atomic::AtomicBool::new(false);
         let write = async {
             let mut stdin = self.stdin.lock().await;
+            started.store(true, Ordering::SeqCst);
             stdin.write_all(line).await
         };
         match tokio::time::timeout_at(deadline, write).await {
@@ -1798,6 +1807,10 @@ impl PluginHost {
                 self.declare_gone(&format!("stdin write failed writing {what}: {e}"));
                 Err("plugin host died".into())
             }
+            Err(_) if !started.load(Ordering::SeqCst) => Err(format!(
+                "plugin host stdin busy for {}s writing {what} (a concurrent write held the pipe; only this call failed)",
+                self.rpc_wait.as_secs()
+            )),
             Err(_) => {
                 let msg = format!(
                     "plugin host stdin blocked for {}s writing {what} (the host stopped reading)",
@@ -2992,6 +3005,62 @@ mod vite_values_tests {
             "fail-fast on a declared-gone host: {:?}",
             t1.elapsed()
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The other half of the write belt: a timeout that elapsed while still
+    // WAITING ON THE STDIN MUTEX wrote zero bytes of its frame — the holder
+    // is a concurrent write against a possibly healthy pipe — so it fails
+    // ONLY that call. The host survives and later calls succeed; only a
+    // mid-frame timeout (the test above) declares the host gone.
+    #[tokio::test]
+    async fn write_timeout_waiting_on_the_stdin_mutex_fails_only_that_call() {
+        let root = std::env::temp_dir().join(format!("oj-busy-stdin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let plugins = root.join("oj.plugins.mjs");
+        std::fs::write(&plugins, "export default [];\n").unwrap();
+        let config = serde_json::json!({
+            "config": { "root": root.display().to_string() },
+            "env": { "command": "serve", "mode": "development" },
+        })
+        .to_string();
+        let host = match PluginHost::spawn_with_timeouts(
+            &root,
+            &plugins,
+            &config,
+            true,
+            SpawnTimeouts {
+                init_wait: Some(std::time::Duration::from_secs(30)),
+                rpc: Some(std::time::Duration::from_secs(1)),
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Ok(h) => h,
+            Err(_) => return, // no node on this machine
+        };
+        // Healthy and initialized (the serve-info ACK is already written).
+        host.load("warmup").await.expect("healthy host answers");
+
+        // A concurrent writer holds the pipe (the healthy-but-slow-drain
+        // shape, made deterministic): the racing call must time out WAITING,
+        // having written nothing — and fail alone.
+        let guard = host.stdin.lock().await;
+        let racer = std::sync::Arc::clone(&host);
+        let err = tokio::spawn(async move { racer.load("raced").await })
+            .await
+            .unwrap()
+            .expect_err("the call bounded by a held pipe fails");
+        assert!(err.contains("stdin busy"), "names the busy pipe, not a wedge: {err}");
+        drop(guard);
+
+        // The host was NOT declared gone: later calls succeed.
+        host.load("after")
+            .await
+            .expect("the host survives a zero-byte write timeout");
+        host.shutdown();
         let _ = std::fs::remove_dir_all(&root);
     }
 

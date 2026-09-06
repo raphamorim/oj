@@ -308,16 +308,9 @@ struct ServerState {
     plugins: Option<std::sync::Arc<PluginHost>>,
     plugin_serve: Arc<PluginServe>,
     plugins_ssr: tokio::sync::OnceCell<Option<std::sync::Arc<PluginHost>>>,
-    /// Watcher events (file, change type) the lazily spawned SSR host could
-    /// not take yet: the watcher fast-skips a pre-init host — dispatching
-    /// would serially burn a full per-call init window per hook per save on a
-    /// wedged init — and queues the event here for a watchChange catch-up
-    /// replay at the host's init (see `spawn_ssr_watch_catch_up`). Deduped by
-    /// file (the latest change type wins), so it is bounded by the files
-    /// edited during the window.
-    ssr_watch_backlog: Arc<Mutex<Vec<(String, String)>>>,
-    /// One line for the first skip, not one per save.
-    ssr_watch_skip_logged: std::sync::atomic::AtomicBool,
+    /// Watcher events the lazily spawned SSR host could not take yet, plus
+    /// the dispatch-order lock — see [`SsrWatchQueue`].
+    ssr_watch: Arc<SsrWatchQueue>,
     ssr_plugin_config: String,
     plugin_watched: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
     plugins_use_module_parsed: bool,
@@ -1185,8 +1178,7 @@ impl DevServer {
             plugins: plugin_host.clone(),
             plugin_serve: Arc::clone(&plugin_serve),
             plugins_ssr: tokio::sync::OnceCell::new(),
-            ssr_watch_backlog: Arc::new(Mutex::new(Vec::new())),
-            ssr_watch_skip_logged: std::sync::atomic::AtomicBool::new(false),
+            ssr_watch: Arc::new(SsrWatchQueue::default()),
             ssr_plugin_config,
             plugin_watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             plugins_use_module_parsed,
@@ -1731,10 +1723,10 @@ async fn ssr_plugin_host(state: &Arc<ServerState>) -> Option<std::sync::Arc<Plug
                     eprintln!("oj ssr: plugins (ssr environment) from {}", file.display());
                     // The catch-up half of the watcher's pre-init fast-skip:
                     // events skipped while this host initializes replay at
-                    // its init (see ssr_watch_backlog).
+                    // its init (see SsrWatchQueue).
                     spawn_ssr_watch_catch_up(
                         std::sync::Arc::clone(&host),
-                        Arc::clone(&state.ssr_watch_backlog),
+                        Arc::clone(&state.ssr_watch),
                     );
                     Some(host)
                 }
@@ -1748,25 +1740,38 @@ async fn ssr_plugin_host(state: &Arc<ServerState>) -> Option<std::sync::Arc<Plug
         .clone()
 }
 
+/// Watcher events (file, change type) the lazily spawned SSR host could not
+/// take yet: the watcher fast-skips a pre-init host — dispatching would
+/// serially burn a full per-call init window per hook per save on a wedged
+/// init — and queues the event here for a watchChange catch-up replay at the
+/// host's init (see `spawn_ssr_watch_catch_up`). The backlog dedups by file
+/// (the latest change type wins), so it is bounded by the files edited during
+/// the window. `order` serializes EVERY watchChange dispatch toward that host
+/// — the catch-up replay and the watcher's live post-init dispatch alike, the
+/// live path draining the backlog first — so a stale queued event can never
+/// land after a newer live event for the same file.
+#[derive(Default)]
+struct SsrWatchQueue {
+    backlog: Mutex<Vec<(String, String)>>,
+    order: tokio::sync::Mutex<()>,
+    /// One line for the first skip, not one per save.
+    logged: std::sync::atomic::AtomicBool,
+}
+
 /// Records a watcher event the pre-init lazy SSR host cannot take yet (the
-/// watcher's fast-skip; see `ServerState::ssr_watch_backlog`): deduped by
-/// file, the latest change type winning — a delete after an update is what
-/// the replay must report.
-fn note_ssr_watch_skip(
-    backlog: &Mutex<Vec<(String, String)>>,
-    logged: &std::sync::atomic::AtomicBool,
-    file: &str,
-    change_type: &str,
-) {
+/// watcher's fast-skip; see [`SsrWatchQueue`]): deduped by file, the latest
+/// change type winning — a delete after an update is what the replay must
+/// report.
+fn note_ssr_watch_skip(queue: &SsrWatchQueue, file: &str, change_type: &str) {
     {
-        let mut b = backlog.lock().unwrap();
+        let mut b = queue.backlog.lock().unwrap();
         if let Some(entry) = b.iter_mut().find(|(f, _)| f == file) {
             entry.1 = change_type.to_string();
         } else {
             b.push((file.to_string(), change_type.to_string()));
         }
     }
-    if !logged.swap(true, std::sync::atomic::Ordering::SeqCst) {
+    if !queue.logged.swap(true, std::sync::atomic::Ordering::SeqCst) {
         println!(
             "oj: ssr plugin host still initializing; queuing file changes for a catch-up replay at its init"
         );
@@ -1777,12 +1782,16 @@ fn note_ssr_watch_skip(
 /// SSR host — the invalidation notice its plugins missed while pre-init; the
 /// late hotUpdate half is deliberately not replayed (its result steers no
 /// client update on the ssr environment, and the client updates already
-/// happened through oj's own pipeline). Loops: a skip racing the drain lands
-/// in a later batch instead of being lost.
-async fn replay_ssr_watch_backlog(host: &PluginHost, backlog: &Mutex<Vec<(String, String)>>) {
+/// happened through oj's own pipeline). The whole replay holds the queue's
+/// order lock: a live dispatcher flushing the backlog before its own newer
+/// event blocks here until an in-flight replay has fully drained, so queued
+/// (older) events always reach the host before live (newer) ones. Loops: a
+/// skip racing the drain lands in a later batch instead of being lost.
+async fn replay_ssr_watch_backlog(host: &PluginHost, queue: &SsrWatchQueue) {
+    let _order = queue.order.lock().await;
     loop {
         let batch: Vec<(String, String)> = {
-            let mut b = backlog.lock().unwrap();
+            let mut b = queue.backlog.lock().unwrap();
             b.drain(..).collect()
         };
         if batch.is_empty() {
@@ -1804,10 +1813,7 @@ async fn replay_ssr_watch_backlog(host: &PluginHost, backlog: &Mutex<Vec<(String
 /// host that dies pre-init releases the wait (its backlog stays for a
 /// respawn, which never happens today — the OnceCell holds one spawn — so
 /// the queue simply dies with the session).
-fn spawn_ssr_watch_catch_up(
-    host: std::sync::Arc<PluginHost>,
-    backlog: Arc<Mutex<Vec<(String, String)>>>,
-) {
+fn spawn_ssr_watch_catch_up(host: std::sync::Arc<PluginHost>, queue: Arc<SsrWatchQueue>) {
     tokio::spawn(async move {
         let mut init = host.initialized_updates();
         loop {
@@ -1819,7 +1825,7 @@ fn spawn_ssr_watch_catch_up(
                 _ = host.host_gone_wait() => return,
             }
         }
-        replay_ssr_watch_backlog(&host, &backlog).await;
+        replay_ssr_watch_backlog(&host, &queue).await;
     });
 }
 
@@ -8111,16 +8117,20 @@ async fn decide(
                     if !ssr.is_initialized()
                         && (state.plugins_watch_change || state.plugins_hot_update) =>
                 {
-                    note_ssr_watch_skip(
-                        &state.ssr_watch_backlog,
-                        &state.ssr_watch_skip_logged,
-                        &file,
-                        change_type,
-                    );
+                    note_ssr_watch_skip(&state.ssr_watch, &file, change_type);
                     if ssr.is_initialized() {
-                        replay_ssr_watch_backlog(&ssr, &state.ssr_watch_backlog).await;
+                        replay_ssr_watch_backlog(&ssr, &state.ssr_watch).await;
                     }
                     None
+                }
+                Some(ssr) if state.plugins_watch_change || state.plugins_hot_update => {
+                    // Initialized: flush any queued catch-up events FIRST —
+                    // under the queue's order lock, blocking while the
+                    // catch-up task is mid-replay — so a stale queued
+                    // watchChange can never land after this newer live event
+                    // for the same file. Empty-queue cost is one lock check.
+                    replay_ssr_watch_backlog(&ssr, &state.ssr_watch).await;
+                    Some(ssr)
                 }
                 other => other,
             };
@@ -8388,21 +8398,20 @@ mod tests {
             Ok(h) => h,
             Err(_) => return, // no node on this machine
         };
-        let backlog = Arc::new(Mutex::new(Vec::new()));
-        let logged = std::sync::atomic::AtomicBool::new(false);
+        let queue = Arc::new(SsrWatchQueue::default());
         assert!(!wedged.is_initialized());
         let t0 = std::time::Instant::now();
         // What decide() does per save while the host is pre-init.
-        note_ssr_watch_skip(&backlog, &logged, "/app/a.ts", "update");
-        note_ssr_watch_skip(&backlog, &logged, "/app/a.ts", "delete");
-        note_ssr_watch_skip(&backlog, &logged, "/app/b.ts", "update");
+        note_ssr_watch_skip(&queue, "/app/a.ts", "update");
+        note_ssr_watch_skip(&queue, "/app/a.ts", "delete");
+        note_ssr_watch_skip(&queue, "/app/b.ts", "update");
         assert!(
             t0.elapsed() < std::time::Duration::from_millis(200),
             "a skipped dispatch never waits on the host: {:?}",
             t0.elapsed()
         );
         assert_eq!(
-            *backlog.lock().unwrap(),
+            *queue.backlog.lock().unwrap(),
             vec![
                 ("/app/a.ts".to_string(), "delete".to_string()),
                 ("/app/b.ts".to_string(), "update".to_string()),
@@ -8428,9 +8437,9 @@ mod tests {
             Ok(h) => h,
             Err(_) => return,
         };
-        spawn_ssr_watch_catch_up(std::sync::Arc::clone(&host), Arc::clone(&backlog));
+        spawn_ssr_watch_catch_up(std::sync::Arc::clone(&host), Arc::clone(&queue));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while !backlog.lock().unwrap().is_empty() {
+        while !queue.backlog.lock().unwrap().is_empty() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the backlog must drain once the host initializes"
@@ -8438,6 +8447,89 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert!(host.is_initialized(), "the replay only runs post-init");
+        host.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The ordering guarantee: every dispatch toward the SSR host serializes
+    // on the queue's order lock with the backlog drained first, so a queued
+    // (older) watchChange always reaches the host BEFORE a live (newer) event
+    // for the same file — even when the live dispatch races the catch-up
+    // task mid-replay. The host-side plugin logs arrivals; the log's last
+    // line must be the live event.
+    #[tokio::test]
+    async fn ssr_watch_catch_up_events_land_before_a_racing_live_event() {
+        let root = std::env::temp_dir().join(format!("oj-ssr-watch-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("watch.log");
+        // A slow-boot host whose watchChange hook is slow and logs arrivals:
+        // the live dispatch below races the catch-up task mid-replay.
+        let plugins = root.join("oj.plugins.mjs");
+        std::fs::write(
+            &plugins,
+            format!(
+                r#"import {{ appendFileSync }} from "node:fs";
+await new Promise((r) => setTimeout(r, 800));
+export default [{{
+  name: "watch-logger",
+  async watchChange(id, change) {{
+    await new Promise((r) => setTimeout(r, 150));
+    appendFileSync({log:?}, id + "|" + ((change && change.event) || "?") + "\n");
+  }},
+}}];
+"#,
+                log = log.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let config = serde_json::json!({
+            "config": { "root": root.display().to_string() },
+            "env": { "command": "serve", "mode": "development" },
+        })
+        .to_string();
+        let host = match plugins::PluginHost::spawn_lazy_with_wait(
+            &root,
+            &plugins,
+            &config,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        {
+            Ok(h) => h,
+            Err(_) => return, // no node on this machine
+        };
+        let queue = Arc::new(SsrWatchQueue::default());
+        note_ssr_watch_skip(&queue, "/app/a.ts", "update");
+        note_ssr_watch_skip(&queue, "/app/b.ts", "update");
+        spawn_ssr_watch_catch_up(std::sync::Arc::clone(&host), Arc::clone(&queue));
+        // Wait out init, then dispatch a LIVE event while the catch-up task
+        // is (very likely) mid-replay — the order lock, not luck, is what
+        // guarantees the outcome under every interleaving.
+        let mut init = host.initialized_updates();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            init.wait_for(|v| *v),
+        )
+        .await
+        .is_ok_and(|r| r.is_ok()));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // What decide() does for a live post-init event: flush, then send.
+        replay_ssr_watch_backlog(&host, &queue).await;
+        host.watch_change("/app/a.ts", "live")
+            .await
+            .expect("live dispatch reaches the host");
+        let lines = std::fs::read_to_string(&log).unwrap_or_default();
+        let lines: Vec<&str> = lines.lines().collect();
+        assert_eq!(
+            lines.last().copied(),
+            Some("/app/a.ts|live"),
+            "the live (newer) event lands LAST: {lines:?}"
+        );
+        assert!(
+            lines.contains(&"/app/a.ts|update") && lines.contains(&"/app/b.ts|update"),
+            "both queued events were replayed before it: {lines:?}"
+        );
         host.shutdown();
         let _ = std::fs::remove_dir_all(&root);
     }
