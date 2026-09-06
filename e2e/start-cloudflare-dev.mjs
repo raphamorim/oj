@@ -14,12 +14,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertHydrates, parseBoundPort } from "./lib/hydration.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.join(here, "..");
 const fixture = path.join(here, "fixtures", "start-app");
 const oj = path.join(repo, "target", "debug", "oj");
-const PORT = 6840;
+const REQ_PORT = 6840;
+// The port oj actually bound (it auto-increments off a busy port); read from its
+// stdout so a stale server never makes the browser hit the wrong server.
+let PORT = REQ_PORT;
 
 const installed =
   fs.existsSync(path.join(fixture, "node_modules", "@tanstack", "react-start")) &&
@@ -90,8 +94,14 @@ function makeApp() {
   // to what this test drives: a worker render with a server function reading a
   // wrangler var. The full-fat route stays covered by start.mjs (Node runner)
   // and start-cloudflare.mjs (prod worker build).
+  // The mount probe + counter give the browser hydration gate a client-only
+  // marker (absent from SSR HTML) and a post-hydration interaction, so the CF
+  // worker-render path is proven to HYDRATE, not just to emit SSR HTML. The
+  // counter is pure client state (no server call), so it does not trip the CF
+  // slim-app server-fn limitation.
   fs.writeFileSync(path.join(app, "src", "routes", "index.tsx"), [
     'import { createRoute, useLoaderData } from "@tanstack/react-router";',
+    'import { useEffect, useState } from "react";',
     'import { rootRoute } from "./__root";',
     'import { getGreeting } from "../server/data";',
     'import { shout } from "#lib/format";',
@@ -105,10 +115,15 @@ function makeApp() {
     "",
     "function Index() {",
     "  const data = useLoaderData({ from: indexRoute.id });",
+    "  const [mounted, setMounted] = useState(false);",
+    "  const [count, setCount] = useState(0);",
+    "  useEffect(() => setMounted(true), []);",
     "  return (",
     "    <main>",
     '      <h1 className="fixture-heading">{shout("home")}</h1>',
     '      <p data-testid="server-fn">{data.message} / edition={data.edition}</p>',
+    '      {mounted ? <span data-testid="client-mounted">client-mounted-ok</span> : null}',
+    '      <button data-testid="counter" onClick={() => setCount((c) => c + 1)}>count: {count}</button>',
     "    </main>",
     "  );",
     "}",
@@ -134,6 +149,14 @@ const get = async (route) => {
   return { status: res.status, body: await res.text() };
 };
 
+async function loadPlaywright() {
+  try {
+    return (await import("playwright")).chromium;
+  } catch {
+    return null;
+  }
+}
+
 async function runDev() {
   let log = "";
   const srv = spawn(oj, ["dev", app, "--port", String(PORT)], {
@@ -149,6 +172,14 @@ async function runDev() {
     setTimeout(() => { try { process.kill(-srv.pid, "SIGKILL"); } catch {} }, 2000).unref();
   };
   try {
+    // Read the port oj actually bound before probing it (it may increment off a
+    // busy REQ_PORT), so a stale server never fools the probes or the browser.
+    for (let i = 0; i < 240; i++) {
+      if (srv.exitCode != null) break;
+      const bound = parseBoundPort(log);
+      if (bound) { PORT = bound; break; }
+      await new Promise((r) => setTimeout(r, 250));
+    }
     let up = false;
     for (let i = 0; i < 240 && !up; i++) {
       if (srv.exitCode != null) break;
@@ -176,6 +207,37 @@ async function runDev() {
     const about = await get("/about");
     if (about.status !== 200 || !about.body.includes("about-page-marker")) {
       throw new Error(`/about did not render (${about.status})`);
+    }
+
+    // The CF worker-render path must HYDRATE, not just emit SSR HTML: load `/`
+    // in a real browser, prove the client module graph serves and the runtime
+    // mounts + responds. Whitelist the documented CF slim-app limitation (a
+    // client→server-fn call can't run in oj's Node SSR loader, which can't
+    // import cloudflare:workers) plus the incidental favicon 404. Run before the
+    // edit loop mutates HOME! into HOME-RAPID!.
+    const chromium = await loadPlaywright();
+    if (chromium) {
+      const browser = await chromium.launch();
+      try {
+        await assertHydrates(browser, `http://127.0.0.1:${PORT}/`, {
+          ssrMarker: "server-fn-marker",
+          clientMarker: '[data-testid="client-mounted"]',
+          clientMarkerText: "client-mounted-ok",
+          interaction: { click: '[data-testid="counter"]', expect: { selector: '[data-testid="counter"]', text: "count: 1" } },
+          whitelist: [/favicon\.ico/, "cloudflare:workers", "/_serverFn/", "createServerFn"],
+        });
+        console.log("start-cloudflare-dev: browser hydration ok (worker render mounts + counter interaction)");
+      } catch (e) {
+        // A browser-observed 500/crash in oj's own pipeline leaves its cause
+        // only in oj's server log; surface a bounded tail on the thrown error
+        // so CI names the compile/loader failure instead of a bare status.
+        e.message += `\n--- oj server log (tail) ---\n${log.slice(-3000)}`;
+        throw e;
+      } finally {
+        await browser.close();
+      }
+    } else {
+      console.log("start-cloudflare-dev: playwright not installed locally; skipped the browser hydration pass (CI runs it)");
     }
 
     // The edit loop: change the route, require the next document to be fresh.
@@ -353,8 +415,8 @@ function spawnSlowDev(port, extraEnv) {
 
 // Their own ports: the previous phase's server may still be tearing down and
 // oj would silently bind PORT+1, leaving the probes pointed at a dead socket.
-const GATED_PORT = PORT + 3;
-const DEGRADED_PORT = PORT + 4;
+const GATED_PORT = REQ_PORT + 3;
+const DEGRADED_PORT = REQ_PORT + 4;
 
 // Phase 1: the default init deadline. Boot blocks on the 8s init instead of
 // racing per-RPC timeouts against it: the forwarding line prints WITHOUT the

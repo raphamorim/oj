@@ -1,4 +1,5 @@
 import { createRoute, useLoaderData } from "@tanstack/react-router";
+import { useEffect, useState } from "react";
 
 import { rootRoute } from "./__root";
 import { getGreeting } from "../server/data";
@@ -69,21 +70,37 @@ export const indexRoute = createRoute({
 
 function Index() {
   const data = useLoaderData({ from: indexRoute.id });
+  // A client-only hydration probe for the browser gate: the span is rendered
+  // only after mount (absent from the SSR HTML, so its appearance proves the
+  // client runtime came alive), and the counter's onClick proves event handlers
+  // attached post-hydration.
+  const [mounted, setMounted] = useState(false);
+  const [count, setCount] = useState(0);
+  useEffect(() => setMounted(true), []);
   return (
     <main>
       <h1 className="fixture-heading">{shout("home")}</h1>
+      {mounted ? <span data-testid="client-mounted">client-mounted-ok</span> : null}
+      <button data-testid="counter" onClick={() => setCount((c) => c + 1)}>count: {count}</button>
       <p data-testid="server-fn">{data.message} / edition={data.edition}</p>
       <p data-testid="paths-alias">{shoutViaPaths("alias")}</p>
       <p data-testid="cjs">{badge("interop")}</p>
       <p data-testid="cjs-subpath">{deep("ok")}</p>
       <p data-testid="virtual">{buildTag}</p>
-      <p data-testid="fresh-module">{gen.LABEL}</p>
-      <p data-testid="fresh-fn">{gen.freshMsg_cta()}</p>
+      {/* Deliberately environment-divergent (this.environment.name + consumer):
+          "ssr-server" server-side, "client-client" in the client bundle. Like
+          env-define below, this is an intentional per-environment difference, so
+          suppress the (correct) hydration-mismatch warning it would otherwise
+          raise. */}
+      <p data-testid="fresh-module" suppressHydrationWarning>{gen.LABEL}</p>
+      <p data-testid="fresh-fn" suppressHydrationWarning>{gen.freshMsg_cta()}</p>
       <p data-testid="glob">{titles}</p>
       <p data-testid="glob-jsx"><GlobWidget /></p>
       <p data-testid="glob-js">{plainGlobTitles}</p>
       <p data-testid="glob-ts-generic">{genericGlobTitles}</p>
-      <p data-testid="js-env">{envProbe}</p>
+      {/* envProbe embeds import.meta.env.SSR (true server-side, false in the
+          client bundle), so it is intentionally environment-divergent too. */}
+      <p data-testid="js-env" suppressHydrationWarning>{envProbe}</p>
       <p data-testid="json-named">{`json-named:${alphaTitle}`}</p>
       <p data-testid="define">{__FIXTURE_DEFINE__}</p>
       <p data-testid="env-define" suppressHydrationWarning>{__FIXTURE_SIDE__}</p>

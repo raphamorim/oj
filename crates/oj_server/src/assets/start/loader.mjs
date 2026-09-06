@@ -584,6 +584,10 @@ const ALIASES = {
   "tanstack-start-manifest:v": pathResolve(HERE, "manifest-dev.ts"),
   "tanstack-start-injected-head-scripts:v": pathResolve(HERE, "injected-head-scripts.ts"),
   "@cloudflare/vite-plugin/server": pathResolve(HERE, "cf-server.mjs"),
+  // The `cloudflare:workers` runtime module has no workerd here; resolve it to
+  // oj's dev stub so a server function reading `env` runs instead of Node's
+  // default loader crashing on the `cloudflare:` scheme (ERR_UNSUPPORTED_ESM_URL_SCHEME).
+  "cloudflare:workers": pathResolve(HERE, "cf-workers.mjs"),
   // Start's default server entry is oj's runner entry: an app `server.entry` that
   // wraps it (as Vite runs it) wraps oj's handler.
   "@tanstack/react-start/server-entry": pathResolve(HERE, "server-entry.tsx"),
@@ -931,6 +935,16 @@ export function load(url, context, next) {
     const rid = decodeURIComponent(stripQ(url).slice(VIRTUAL_SCHEME.length));
     const code = container ? container.load(rid) : null;
     return { format: "module", source: code ?? emptyVirtualStub(APP, rid), shortCircuit: true };
+  }
+  // A specifier that resolved to a scheme Node's default ESM loader rejects (a
+  // `cloudflare:*` runtime module with no workerd here, or another virtual
+  // runtime scheme) must never crash the dev server the way Node's
+  // ERR_UNSUPPORTED_ESM_URL_SCHEME would. `cloudflare:workers` is aliased to a
+  // real stub in resolve(); this is the net for any other such scheme: serve an
+  // empty module so the import resolves instead of taking the process down.
+  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(url)?.[1]?.toLowerCase();
+  if (scheme && scheme !== "file" && scheme !== "data" && scheme !== "node") {
+    return { format: "module", source: "export default {};", shortCircuit: true };
   }
   const clean = stripQ(url);
   const kind = /[?&]ojasset=(\w+)/.exec(url)?.[1];

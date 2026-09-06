@@ -7,6 +7,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { HYDRATION_SIGNATURES, collectBrowserErrors } from "./lib/hydration.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.join(here, "..");
@@ -391,9 +392,10 @@ try {
       console.log("ssr-dev: connection gating + change ok (Data Saver suppresses, improve resumes, click navigates)");
 
       const page = await browser.newPage();
-      const errors = [];
-      page.on("pageerror", (e) => errors.push(String(e)));
-      page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
+      // Unified browser-error gate (shared with the hydration suites): captures
+      // page errors + console errors/warnings, so the React hydration-mismatch
+      // strings are asserted absent explicitly, not just "no console errors".
+      const diag = collectBrowserErrors(page);
       await page.goto(`${base}/`, { waitUntil: "networkidle" });
       await page.waitForSelector("button");
       const counterBtn = page.locator("button", { hasText: "ssr" });
@@ -427,6 +429,11 @@ try {
       const marker = await page.evaluate(() => window.__marker);
       if (!afterEdit.includes("= 3")) throw new Error(`state lost or edit not applied: ${afterEdit}`);
       if (marker !== 7) throw new Error("page fully reloaded (state would be lost)");
+      const hydrationHits = [...diag.pageErrors, ...diag.consoleMessages.map((m) => m.text)].filter((s) =>
+        HYDRATION_SIGNATURES.some((sig) => s.includes(sig)),
+      );
+      if (hydrationHits.length) throw new Error(`React hydration-mismatch signatures: ${hydrationHits.join("; ")}`);
+      const errors = [...diag.pageErrors, ...diag.consoleMessages.filter((m) => m.type === "error").map((m) => m.text)];
       if (errors.length) throw new Error(`console errors: ${errors.join("; ")}`);
       console.log(`ssr-dev: SSR HMR ok (${clicked} -> hot edit -> ${afterEdit}, no reload)`);
     } finally {

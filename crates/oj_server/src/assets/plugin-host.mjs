@@ -128,6 +128,41 @@ const ojStartMode = initial.ojStartMode === true;
 const _ojTTY = process.stderr.isTTY && !process.env.NO_COLOR;
 const OJ = _ojTTY ? "\x1b[48;2;255;255;255m\x1b[1;38;2;42;51;212m oj \x1b[0m" : "oj";
 
+// oj does not implement Vite's `experimental.bundledDev` (Rolldown bundled
+// client dev mode): oj bundles the client itself, so bundledDev is redundant
+// under oj, and left on the app's TanStack manifest emits a `/assets/index.js`
+// client script oj never builds nor serves. Coerce it off wherever oj drives the
+// config so the standard Vite dev client entry (which oj serves) is used, and
+// warn once per session. Returns whether it flipped a truthy value.
+let _bundledDevWarned = false;
+function coerceBundledDevOff(cfg) {
+  if (!cfg || typeof cfg !== "object") return false;
+  // bundledDev is Vite's serve-only bundled-client mode; only serve derives
+  // `environments.*.isBundled` from it. During a build Vite sets `isBundled`
+  // true on every environment regardless (the normal production state), so
+  // clearing it there is wrong and would emit a dev-worded warning on a build.
+  if (command !== "serve") return false;
+  let flipped = false;
+  if (cfg.experimental && cfg.experimental.bundledDev) {
+    cfg.experimental.bundledDev = false;
+    flipped = true;
+  }
+  // Vite derives `environments.client.isBundled` from `experimental.bundledDev`
+  // in `resolveConfig`; a resolved config carries it and the DevEnvironment
+  // constructor (plus TanStack's manifest plugin) reads it directly.
+  for (const name of Object.keys(cfg.environments || {})) {
+    if (cfg.environments[name] && cfg.environments[name].isBundled) {
+      cfg.environments[name].isBundled = false;
+      flipped = true;
+    }
+  }
+  if (flipped && !_bundledDevWarned) {
+    _bundledDevWarned = true;
+    process.stderr.write(`${OJ}: experimental.bundledDev is not supported; using the standard dev client entry instead\n`);
+  }
+  return flipped;
+}
+
 // The one writer for every oj protocol line (RPC replies, ctx-RPC requests,
 // and the ojServeInfo/ojServer/ojWs pushes). Plugin code shares this stdout,
 // so the frame defends the control plane on both sides: the leading newline
@@ -612,6 +647,16 @@ const OJ_NATIVE_PLUGIN_NAMES = new Set([
   "vite:react-refresh",
   "vite:react-swc",
   "vite:react-swc:resolve-runtime",
+  // rolldown-vite's @vitejs/plugin-react does its client Fast Refresh wrapping by
+  // returning the rolldown builtin `builtin:vite-react-refresh-wrapper` from this
+  // plugin's `applyToEnvironment`. oj already reimplements React refresh natively
+  // (its own preamble + refresh runtime), so this is redundant; left active the
+  // builtin's transform runs and throws "Missing field `moduleType`" (oj drives
+  // transform hooks with Vite's { ssr } options, not the builtin's rolldown
+  // { moduleType } extra args), which 500s the client entry and stops the browser
+  // from ever hydrating. Skipping the parent here removes it before
+  // applyToEnvironment can introduce the builtin.
+  "vite:react:refresh-wrapper",
 ]);
 
 // Dev-tooling plugins oj cannot host: they drive a full Vite dev server (ws
@@ -944,6 +989,10 @@ async function runConfigHooks() {
     const { plugins: _fresh, ...base } = userResolvedViteConfig;
     config = mergeConfigLite(base, config);
   }
+  // Coerce experimental.bundledDev off BEFORE the config/configResolved hooks
+  // run, so TanStack's start-manifest-plugin emits the standard dev client entry
+  // (not `/assets/index.js`) and any bundled-dev middleware early-returns.
+  coerceBundledDevOff(config);
   // Vite hands the config hook the user config, whose `plugins` is the flat
   // plugin array; plugins like @crxjs read `config.plugins` to find sibling
   // plugins. Use the apply-filtered active set (not allPlugins) so command-
@@ -1266,6 +1315,12 @@ async function buildEnvironments(server) {
     rc = await vite.resolveConfig({ root, configFile: undefined, mode: environment.mode }, "serve", "development", "development");
     hostPhase("cf: resolveConfig done");
     initStage("cf:resolveConfig-done");
+    // The fresh resolve reads the app's vite.config again, so bundledDev is back
+    // on here (and Vite has stamped environments.client.isBundled). Coerce it off
+    // BEFORE the environments are built off `rc`: the DevEnvironment constructor
+    // makes the client env bundled from these fields, and the manifest plugin
+    // bound to these environments reads them at load time.
+    coerceBundledDevOff(rc);
   } catch (e) {
     process.stderr.write(`${OJ} plugin host: vite.resolveConfig failed: ${(e && e.message) || e}\n`);
     return undefined;
