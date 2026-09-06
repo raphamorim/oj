@@ -3612,16 +3612,19 @@ async fn serve_compiled(
         module.code.clone()
     };
     if !state.bundle && module.kind != "svelte" {
-        if module.hot.is_some() {
+        let ctx_predefined = module.hot.is_some();
+        if ctx_predefined {
             // The module reads import.meta.hot itself: define the context before
-            // its body runs (the React refresh glue below re-uses it).
+            // its body runs. The refresh glue below then REUSES it (its own
+            // import would re-declare `__oj_createHotContext` — a SyntaxError
+            // that kills the module).
             let full = match query {
                 Some(q) if !q.is_empty() => format!("{base_url}?{q}"),
                 _ => base_url.to_string(),
             };
             body = format!("{}{}", svelte_hot_glue(&strip_hmr_timestamp(&full)), body);
         }
-        body.push_str(&hot_glue(base_url, query, module.is_boundary));
+        body.push_str(&hot_glue(base_url, query, module.is_boundary, ctx_predefined));
     }
     if let Some(map_url) = &module.map_data_url {
         body.push_str(&format!("\n//# sourceMappingURL={map_url}\n"));
@@ -5304,7 +5307,14 @@ fn stamp_import_url(url: &str, timestamp: u64) -> String {
     }
 }
 
-fn hot_glue(url: &str, query: Option<&str>, is_boundary: bool) -> String {
+/// `ctx_predefined`: the served body already carries the hot-context banner
+/// (serve_compiled prepends it when the module reads `import.meta.hot`
+/// itself). The glue must then REUSE `import.meta.hot` — as Vite's refresh
+/// footer reuses the import-analysis banner — never re-import: an import
+/// binding is a lexical declaration, and a second
+/// `import {{ createHotContext as __oj_createHotContext }}` in the same
+/// module scope is a SyntaxError that kills the whole module.
+fn hot_glue(url: &str, query: Option<&str>, is_boundary: bool, ctx_predefined: bool) -> String {
     if !is_boundary {
         return String::new();
     }
@@ -5319,11 +5329,16 @@ fn hot_glue(url: &str, query: Option<&str>, is_boundary: bool) -> String {
         _ => url.to_string(),
     };
     let id = strip_hmr_timestamp(&self_specifier);
+    let ctx = if ctx_predefined {
+        String::new()
+    } else {
+        format!(
+            "import {{ createHotContext as __oj_createHotContext }} from \"/@oj/client.js\";\nimport.meta.hot ??= __oj_createHotContext({id:?});\n"
+        )
+    };
     format!(
         r#"
-import {{ createHotContext as __oj_createHotContext }} from "/@oj/client.js";
-import.meta.hot ??= __oj_createHotContext({id:?});
-import * as RefreshRuntime from "/@oj/refresh-runtime.js";
+{ctx}import * as RefreshRuntime from "/@oj/refresh-runtime.js";
 import * as __oj_currentExports from {self_specifier:?};
 if (import.meta.hot) {{
   if (!window.__oj_refresh_installed__) {{
@@ -8589,12 +8604,32 @@ mod tests {
 
     #[test]
     fn glue_only_added_for_boundary_modules() {
-        assert!(hot_glue("/src/util.ts", None, false).is_empty());
-        let glue = hot_glue("/src/App.tsx", Some("t=1700000000000"), true);
+        assert!(hot_glue("/src/util.ts", None, false, false).is_empty());
+        let glue = hot_glue("/src/App.tsx", Some("t=1700000000000"), true, false);
         assert!(glue.contains(r#"createHotContext("/src/App.tsx")"#));
         assert!(glue.contains(r#"from "/src/App.tsx?t=1700000000000""#), "{glue}");
         assert!(glue.contains("validateRefreshBoundaryAndEnqueueUpdate"));
         assert!(glue.contains("function $RefreshReg$"));
+    }
+
+    // A module that reads import.meta.hot itself gets the hot-context banner
+    // PREPENDED (svelte_hot_glue); the appended refresh glue must then reuse
+    // that context, never re-import it — an import binding is a lexical
+    // declaration, and a second `__oj_createHotContext` in the same module
+    // scope is a SyntaxError that kills the module (seen on TanStack route
+    // files, whose router plugin injects its own import.meta.hot handler).
+    #[test]
+    fn glue_reuses_a_predefined_hot_context_instead_of_redeclaring_it() {
+        let banner = svelte_hot_glue("/src/routes/a.tsx");
+        let glue = hot_glue("/src/routes/a.tsx", Some("t=1700000000000"), true, true);
+        assert!(!glue.contains("__oj_createHotContext"), "{glue}");
+        assert!(glue.contains("registerExportsForReactRefresh"), "{glue}");
+        let combined = format!("{banner}{glue}");
+        assert_eq!(
+            combined.matches("createHotContext as __oj_createHotContext").count(),
+            1,
+            "exactly one declaration per module scope: {combined}"
+        );
     }
 
     #[test]
@@ -8603,7 +8638,7 @@ mod tests {
         // that already has its query AND the same query again. The self-import
         // must not grow (`?t=X?t=X` grew per edit until hyper answered 414) and
         // the hot-context id must stay the clean path the server sends updates for.
-        let glue = hot_glue("/src/App.tsx?t=1700000000000", Some("t=1700000000000"), true);
+        let glue = hot_glue("/src/App.tsx?t=1700000000000", Some("t=1700000000000"), true, false);
         assert!(glue.contains(r#"createHotContext("/src/App.tsx")"#), "{glue}");
         assert!(glue.contains(r#"from "/src/App.tsx?t=1700000000000""#), "{glue}");
         assert!(!glue.contains("?t=1700000000000?t=1700000000000"), "{glue}");
@@ -8614,6 +8649,7 @@ mod tests {
             "/src/r.tsx?tsr-shared=1&t=1700000000000",
             Some("tsr-shared=1&t=1700000000000"),
             true,
+            false,
         );
         assert!(v.contains(r#"createHotContext("/src/r.tsx?tsr-shared=1")"#), "{v}");
         assert!(v.contains(r#"from "/src/r.tsx?tsr-shared=1&t=1700000000000""#), "{v}");
