@@ -183,45 +183,25 @@ pub async fn start_dev(
     // bounded, so a host that never comes up still gets a warm runner — and
     // skips it iff the worker environments render (warming the runner is
     // wasted CPU then).
-    type ServeInfoUpdates = tokio::sync::watch::Receiver<Option<oj_server::plugins::ServeInfo>>;
-    let (cf_tx, cf_rx) =
-        tokio::sync::oneshot::channel::<Option<(ServeInfoUpdates, tokio::time::Instant)>>();
+    let (cf_tx, cf_rx) = tokio::sync::oneshot::channel::<Option<PrewarmHold>>();
     {
         let runner = Arc::clone(&runner);
         let reload_tx = reload_tx.clone();
         tokio::spawn(async move {
             if cf_hint {
-                if let Ok(Some((mut updates, init_deadline))) = cf_rx.await {
-                    // Bounded twice over: never past the host's OWN init
-                    // deadline (its spawn instant + OJ_PLUGIN_INIT_TIMEOUT —
-                    // a fresh full period measured from here could double the
-                    // knob), and never longer than one RPC-timeout window
-                    // from now — a host that never pushes must not hold the
-                    // fallback runner cold for the whole 300 s init deadline.
-                    // On that wedged path the runner is prewarmed anyway; a
-                    // LATE serve-info activation still supersedes (prewarming
-                    // and then discovering worker environments render is only
-                    // the pre-PR waste).
-                    let hold = prewarm_hold_deadline(
-                        init_deadline,
-                        tokio::time::Instant::now(),
-                        oj_server::plugins::plugin_rpc_timeout(),
-                    );
-                    let known = tokio::time::timeout_at(hold, async {
-                        loop {
-                            if let Some(info) = *updates.borrow_and_update() {
-                                return info;
-                            }
-                            if updates.changed().await.is_err() {
-                                return oj_server::plugins::ServeInfo::default();
-                            }
+                if let Ok(Some(mut hold)) = cf_rx.await {
+                    // Held until the serve info is KNOWN or there is wedge
+                    // EVIDENCE (host death, a burned init window, the host's
+                    // own init deadline) — see hold_prewarm_for_serve_info.
+                    // On an evidence release the runner is prewarmed anyway;
+                    // a LATE serve-info activation still supersedes
+                    // (prewarming and then discovering worker environments
+                    // render is only the pre-PR waste).
+                    if let Some(known) = hold_prewarm_for_serve_info(&mut hold).await {
+                        if known.middleware_port.is_some() && known.runner_environments {
+                            oj_server::boot_phase("prewarm skipped (worker environments)");
+                            return;
                         }
-                    })
-                    .await
-                    .unwrap_or_default();
-                    if known.middleware_port.is_some() && known.runner_environments {
-                        oj_server::boot_phase("prewarm skipped (worker environments)");
-                        return;
                     }
                 }
             }
@@ -236,12 +216,12 @@ pub async fn start_dev(
     let (bundle_res, built_res) = tokio::join!(bundle, built_task);
     let pinned = bundle_res??;
     let built = built_res??;
-    let _ = cf_tx.send(
-        built
-            .plugin_host
-            .as_ref()
-            .map(|h| (h.serve_info_updates(), h.init_deadline_at())),
-    );
+    let _ = cf_tx.send(built.plugin_host.as_ref().map(|h| PrewarmHold {
+        updates: h.serve_info_updates(),
+        host_gone: h.host_gone_updates(),
+        init_failed: h.init_failure_updates(),
+        init_deadline: h.init_deadline_at(),
+    }));
     oj_server::boot_phase("bundle+build joined");
     let css_host = if app_uses_tailwind(&root) {
         spawn_node_service(&root, &cache.join("css-host.mjs"), &mode)
@@ -1686,19 +1666,58 @@ fn inject_reload_client(resp: Response) -> Response {
     Response::from_parts(parts, axum::body::Body::from_stream(stream))
 }
 
-/// How long the Cloudflare prewarm hold may wait for the plugin host's serve
-/// info: the EARLIER of the host's own init deadline (spawn +
-/// `OJ_PLUGIN_INIT_TIMEOUT`) and one RPC-timeout window
-/// (`OJ_PLUGIN_TIMEOUT`) from the wait's own start. A wedged host that never
-/// pushes must not hold the fallback runner cold for the whole init deadline
-/// (300 s of cold-runner documents); past this bound the runner is prewarmed
-/// anyway, and a late serve-info activation still supersedes.
-fn prewarm_hold_deadline(
+/// The signals the Cloudflare prewarm hold selects on, captured from the boot
+/// plugin host once the server build joins.
+type ServeInfoUpdates = tokio::sync::watch::Receiver<Option<oj_server::plugins::ServeInfo>>;
+struct PrewarmHold {
+    updates: ServeInfoUpdates,
+    host_gone: tokio::sync::watch::Receiver<bool>,
+    init_failed: tokio::sync::watch::Receiver<bool>,
     init_deadline: tokio::time::Instant,
-    now: tokio::time::Instant,
-    rpc_timeout: std::time::Duration,
-) -> tokio::time::Instant {
-    init_deadline.min(now + rpc_timeout)
+}
+
+/// Holds the Cloudflare prewarm until the plugin host's serve info is KNOWN,
+/// releasing early only on wedge EVIDENCE: (a) the info arriving decides
+/// (worker environments render → skip the prewarm; none → prewarm), (b) the
+/// host dying (`host_gone`) or a pre-init RPC having burned a full init
+/// window (the init-failure evidence watch) releases immediately, and (c) the
+/// host's OWN init deadline (spawn + `OJ_PLUGIN_INIT_TIMEOUT` — never a fresh
+/// full period measured from here) is the outer bound. A merely slow, healthy
+/// boot — elapsed time short of that deadline, with no evidence — keeps
+/// holding: the earlier flat RPC-scale timer prewarmed (wasted CPU, competing
+/// with the boot) on every healthy boot slower than one RPC window. `None`
+/// means "not known: prewarm"; a LATE serve-info activation still supersedes.
+async fn hold_prewarm_for_serve_info(
+    hold: &mut PrewarmHold,
+) -> Option<oj_server::plugins::ServeInfo> {
+    loop {
+        if let Some(info) = *hold.updates.borrow_and_update() {
+            return Some(info);
+        }
+        if *hold.host_gone.borrow_and_update() || *hold.init_failed.borrow_and_update() {
+            return None;
+        }
+        tokio::select! {
+            changed = hold.updates.changed() => {
+                if changed.is_err() {
+                    return None;
+                }
+            }
+            changed = hold.host_gone.changed() => {
+                if changed.is_err() {
+                    return None;
+                }
+            }
+            changed = hold.init_failed.changed() => {
+                if changed.is_err() {
+                    return None;
+                }
+            }
+            _ = tokio::time::sleep_until(hold.init_deadline) => {
+                return None;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1728,22 +1747,92 @@ mod tests {
             .unwrap()
     }
 
-    // The prewarm hold is bounded at the RPC-timeout scale: a wedged host that
-    // never pushes serve info releases the prewarm after one OJ_PLUGIN_TIMEOUT
-    // window, never the whole 300 s init deadline — while a host whose init
-    // deadline is nearer still bounds the hold to that.
-    #[test]
-    fn prewarm_hold_is_bounded_by_the_rpc_timeout_scale() {
-        let now = tokio::time::Instant::now();
-        let rpc = std::time::Duration::from_secs(20);
-        // A fresh boot host: its init deadline (300 s out) must NOT govern the
-        // hold — the RPC-timeout window does.
-        let far = now + std::time::Duration::from_secs(300);
-        assert_eq!(prewarm_hold_deadline(far, now, rpc), now + rpc);
-        // A host most of the way through its init deadline: the nearer init
-        // deadline still wins (the hold never outlives it).
-        let near = now + std::time::Duration::from_secs(5);
-        assert_eq!(prewarm_hold_deadline(near, now, rpc), near);
+    fn prewarm_channels() -> (
+        tokio::sync::watch::Sender<Option<oj_server::plugins::ServeInfo>>,
+        tokio::sync::watch::Sender<bool>,
+        tokio::sync::watch::Sender<bool>,
+        PrewarmHold,
+    ) {
+        let (info_tx, updates) = tokio::sync::watch::channel(None);
+        let (gone_tx, host_gone) = tokio::sync::watch::channel(false);
+        let (fail_tx, init_failed) = tokio::sync::watch::channel(false);
+        let hold = PrewarmHold {
+            updates,
+            host_gone,
+            init_failed,
+            init_deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+        };
+        (info_tx, gone_tx, fail_tx, hold)
+    }
+
+    // (a) The hold outlives any flat RPC-scale timer while the boot is merely
+    // slow and healthy: the serve info arriving is what decides, even minutes
+    // in — never a 20 s timer prewarming against a still-booting host.
+    #[tokio::test(start_paused = true)]
+    async fn prewarm_hold_waits_out_a_healthy_slow_boot_for_the_serve_info() {
+        let (info_tx, _gone_tx, _fail_tx, mut hold) = prewarm_channels();
+        let start = tokio::time::Instant::now();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            let _ = info_tx.send(Some(oj_server::plugins::ServeInfo::default()));
+        });
+        let known = hold_prewarm_for_serve_info(&mut hold).await;
+        assert!(known.is_some(), "the arriving serve info decides");
+        let held = start.elapsed();
+        assert!(
+            held >= std::time::Duration::from_secs(120),
+            "held past the old RPC-scale bound on a healthy slow boot: {held:?}"
+        );
+        assert!(
+            held < std::time::Duration::from_secs(300),
+            "released by the info, not the deadline: {held:?}"
+        );
+    }
+
+    // (c) With nothing deciding and no wedge evidence, the hold's outer bound
+    // is the host's OWN init deadline — the prewarm then proceeds anyway.
+    #[tokio::test(start_paused = true)]
+    async fn prewarm_hold_releases_at_the_init_deadline_when_nothing_decides() {
+        let (_info_tx, _gone_tx, _fail_tx, mut hold) = prewarm_channels();
+        let start = tokio::time::Instant::now();
+        let known = hold_prewarm_for_serve_info(&mut hold).await;
+        assert!(known.is_none(), "not known: the caller prewarms");
+        assert!(
+            start.elapsed() >= std::time::Duration::from_secs(300),
+            "the outer bound is the init deadline, got {:?}",
+            start.elapsed()
+        );
+    }
+
+    // (b) Wedge evidence releases the hold immediately: the host dying, or a
+    // pre-init RPC having burned a full init window (the init-failure watch).
+    #[tokio::test(start_paused = true)]
+    async fn prewarm_hold_releases_on_wedge_evidence() {
+        let (_info_tx, _gone_tx, fail_tx, mut hold) = prewarm_channels();
+        let start = tokio::time::Instant::now();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(40)).await;
+            let _ = fail_tx.send(true);
+        });
+        assert!(hold_prewarm_for_serve_info(&mut hold).await.is_none());
+        let held = start.elapsed();
+        assert!(
+            held >= std::time::Duration::from_secs(40) && held < std::time::Duration::from_secs(300),
+            "the init-failure evidence released the hold: {held:?}"
+        );
+
+        let (_info_tx, gone_tx, _fail_tx, mut hold) = prewarm_channels();
+        let start = tokio::time::Instant::now();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            let _ = gone_tx.send(true);
+        });
+        assert!(hold_prewarm_for_serve_info(&mut hold).await.is_none());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(300),
+            "the host dying released the hold: {:?}",
+            start.elapsed()
+        );
     }
 
     // The rebundle worker snapshots the regen outputs around a run and pushes

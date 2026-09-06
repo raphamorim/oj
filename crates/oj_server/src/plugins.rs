@@ -1134,20 +1134,18 @@ pub struct PluginHost {
     /// spawn-anchored short bound gave calls arriving after `spawn +
     /// init_wait` during a still-pending init a zero-length window (instant
     /// failure), where pre-init-gate semantics gave every call its own
-    /// per-call timeout. Per-call windows apply only while init is still
-    /// plausibly live: once ONE call's window elapses with init pending,
-    /// `init_failed` latches and later calls fail fast (see below).
+    /// per-call timeout. Every pre-init call gets its own full window: an
+    /// earlier call's expired window is evidence of a slow boot, not a wedge,
+    /// so it never fails a later call early (see `call`).
     lazy: bool,
-    /// Lazy-host init-failure latch: set when a per-call init window elapsed
-    /// with init still pending. From then on, pre-init calls fail immediately
-    /// instead of each burning a full window against a host already known
-    /// wedged (serially freezing every consumer for `init_wait` apiece). A
-    /// LATE init still clears it: the latch is consulted only while
-    /// `initialized` is false, so a host that recovers (its serve-info push,
-    /// ojInit signal, or first reply lands after the latch) serves calls
-    /// normally again. Boot hosts don't need it — their deadline is shared
-    /// and spawn-anchored, so it is already in the past for every later call.
-    init_failed: std::sync::atomic::AtomicBool,
+    /// Wedge EVIDENCE, not a call gate: flips true when a pre-init call's
+    /// full init window elapsed with init still pending, and back false the
+    /// moment init progresses (any `initialized` flip). Calls never consult
+    /// it — time alone must not fail a call that a landing init would have
+    /// served — but waiters gating separate work on the host's health (the
+    /// Start prewarm hold) select on it, alongside `host_gone`, instead of
+    /// running their own flat timers against a healthy slow boot.
+    init_failed: tokio::sync::watch::Sender<bool>,
     /// The env knob named when the init wait elapses (matches `init_wait`).
     init_knob: &'static str,
     /// Last "still initializing" progress line, so concurrent init-gated calls
@@ -1379,7 +1377,7 @@ impl PluginHost {
             spawned: tokio::time::Instant::now(),
             init_wait,
             lazy,
-            init_failed: std::sync::atomic::AtomicBool::new(false),
+            init_failed: tokio::sync::watch::channel(false).0,
             init_knob,
             init_progress: Mutex::new(std::time::Instant::now()),
         });
@@ -1410,6 +1408,7 @@ impl PluginHost {
                         .serve_info_push
                         .send_replace(Some(ServeInfo::from_json(info)));
                     let _ = reader_ref.initialized.send_replace(true);
+                    let _ = reader_ref.init_failed.send_replace(false);
                     // ACK so the host stops re-pushing (it re-sends until
                     // acknowledged, healing a copy a plugin's unterminated
                     // partial write may have spliced).
@@ -1424,6 +1423,7 @@ impl PluginHost {
                     // reply — a hanging first hook would wait out the whole
                     // init deadline blamed on initialization.
                     let _ = reader_ref.initialized.send_replace(true);
+                    let _ = reader_ref.init_failed.send_replace(false);
                     continue;
                 }
                 if let Some(ev) = msg.get("ojServer") {
@@ -1461,6 +1461,7 @@ impl PluginHost {
                 // Any reply proves the host's top-level init completed: the RPC
                 // listener only registers after every top-level await.
                 let _ = reader_ref.initialized.send_replace(true);
+                let _ = reader_ref.init_failed.send_replace(false);
                 let result = if let Some(err) = msg.get("error").and_then(|e| e.as_str()) {
                     Err(err.to_string())
                 } else {
@@ -1495,92 +1496,67 @@ impl PluginHost {
         if *self.host_gone.borrow() {
             return Err("plugin host exited".into());
         }
-        let req_id = self.counter.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(req_id, tx);
-        let request = serde_json::json!({ "id": req_id, "hook": hook, "args": args });
-        {
-            let mut stdin = self.stdin.lock().await;
-            if stdin
-                .write_all(format!("{request}\n").as_bytes())
-                .await
-                .is_err()
-            {
-                self.pending.lock().unwrap().remove(&req_id);
-                return Err("plugin host died".into());
-            }
-        }
-        let mut rx = rx;
         // The host answers RPCs only after its top-level init completes (the
         // listener registers after every top-level await), so a call during a
         // slow boot must wait for init — bounded by this spawn's init-wait
-        // policy (the long deadline on a boot host, the short per-call bound
-        // on a lazy one), shared across calls and measured from spawn —
-        // instead of racing its own per-call timeout against the boot and
-        // permanently snapshotting wrong defaults. Fast boots are untouched:
-        // initialized flips with the serve-info push, the ojInit signal, or
-        // the first reply, all preceding any wait here.
+        // policy (the long spawn-anchored deadline on a boot host, the short
+        // per-call window on a lazy one) — instead of racing its own per-call
+        // timeout against the boot and permanently snapshotting wrong
+        // defaults. Fast boots are untouched: initialized flips with the
+        // serve-info push, the ojInit signal, or the first reply, all
+        // preceding any wait here.
+        //
+        // The gate runs BEFORE anything touches stdin. A wedged host is not
+        // reading its stdin (the host installs readline only after init), so
+        // once the pipe fills, a write_all would block forever HOLDING the
+        // stdin mutex — deadlocking every later call behind it with no
+        // timeout in reach. A pre-init call therefore writes nothing: it
+        // waits on the init watch and either proceeds (init flipped: the host
+        // is reading) or fails at its window without a byte sent.
+        //
+        // Per-call windows, deliberately with NO time-based fail-fast latch:
+        // a previous call's expired window is evidence only of a slow boot,
+        // not a wedge, so a later call must still get its own full window —
+        // a healthy 30 s init serves a call arriving at 21 s the moment init
+        // lands, where a latch would fail it milliseconds short. Time alone
+        // never fails a call early: only host death (host_gone) fails fast.
+        // A truly wedged host costs each caller one window (degrading like a
+        // slow hook) with zero pipe writes; `init_failed` still records the
+        // expired-window evidence — cleared whenever init progresses — for
+        // waiters that select on wedge evidence (the Start prewarm hold).
         let mut init_rx = self.initialized.subscribe();
         if !*init_rx.borrow_and_update() {
-            // The latch: a lazy host whose init already outlived one call's
-            // full window is known wedged — fail fast instead of burning a
-            // fresh window per call. Cleared by recovery implicitly: once
-            // `initialized` flips (a late init push, or any reply), this
-            // branch is never taken again.
-            if self.lazy
-                && self
-                    .init_failed
-                    .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                self.pending.lock().unwrap().remove(&req_id);
-                return Err(format!(
-                    "plugin host init already timed out after {}s; failing {hook} fast until init completes (raise {} for slower boots)",
-                    self.init_wait.as_secs(),
-                    self.init_knob,
-                ));
-            }
-            // A boot host's deadline is shared and spawn-anchored (boot RPCs
-            // ride one deadline instead of stacking). A lazy host's is
-            // per-call: each call gets its own full `init_wait` window from
-            // its own start — spawn-anchoring the short bound made every call
-            // arriving after `spawn + init_wait` (with init still pending)
-            // fail instantly instead of degrading like a slow hook — but only
-            // while no window has elapsed yet (see the latch above).
             let deadline = call_init_deadline(
                 self.lazy,
                 self.spawned,
                 self.init_wait,
                 tokio::time::Instant::now(),
             );
+            let mut host_gone_rx = self.host_gone.subscribe();
             let mut progress = tokio::time::interval_at(
                 tokio::time::Instant::now() + std::time::Duration::from_secs(30),
                 std::time::Duration::from_secs(30),
             );
             loop {
                 tokio::select! {
-                    // Deterministic when arms are simultaneously ready: a reply
-                    // (or the init flip) racing an elapsed deadline must win.
+                    // Deterministic when arms are simultaneously ready: an
+                    // init flip racing an elapsed deadline must win.
                     biased;
-                    res = &mut rx => {
-                        // The reply itself proves init completed.
-                        return match res {
-                            Ok(result) => result,
-                            Err(_) => Err("plugin host exited".into()),
-                        };
-                    }
                     changed = init_rx.changed() => {
                         if changed.is_err() || *init_rx.borrow() {
                             break;
                         }
                     }
-                    _ = tokio::time::sleep_until(deadline) => {
-                        // A full window elapsed with init still pending: latch
-                        // (lazy hosts), so later pre-init calls fail fast.
-                        if self.lazy {
-                            self.init_failed
-                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                    changed = host_gone_rx.changed() => {
+                        if changed.is_err() || *host_gone_rx.borrow() {
+                            return Err("plugin host exited".into());
                         }
-                        self.pending.lock().unwrap().remove(&req_id);
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        // A full window elapsed with init still pending:
+                        // wedge EVIDENCE for selecting waiters (never a gate
+                        // for later calls — see above).
+                        let _ = self.init_failed.send_replace(true);
                         return Err(format!(
                             "plugin host still initializing after {}s running {hook} (raise {} for slower boots)",
                             self.init_wait.as_secs(),
@@ -1602,7 +1578,33 @@ impl PluginHost {
                 }
             }
         }
-        // Initialized: the ordinary per-call timeout applies unchanged.
+        // Initialized: the host is reading stdin. Register the reply slot
+        // before writing (a fast reply must find it), then write — with the
+        // per-call timeout as a belt even here, so a pipe that somehow fills
+        // post-init degrades into a timed-out hook instead of a held mutex.
+        let req_id = self.counter.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().unwrap().insert(req_id, tx);
+        let request = serde_json::json!({ "id": req_id, "hook": hook, "args": args });
+        let write = async {
+            let mut stdin = self.stdin.lock().await;
+            stdin.write_all(format!("{request}\n").as_bytes()).await
+        };
+        match tokio::time::timeout(plugin_rpc_timeout(), write).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                self.pending.lock().unwrap().remove(&req_id);
+                return Err("plugin host died".into());
+            }
+            Err(_) => {
+                self.pending.lock().unwrap().remove(&req_id);
+                return Err(format!(
+                    "plugin host stdin blocked for {}s writing {hook} (the host stopped reading)",
+                    plugin_rpc_timeout().as_secs()
+                ));
+            }
+        }
+        // The ordinary per-call timeout applies unchanged.
         match tokio::time::timeout(plugin_rpc_timeout(), rx).await {
             Ok(Ok(result)) => result,
             _ => Err(format!(
@@ -1625,6 +1627,23 @@ impl PluginHost {
     /// starting a fresh full period of its own.
     pub fn init_deadline_at(&self) -> tokio::time::Instant {
         self.spawned + self.init_wait
+    }
+
+    /// Live updates of the host-gone flag (the process exited: its stdout
+    /// closed). For waiters selecting on wedge evidence without holding the
+    /// `Arc<PluginHost>` (the Start prewarm hold).
+    pub fn host_gone_updates(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.host_gone.subscribe()
+    }
+
+    /// Live updates of the init-failure evidence: true while some pre-init
+    /// call burned its full init window with init still pending, false again
+    /// the moment init progresses. Evidence for waiters gating separate work
+    /// on the host's health (the Start prewarm hold selects on it, with
+    /// `host_gone_updates` and `init_deadline_at`, instead of a flat timer a
+    /// healthy slow boot would trip) — never a per-call gate.
+    pub fn init_failure_updates(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.init_failed.subscribe()
     }
 
     /// Resolves when the host process has exited (its stdout closed). Lets a
@@ -2400,17 +2419,18 @@ mod vite_values_tests {
         assert_eq!(buf.len(), 10, "appends past the cap are dropped entirely");
     }
 
-    // The lazy-host init-failure latch: the FIRST pre-init call waits out its
-    // own full window; once that window elapsed with init still pending, later
-    // pre-init calls fail fast instead of each burning a window — and a LATE
-    // init clears the fail-fast (the latch is consulted only pre-init).
+    // Per-call init windows with NO time-based fail-fast: an earlier call's
+    // expired window is slow-boot evidence, not a wedge, so a later pre-init
+    // call still waits its OWN full window and is served the moment a healthy
+    // (merely slow) init lands. The expired window flips the init-failure
+    // EVIDENCE watch for selecting waiters (the Start prewarm hold), and init
+    // progressing clears it.
     #[tokio::test]
-    async fn lazy_host_latches_init_failure_and_a_late_init_clears_it() {
-        let root = std::env::temp_dir().join(format!("oj-lazy-latch-{}", std::process::id()));
+    async fn pre_init_calls_keep_their_own_window_after_an_earlier_one_expired() {
+        let root = std::env::temp_dir().join(format!("oj-lazy-window-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        // A plugins file that wedges the host's top-level init (a top-level
-        // await), then recovers.
+        // A plugins file whose top-level init is slow but healthy.
         let plugins = root.join("oj.plugins.mjs");
         std::fs::write(
             &plugins,
@@ -2433,46 +2453,108 @@ mod vite_values_tests {
             Ok(h) => h,
             Err(_) => return, // no node on this machine
         };
+        let mut evidence = host.init_failure_updates();
+        assert!(!*evidence.borrow_and_update(), "no evidence before a window expires");
 
         // First call: waits its full per-call window (init is live), then
-        // fails on the window and latches.
+        // fails on the window — flipping the evidence watch.
         let t0 = std::time::Instant::now();
         let first = host.resolve_id("x", "").await;
-        let first_err = first.expect_err("init is wedged: the first call fails at its window");
+        let first_err = first.expect_err("init outlives the first call's window");
         assert!(first_err.contains("still initializing"), "{first_err}");
         assert!(
             t0.elapsed() >= std::time::Duration::from_millis(900),
             "the first call waits its full window, got {:?}",
             t0.elapsed()
         );
+        assert!(*evidence.borrow_and_update(), "the expired window is wedge evidence");
 
-        // Second call: fails fast off the latch, never a second full window.
-        let t1 = std::time::Instant::now();
-        let second_err = host
-            .resolve_id("x", "")
-            .await
-            .expect_err("the latch fails pre-init calls");
-        assert!(second_err.contains("already timed out"), "{second_err}");
-        assert!(
-            t1.elapsed() < std::time::Duration::from_millis(500),
-            "the latched call fails fast, got {:?}",
-            t1.elapsed()
-        );
-
-        // The host recovers (init completes): calls flow again.
+        // Later calls: each keeps its OWN full window (never the removed
+        // fail-fast), so one of them is served the moment init lands. Every
+        // failure on the way is a full-window "still initializing", and a
+        // failing call burned at least most of a window rather than failing
+        // in milliseconds off a latch.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
+            let t = std::time::Instant::now();
             match host.resolve_id("x", "").await {
                 Ok(_) => break,
                 Err(e) => {
+                    assert!(e.contains("still initializing"), "never a latched fail-fast: {e}");
+                    assert!(
+                        t.elapsed() >= std::time::Duration::from_millis(900),
+                        "a pre-init call after an expired window still gets its own window, got {:?}",
+                        t.elapsed()
+                    );
                     assert!(
                         std::time::Instant::now() < deadline,
-                        "a late init never cleared the fail-fast: {e}"
+                        "a late init never served a waiting call: {e}"
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
             }
         }
+        assert!(
+            !*evidence.borrow_and_update(),
+            "init progressing clears the wedge evidence"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The write-before-gate deadlock, pinned: a wedged host never installs its
+    // stdin reader, so once the pipe fills a pre-gate write_all would block
+    // forever HOLDING the stdin mutex — no timeout in reach, every later call
+    // queued behind it. Pre-init calls must write NOTHING: even with an
+    // argument far larger than any pipe capacity, concurrent calls each fail
+    // at their own window ("still initializing"), proving no call sat in a
+    // blocked write or waited on a held mutex.
+    #[tokio::test]
+    async fn wedged_host_pre_init_calls_fail_at_their_window_without_touching_stdin() {
+        let root = std::env::temp_dir().join(format!("oj-wedged-stdin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // Init never completes: the host never reads stdin. (The interval
+        // keeps the event loop alive — a bare unsettled top-level await would
+        // exit the process instead of wedging it.)
+        let plugins = root.join("oj.plugins.mjs");
+        std::fs::write(
+            &plugins,
+            "setInterval(() => {}, 1000);\nawait new Promise(() => {});\nexport default [];\n",
+        )
+        .unwrap();
+        let config = serde_json::json!({
+            "config": { "root": root.display().to_string() },
+            "env": { "command": "serve", "mode": "development" },
+        })
+        .to_string();
+        let host = match PluginHost::spawn_lazy_with_wait(
+            &root,
+            &plugins,
+            &config,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        {
+            Ok(h) => h,
+            Err(_) => return, // no node on this machine
+        };
+        // Far past any OS pipe buffer: the old write-first path would block
+        // here forever instead of ever reaching an init gate.
+        let big = "x".repeat(2 * 1024 * 1024);
+        let t0 = std::time::Instant::now();
+        let (a, b) = tokio::join!(host.resolve_id(&big, ""), host.resolve_id(&big, ""));
+        for res in [a, b] {
+            let err = res.expect_err("a wedged host fails pre-init calls at their window");
+            assert!(err.contains("still initializing"), "{err}");
+        }
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(900),
+            "each call waits its window, got {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "concurrent windows, not serialized blocked writes: {elapsed:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
