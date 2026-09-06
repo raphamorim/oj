@@ -147,13 +147,24 @@ impl OjResolver {
                 (find.clone(), vec![AliasValue::Path(target)])
             })
             .collect();
-        let main_fields = settings.main_fields.unwrap_or_else(|| {
+        let mut main_fields = settings.main_fields.unwrap_or_else(|| {
             if settings.server {
                 default_server_main_fields()
             } else {
                 default_main_fields()
             }
         });
+        // Vite's resolvePackageEntry ALWAYS falls back to `pkg.main` after the
+        // mainFields walk (`entryPoint ||= data.main`) — its
+        // DEFAULT_MAIN_FIELDS deliberately omits "main" because of that
+        // fallback. oxc_resolver has no such fallback (an exhausted
+        // main_fields goes straight to the index files), so the list must end
+        // with "main", or a package whose only entry is `main` (a linked
+        // workspace package with a TS main, say) stops resolving the moment a
+        // Vite-shaped mainFields list is adopted from the config.
+        if !main_fields.iter().any(|f| f == "main") {
+            main_fields.push("main".to_string());
+        }
         // Vite applies the package.json `browser` object only when mainFields
         // include `browser` (the client default; a server list opts in by naming it).
         let alias_fields = if main_fields.iter().any(|f| f == "browser") {
@@ -569,6 +580,55 @@ mod tests {
                 .unwrap()
                 .ends_with("cjs.js"),
             "mainFields:[main] must pick the main entry",
+        );
+    }
+
+    // Vite's resolvePackageEntry always falls back to `pkg.main` after the
+    // mainFields walk, so its DEFAULT_MAIN_FIELDS list omits "main" entirely.
+    // Adopting that list verbatim into oxc_resolver (no such fallback) made a
+    // package whose ONLY entry is `main` unresolvable — the lovable/web shape:
+    // a linked workspace package with `"main": "src/x.ts"` and no index file.
+    #[test]
+    fn a_vite_shaped_main_fields_list_still_falls_back_to_main() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let pkg = root.join("node_modules/@acme/parser");
+        std::fs::create_dir_all(pkg.join("src")).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"@acme/parser","main":"src/parse.ts"}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("src/parse.ts"), "export const x = 1;\n").unwrap();
+        std::fs::write(root.join("package.json"), r#"{"name":"app"}"#).unwrap();
+        // Vite's DEFAULT_MAIN_FIELDS, as the extractor adopts them.
+        let vite_shaped = OjResolver::with_settings(
+            root,
+            ResolveSettings {
+                conditions: ["import", "default"].map(String::from).to_vec(),
+                main_fields: Some(
+                    ["browser", "module", "jsnext:main", "jsnext"].map(String::from).to_vec(),
+                ),
+                ..ResolveSettings::default()
+            },
+        );
+        assert!(
+            vite_shaped.resolve(root, "@acme/parser").unwrap().ends_with("parse.ts"),
+            "a main-only package must resolve under Vite's main-less mainFields",
+        );
+        // The fallback is LAST: a list preferring `module` still picks it over main.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/mainfields");
+        let module_first = OjResolver::with_settings(
+            &dir,
+            ResolveSettings {
+                conditions: ["import", "default"].map(String::from).to_vec(),
+                main_fields: Some(vec!["module".to_string()]),
+                ..ResolveSettings::default()
+            },
+        );
+        assert!(
+            module_first.resolve(&dir, "mf-pkg").unwrap().ends_with("esm.js"),
+            "the appended main fallback must not outrank the user's fields",
         );
     }
 
