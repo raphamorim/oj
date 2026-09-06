@@ -227,6 +227,12 @@ async function runDev() {
           whitelist: [/favicon\.ico/, "cloudflare:workers", "/_serverFn/", "createServerFn"],
         });
         console.log("start-cloudflare-dev: browser hydration ok (worker render mounts + counter interaction)");
+      } catch (e) {
+        // A browser-observed 500/crash in oj's own pipeline leaves its cause
+        // only in oj's server log; surface a bounded tail on the thrown error
+        // so CI names the compile/loader failure instead of a bare status.
+        e.message += `\n--- oj server log (tail) ---\n${log.slice(-3000)}`;
+        throw e;
       } finally {
         await browser.close();
       }
