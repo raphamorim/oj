@@ -62,9 +62,6 @@ const pluginsPath = process.argv[2];
 const initial = JSON.parse(process.argv[3] ?? "{}");
 
 process.env.VITE_CONFIG_NATIVE_IGNORE_WARNING ??= "true";
-// Snapshot after the host's own env tweaks so the config()-hook delta reports
-// only plugin mutations, not host bootstrap noise.
-const ssrEnvBase = { ...process.env };
 // Vite's ConfigEnv (config.ts): `{ mode, command, isSsrBuild, isPreview }`.
 // oj builds the ssr environment in its own host, so that host's build is the
 // ssr build (Vite: `command === "build" && !!config.build.ssr`).
@@ -72,6 +69,25 @@ const hostEnvName = initial.environment?.name ?? "client";
 const env = { command: "serve", mode: "development", ...(initial.env ?? {}) };
 env.isSsrBuild = env.isSsrBuild ?? (env.command === "build" && hostEnvName !== "client");
 env.isPreview = env.isPreview ?? false;
+
+// Vite's defaultNodeEnv follows the COMMAND, never the mode (config.ts: serve
+// resolves with defaultNodeEnv "development", build with "production"), so
+// `build --mode staging` still sees NODE_ENV=production/isProduction=true.
+// Pre-set before any plugin or config code evaluates, as resolveConfig sets it
+// before loadConfigFromFile — the synthesized-config path has no resolveConfig
+// of its own to do it. Mirrors vite-extract.mjs, the guarded unset before a
+// real vite.resolveConfig run included: the untouched pre-set must not make
+// Vite compute isNodeEnvSet=true (its VITE_USER_NODE_ENV handling stays live),
+// while a config-module NODE_ENV assignment survives.
+const defaultNodeEnv = env.command === "build" ? "production" : "development";
+const nodeEnvWasSet = !!process.env.NODE_ENV;
+if (!nodeEnvWasSet) process.env.NODE_ENV = defaultNodeEnv;
+const unsetOjNodeEnvForResolve = () => {
+  if (!nodeEnvWasSet && process.env.NODE_ENV === defaultNodeEnv) delete process.env.NODE_ENV;
+};
+// Snapshot after the host's own env tweaks (the NODE_ENV pre-set included) so
+// the config()-hook delta reports only plugin mutations, not bootstrap noise.
+const ssrEnvBase = { ...process.env };
 
 // resolve.alias from the app's own vite config (loaded below for its plugins).
 // oj applies aliases in its Rust resolver and does not forward them in the
@@ -279,7 +295,10 @@ function withResolvedDefaults(config) {
       mode: env.mode,
       root: c.root ?? initial.config?.root ?? process.cwd(),
       base: "/",
-      isProduction: env.mode === "production",
+      // Vite: `isProduction = process.env.NODE_ENV === "production"` (after
+      // its command-based default fill), never derived from the mode — a
+      // custom `--mode staging` build is still a production build.
+      isProduction: process.env.NODE_ENV === "production",
       experimental: {},
       // Vite's resolved `build` carries defaults plugins read in configResolved
       // (e.g. UnoCSS resolves `config.build.outDir` and reads
@@ -369,16 +388,24 @@ async function loadUserResolvedViteConfig() {
   }
   if (typeof vite.resolveConfig !== "function") return null;
   try {
+    // Vite's own NODE_ENV handling runs inside resolveConfig; hand it the
+    // command-based defaultNodeEnv (never the mode) and lift oj's untouched
+    // pre-set first so it computes isNodeEnvSet like a real CLI run.
+    unsetOjNodeEnvForResolve();
     const rc = await vite.resolveConfig(
       { root: appRoot, configFile: pluginsPath, mode: env.mode, logLevel: "silent" },
       env.command,
       env.mode,
-      env.mode,
+      defaultNodeEnv,
     );
     return rc && typeof rc === "object" ? rc : null;
   } catch (e) {
     process.stderr.write(`${OJ} plugin host: vite.resolveConfig failed, using synthesized config: ${(e && e.message) || e}\n`);
     return null;
+  } finally {
+    // A throwing resolveConfig may leave the unset behind; the fallback paths
+    // below still evaluate config/plugin code that must see a value.
+    if (!process.env.NODE_ENV) process.env.NODE_ENV = defaultNodeEnv;
   }
 }
 

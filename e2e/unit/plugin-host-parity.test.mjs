@@ -55,6 +55,52 @@ test("ConfigEnv carries isSsrBuild / isPreview and apply() sees the merged confi
   }
 });
 
+// Vite's NODE_ENV rule in the host, synthesized-config path included: the
+// default follows the COMMAND, never the mode, is pre-set before any plugin
+// or config code evaluates (as resolveConfig sets it before
+// loadConfigFromFile), and isProduction derives from process.env.NODE_ENV —
+// a custom `--mode staging` build is still a production build; serve stays
+// development. An environment that already names NODE_ENV wins.
+test("NODE_ENV follows the command under a custom mode and isProduction tracks it", async () => {
+  const plugin = `const seen = { moduleScope: process.env.NODE_ENV };
+     export default [{
+       name: "nodeenv-probe",
+       config() { seen.configHook = process.env.NODE_ENV; },
+       configResolved(config) { seen.isProduction = config.isProduction; },
+       transform(code, id) { return id.endsWith("probe.js") ? JSON.stringify(seen) : null; },
+     }];\n`;
+  const run = async (command, hostEnv = {}) => {
+    const fx = tmpProject({ prefix: "oj-parity-nodeenv-" });
+    fx.write("oj.plugins.mjs", plugin);
+    const host = rpcSidecar("plugin-host.mjs", {
+      args: [
+        path.join(fx.root, "oj.plugins.mjs"),
+        JSON.stringify({ config: { root: fx.root }, env: { command, mode: "staging" } }),
+      ],
+      // NODE_ENV cleared so the host's own pre-set is what the plugin sees
+      // (an empty value counts as unset, as in the extractor).
+      env: { OJ_CACHE_ROOT: fx.root, NODE_ENV: "", ...hostEnv },
+      cwd: fx.root,
+    });
+    try {
+      return await probe(host, fx);
+    } finally {
+      host.close();
+      fx.cleanup();
+    }
+  };
+  const build = await run("build");
+  assert.equal(build.moduleScope, "production", "build --mode staging pre-sets NODE_ENV=production at module scope");
+  assert.equal(build.configHook, "production");
+  assert.equal(build.isProduction, true, "a custom-mode build is a production build");
+  const serve = await run("serve");
+  assert.equal(serve.moduleScope, "development", "serve --mode staging stays development");
+  assert.equal(serve.isProduction, false);
+  const forced = await run("build", { NODE_ENV: "development" });
+  assert.equal(forced.moduleScope, "development", "a set NODE_ENV is never overridden");
+  assert.equal(forced.isProduction, false, "isProduction follows the environment's NODE_ENV, as in Vite");
+});
+
 test("a client dev host reports isSsrBuild false", async () => {
   const fx = tmpProject({ prefix: "oj-parity-" });
   fx.write(
