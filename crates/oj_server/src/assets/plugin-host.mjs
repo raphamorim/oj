@@ -228,7 +228,7 @@ function makeCreateResolver(config) {
 
 function withResolvedDefaults(config) {
   const c = config ?? {};
-  const merged = deepMerge(
+  const merged = mergeConfigLite(
     {
       command: env.command,
       mode: env.mode,
@@ -291,7 +291,7 @@ const environment = {
   name: envName,
   mode: initial.environment?.mode ?? env.mode,
   config: withResolvedDefaults(
-    deepMerge(initial.config ?? {}, (initial.config?.environments ?? {})[envName] ?? {}),
+    mergeConfigLite(initial.config ?? {}, (initial.config?.environments ?? {})[envName] ?? {}),
   ),
 };
 // Vite tags each environment's resolved config with a `consumer` ("client" or
@@ -561,7 +561,7 @@ try {
   // config is the user's loaded config file merged with the inline config. oj's
   // values (root, base, define, server) overlay the file's.
   const { plugins: _userPlugins, ...userConfigRest } = userConfig ?? {};
-  const applyConfig = { ...deepMerge(userConfigRest, initial.config ?? {}), mode: env.mode };
+  const applyConfig = { ...mergeConfigLite(userConfigRest, initial.config ?? {}), mode: env.mode };
   plugins = plugins.filter((p) => {
     if (p.apply == null) return true;
     try {
@@ -835,14 +835,45 @@ function ctxFor(p) {
   return c;
 }
 
-function deepMerge(a, b) {
-  if (Array.isArray(a) && Array.isArray(b)) return [...a, ...b];
-  if (a && b && typeof a === "object" && typeof b === "object") {
-    const out = { ...a };
-    for (const k of Object.keys(b)) out[k] = k in a ? deepMerge(a[k], b[k]) : b[k];
-    return out;
+// The slice of Vite's mergeConfigRecursively these assets need (twin copies:
+// one in vite-extract.mjs, one in plugin-host.mjs — keep them byte-identical):
+// null and undefined override values are skipped (a `key: null` override must
+// not clobber a set value), arrays concatenate, plain objects merge
+// recursively, scalars and functions take the later value — and a `true` on
+// either side of ssr/resolve `noExternal`/`external` wins over lists
+// (mergeConfigRecursively's special case).
+const environmentPathRE = /^environments\.[^.]+$/;
+function mergeConfigLite(defaults, overrides, rootPath = "") {
+  const merged = { ...defaults };
+  for (const key of Object.keys(overrides ?? {})) {
+    const value = overrides[key];
+    if (value == null) continue;
+    const existing = merged[key];
+    if (
+      (key === "noExternal" || key === "external") &&
+      (rootPath === "ssr" || rootPath === "resolve") &&
+      (existing === true || value === true)
+    ) {
+      merged[key] = true;
+      continue;
+    }
+    if (existing == null) merged[key] = value;
+    else if (Array.isArray(existing) || Array.isArray(value)) {
+      merged[key] = [
+        ...(Array.isArray(existing) ? existing : [existing]),
+        ...(Array.isArray(value) ? value : [value]),
+      ];
+    } else if (typeof existing === "object" && typeof value === "object") {
+      // As in Vite: an `environments.<name>` node restarts path tracking, so
+      // `environments.ssr.resolve.noExternal` merges like `resolve.noExternal`.
+      merged[key] = mergeConfigLite(
+        existing,
+        value,
+        rootPath && !environmentPathRE.test(rootPath) ? `${rootPath}.${key}` : key,
+      );
+    } else merged[key] = value;
   }
-  return b === undefined ? a : b;
+  return merged;
 }
 
 let pluginConfigDelta = {};
@@ -853,7 +884,7 @@ async function runConfigHooks() {
     // The user's resolved config is the base; oj's own values (root, base,
     // define, server, environments) overlay it; the plugin list is replaced below.
     const { plugins: _fresh, ...base } = userResolvedViteConfig;
-    config = deepMerge(base, config);
+    config = mergeConfigLite(base, config);
   }
   // Vite hands the config hook the user config, whose `plugins` is the flat
   // plugin array; plugins like @crxjs read `config.plugins` to find sibling
@@ -862,7 +893,7 @@ async function runConfigHooks() {
   // `@crxjs`'s serve-only `crx:hmr` must not appear during a build, or crx calls
   // its `transformCrxManifest` (which reads an unset `config`) and throws.
   // The exposed plugin array: the apply-filtered active set plus the css-post
-  // shim. Pinned across the config-hook merges below so deepMerge (which
+  // shim. Pinned across the config-hook merges below so mergeConfigLite (which
   // concatenates arrays) can't accumulate it into duplicates.
   // The natively reimplemented React plugins stay listed (hooks unrun), in
   // enforce order like Vite's resolved plugin array.
@@ -875,11 +906,11 @@ async function runConfigHooks() {
     try {
       const partial = await fn.call(ctxFor(p), config, env);
       if (partial) {
-        config = deepMerge(config, partial);
+        config = mergeConfigLite(config, partial);
         // What the plugins themselves contributed (Vite merges it into the
         // resolved config); Rust asks for it via getPluginConfig so values oj
         // applies natively (define) reach the compile too.
-        pluginConfigDelta = deepMerge(pluginConfigDelta, partial);
+        pluginConfigDelta = mergeConfigLite(pluginConfigDelta, partial);
       }
     } catch (e) {
       if (!ojStartMode) throw e;
@@ -906,7 +937,7 @@ async function runConfigHooks() {
       for (const { p, fn } of configEnvHooks) {
         try {
           const r = await fn.call(ctx, name, config.environments[name], opts);
-          if (r) config.environments[name] = deepMerge(config.environments[name], r);
+          if (r) config.environments[name] = mergeConfigLite(config.environments[name], r);
         } catch (e) {
           if (!ojStartMode) throw e;
           process.stderr.write(`${OJ} plugin host: configEnvironment(${p.name ?? "?"}) skipped: ${(e && e.message) || e}\n`);
@@ -932,7 +963,7 @@ await runConfigHooks();
 environment.config =
   envName === "client"
     ? resolvedConfig
-    : withResolvedDefaults(deepMerge(resolvedConfig, (resolvedConfig.environments ?? {})[envName] ?? {}));
+    : withResolvedDefaults(mergeConfigLite(resolvedConfig, (resolvedConfig.environments ?? {})[envName] ?? {}));
 environment.config.consumer = environment.config.consumer ?? (envName === "client" ? "client" : "server");
 environment.logger = resolvedConfig.logger;
 environment.getTopLevelConfig = () => resolvedConfig;
@@ -1284,6 +1315,9 @@ function graphKnowsFile(environments, file) {
   return false;
 }
 let invalidateQueue = Promise.resolve();
+// Whether a resync is already enqueued (and not yet run): duplicates coalesce
+// into it — see the /__oj_invalidate resync branch.
+let resyncPending = false;
 // The catch-up for a late middleware activation ({resync:true} on
 // /__oj_invalidate): edits made while oj had no port to invalidate never
 // reached these graphs, and init-time pre-transforms (preTransformRequests)
@@ -1597,7 +1631,7 @@ function stubEnvironment(name, server) {
   const base = resolvedConfig ?? {};
   const config = isClient
     ? base
-    : withResolvedDefaults(deepMerge(base, (base.environments ?? {})[name] ?? {}));
+    : withResolvedDefaults(mergeConfigLite(base, (base.environments ?? {})[name] ?? {}));
   // Vite tags each environment's config with its consumer; the merge above
   // inherits the host environment's tag, so set it per environment.
   if (isClient) config.consumer = config.consumer ?? "client";
@@ -1838,16 +1872,36 @@ async function setupConfigureServer() {
           changes = parsed.changes
             || (parsed.paths || []).map((p) => ({ path: p, type: "update" }));
         } catch {}
+        if (resync) {
+          // ACK on ENQUEUE: the queue is serialized, so an enqueued resync is
+          // guaranteed to run after everything already queued — answering only
+          // after the (possibly long) drain made the caller's bounded client
+          // time out and retry a resync that was already coming. Idempotent
+          // and coalesced: a pending resync invalidates whole graphs, so it
+          // already covers everything a duplicate would — duplicates (a
+          // caller retry racing a slow queue) are absorbed instead of
+          // stacking full-reloads.
+          if (!resyncPending) {
+            resyncPending = true;
+            invalidateQueue = invalidateQueue
+              .then(() => {
+                resyncPending = false;
+                resyncEnvironments(server.environments);
+              })
+              .catch(() => {
+                resyncPending = false;
+              });
+          }
+          res.statusCode = 204;
+          res.end();
+          return;
+        }
         // Answer only once the invalidation is done, so the Rust side's POST
         // completing means a next request cannot be served from stale modules.
         // Serialized: the early (pre-settle) and settled sends for one edit
         // batch must not interleave their module-graph walks.
         invalidateQueue = invalidateQueue
-          .then(() =>
-            resync
-              ? resyncEnvironments(server.environments)
-              : invalidateEnvironments(server.environments, fileWatcher, changes),
-          )
+          .then(() => invalidateEnvironments(server.environments, fileWatcher, changes))
           .catch(() => {});
         await invalidateQueue;
         res.statusCode = 204;
