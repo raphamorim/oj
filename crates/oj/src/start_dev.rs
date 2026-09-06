@@ -221,6 +221,7 @@ pub async fn start_dev(
         host_gone: h.host_gone_updates(),
         init_failed: h.init_failure_updates(),
         init_deadline: h.init_deadline_at(),
+        confirm: oj_server::plugins::plugin_rpc_timeout(),
     }));
     oj_server::boot_phase("bundle+build joined");
     let css_host = if app_uses_tailwind(&root) {
@@ -1674,15 +1675,27 @@ struct PrewarmHold {
     host_gone: tokio::sync::watch::Receiver<bool>,
     init_failed: tokio::sync::watch::Receiver<bool>,
     init_deadline: tokio::time::Instant,
+    /// How long an evidence release stays PENDING before the prewarm commits
+    /// (the RPC-timeout scale, matching the stall monitor's window): the
+    /// stall monitor's evidence is clearable — one silent >window step of a
+    /// healthy boot flips it and the next milestone clears it — so a clear
+    /// landing within this window re-arms the hold instead of the release
+    /// being one-shot. Host death and the init deadline still release
+    /// immediately.
+    confirm: std::time::Duration,
 }
 
 /// Holds the Cloudflare prewarm until the plugin host's serve info is KNOWN,
 /// releasing early only on wedge EVIDENCE: (a) the info arriving decides
 /// (worker environments render → skip the prewarm; none → prewarm), (b) the
-/// host dying (`host_gone`) or the init-failure evidence watch — the host's
-/// stall monitor flipping it when a full RPC-scale window passed with no init
-/// milestone, or a pre-init RPC having burned its full init window —
-/// releases immediately, and (c) the
+/// host dying (`host_gone`) releases immediately, while the init-failure
+/// evidence watch — the host's stall monitor flipping it when a full
+/// RPC-scale window passed with no init milestone, or a pre-init RPC having
+/// burned its full init window — makes the release PENDING for one more
+/// RPC-scale window (`PrewarmHold::confirm`): the evidence is clearable, so a
+/// milestone landing within that window re-arms the hold instead of a single
+/// silent step of a healthy boot one-shot-releasing a wasted prewarm, and
+/// (c) the
 /// host's OWN init deadline (spawn + `OJ_PLUGIN_INIT_TIMEOUT` — never a fresh
 /// full period measured from here) is the outer bound. A merely slow, healthy
 /// boot — elapsed time short of that deadline, with no evidence — keeps
@@ -1696,8 +1709,51 @@ async fn hold_prewarm_for_serve_info(
         if let Some(info) = *hold.updates.borrow_and_update() {
             return Some(info);
         }
-        if *hold.host_gone.borrow_and_update() || *hold.init_failed.borrow_and_update() {
+        if *hold.host_gone.borrow_and_update() {
             return None;
+        }
+        if *hold.init_failed.borrow_and_update() {
+            // Init-failure evidence: a wedge — or one clearable silent step
+            // of a healthy boot (the stall monitor flips on any full window
+            // with no milestone; the next milestone clears it). The release
+            // is therefore not one-shot: it stays PENDING for one more
+            // RPC-scale window, and an evidence-clear landing within it
+            // re-arms the hold (the prewarm has not started while we are
+            // still in here). Serve info, host death and the init deadline
+            // decide immediately as before.
+            let confirm = std::cmp::min(
+                hold.init_deadline,
+                tokio::time::Instant::now() + hold.confirm,
+            );
+            loop {
+                tokio::select! {
+                    changed = hold.updates.changed() => {
+                        if changed.is_err() {
+                            return None;
+                        }
+                        if let Some(info) = *hold.updates.borrow_and_update() {
+                            return Some(info);
+                        }
+                    }
+                    changed = hold.host_gone.changed() => {
+                        if changed.is_err() || *hold.host_gone.borrow_and_update() {
+                            return None;
+                        }
+                    }
+                    changed = hold.init_failed.changed() => {
+                        if changed.is_err() {
+                            return None;
+                        }
+                        if !*hold.init_failed.borrow_and_update() {
+                            break; // cleared: a false positive — re-arm
+                        }
+                    }
+                    _ = tokio::time::sleep_until(confirm) => {
+                        return None; // still standing: release, prewarm
+                    }
+                }
+            }
+            continue;
         }
         tokio::select! {
             changed = hold.updates.changed() => {
@@ -1763,6 +1819,7 @@ mod tests {
             host_gone,
             init_failed,
             init_deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+            confirm: std::time::Duration::from_secs(20),
         };
         (info_tx, gone_tx, fail_tx, hold)
     }
@@ -1806,8 +1863,9 @@ mod tests {
         );
     }
 
-    // (b) Wedge evidence releases the hold immediately: the host dying, or a
-    // pre-init RPC having burned a full init window (the init-failure watch).
+    // (b) Wedge evidence releases the hold: the host dying immediately, and
+    // standing init-failure evidence after its pending-release confirmation
+    // window (the evidence is clearable now, so the release is not one-shot).
     #[tokio::test(start_paused = true)]
     async fn prewarm_hold_releases_on_wedge_evidence() {
         let (_info_tx, _gone_tx, fail_tx, mut hold) = prewarm_channels();
@@ -1815,12 +1873,15 @@ mod tests {
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(40)).await;
             let _ = fail_tx.send(true);
+            // The real sender lives in the PluginHost for the whole session:
+            // dropping it here would read as the host vanishing.
+            std::mem::forget(fail_tx);
         });
         assert!(hold_prewarm_for_serve_info(&mut hold).await.is_none());
         let held = start.elapsed();
         assert!(
-            held >= std::time::Duration::from_secs(40) && held < std::time::Duration::from_secs(300),
-            "the init-failure evidence released the hold: {held:?}"
+            held >= std::time::Duration::from_secs(60) && held < std::time::Duration::from_secs(300),
+            "standing evidence released the hold after its confirmation window: {held:?}"
         );
 
         let (_info_tx, gone_tx, _fail_tx, mut hold) = prewarm_channels();
@@ -1834,6 +1895,43 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(300),
             "the host dying released the hold: {:?}",
             start.elapsed()
+        );
+    }
+
+    // (b') The evidence release is NOT one-shot: the stall monitor's evidence
+    // clears on the next milestone, so a healthy boot with ONE silent step
+    // longer than the stall window flips it and then clears it — the pending
+    // release re-arms and the hold keeps holding for the serve info instead
+    // of launching a wasted prewarm. Standing evidence still releases (the
+    // test above); a second, later wedge still gets its own pending release.
+    #[tokio::test(start_paused = true)]
+    async fn prewarm_hold_re_arms_when_evidence_clears_before_the_confirm_window() {
+        let (info_tx, _gone_tx, fail_tx, mut hold) = prewarm_channels();
+        let start = tokio::time::Instant::now();
+        tokio::spawn(async move {
+            // One silent >window step: evidence at 30s, milestone clears it
+            // at 35s (inside the 20s confirmation window).
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let _ = fail_tx.send(true);
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let _ = fail_tx.send(false);
+            // The boot finishes much later: the serve info decides.
+            tokio::time::sleep(std::time::Duration::from_secs(85)).await;
+            let _ = info_tx.send(Some(oj_server::plugins::ServeInfo::default()));
+            // As above: the real senders outlive the hold.
+            std::mem::forget(fail_tx);
+            std::mem::forget(info_tx);
+        });
+        let known = hold_prewarm_for_serve_info(&mut hold).await;
+        assert!(known.is_some(), "the cleared evidence re-armed the hold; the info decided");
+        let held = start.elapsed();
+        assert!(
+            held >= std::time::Duration::from_secs(120),
+            "held through the false positive to the serve info: {held:?}"
+        );
+        assert!(
+            held < std::time::Duration::from_secs(300),
+            "released by the info, not the deadline: {held:?}"
         );
     }
 
