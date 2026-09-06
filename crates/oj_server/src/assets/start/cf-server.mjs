@@ -89,11 +89,19 @@ const ASSETS = {
   },
 };
 
+// The dev `env`: the wrangler vars (and `.dev.vars`) over the process env, plus
+// the ASSETS binding. Shared with the `cloudflare:workers` scheme stub
+// (cf-workers.mjs) so a server function reading `env` sees the same values
+// whether it imports the plugin's server helper or the runtime module.
+export function cloudflareEnv() {
+  return { ASSETS, ...process.env, ...wranglerVars(), ...devVars() };
+}
+
 let cached;
 export async function getCloudflareContext() {
   if (!cached) {
     cached = {
-      env: { ASSETS, ...process.env, ...wranglerVars(), ...devVars() },
+      env: cloudflareEnv(),
       cf: {},
       ctx: { waitUntil() {}, passThroughOnException() {} },
     };
