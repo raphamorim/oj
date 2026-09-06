@@ -849,13 +849,26 @@ impl DevServer {
                     // nothing is left after that filtering, the host is an idle
                     // Node process sitting on the per-request/HMR path -- drop it
                     // and serve natively. Dropping the Arc kills the process.
-                    if host.plugin_count().await == 0 {
+                    // EXCEPT when `server.proxy` is configured: the single proxy
+                    // lives in the host's middleware stack, and a FUNCTION rewrite
+                    // (or `configure`/`bypass`) has no other place to run — keep
+                    // the already-spawned host so the proxy always has a Node home
+                    // instead of the Rust fallback silently forwarding unstripped.
+                    let keep_for_proxy = server_cfg.proxy.as_ref().is_some_and(|p| !p.is_empty());
+                    let plugin_count = host.plugin_count().await;
+                    if plugin_count == 0 && !keep_for_proxy {
                         host.shutdown();
                         if ssr_bridge_dir.is_some() {
                             plugins::disable_ssr_bridge(&root);
                         }
                         println!("  plugins: {plugins_label} (none active after native filtering; served natively)");
                         None
+                    } else if plugin_count == 0 {
+                        // Kept only to host the single `server.proxy` (no plugins
+                        // to build): the middleware stack runs the proxy so a
+                        // function rewrite / configure / bypass has a Node home.
+                        println!("  plugins: {plugins_label} (none active; host kept for server.proxy)");
+                        Some(host)
                     } else {
                         println!("  plugins: {plugins_label}");
                         if !is_start {
@@ -2587,6 +2600,40 @@ async fn proxy_middleware(
     };
     let matched = select_proxy(&state.proxy, &state.proxy_regex, &url);
     let Some((prefix, entry)) = matched else {
+        // A proxy context oj's regex engine cannot compile (a JS RegExp with
+        // lookaround/backreference) is left unmatched by select_proxy, so oj
+        // would serve the path as a route. When a plugin host runs, the Node
+        // proxy has the SAME contexts but a full JS RegExp, so let it decide:
+        // forward there, take its response if it proxied, and fall back to
+        // normal routing on its fallthrough signal. (A `ws: true` uncompilable
+        // context still can't upgrade through this path — a known harder gap.)
+        let has_uncompilable = state
+            .proxy
+            .iter()
+            .zip(&state.proxy_regex)
+            .any(|((ctx, _), re)| ctx.starts_with('^') && re.is_none());
+        if has_uncompilable {
+            if let Some(port) = state.plugin_serve.mw_port() {
+                let method = req.method().as_str().to_string();
+                let pq = req
+                    .uri()
+                    .path_and_query()
+                    .map(|p| p.as_str().to_string())
+                    .unwrap_or_else(|| path.clone());
+                let (parts, body) = req.into_parts();
+                let body_bytes = axum::body::to_bytes(body, usize::MAX)
+                    .await
+                    .map(|b| b.to_vec())
+                    .unwrap_or_default();
+                if let Some(resp) =
+                    forward_to_plugin_mw(port, &method, &pq, &parts.headers, Some(body_bytes.clone())).await
+                {
+                    return resp;
+                }
+                let req = axum::extract::Request::from_parts(parts, Body::from(body_bytes));
+                return next.run(req).await;
+            }
+        }
         return next.run(req).await;
     };
     let prefix = prefix.to_string();
