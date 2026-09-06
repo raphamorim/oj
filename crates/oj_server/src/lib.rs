@@ -3098,8 +3098,10 @@ fn plugin_mw_client() -> &'static reqwest::Client {
 /// DevEnvironment's whole module graph and send a full-reload, bypassing the
 /// per-change dedup. Sent on late activation, covering every edit made while
 /// the middleware path was down (the watcher had no port to invalidate).
-/// Returns whether the middleware acknowledged it (the host answers only after
-/// the invalidation ran) — the caller must not claim "resynced" otherwise.
+/// Returns whether the middleware acknowledged the ENQUEUE: the host answers
+/// the moment the resync is on its serialized invalidate queue (guaranteed to
+/// run after everything already queued), so the ACK is fast even behind a
+/// slow queue — the caller must not claim "resynced" without it.
 pub async fn notify_plugin_mw_resync(port: u16) -> bool {
     match plugin_mw_client()
         .post(format!("http://127.0.0.1:{port}/__oj_invalidate"))
@@ -3115,8 +3117,11 @@ pub async fn notify_plugin_mw_resync(port: u16) -> bool {
 
 /// [`notify_plugin_mw_resync`] with a few backed-off retries: the resync races
 /// the host's middleware server settling in, and a transient failure must not
-/// leave the degraded window's edits silently stale. `false` after the last
-/// attempt — the caller then warns instead of logging success.
+/// leave the degraded window's edits silently stale. The host ACKs on enqueue
+/// and coalesces duplicates (a pending resync absorbs them), so retrying is
+/// safe — it can never stack full-reloads — and a client timeout means only
+/// "enqueue unconfirmed", which the next attempt settles either way. `false`
+/// after the last attempt — the caller then warns instead of logging success.
 pub async fn resync_plugin_mw_with_retry(port: u16) -> bool {
     for delay in [
         std::time::Duration::ZERO,
