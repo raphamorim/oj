@@ -79,6 +79,11 @@ const seen = [];
 const backend = http.createServer((req, res) => {
   seen.push(req.url);
   res.setHeader("content-type", "application/json");
+  // A real upstream that (adversarially or coincidentally) emits oj's internal
+  // signal headers must NOT be misread as the host stack's fallthrough: the
+  // proxy strips them, so these responses still proxy through cleanly.
+  res.setHeader("x-oj-fallthrough", "1");
+  res.setHeader("x-oj-rewritten-url", "/evil");
   res.end(JSON.stringify({ ok: true, path: req.url }));
 });
 

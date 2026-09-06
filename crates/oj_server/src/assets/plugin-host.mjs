@@ -1849,6 +1849,14 @@ async function createProxyMiddleware(proxyConfig, appRoot) {
           process.stderr.write(`${OJ} plugin host: server.proxy["${context}"].configure threw: ${(e && e.message) || e}\n`);
         }
       }
+      // Strip oj's internal signal headers from the target's response so a
+      // real upstream emitting them cannot be misread as the host fallthrough.
+      proxy.on("proxyRes", (proxyRes) => {
+        if (proxyRes && proxyRes.headers) {
+          delete proxyRes.headers["x-oj-fallthrough"];
+          delete proxyRes.headers["x-oj-rewritten-url"];
+        }
+      });
       // Vite dist node.js:19167-19187: distinguish a web response (`"req" in
       // res`) — 502 + end when nothing was sent yet — from a ws socket (end).
       proxy.on("error", (err, _req, res) => {
@@ -1908,8 +1916,14 @@ async function createProxyMiddleware(proxyConfig, appRoot) {
     if (isHttps && opts.secure === false) options.rejectUnauthorized = false;
     const upstream = lib.request(options, (r) => {
       // Pass the upstream status and ALL headers straight through (Set-Cookie,
-      // Location, content-type … untouched), as http-proxy does by default.
-      res.writeHead(r.statusCode || 502, r.headers);
+      // Location, content-type … untouched), as http-proxy does by default —
+      // but STRIP oj's internal signal headers so a real upstream that happens
+      // to emit them cannot be misread as the host stack's fallthrough (only
+      // the host's runStack may set these).
+      const headers = { ...r.headers };
+      delete headers["x-oj-fallthrough"];
+      delete headers["x-oj-rewritten-url"];
+      res.writeHead(r.statusCode || 502, headers);
       r.pipe(res);
     });
     upstream.on("error", (e) => {
@@ -1920,8 +1934,12 @@ async function createProxyMiddleware(proxyConfig, appRoot) {
       if (res.headersSent || res.writableEnded) {
         res.destroy();
       } else {
-        try { res.writeHead(502, { "content-type": "text/plain; charset=utf-8" }); } catch {}
-        res.end(`oj proxy: ${targetLabel(opts.target)} unreachable: ${e.message}`);
+        // res may already have been destroyed by the client-abort close handler
+        // (ERR_STREAM_DESTROYED), so guard the write/end.
+        try {
+          res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+          res.end(`oj proxy: ${targetLabel(opts.target)} unreachable: ${e.message}`);
+        } catch {}
       }
     });
     // Client disconnect / response error: abort the upstream so its socket is
