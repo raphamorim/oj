@@ -1740,6 +1740,34 @@ function doesProxyContextMatchUrl(context, url) {
   return (context[0] === "^" && new RegExp(context).test(url)) || url.startsWith(context);
 }
 
+// A proxy `target` can be a string, a URL, or an object with {host/hostname,
+// port, protocol, pathname/path/href} (what http-proxy's setupOutgoing reads,
+// dist common.js:18190-18234). Normalize any of them to a URL the node pipe can
+// dial; returns null for an unusable target.
+function pipeTarget(target) {
+  if (target instanceof URL) return target;
+  if (typeof target === "string") {
+    try { return new URL(target); } catch { return null; }
+  }
+  if (target && typeof target === "object") {
+    if (typeof target.href === "string") {
+      try { return new URL(target.href); } catch {}
+    }
+    let protocol = typeof target.protocol === "string" && target.protocol ? target.protocol : "http:";
+    if (!protocol.endsWith(":")) protocol += ":";
+    const hostOnly = typeof target.host === "string" ? target.host.split(":") : [];
+    const hostname = target.hostname || hostOnly[0] || "";
+    if (!hostname) return null;
+    const port = target.port != null ? String(target.port) : (hostOnly[1] || "");
+    const pathname = target.pathname || target.path || "";
+    try { return new URL(`${protocol}//${hostname}${port ? ":" + port : ""}${pathname}`); } catch { return null; }
+  }
+  return null;
+}
+
+const targetLabel = (target) =>
+  typeof target === "string" ? target : (target && (target.href || target.host)) || "target";
+
 // The single `server.proxy`, hosted in the connect stack the way Vite hosts it
 // inside `server.middlewares`. This covers BOTH request origins with one proxy:
 // the browser (Rust delegates matched prefixes here) and the worker's OUTBOUND
@@ -1761,7 +1789,11 @@ async function createProxyMiddleware(proxyConfig, appRoot) {
     if (!opts) continue;
     // Vite: a string is shorthand for { target, changeOrigin: true }.
     if (typeof opts === "string") opts = { target: opts, changeOrigin: true };
-    if (!opts || typeof opts.target !== "string") continue;
+    // Vite accepts a string, a URL, or an object target (passing them straight
+    // to http-proxy's createProxyServer). Skipping a valid non-string target
+    // would re-open the wedge (worker fetch -> catch-all -> hang), so accept any
+    // non-null target; the pipe derives host/port/protocol from any of the three.
+    if (!opts || opts.target == null) continue;
     // Normalize `rewrite` to a function. Three forms reach here: a FUNCTION
     // (vite-format, called as-is like Vite's `opts.rewrite(req.url)`); a
     // {from,to} OBJECT (oj-format over the JSON bridge — `from` is a regex
@@ -1849,12 +1881,10 @@ async function createProxyMiddleware(proxyConfig, appRoot) {
 
   // Faithful node http/https pipe (used when http-proxy is not resolvable).
   const pipeForward = (opts, req, res) => {
-    let target;
-    try {
-      target = new URL(opts.target);
-    } catch {
+    const target = pipeTarget(opts.target);
+    if (!target) {
       res.statusCode = 502;
-      res.end(`oj proxy: invalid target ${opts.target}`);
+      res.end(`oj proxy: invalid target ${typeof opts.target === "object" ? JSON.stringify(opts.target) : opts.target}`);
       return;
     }
     const isHttps = target.protocol === "https:";
@@ -1883,11 +1913,24 @@ async function createProxyMiddleware(proxyConfig, appRoot) {
       r.pipe(res);
     });
     upstream.on("error", (e) => {
-      if (!res.headersSent) {
+      // Mirror http-proxy's error handling: once the response has started the
+      // stream is committed, so DESTROY the socket rather than appending an
+      // error string onto the partial body (which would corrupt the response).
+      // Only synthesize a 502 when nothing has been sent yet.
+      if (res.headersSent || res.writableEnded) {
+        res.destroy();
+      } else {
         try { res.writeHead(502, { "content-type": "text/plain; charset=utf-8" }); } catch {}
+        res.end(`oj proxy: ${targetLabel(opts.target)} unreachable: ${e.message}`);
       }
-      res.end(`oj proxy: ${opts.target} unreachable: ${e.message}`);
     });
+    // Client disconnect / response error: abort the upstream so its socket is
+    // not leaked, and swallow res errors (EPIPE/ECONNRESET) so they do not
+    // surface as an unhandled error on the host.
+    const abortUpstream = () => { if (!upstream.destroyed) upstream.destroy(); };
+    res.on("close", () => { if (!res.writableFinished) abortUpstream(); });
+    res.on("error", abortUpstream);
+    req.on("error", abortUpstream);
     // Stream the request body through (uploads are never buffered whole).
     req.pipe(upstream);
   };
@@ -1962,6 +2005,10 @@ async function setupConfigureServer() {
       const upstream = req.headers["x-oj-forward-to"];
       if (typeof upstream === "string" && /^\d+$/.test(upstream)) return forwardUpstream(req, res, Number(upstream));
       res.setHeader("x-oj-fallthrough", "1");
+      // A proxy `bypass` returning a string rewrote req.url and fell through
+      // (nothing in the stack served it): report the rewritten url so the Rust
+      // delegate can serve it via normal routing instead of returning this 404.
+      try { res.setHeader("x-oj-rewritten-url", req.url); } catch {}
       res.statusCode = 404;
       res.end();
     };
