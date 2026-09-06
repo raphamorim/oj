@@ -285,6 +285,12 @@ struct ServerState {
     /// Per `proxy` entry: the compiled pattern of a `^` (regex) context, `None`
     /// for a plain prefix. Built once so request matching does not recompile.
     proxy_regex: Vec<Option<regex::Regex>>,
+    /// Literal path prefixes of `^` contexts oj's regex engine could NOT compile
+    /// (JS RegExp lookaround/backreference). Empty in the common case. Used to
+    /// narrow the "delegate an unmatched request to the Node proxy so its JS
+    /// RegExp decides" path to plausible candidates, so normal traffic never
+    /// takes the Node hop.
+    proxy_uncompilable_prefixes: Vec<String>,
     http: reqwest::Client,
     /// For `server.proxy` entries with `secure: false`: accepts any certificate.
     /// Built on first use, so projects that never opt in pay nothing.
@@ -773,6 +779,12 @@ impl DevServer {
             .collect();
         let proxy_regex: Vec<Option<regex::Regex>> =
             proxy.iter().map(|(ctx, _)| proxy_context_regex(ctx)).collect();
+        let proxy_uncompilable_prefixes: Vec<String> = proxy
+            .iter()
+            .zip(&proxy_regex)
+            .filter(|((ctx, _), re)| ctx.starts_with('^') && re.is_none())
+            .map(|((ctx, _), _)| regex_literal_prefix(ctx))
+            .collect();
 
         // TanStack Start owns its module graph and SSR; oj runs the plugin host
         // only to host configureServer middleware (the editor dev-server bridge),
@@ -1179,6 +1191,7 @@ impl DevServer {
             preload_snapshot: load_graph_snapshot(&root),
             proxy,
             proxy_regex,
+            proxy_uncompilable_prefixes,
             http: reqwest::Client::new(),
             http_insecure: std::sync::OnceLock::new(),
             proxy_tls: [std::sync::OnceLock::new(), std::sync::OnceLock::new()],
@@ -2571,6 +2584,67 @@ async fn apply_dev_headers(
 /// (rewritten) request path and the original query. Applies the `{from,to}`
 /// string rewrite form only; the FUNCTION rewrite form is honored by the Node
 /// proxy (the browser path delegates there when a plugin host is running).
+/// The literal path prefix of a `^`-anchored context, up to the first regex
+/// metacharacter: `^/api(?=/)` -> `/api`. A cheap over-approximation used only
+/// to decide whether an unmatched request could plausibly hit an uncompilable
+/// context (and so is worth delegating to Node's JS RegExp).
+fn regex_literal_prefix(context: &str) -> String {
+    let s = context.strip_prefix('^').unwrap_or(context);
+    let mut out = String::new();
+    for c in s.chars() {
+        if "\\.^$*+?()[]{}|".contains(c) {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Delegate a request to the single Vite-shaped proxy in the plugin host's
+/// middleware stack: stream the body there, stream the reply back. If the host's
+/// proxy declined (`x-oj-fallthrough` — a `bypass` that returned a string and
+/// fell through, or a JS-RegExp non-match on an uncompilable context), serve the
+/// possibly-rewritten url through normal oj routing instead of returning the
+/// host's 404. The re-routed request carries no body (it was streamed to the
+/// host): this covers the realistic GET bypass rewrite; a non-GET fallthrough
+/// re-route loses its body.
+async fn delegate_to_node_proxy(
+    next: axum::middleware::Next,
+    port: u16,
+    req: axum::extract::Request,
+) -> Response {
+    let (parts, body) = req.into_parts();
+    let method = parts.method.as_str().to_string();
+    let pq = parts
+        .uri
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| parts.uri.path().to_string());
+    match proxy_to_loopback_streaming(port, &method, &pq, &parts.headers, Some(body)).await {
+        Ok(resp) => {
+            if resp.headers().contains_key("x-oj-fallthrough") {
+                let mut parts = parts;
+                if let Some(uri) = resp
+                    .headers()
+                    .get("x-oj-rewritten-url")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<Uri>().ok())
+                {
+                    parts.uri = uri;
+                }
+                let rreq = axum::extract::Request::from_parts(parts, Body::empty());
+                return next.run(rreq).await;
+            }
+            resp
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            format!("oj proxy delegation to plugin host failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 fn proxy_target(entry: &oj_config::ProxyEntry, path: &str, query: Option<&str>) -> String {
     let mut fwd_path = path.to_string();
     if let Some((from, to)) = entry.rewrite() {
@@ -2603,35 +2677,21 @@ async fn proxy_middleware(
         // A proxy context oj's regex engine cannot compile (a JS RegExp with
         // lookaround/backreference) is left unmatched by select_proxy, so oj
         // would serve the path as a route. When a plugin host runs, the Node
-        // proxy has the SAME contexts but a full JS RegExp, so let it decide:
-        // forward there, take its response if it proxied, and fall back to
-        // normal routing on its fallthrough signal. (A `ws: true` uncompilable
-        // context still can't upgrade through this path — a known harder gap.)
-        let has_uncompilable = state
-            .proxy
-            .iter()
-            .zip(&state.proxy_regex)
-            .any(|((ctx, _), re)| ctx.starts_with('^') && re.is_none());
-        if has_uncompilable {
+        // proxy has the SAME contexts but a full JS RegExp, so let IT decide —
+        // but only for a request whose path could plausibly hit such a context
+        // (its cheap literal prefix), so normal traffic never takes the hop and
+        // no body is buffered on the hot path. The body streams through and a
+        // JS-RegExp non-match falls back to native routing. (A `ws: true`
+        // uncompilable context still can't upgrade through this path — a known
+        // harder gap.)
+        if !state.proxy_uncompilable_prefixes.is_empty()
+            && state
+                .proxy_uncompilable_prefixes
+                .iter()
+                .any(|p| path.starts_with(p.as_str()))
+        {
             if let Some(port) = state.plugin_serve.mw_port() {
-                let method = req.method().as_str().to_string();
-                let pq = req
-                    .uri()
-                    .path_and_query()
-                    .map(|p| p.as_str().to_string())
-                    .unwrap_or_else(|| path.clone());
-                let (parts, body) = req.into_parts();
-                let body_bytes = axum::body::to_bytes(body, usize::MAX)
-                    .await
-                    .map(|b| b.to_vec())
-                    .unwrap_or_default();
-                if let Some(resp) =
-                    forward_to_plugin_mw(port, &method, &pq, &parts.headers, Some(body_bytes.clone())).await
-                {
-                    return resp;
-                }
-                let req = axum::extract::Request::from_parts(parts, Body::from(body_bytes));
-                return next.run(req).await;
+                return delegate_to_node_proxy(next, port, req).await;
             }
         }
         return next.run(req).await;
@@ -2653,24 +2713,11 @@ async fn proxy_middleware(
     // the browser path and the worker's outbound fetch share ONE proxy, with the
     // app's real config (function `rewrite`, `configure`, `bypass`) intact. The
     // ORIGINAL unstripped path is forwarded; the Node proxy re-matches and
-    // rewrites it. The request body streams through, so uploads are not capped.
+    // rewrites it. The request body streams through, so uploads are not capped;
+    // a `bypass` that returned a string (host proxy falls through) is served via
+    // normal routing at the rewritten url rather than returning the host's 404.
     if let Some(port) = state.plugin_serve.mw_port() {
-        let method = req.method().as_str().to_string();
-        let pq = req
-            .uri()
-            .path_and_query()
-            .map(|p| p.as_str().to_string())
-            .unwrap_or_else(|| path.clone());
-        let headers = req.headers().clone();
-        let body = req.into_body();
-        return match proxy_to_loopback_streaming(port, &method, &pq, &headers, Some(body)).await {
-            Ok(resp) => resp,
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                format!("oj proxy delegation to plugin host failed: {e}"),
-            )
-                .into_response(),
-        };
+        return delegate_to_node_proxy(next, port, req).await;
     }
 
     // Fallback: no plugin host (a plain `oj dev` app with `server.proxy`, or the
