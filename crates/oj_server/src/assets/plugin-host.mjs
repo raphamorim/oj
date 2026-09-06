@@ -1905,20 +1905,25 @@ async function setupConfigureServer() {
             || (parsed.paths || []).map((p) => ({ path: p, type: "update" }));
         } catch {}
         if (resync) {
-          // ACK on ENQUEUE: the queue is serialized, so an enqueued resync is
-          // guaranteed to run after everything already queued — answering only
-          // after the (possibly long) drain made the caller's bounded client
-          // time out and retry a resync that was already coming. Idempotent
-          // and coalesced: a pending resync invalidates whole graphs, so it
-          // already covers everything a duplicate would — duplicates (a
-          // caller retry racing a slow queue) are absorbed instead of
-          // stacking full-reloads.
+          // ACK on ENQUEUE (202-style): the queue is serialized, so an
+          // enqueued resync is guaranteed to run after everything already
+          // queued — answering only after the (possibly long) drain made the
+          // caller's bounded client time out and retry a resync that was
+          // already coming. The ack therefore only means "enqueued"; when the
+          // resync EXECUTES, a control-plane `{ ojResyncDone }` push tells
+          // the Rust side, which claims "resynced" only then (a stuck queue
+          // warns instead of logging success). Idempotent and coalesced: a
+          // pending resync invalidates whole graphs, so it already covers
+          // everything a duplicate would — duplicates (a caller retry racing
+          // a slow queue) are absorbed instead of stacking full-reloads, and
+          // one done push may answer several coalesced enqueues.
           if (!resyncPending) {
             resyncPending = true;
             invalidateQueue = invalidateQueue
               .then(() => {
                 resyncPending = false;
                 resyncEnvironments(server.environments);
+                ctl({ ojResyncDone: true });
               })
               .catch(() => {
                 resyncPending = false;
