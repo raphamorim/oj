@@ -29,12 +29,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertHydrates, assertModuleGraphServes, parseBoundPort } from "./lib/hydration.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.join(here, "..");
 const fixture = path.join(here, "fixtures", "start-app");
 const oj = path.join(repo, "target", "debug", "oj");
-const PORT = 6860;
+const REQ_PORT = 6860;
+// The port oj actually bound (it auto-increments off a busy port); read from its
+// stdout so a stale server never makes the browser hit the wrong server.
+let PORT = REQ_PORT;
 
 const installed =
   fs.existsSync(path.join(fixture, "node_modules", "@tanstack", "react-start")) &&
@@ -119,6 +123,9 @@ function makeApp() {
   // dev.mjs documents). The `client-mounted-ok` span is rendered only AFTER the
   // component mounts, so it is absent from the SSR HTML and its appearance in the
   // browser proves React hydrated — the exact thing the bundledDev bug broke.
+  // The counter button proves event handlers attached post-hydration: it starts
+  // at 0 server-side and only increments once the client runtime is live and its
+  // onClick is wired (the interaction step of the shared hydration gate).
   fs.writeFileSync(path.join(app, "src", "routes", "index.tsx"), [
     'import { createRoute } from "@tanstack/react-router";',
     'import { useEffect, useState } from "react";',
@@ -133,11 +140,13 @@ function makeApp() {
     "",
     "function Index() {",
     "  const [mounted, setMounted] = useState(false);",
+    "  const [count, setCount] = useState(0);",
     "  useEffect(() => setMounted(true), []);",
     "  return (",
     "    <main>",
     '      <h1 className="fixture-heading">{shout("home")}</h1>',
     '      {mounted ? <span data-testid="client-mounted">client-mounted-ok</span> : null}',
+    '      <button data-testid="counter" onClick={() => setCount((c) => c + 1)}>count: {count}</button>',
     "    </main>",
     "  );",
     "}",
@@ -163,32 +172,15 @@ async function loadPlaywright() {
   }
 }
 
-// Load `/` in a headless browser and report whether the client-only marker
-// appeared within the deadline (i.e. React hydrated). Returns { hydrated, err }.
-async function browserHydrates(chromium, deadlineMs) {
-  const browser = await chromium.launch();
-  const page = await browser.newPage();
-  if (process.env.OJ_E2E_DEBUG_BROWSER) {
-    page.on("console", (m) => console.error(`  [browser console.${m.type()}] ${m.text()}`));
-    page.on("pageerror", (e) => console.error(`  [browser pageerror] ${e.message}`));
-    page.on("requestfailed", (r) => console.error(`  [browser requestfailed] ${r.url()} :: ${r.failure()?.errorText}`));
-    page.on("response", (r) => { if (r.status() >= 400) console.error(`  [browser resp ${r.status()}] ${r.url()}`); });
-  }
-  try {
-    await page.goto(`http://127.0.0.1:${PORT}/`, { waitUntil: "domcontentloaded" });
-    await page.waitForSelector('[data-testid="client-mounted"]', { timeout: deadlineMs });
-    const text = await page.textContent('[data-testid="client-mounted"]');
-    return { hydrated: text === "client-mounted-ok", err: null };
-  } catch (e) {
-    return { hydrated: false, err: (e && e.message) || String(e) };
-  } finally {
-    await browser.close();
-  }
-}
+// A client→server-function call can't run in oj's Node SSR loader on this slim
+// CF app (it can't import `cloudflare:workers`); this route is deliberately
+// backend-free, so nothing here trips it, but the whitelist documents the known
+// noise the shared gate should ignore.
+const HYDRATION_WHITELIST = [/favicon\.ico/, "cloudflare:workers"];
 
 async function run() {
   let log = "";
-  const srv = spawn(oj, ["dev", app, "--port", String(PORT)], {
+  const srv = spawn(oj, ["dev", app, "--port", String(REQ_PORT)], {
     cwd: app,
     detached: true,
     stdio: ["ignore", "pipe", "pipe"],
@@ -201,6 +193,14 @@ async function run() {
     setTimeout(() => { try { process.kill(-srv.pid, "SIGKILL"); } catch {} }, 2000).unref();
   };
   try {
+    // Read the port oj actually bound before probing it: it may have incremented
+    // off REQ_PORT, and probing REQ_PORT would then hit a stale server.
+    for (let i = 0; i < 240; i++) {
+      if (srv.exitCode != null) break;
+      const bound = parseBoundPort(log);
+      if (bound) { PORT = bound; break; }
+      await new Promise((r) => setTimeout(r, 250));
+    }
     let up = false;
     let lastStatus = "no response";
     for (let i = 0; i < 240 && !up; i++) {
@@ -228,10 +228,12 @@ async function run() {
     }
 
     const chromium = await loadPlaywright();
+    const base = `http://127.0.0.1:${PORT}`;
     const referencesBundled = home.body.includes(BUNDLED_ENTRY);
 
     if (referencesBundled) {
       // ---- UNFIXED TREE: reproduce the bug and FAIL with evidence. ----
+      // This is the branch a tree with the bundledDev coercion REVERTED lands in.
       console.error("bundledDev-coerce: REPRODUCED the bug (document references /assets/index.js)");
       // The bundled client script is never delivered: on Vite it hangs on the
       // app's own entry hold; under oj (which never installs the bundled-dev
@@ -247,8 +249,21 @@ async function run() {
         console.error("  /assets/index.js HANGS within 5s (no client JS is ever delivered) — confirmed");
       }
       if (chromium) {
-        const { hydrated } = await browserHydrates(chromium, 8000);
-        console.error(`  headless Chromium hydration: ${hydrated ? "HYDRATED (unexpected)" : "did NOT hydrate (client-mounted-ok never appeared) — confirmed"}`);
+        // The shared hydration gate surfaces the same failure at step 2 (the
+        // client module graph served >= 400) rather than a bare timeout.
+        const browser = await chromium.launch();
+        try {
+          const { failures } = await assertHydrates(browser, `${base}/`, {
+            ssrMarker: "HOME!",
+            clientMarker: '[data-testid="client-mounted"]',
+            deadlineMs: 8000,
+            whitelist: HYDRATION_WHITELIST,
+            throwOnFail: false,
+          });
+          console.error("  hydration gate failures:\n    " + failures.join("\n    "));
+        } finally {
+          await browser.close();
+        }
       } else {
         console.error("  (playwright not installed locally; skipped the browser no-hydration check — CI covers it)");
       }
@@ -282,13 +297,40 @@ async function run() {
     }
     console.log("bundledDev-coerce: the one-time coercion warning was printed");
 
-    // The gate the log-greps missed: a real browser must HYDRATE.
+    // The gates the log-greps missed: the whole client module graph must serve,
+    // and a real browser must HYDRATE. assertModuleGraphServes follows the
+    // virtual entry to the physical client.tsx behind it, so a 500 there (the
+    // react-refresh-wrapper regression) surfaces as a named `500 …/client.tsx`,
+    // not a silent waitForSelector timeout.
     if (chromium) {
-      const { hydrated, err } = await browserHydrates(chromium, 30000);
-      if (!hydrated) {
-        throw new Error(`headless Chromium did not hydrate (client-mounted-ok never appeared): ${err ?? "unknown"}\nlog tail:\n${log.slice(-2000)}`);
+      const browser = await chromium.launch();
+      try {
+        const page = await browser.newPage();
+        try {
+          const graph = await assertModuleGraphServes(page, `${base}/@id/${STANDARD_ENTRY}`);
+          if (!graph.ok) {
+            throw new Error(
+              "the dev client entry's module graph did not fully serve 200:\n  " + graph.failures.join("\n  "),
+            );
+          }
+          console.log("bundledDev-coerce: the client entry module graph (incl. the physical client.tsx) serves 200");
+        } finally {
+          await page.close();
+        }
+        // Full ladder: SSR marker, client mount, correct marker text, and an
+        // interaction (the counter) proving handlers attached post-hydration.
+        await assertHydrates(browser, `${base}/`, {
+          ssrMarker: "HOME!",
+          clientMarker: '[data-testid="client-mounted"]',
+          clientMarkerText: "client-mounted-ok",
+          interaction: { click: '[data-testid="counter"]', expect: { selector: '[data-testid="counter"]', text: "count: 1" } },
+          deadlineMs: 30000,
+          whitelist: HYDRATION_WHITELIST,
+        });
+        console.log("bundledDev-coerce: headless Chromium HYDRATED (marker + counter interaction) — client runtime is live");
+      } finally {
+        await browser.close();
       }
-      console.log("bundledDev-coerce: headless Chromium HYDRATED (client-only marker appeared) — client runtime is live");
     } else {
       console.log("bundledDev-coerce: playwright not installed locally; ran the HTTP-level assertions and skipped the browser hydration check (CI runs it)");
     }
