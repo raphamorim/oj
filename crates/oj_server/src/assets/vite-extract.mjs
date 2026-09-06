@@ -3,7 +3,7 @@
 
 import { createRequire, isBuiltin, syncBuiltinESMExports } from "node:module";
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { basename, dirname, isAbsolute, resolve, sep } from "node:path";
+import { dirname, isAbsolute, resolve, sep } from "node:path";
 import fs, { writeFileSync, readFileSync, realpathSync, existsSync, unlinkSync, writeSync } from "node:fs";
 
 // The slice of Vite's mergeConfigRecursively these assets need (twin copies:
@@ -94,24 +94,35 @@ const unsetOjNodeEnvForResolve = () => {
   if (!nodeEnvWasSet && process.env.NODE_ENV === defaultNodeEnv) delete process.env.NODE_ENV;
 };
 
-// Wrangler config files the config evaluation touched. The Cloudflare plugin's
+// Config-shaped files the config evaluation touched. The Cloudflare plugin's
 // `config` hook reads the Worker config (wrangler.unstable_readConfig) from
 // wherever `cloudflare({ configPath })` and `auxiliaryWorkers[].configPath`
-// point — files the root-level cache epoch (wrangler.* in the app root) cannot
-// see. Recording the actual reads is the honest signal (no config-shape
-// heuristics): every observed path joins `__deps`, so the Rust extraction
+// point — under ANY filename (a custom worker.jsonc, a
+// CLOUDFLARE_VITE_WRANGLER_CONFIG_PATH override, a
+// .wrangler/deploy/config.json redirect) — files the root-level cache epoch
+// (wrangler.* in the app root) cannot see. Recording the actual reads is the
+// honest signal (no config-shape or filename heuristics): every read of a
+// .json/.jsonc/.toml file observed during the evaluation, outside
+// node_modules and oj's own cache dir, joins `__deps`, so the Rust extraction
 // cache stamps it like a config import. Attempted reads and existence probes
-// of MISSING wrangler files are recorded too — the absent state is stamped, so
-// creating the file later is a cache miss.
-const observedWranglerReads = new Set();
-function installWranglerReadRecorder() {
-  const WRANGLER_FILE = /^wrangler\.(?:json|jsonc|toml)$/;
+// of MISSING files are recorded too — the absent state is stamped, so
+// creating the file later is a cache miss. Growth is guarded: reads during
+// config evaluation are few, the set dedups, and recording stops at a cap
+// instead of stamping a huge crawled tree.
+const observedConfigReads = new Set();
+const OBSERVED_READS_MAX = 512;
+function installConfigReadRecorder() {
+  const CONFIG_FILE = /\.(?:json|jsonc|toml)$/i;
+  const ojCacheDir = process.env.OJ_CACHE_DIR || null;
   const record = (p) => {
     try {
+      if (observedConfigReads.size >= OBSERVED_READS_MAX) return;
       const s = typeof p === "string" ? p : p instanceof URL ? fileURLToPath(p) : null;
-      if (s && WRANGLER_FILE.test(basename(s)) && !s.split(sep).includes("node_modules")) {
-        observedWranglerReads.add(resolve(appRoot, s));
-      }
+      if (!s || !CONFIG_FILE.test(s) || s.split(sep).includes("node_modules")) return;
+      const abs = resolve(appRoot, s);
+      if (abs.split(sep).includes(".oj-cache")) return;
+      if (ojCacheDir && (abs === ojCacheDir || abs.startsWith(ojCacheDir + sep))) return;
+      observedConfigReads.add(abs);
     } catch {}
   };
   const wrap = (obj, name) => {
@@ -1148,7 +1159,7 @@ const emitResult = (json) => {
 
 if (isMainRun) {
 try {
-  installWranglerReadRecorder();
+  installConfigReadRecorder();
   const { config, raw, deps, runnerBacked, merge } = (await loadConfig()) ?? {};
   const c = config ?? {};
   warnUnsupported(raw ?? c);
@@ -1199,9 +1210,10 @@ try {
   emitResult(
     JSON.stringify({
       __ok: true,
-      // Config imports plus the wrangler configs the evaluation read (or
-      // probed): both invalidate the extraction cache when they change.
-      __deps: [...new Set([...(deps ?? []), ...observedWranglerReads])],
+      // Config imports plus the config-shaped files (.json/.jsonc/.toml) the
+      // evaluation read (or probed): both invalidate the extraction cache
+      // when they change.
+      __deps: [...new Set([...(deps ?? []), ...observedConfigReads])],
       base: typeof c.base === "string" ? c.base : null,
       publicDir: typeof c.publicDir === "string" ? c.publicDir : c.publicDir === false ? false : null,
       port: typeof c.server?.port === "number" ? c.server.port : null,
