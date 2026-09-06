@@ -129,6 +129,18 @@ pub struct OptimizeInput {
     pub needs_interop: Vec<String>,
 }
 
+/// The mainFields the prebundle resolves with, from the resolved config: the
+/// user's `resolve.mainFields` (or the dev resolver's defaults) with Vite's
+/// `pkg.main` fallback appended last. The sidecar's bundler walks the list
+/// verbatim (no resolvePackageEntry fallback), so a Vite-shaped main-less
+/// list from the config must not make a dep that resolves in the dev server
+/// fail the prebundle.
+pub fn optimizer_main_fields(config: &oj_config::OjConfig) -> Vec<String> {
+    oj_resolver::with_main_fallback(
+        oj_config::resolve_main_fields(config).unwrap_or_else(oj_resolver::default_main_fields),
+    )
+}
+
 /// Vite's lockfileFormats (optimizer/index.ts): the lockfile a package manager
 /// writes, paired with the patch-package directory whose mtime must also
 /// invalidate the prebundle (`checkPatchesDir`).
@@ -362,6 +374,30 @@ mod tests {
             alias: Vec::new(),
             ..Default::default()
         }
+    }
+
+    // The optimizer seam of Vite's pkg.main fallback: OptimizeInput takes the
+    // adopted mainFields with "main" appended last, so a dep that resolves in
+    // the dev server never fails the prebundle under a Vite-shaped list.
+    #[test]
+    fn optimizer_main_fields_append_vites_main_fallback() {
+        let from = |json: &str| -> oj_config::OjConfig { serde_json::from_str(json).unwrap() };
+        assert_eq!(
+            optimizer_main_fields(&from(
+                r#"{ "resolve": { "mainFields": ["browser", "module", "jsnext:main", "jsnext"] } }"#
+            )),
+            ["browser", "module", "jsnext:main", "jsnext", "main"].map(String::from)
+        );
+        // A configured "main" is never duplicated or outranked.
+        assert_eq!(
+            optimizer_main_fields(&from(r#"{ "resolve": { "mainFields": ["main", "module"] } }"#)),
+            ["main", "module"].map(String::from)
+        );
+        // No user list: the dev resolver's defaults (already main-terminated).
+        assert_eq!(
+            optimizer_main_fields(&from("{}")),
+            oj_resolver::default_main_fields()
+        );
     }
 
     fn project(files: &[(&str, &str)]) -> tempfile::TempDir {

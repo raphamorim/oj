@@ -1516,7 +1516,10 @@ fn rolldown_resolve(
     // resolves in the build. Only user-set values are forwarded; rolldown keeps
     // its own defaults for the rest.
     let extensions = oj_config::resolve_extensions(config);
-    let main_fields = oj_config::resolve_main_fields(config);
+    // Vite's pkg.main fallback (entryPoint ||= data.main): rolldown walks the
+    // list verbatim, so a Vite-shaped main-less list must get "main" appended
+    // here too, or an import that resolves in dev fails in the build.
+    let main_fields = oj_config::resolve_main_fields(config).map(oj_resolver::with_main_fallback);
     // Conditions are always explicit: Vite resolves a build with `production`
     // (its `development|production` default), and the dev server passes the
     // same list, so a dep with a `development` export never differs between
@@ -5613,6 +5616,30 @@ mod tests {
         let conditions = rolldown_resolve(root, &node_target, "ssr").unwrap().condition_names.unwrap();
         assert_eq!(conditions, oj_config::node_server_conditions(&node_target, false));
         assert!(!conditions.contains(&"workerd".to_string()));
+    }
+
+    // Vite's pkg.main fallback at the build seam: dev's OjResolver appends
+    // "main" to an adopted Vite-shaped (main-less) mainFields list, so the
+    // rolldown build must resolve with the same appended list — or the same
+    // import resolves in dev and fails in the build.
+    #[test]
+    fn rolldown_main_fields_carry_vites_main_fallback() {
+        let from = |json: &str| -> oj_config::OjConfig { serde_json::from_str(json).unwrap() };
+        let root = Path::new("/some/app");
+        let vite_shaped = from(
+            r#"{ "resolve": { "mainFields": ["browser", "module", "jsnext:main", "jsnext"] } }"#,
+        );
+        let fields = rolldown_resolve(root, &vite_shaped, "client").unwrap().main_fields.unwrap();
+        assert_eq!(
+            fields,
+            ["browser", "module", "jsnext:main", "jsnext", "main"].map(String::from)
+        );
+        // A list already naming main is untouched (no duplicate, no reorder).
+        let named = from(r#"{ "resolve": { "mainFields": ["main", "module"] } }"#);
+        let fields = rolldown_resolve(root, &named, "client").unwrap().main_fields.unwrap();
+        assert_eq!(fields, ["main", "module"].map(String::from));
+        // No user list: rolldown keeps its own defaults (None passes through).
+        assert!(rolldown_resolve(root, &from("{}"), "client").unwrap().main_fields.is_none());
     }
 
     #[test]

@@ -85,6 +85,21 @@ pub fn default_server_main_fields() -> Vec<String> {
         .collect()
 }
 
+/// Vite's `pkg.main` fallback as a list transform: resolvePackageEntry ALWAYS
+/// falls back to `pkg.main` after the mainFields walk (`entryPoint ||=
+/// data.main`; its resolve plugin spells it `mainFields.concat(["main"])`), so
+/// its DEFAULT_MAIN_FIELDS deliberately omit "main". A resolver without that
+/// fallback (oxc_resolver, rolldown, the dep optimizer's sidecar) must take
+/// the list with "main" appended LAST — never outranking the configured
+/// fields — or a package whose only entry is `main` resolves in one consumer
+/// and fails in the next.
+pub fn with_main_fallback(mut fields: Vec<String>) -> Vec<String> {
+    if !fields.iter().any(|f| f == "main") {
+        fields.push("main".to_string());
+    }
+    fields
+}
+
 /// Vite's TS-output remap (resolve.ts `tryCleanFsResolve` / `isPossibleTsOutput`):
 /// an import ending in `.js`/`.jsx`/`.mjs`/`.cjs` with no such file on disk
 /// resolves to its TypeScript source (`.ts` then `.tsx`, `.tsx`, `.mts`, `.cts`),
@@ -147,24 +162,19 @@ impl OjResolver {
                 (find.clone(), vec![AliasValue::Path(target)])
             })
             .collect();
-        let mut main_fields = settings.main_fields.unwrap_or_else(|| {
+        // The `with_main_fallback` append: oxc_resolver has no pkg.main
+        // fallback (an exhausted main_fields goes straight to the index
+        // files), so the list must end with "main", or a package whose only
+        // entry is `main` (a linked workspace package with a TS main, say)
+        // stops resolving the moment a Vite-shaped mainFields list is adopted
+        // from the config.
+        let main_fields = with_main_fallback(settings.main_fields.unwrap_or_else(|| {
             if settings.server {
                 default_server_main_fields()
             } else {
                 default_main_fields()
             }
-        });
-        // Vite's resolvePackageEntry ALWAYS falls back to `pkg.main` after the
-        // mainFields walk (`entryPoint ||= data.main`) — its
-        // DEFAULT_MAIN_FIELDS deliberately omits "main" because of that
-        // fallback. oxc_resolver has no such fallback (an exhausted
-        // main_fields goes straight to the index files), so the list must end
-        // with "main", or a package whose only entry is `main` (a linked
-        // workspace package with a TS main, say) stops resolving the moment a
-        // Vite-shaped mainFields list is adopted from the config.
-        if !main_fields.iter().any(|f| f == "main") {
-            main_fields.push("main".to_string());
-        }
+        }));
         // Vite applies the package.json `browser` object only when mainFields
         // include `browser` (the client default; a server list opts in by naming it).
         let alias_fields = if main_fields.iter().any(|f| f == "browser") {
@@ -630,6 +640,23 @@ mod tests {
             module_first.resolve(&dir, "mf-pkg").unwrap().ends_with("esm.js"),
             "the appended main fallback must not outrank the user's fields",
         );
+    }
+
+    // The shared transform every non-fallback resolver (oxc, rolldown, the
+    // optimizer sidecar) applies to an adopted mainFields list.
+    #[test]
+    fn with_main_fallback_appends_main_last_and_dedups() {
+        assert_eq!(
+            with_main_fallback(["browser", "module"].map(String::from).to_vec()),
+            ["browser", "module", "main"].map(String::from)
+        );
+        // Already present (anywhere): the list is untouched — the fallback
+        // never outranks or duplicates a configured "main".
+        assert_eq!(
+            with_main_fallback(["main", "module"].map(String::from).to_vec()),
+            ["main", "module"].map(String::from)
+        );
+        assert_eq!(with_main_fallback(Vec::new()), ["main".to_string()]);
     }
 
     #[test]
