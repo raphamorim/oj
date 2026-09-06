@@ -13,6 +13,47 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { stripVTControlCharacters } from "node:util";
 import { EventEmitter } from "node:events";
 
+// The slice of Vite's mergeConfigRecursively these assets need (twin copies:
+// one in vite-extract.mjs, one in plugin-host.mjs — keep them byte-identical):
+// null and undefined override values are skipped (a `key: null` override must
+// not clobber a set value), arrays concatenate, plain objects merge
+// recursively, scalars and functions take the later value — and a `true` on
+// either side of ssr/resolve `noExternal`/`external` wins over lists
+// (mergeConfigRecursively's special case).
+const environmentPathRE = /^environments\.[^.]+$/;
+function mergeConfigLite(defaults, overrides, rootPath = "") {
+  const merged = { ...defaults };
+  for (const key of Object.keys(overrides ?? {})) {
+    const value = overrides[key];
+    if (value == null) continue;
+    const existing = merged[key];
+    if (
+      (key === "noExternal" || key === "external") &&
+      (rootPath === "ssr" || rootPath === "resolve") &&
+      (existing === true || value === true)
+    ) {
+      merged[key] = true;
+      continue;
+    }
+    if (existing == null) merged[key] = value;
+    else if (Array.isArray(existing) || Array.isArray(value)) {
+      merged[key] = [
+        ...(Array.isArray(existing) ? existing : [existing]),
+        ...(Array.isArray(value) ? value : [value]),
+      ];
+    } else if (typeof existing === "object" && typeof value === "object") {
+      // As in Vite: an `environments.<name>` node restarts path tracking, so
+      // `environments.ssr.resolve.noExternal` merges like `resolve.noExternal`.
+      merged[key] = mergeConfigLite(
+        existing,
+        value,
+        rootPath && !environmentPathRE.test(rootPath) ? `${rootPath}.${key}` : key,
+      );
+    } else merged[key] = value;
+  }
+  return merged;
+}
+
 const pluginsPath = process.argv[2];
 const initial = JSON.parse(process.argv[3] ?? "{}");
 
@@ -835,46 +876,6 @@ function ctxFor(p) {
   return c;
 }
 
-// The slice of Vite's mergeConfigRecursively these assets need (twin copies:
-// one in vite-extract.mjs, one in plugin-host.mjs — keep them byte-identical):
-// null and undefined override values are skipped (a `key: null` override must
-// not clobber a set value), arrays concatenate, plain objects merge
-// recursively, scalars and functions take the later value — and a `true` on
-// either side of ssr/resolve `noExternal`/`external` wins over lists
-// (mergeConfigRecursively's special case).
-const environmentPathRE = /^environments\.[^.]+$/;
-function mergeConfigLite(defaults, overrides, rootPath = "") {
-  const merged = { ...defaults };
-  for (const key of Object.keys(overrides ?? {})) {
-    const value = overrides[key];
-    if (value == null) continue;
-    const existing = merged[key];
-    if (
-      (key === "noExternal" || key === "external") &&
-      (rootPath === "ssr" || rootPath === "resolve") &&
-      (existing === true || value === true)
-    ) {
-      merged[key] = true;
-      continue;
-    }
-    if (existing == null) merged[key] = value;
-    else if (Array.isArray(existing) || Array.isArray(value)) {
-      merged[key] = [
-        ...(Array.isArray(existing) ? existing : [existing]),
-        ...(Array.isArray(value) ? value : [value]),
-      ];
-    } else if (typeof existing === "object" && typeof value === "object") {
-      // As in Vite: an `environments.<name>` node restarts path tracking, so
-      // `environments.ssr.resolve.noExternal` merges like `resolve.noExternal`.
-      merged[key] = mergeConfigLite(
-        existing,
-        value,
-        rootPath && !environmentPathRE.test(rootPath) ? `${rootPath}.${key}` : key,
-      );
-    } else merged[key] = value;
-  }
-  return merged;
-}
 
 let pluginConfigDelta = {};
 async function runConfigHooks() {
