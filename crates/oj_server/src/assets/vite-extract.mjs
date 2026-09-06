@@ -655,14 +655,16 @@ function extractProxy(proxy) {
       if (typeof v.ws === "boolean") entry.ws = v.ws;
       if (typeof v.secure === "boolean") entry.secure = v.secure;
       if (typeof v.rewriteWsOrigin === "boolean") entry.rewriteWsOrigin = v.rewriteWsOrigin;
-      // Function-valued options cannot cross the config bridge (oj reads the
-      // extracted config as JSON): the entry still proxies, without them.
-      if (typeof v.rewrite === "function") {
-        warn(`server.proxy["${ctx}"].rewrite is a function; oj applies only {from,to} string rewrites`);
-      }
+      // A FUNCTION `rewrite` cannot cross this JSON config bridge, but it is no
+      // longer dropped: when a plugin host runs it hosts the single
+      // `server.proxy` from the app's real (un-serialized) config, where the
+      // function is intact, for both the browser and the worker's outbound
+      // fetch. Only a plain app with no plugin host still falls back to the
+      // {from,to} form. `configure`/`bypass` only reach the plugin host proxy;
+      // warn that the extracted (Rust-fallback) config cannot carry them.
       for (const fn of ["configure", "bypass"]) {
         if (typeof v[fn] === "function") {
-          warn(`server.proxy["${ctx}"].${fn} is a function and cannot cross the config bridge; ignored`);
+          warn(`server.proxy["${ctx}"].${fn} is a function; applied by the plugin host, not the built-in fallback proxy`);
         }
       }
       out[ctx] = entry;

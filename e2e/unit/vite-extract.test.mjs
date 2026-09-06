@@ -87,7 +87,7 @@ test("proxy contexts pass through verbatim, regex (^) contexts included", () => 
   });
 });
 
-test("function-valued proxy options are dropped with a warning, the entry still proxies", () => {
+test("function-valued proxy options: the extracted entry drops them, but rewrite no longer warns (the plugin host applies it)", () => {
   let out;
   const err = captureStderr(() => {
     out = extractProxy({
@@ -100,9 +100,11 @@ test("function-valued proxy options are dropped with a warning, the entry still 
     });
   });
   assert.deepEqual(out, { "/api": { target: "http://localhost:3000" } });
-  assert.match(err, /server\.proxy\["\/api"\]\.rewrite is a function/);
-  assert.match(err, /server\.proxy\["\/api"\]\.configure is a function and cannot cross the config bridge/);
-  assert.match(err, /server\.proxy\["\/api"\]\.bypass is a function and cannot cross the config bridge/);
+  // A function rewrite is honored by the plugin host's single proxy, so the
+  // extractor no longer warns that it is dropped.
+  assert.doesNotMatch(err, /rewrite is a function/);
+  assert.match(err, /server\.proxy\["\/api"\]\.configure is a function; applied by the plugin host/);
+  assert.match(err, /server\.proxy\["\/api"\]\.bypass is a function; applied by the plugin host/);
 });
 
 
