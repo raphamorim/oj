@@ -828,9 +828,16 @@ test("detection true with nothing built prints the none-came-up warning, whateve
   try {
     const info = await host.serveInfo();
     assert.equal(info.runnerEnvironments, false);
+    // The warning is written to stderr independently of the serve-info push,
+    // so poll for it rather than assuming it flushed by the time serveInfo
+    // resolves (that race made this test flaky under CI load).
+    const warning = /a plugin declared a custom dev environment but none came up/;
+    for (let i = 0; i < 100 && !warning.test(host.stderr()); i++) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
     assert.match(
       host.stderr(),
-      /a plugin declared a custom dev environment but none came up/,
+      warning,
       "silent degradation to the Node SSR runner is never acceptable",
     );
   } finally {
