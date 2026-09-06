@@ -578,6 +578,84 @@ test("config-shaped files the evaluation reads travel in __deps, custom names an
   }
 });
 
+// Vite's resolveConfig loads `.env`, `.env.local`, `.env.${mode}` and
+// `.env.${mode}.local` under the RESOLVED envDir (getEnvFilesForMode →
+// loadEnv), and their values change the verdict. The read recorder stamps the
+// env files the evaluation actually consulted — the probed-but-missing ones
+// included — so editing (or creating) `.env.production` invalidates a
+// build-mode extraction even under a custom envDir the root-level epoch
+// cannot name.
+test("real vite: the mode's env files under the resolved envDir travel in __deps", { skip: skipNoVite }, () => {
+  const base = realViteDir("oj-vite-extract-envdeps-");
+  try {
+    fs.mkdirSync(join(base, "cfg"));
+    writeFileSync(join(base, "vite.config.mjs"), 'export default { envDir: "./cfg" };\n');
+    writeFileSync(join(base, "cfg", ".env"), "VITE_A=1\n");
+    writeFileSync(join(base, "cfg", ".env.production"), "VITE_B=2\n");
+    const out = JSON.parse(runExtractor(base, "vite.config.mjs", ["build", "production", "explicit"]));
+    assert.equal(out.__ok, true);
+    // Vite resolves the envDir from the root as handed in (no realpath), but
+    // stay robust to either spelling.
+    const real = fs.realpathSync(base);
+    const dep = (rel) => out.__deps.includes(join(base, rel)) || out.__deps.includes(join(real, rel));
+    assert.ok(dep("cfg/.env"), `.env read by loadEnv is a stamped dep: ${JSON.stringify(out.__deps)}`);
+    assert.ok(
+      dep("cfg/.env.production"),
+      "the build mode's .env.production is a stamped dep — editing it must invalidate",
+    );
+    assert.ok(
+      dep("cfg/.env.production.local"),
+      "a probed-but-missing mode env file is stamped too (creating it must invalidate)",
+    );
+    assert.equal(out.__depsTruncated, undefined, "a whole stamp carries no truncation flag");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// The read recorder's cap is honest: overflowing it flags the emit
+// (__depsTruncated) so the Rust side serves the result WITHOUT caching it —
+// an incomplete stamp could survive an edit to an unrecorded file. Re-reading
+// an already recorded path at the cap is NOT truncation.
+test("recorder overflow sets __depsTruncated; re-reads at the cap do not", () => {
+  const base = mkdtempSync(join(tmpdir(), "oj-vite-extract-trunc-"));
+  try {
+    copyFileSync(asset("vite-extract.mjs"), join(base, "vite-extract.mjs"));
+    writeFileSync(join(base, "package.json"), JSON.stringify({ name: "fx", type: "module" }));
+    writeFileSync(join(base, "a.json"), "{}");
+    writeFileSync(join(base, "b.json"), "{}");
+    writeFileSync(
+      join(base, "vite.config.mjs"),
+      `import fs from "node:fs";
+      fs.readFileSync(new URL("./a.json", import.meta.url), "utf8");
+      fs.readFileSync(new URL("./b.json", import.meta.url), "utf8");
+      export default { base: "/t/" };\n`,
+    );
+    writeFileSync(
+      join(base, "dupe.config.mjs"),
+      `import fs from "node:fs";
+      fs.readFileSync(new URL("./a.json", import.meta.url), "utf8");
+      fs.readFileSync(new URL("./a.json", import.meta.url), "utf8");
+      export default { base: "/d/" };\n`,
+    );
+    const run = (config, env) => JSON.parse(runExtractor(base, config, [], { env: { ...process.env, ...env } }));
+    const capped = run("vite.config.mjs", { OJ_OBSERVED_READS_MAX: "1" });
+    assert.equal(capped.__ok, true);
+    assert.equal(capped.__depsTruncated, true, "a dropped NEW path past the cap flags the emit");
+    const whole = run("vite.config.mjs", {});
+    assert.equal(whole.__ok, true);
+    assert.equal(whole.__depsTruncated, undefined, "no overflow, no flag");
+    const real = fs.realpathSync(base);
+    assert.ok(whole.__deps.includes(join(real, "b.json")));
+    const dupe = run("dupe.config.mjs", { OJ_OBSERVED_READS_MAX: "1" });
+    assert.equal(dupe.__ok, true);
+    assert.equal(dupe.__depsTruncated, undefined, "re-reading a recorded path at the cap is not truncation");
+    assert.ok(dupe.__deps.includes(join(real, "a.json")));
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
 // Vite sets NODE_ENV (when the environment leaves it unset) BEFORE the config
 // file's module evaluation, so a config branching on process.env.NODE_ENV at
 // module scope sees a value; the extractor mirrors it on every loader path,

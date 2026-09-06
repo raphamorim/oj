@@ -65,31 +65,23 @@ const resultPath = process.argv[7] || null;
 
 process.env.VITE_CONFIG_NATIVE_IGNORE_WARNING ??= "true";
 
-// Vite's defaultNodeEnv follows the COMMAND, never the mode: serve resolves
-// with resolveConfig(inline, "serve") (defaultNodeEnv "development"), build
-// with resolveConfig(inline, "build", "production", "production") — so
-// `build --mode staging` still sees NODE_ENV=production/isProduction=true and
-// `serve --mode staging` sees development.
+// Vite's defaultNodeEnv follows the COMMAND, never the mode (node.js
+// resolveConfig: serve resolves with defaultNodeEnv "development", build with
+// "production"), so `build --mode staging` still sees NODE_ENV=production and
+// isProduction=true. Pre-set before any plugin or config code evaluates, as
+// resolveConfig sets it before loadConfigFromFile (`if (!isNodeEnvSet)
+// process.env.NODE_ENV = defaultNodeEnv`). The untouched pre-set is UNSET
+// again right before a real vite.resolveConfig run (unsetOjNodeEnvForResolve):
+// it must not make Vite compute isNodeEnvSet=true — its VITE_USER_NODE_ENV
+// handling stays live — while a config module that ASSIGNED
+// process.env.NODE_ENV at module scope keeps its value through resolveConfig
+// (Vite snapshots isNodeEnvSet before the load); resolveConfig then re-sets
+// the identical default itself from the defaultNodeEnv oj passes. (Twin
+// copies: one in vite-extract.mjs, one in plugin-host.mjs — keep them
+// byte-identical.)
 const defaultNodeEnv = command === "build" ? "production" : "development";
-// Vite sets NODE_ENV before the config file's module evaluation when the
-// environment leaves it unset or empty (node.js resolveConfig:
-// `if (!isNodeEnvSet) process.env.NODE_ENV = defaultNodeEnv` runs BEFORE
-// loadConfigFromFile). The extractor loads the file itself, so without this a
-// config branching on process.env.NODE_ENV at module scope saw `undefined`
-// where Vite shows a value. The pre-load value is the same command-based
-// default resolveConfig would set — and it is UNSET again right before
-// resolveConfig runs (unsetOjNodeEnvForResolve): the pre-set must not make
-// resolveConfig compute isNodeEnvSet=true, which would disable Vite's
-// VITE_USER_NODE_ENV handling; resolveConfig then re-sets the identical
-// default itself from the defaultNodeEnv oj passes.
 const nodeEnvWasSet = !!process.env.NODE_ENV;
 if (!nodeEnvWasSet) process.env.NODE_ENV = defaultNodeEnv;
-// Unset ONLY while NODE_ENV still equals the untouched pre-set: a config
-// module that ASSIGNED process.env.NODE_ENV at module scope must keep its
-// value through resolveConfig (Vite snapshots isNodeEnvSet before the load,
-// so a config-module assignment survives into its isProduction), while the
-// untouched pre-set is removed so Vite computes isNodeEnvSet=false and its
-// VITE_USER_NODE_ENV handling stays live.
 const unsetOjNodeEnvForResolve = () => {
   if (!nodeEnvWasSet && process.env.NODE_ENV === defaultNodeEnv) delete process.env.NODE_ENV;
 };
@@ -100,28 +92,43 @@ const unsetOjNodeEnvForResolve = () => {
 // point — under ANY filename (a custom worker.jsonc, a
 // CLOUDFLARE_VITE_WRANGLER_CONFIG_PATH override, a
 // .wrangler/deploy/config.json redirect) — files the root-level cache epoch
-// (wrangler.* in the app root) cannot see. Recording the actual reads is the
-// honest signal (no config-shape or filename heuristics): every read of a
-// .json/.jsonc/.toml file observed during the evaluation, outside
-// node_modules and oj's own cache dir, joins `__deps`, so the Rust extraction
-// cache stamps it like a config import. Attempted reads and existence probes
-// of MISSING files are recorded too — the absent state is stamped, so
-// creating the file later is a cache miss. Growth is guarded: reads during
-// config evaluation are few, the set dedups, and recording stops at a cap
-// instead of stamping a huge crawled tree.
+// (wrangler.* in the app root) cannot see. Env files count too: Vite's
+// resolveConfig loads `.env`, `.env.local`, `.env.${mode}` and
+// `.env.${mode}.local` under the RESOLVED envDir (getEnvFilesForMode →
+// loadEnv), and their values change the verdict — a mode- or
+// envDir-addressed file the root-level epoch cannot name either. Recording
+// the actual reads is the honest signal (no config-shape or filename
+// heuristics): every read of a .json/.jsonc/.toml or .env* file observed
+// during the evaluation, outside node_modules and oj's own cache dir, joins
+// `__deps`, so the Rust extraction cache stamps it like a config import.
+// Attempted reads and existence probes of MISSING files are recorded too —
+// the absent state is stamped, so creating the file later is a cache miss.
+// Growth is guarded: reads during config evaluation are few, the set dedups,
+// and recording stops at a cap — flagging the overflow (`__depsTruncated`)
+// so the Rust side serves the result WITHOUT caching it, an incomplete stamp
+// being worse than no cache entry.
 const observedConfigReads = new Set();
-const OBSERVED_READS_MAX = 512;
+let observedReadsTruncated = false;
+const OBSERVED_READS_MAX = Number(process.env.OJ_OBSERVED_READS_MAX) || 512;
 function installConfigReadRecorder() {
   const CONFIG_FILE = /\.(?:json|jsonc|toml)$/i;
+  const ENV_FILE = /(?:^|[\\/])\.env(?:\.[^\\/]*)?$/;
   const ojCacheDir = process.env.OJ_CACHE_DIR || null;
   const record = (p) => {
     try {
-      if (observedConfigReads.size >= OBSERVED_READS_MAX) return;
       const s = typeof p === "string" ? p : p instanceof URL ? fileURLToPath(p) : null;
-      if (!s || !CONFIG_FILE.test(s) || s.split(sep).includes("node_modules")) return;
+      if (!s || !(CONFIG_FILE.test(s) || ENV_FILE.test(s))) return;
+      // Exclusions run on the RESOLVED path: resolve() also normalizes the
+      // separators, so a forward-slash path on win32 cannot dodge the
+      // node_modules check.
       const abs = resolve(appRoot, s);
-      if (abs.split(sep).includes(".oj-cache")) return;
+      if (abs.split(sep).includes("node_modules") || abs.split(sep).includes(".oj-cache")) return;
       if (ojCacheDir && (abs === ojCacheDir || abs.startsWith(ojCacheDir + sep))) return;
+      if (observedConfigReads.size >= OBSERVED_READS_MAX) {
+        // Only a genuinely NEW path past the cap makes the stamp incomplete.
+        if (!observedConfigReads.has(abs)) observedReadsTruncated = true;
+        return;
+      }
       observedConfigReads.add(abs);
     } catch {}
   };
@@ -1210,10 +1217,13 @@ try {
   emitResult(
     JSON.stringify({
       __ok: true,
-      // Config imports plus the config-shaped files (.json/.jsonc/.toml) the
-      // evaluation read (or probed): both invalidate the extraction cache
-      // when they change.
+      // Config imports plus the config-shaped files (.json/.jsonc/.toml,
+      // .env*) the evaluation read (or probed): both invalidate the
+      // extraction cache when they change.
       __deps: [...new Set([...(deps ?? []), ...observedConfigReads])],
+      // The recorder overflowed: __deps is incomplete, so the caller must
+      // not cache this extraction under it (absent when the stamp is whole).
+      ...(observedReadsTruncated ? { __depsTruncated: true } : {}),
       base: typeof c.base === "string" ? c.base : null,
       publicDir: typeof c.publicDir === "string" ? c.publicDir : c.publicDir === false ? false : null,
       port: typeof c.server?.port === "number" ? c.server.port : null,

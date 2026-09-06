@@ -449,3 +449,28 @@ test("mergeConfigLite twins are byte-identical across the two shipped assets", (
     "the two mergeConfigLite copies drifted — keep them byte-identical",
   );
 });
+
+// Same drift guard for the other twins the two assets carry: the NODE_ENV
+// rule block (comment included — the semantics live there too; the host
+// aliases `command` so the code can be identical) and the externalize-deps
+// config-bundling plugin.
+test("NODE_ENV-rule and externalizeDepsPlugin twins are byte-identical across the two shipped assets", () => {
+  const block = (rel, re, what) => {
+    const m = fs.readFileSync(asset(rel), "utf8").match(re);
+    assert.ok(m, `${rel}: ${what} block not found`);
+    return m[0];
+  };
+  const nodeEnvRE =
+    /\/\/ Vite's defaultNodeEnv follows the COMMAND[\s\S]*?const unsetOjNodeEnvForResolve = \(\) => \{\n[\s\S]*?\n\};\n/;
+  assert.equal(
+    block("vite-extract.mjs", nodeEnvRE, "NODE_ENV rule"),
+    block("plugin-host.mjs", nodeEnvRE, "NODE_ENV rule"),
+    "the two NODE_ENV rule copies drifted — keep them byte-identical",
+  );
+  const extRE = /\nfunction externalizeDepsPlugin\(\) \{\n[\s\S]*?\n\}\n/;
+  assert.equal(
+    block("vite-extract.mjs", extRE, "externalizeDepsPlugin"),
+    block("plugin-host.mjs", extRE, "externalizeDepsPlugin"),
+    "the two externalizeDepsPlugin copies drifted — keep them byte-identical",
+  );
+});
