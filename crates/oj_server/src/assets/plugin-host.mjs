@@ -440,13 +440,24 @@ environment.transformRequest = async (rawId) => {
   const id = String(rawId ?? "");
   if (!id) return null;
   const noQuery = id.split("?")[0];
-  const filePath = noQuery.startsWith("/@fs/") ? noQuery.slice(4) : noQuery;
-  if (!isAbsolute(filePath) || !existsSync(filePath)) return null;
-  let source;
-  try {
-    source = readFileSync(filePath, "utf8");
-  } catch {
-    return null;
+  // Vite's transformRequest loads the module (its plugin `load` chain, then the
+  // file) before running the transform pipeline. Mirror that so a dependency
+  // served by a plugin `load` hook (a virtual id, a `\0`-prefixed module) is
+  // handled too, not only an on-disk file -- a server-fn dependency in a real
+  // app can be plugin-served, and returning null there would re-throw the same
+  // `could not load module info`.
+  let source = null;
+  const loaded = await loadFull(id);
+  if (loaded && loaded.code != null) {
+    source = loaded.code;
+  } else {
+    const filePath = noQuery.startsWith("/@fs/") ? noQuery.slice(4) : noQuery;
+    if (!isAbsolute(filePath) || !existsSync(filePath)) return null;
+    try {
+      source = readFileSync(filePath, "utf8");
+    } catch {
+      return null;
+    }
   }
   const out = JSON.parse(await transform(source, id, null));
   return { code: out.code };
