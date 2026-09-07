@@ -192,12 +192,16 @@ export async function assertHydrates(browser, url, opts = {}) {
       // compile/resolve cause instead of a bare status line.
       const lines = [];
       for (const r of badModules) {
+        // The browser saw r.status; re-fetch for the server's error body. A
+        // flaky module can answer the re-fetch differently, so label the body
+        // with its own status rather than implying it shares r.status.
         let detail = "";
         try {
           const again = await page.request.get(r.url);
-          detail = (await again.text()).replace(/\s+/g, " ").trim().slice(0, 400);
+          const body = (await again.text()).replace(/\s+/g, " ").trim().slice(0, 400);
+          if (body) detail = `\n    :: (re-fetch ${again.status()}) ${body}`;
         } catch {}
-        lines.push(`  ${r.status} ${r.url}${detail ? `\n    :: ${detail}` : ""}`);
+        lines.push(`  ${r.status} ${r.url}${detail}`);
       }
       failures.push("client module graph served >= 400:\n" + lines.join("\n"));
     }
