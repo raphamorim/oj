@@ -18,10 +18,23 @@ const app = path.join(workspace, "app");
 const shared = path.join(workspace, "shared");
 const sharedFile = path.join(shared, "util.js");
 
+// A SIGKILLed server's node children flush for a beat and race the removal
+// (ENOTEMPTY); retry like start-cloudflare-dev.mjs / the proxy tests do.
+const rmDirRetry = (dir) => {
+  for (let i = 0; ; i++) {
+    try {
+      return fs.rmSync(dir, { recursive: true, force: true });
+    } catch (e) {
+      if (i >= 20) return;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    }
+  }
+};
+
 let failed = false;
 let child;
 const startApp = async (port, viteConfig) => {
-  fs.rmSync(app, { recursive: true, force: true });
+  rmDirRetry(app);
   fs.mkdirSync(path.join(app, "src"), { recursive: true });
   fs.writeFileSync(path.join(app, "package.json"), '{"name":"fsallow","private":true}');
   fs.writeFileSync(
@@ -100,6 +113,6 @@ try {
   console.error("FAIL:", e.message);
 } finally {
   if (child) child.kill("SIGKILL");
-  fs.rmSync(workspace, { recursive: true, force: true });
+  rmDirRetry(workspace);
 }
 process.exit(failed ? 1 : 0);
