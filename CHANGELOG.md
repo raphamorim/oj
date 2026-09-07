@@ -5,6 +5,12 @@ All notable changes to oj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.22] - 2026-09-07
+
+### Fixed
+- The intermittent Cloudflare-dev hydration failure (a ~1% cold-load 500 on a server-function client module such as `@tanstack/start-client-core/.../createCsrfMiddleware.js`, which broke the client dynamic-import chain so the page rendered but never hydrated) is fixed. oj's plugin-host `environment.transformRequest` was a no-op stub, but TanStack Start's server-fn compiler depends on it in dev: to classify a module it calls `this.environment.transformRequest(<dep>?tss-server-fn-lookup)` so a capture transform hook ingests the dependency into the compiler's module cache before it reads it via `getModuleInfo`. Stubbed, the ingest never happened and correctness fell to module ordering — a cold concurrent load that compiled the dependent before its dependency threw `could not load module info`, which oj served as a hard 500 (browsers never retry a failed dynamic import). `environment.transformRequest` now mirrors Vite's `DevEnvironment.transformRequest` (resolve → load → transform): it runs the plugin `load` chain and the file (an absolute path, a `/@fs/` url, or a root-relative url), resolves a bare/unresolved id like Vite, and runs the transform pipeline so the capture hook fires and the cache is populated on demand — eliminating the ordering race.
+- The `vite-plugin-cloudflare:config` plugin no longer fails its `configResolved` hook on every Cloudflare-dev boot (a benign but noisy `Cannot read properties of undefined (reading 'external')`). The SSR plugin bridge built its resolved config with bare `environments: { client: {}, ssr: {} }`; Vite's `resolveConfig` runs `resolveEnvironmentResolveOptions` for every environment, so each `environments[name].resolve` is a complete object (`external: []`, `noExternal: []`, `dedupe: []`, …) that plugins read in `configResolved`. The bridge now populates each environment's `resolve` the same way.
+
 ## [0.1.21] - 2026-09-07
 
 ### Fixed
