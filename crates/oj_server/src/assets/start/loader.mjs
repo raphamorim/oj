@@ -584,9 +584,14 @@ const ALIASES = {
   "tanstack-start-manifest:v": pathResolve(HERE, "manifest-dev.ts"),
   "tanstack-start-injected-head-scripts:v": pathResolve(HERE, "injected-head-scripts.ts"),
   "@cloudflare/vite-plugin/server": pathResolve(HERE, "cf-server.mjs"),
-  // The `cloudflare:workers` runtime module has no workerd here; resolve it to
-  // oj's dev stub so a server function reading `env` runs instead of Node's
-  // default loader crashing on the `cloudflare:` scheme (ERR_UNSUPPORTED_ESM_URL_SCHEME).
+  // Vite marks `cloudflare:*` as `resolve.builtins` on the worker environment,
+  // so they externalize and workerd provides them at runtime (@cloudflare/vite-plugin's
+  // cloudflareBuiltInModules). oj's SSR loader runs in Node with no workerd, where
+  // externalizing would instead crash on the `cloudflare:` scheme
+  // (ERR_UNSUPPORTED_ESM_URL_SCHEME), so oj must supply the module: resolve the one a
+  // server fn actually needs, `cloudflare:workers`, to a dev stub whose `env` comes from
+  // the wrangler vars. The other cloudflare:* builtins fall to the empty-module net in
+  // load(). Same shape as the `@cloudflare/vite-plugin/server` alias above.
   "cloudflare:workers": pathResolve(HERE, "cf-workers.mjs"),
   // Start's default server entry is oj's runner entry: an app `server.entry` that
   // wraps it (as Vite runs it) wraps oj's handler.
