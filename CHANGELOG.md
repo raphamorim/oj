@@ -5,6 +5,11 @@ All notable changes to oj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.23] - 2026-09-07
+
+### Fixed
+- A dead SSR-container process no longer crashes the whole loader/dev process. The Start SSR plugin bridge talks to the plugin-host container over named-pipe request/reply fds; the reply side already degrades to "down" when the container goes away, but the request write (`writeSync(reqFd, ...)`) was unguarded, so when the container exited or was restarted mid-session the next write threw an uncaught `EPIPE` (broken pipe) that took down the loader (surfacing as a 500 with a dead page). The write is now guarded like the reply side — retry on `EAGAIN`/`EINTR`, otherwise mark the bridge "down" and return null so the caller falls back to oj's own resolve/load — so a transient container death degrades instead of crashing SSR.
+
 ## [0.1.22] - 2026-09-07
 
 ### Fixed
