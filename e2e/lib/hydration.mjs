@@ -69,7 +69,13 @@ export function collectBrowserErrors(page) {
     requestFailures.push({ url: r.url(), error: r.failure()?.errorText ?? "unknown" }),
   );
   page.on("response", (r) => {
-    if (r.status() >= 400 && isModuleUrl(r.url())) badResponses.push({ status: r.status(), url: r.url() });
+    if (r.status() >= 400 && isModuleUrl(r.url())) {
+      // Capture the body the BROWSER actually got (a re-fetch can return a
+      // different result on a flaky module); async, resolves before the assert.
+      const entry = { status: r.status(), url: r.url(), body: "" };
+      badResponses.push(entry);
+      r.text().then((t) => { entry.body = t.replace(/\s+/g, " ").trim().slice(0, 600); }).catch(() => {});
+    }
   });
 
   return { consoleMessages, pageErrors, requestFailures, badResponses };
@@ -192,15 +198,17 @@ export async function assertHydrates(browser, url, opts = {}) {
       // compile/resolve cause instead of a bare status line.
       const lines = [];
       for (const r of badModules) {
-        // The browser saw r.status; re-fetch for the server's error body. A
-        // flaky module can answer the re-fetch differently, so label the body
-        // with its own status rather than implying it shares r.status.
-        let detail = "";
-        try {
-          const again = await page.request.get(r.url);
-          const body = (await again.text()).replace(/\s+/g, " ").trim().slice(0, 400);
-          if (body) detail = `\n    :: (re-fetch ${again.status()}) ${body}`;
-        } catch {}
+        // Prefer the body the browser actually received (captured inline); a
+        // re-fetch can answer differently on a flaky module, so it's a labelled
+        // fallback only.
+        let detail = r.body ? `\n    :: ${r.body}` : "";
+        if (!r.body) {
+          try {
+            const again = await page.request.get(r.url);
+            const body = (await again.text()).replace(/\s+/g, " ").trim().slice(0, 400);
+            if (body) detail = `\n    :: (re-fetch ${again.status()}) ${body}`;
+          } catch {}
+        }
         lines.push(`  ${r.status} ${r.url}${detail}`);
       }
       failures.push("client module graph served >= 400:\n" + lines.join("\n"));
