@@ -69,6 +69,9 @@ test("SSR loader stubs cloudflare:workers (env from wrangler) and never crashes 
     assert.equal(out.isClass, true);
     // The unknown cloudflare:* module resolved to an empty-object default.
     assert.equal(out.sockets, "object");
+    // The net warns once (visibly) for the un-aliased scheme; the aliased
+    // cloudflare:workers is served for real and does not warn.
+    assert.match(result.stderr, /no SSR module for the 'cloudflare:' scheme/);
   } finally {
     rmSync(app, { recursive: true, force: true });
   }

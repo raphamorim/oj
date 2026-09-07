@@ -929,6 +929,9 @@ function transformServerFns(code, path) {
   return rewriteServerFns(code, rel);
 }
 
+// Schemes the load-hook net has already warned about (warn once each).
+const stubbedSchemes = new Set();
+
 export function load(url, context, next) {
   if (isRequire(context)) return next(url, context);
   if (url.startsWith(VIRTUAL_SCHEME)) {
@@ -942,8 +945,16 @@ export function load(url, context, next) {
   // ERR_UNSUPPORTED_ESM_URL_SCHEME would. `cloudflare:workers` is aliased to a
   // real stub in resolve(); this is the net for any other such scheme: serve an
   // empty module so the import resolves instead of taking the process down.
+  // Warn once per scheme so a stray import (an un-aliased `cloudflare:*`, an
+  // `http:`/`blob:` id) is visible in the log rather than silently swallowed —
+  // its named imports will still fail loudly at link time, just without the
+  // process crash.
   const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(url)?.[1]?.toLowerCase();
   if (scheme && scheme !== "file" && scheme !== "data" && scheme !== "node") {
+    if (!stubbedSchemes.has(scheme)) {
+      stubbedSchemes.add(scheme);
+      process.stderr.write(`oj: no SSR module for the '${scheme}:' scheme (e.g. ${stripQ(url)}); serving an empty module\n`);
+    }
     return { format: "module", source: "export default {};", shortCircuit: true };
   }
   const clean = stripQ(url);
