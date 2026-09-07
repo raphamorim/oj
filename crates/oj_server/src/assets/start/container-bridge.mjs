@@ -79,7 +79,20 @@ export function loadPluginContainerSync(app, _opts) {
     frame.writeUInt32LE(json.length, 0);
     json.copy(frame, 4);
     let off = 0;
-    while (off < frame.length) off += writeSync(reqFd, frame, off, frame.length - off);
+    while (off < frame.length) {
+      try {
+        off += writeSync(reqFd, frame, off, frame.length - off);
+      } catch (e) {
+        if (e.code === "EAGAIN" || e.code === "EINTR") { sleep(1); continue; }
+        // The SSR container's read end is gone (the plugin host exited or
+        // restarted): an unguarded writeSync throws EPIPE and crashes the whole
+        // loader/SSR process. Degrade to "down" and return null so the caller
+        // falls back to oj's own resolve/load, exactly as readExact handles the
+        // reply pipe closing.
+        state = "down";
+        return null;
+      }
+    }
     for (;;) {
       const head = readExact(4);
       const m = JSON.parse(readExact(head.readUInt32LE(0)).toString("utf8"));
