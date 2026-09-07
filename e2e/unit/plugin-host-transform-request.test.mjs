@@ -76,3 +76,60 @@ test("this.environment.transformRequest runs the pipeline so an on-demand depend
     fx.cleanup();
   }
 });
+
+test("transformRequest loads a plugin-served (virtual) dependency via the load chain, not only on-disk files", async () => {
+  const fx = tmpProject({ prefix: "oj-tr-virt-" });
+  const csrf = path.join(fx.root, "csrf.js");
+  fx.write("csrf.js", "export const x = 1;\n");
+  // The dependency is a virtual id that only a plugin `load` hook can serve (it
+  // is not on disk). transformRequest must run the load chain, or the capture
+  // ingest never happens and getModuleInfo throws -- the disk-only impl fails here.
+  fx.write(
+    "oj.plugins.mjs",
+    [
+      `const CSRF = ${JSON.stringify(csrf)};`,
+      'const VIRTUAL = "\\0virtual:middleware";',
+      "const cache = new Set();",
+      "export default [",
+      "  { name: 'virtual-dep', load(id) {",
+      "      if (id.split('?')[0] === VIRTUAL) return 'export const createMiddleware = () => ({});';",
+      "      return null;",
+      "  } },",
+      "  { name: 'capture', transform(code, id) {",
+      "      if (id.endsWith('?lookup')) { cache.add(id.slice(0, -'?lookup'.length)); return null; }",
+      "      return null;",
+      "  } },",
+      "  { name: 'compiler', async transform(code, id) {",
+      "      if (id !== CSRF) return null;",
+      "      if (!cache.has(VIRTUAL)) {",
+      "        await this.environment.transformRequest(VIRTUAL + '?lookup');",
+      "        if (!cache.has(VIRTUAL)) throw new Error('could not load module info for ' + VIRTUAL);",
+      "      }",
+      "      return { code: 'export const x = () => {};' };",
+      "  } },",
+      "];",
+      "",
+    ].join("\n"),
+  );
+  const host = rpcSidecar("plugin-host.mjs", {
+    args: [
+      path.join(fx.root, "oj.plugins.mjs"),
+      JSON.stringify({
+        config: { root: fx.root },
+        env: { command: "serve", mode: "development" },
+        environment: { name: "client", mode: "dev" },
+      }),
+    ],
+    env: { OJ_CACHE_ROOT: fx.root },
+    cwd: fx.root,
+  });
+  try {
+    const res = await host.send({ id: 1, hook: "transform", args: ["import '/x';\n", csrf, "null"] });
+    assert.equal(res.error, undefined, `transform must not error: ${res.error}`);
+    const out = JSON.parse(res.result);
+    assert.equal(out.code, "export const x = () => {};", "virtual dependency ingested via the load chain");
+  } finally {
+    host.close();
+    fx.cleanup();
+  }
+});
