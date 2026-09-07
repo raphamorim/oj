@@ -305,6 +305,7 @@ mod tests {
 
     #[test]
     fn cache_root_is_versioned() {
+        let _g = env_guard(); // reads the default; must not race an OJ_CACHE_DIR setter
         let root = cache_root(Path::new("/app"));
         assert_eq!(
             root,
@@ -316,6 +317,7 @@ mod tests {
 
     #[test]
     fn heal_removes_legacy_layout_and_keeps_the_rest() {
+        let _g = env_guard(); // uses cache_root(default); must not race an OJ_CACHE_DIR setter
         let app = std::env::temp_dir().join(format!("oj-heal-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&app);
         let cache = app.join(".oj-cache");
@@ -370,9 +372,18 @@ mod tests {
         });
     }
 
-    // The env is process-wide; this keeps the case above from leaking into any
-    // other test that reads it.
+    // `OJ_CACHE_DIR` is process-wide, and cargo runs these tests as threads in
+    // one process, so a test that sets it races a test that reads the default.
+    // Every test touching `OJ_CACHE_DIR` (setters via temp_env_var, readers via
+    // this guard) serializes on one lock; a setter restores the var before it
+    // releases the lock, so the next reader sees the ambient (unset) value.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn temp_env_var(key: &str, value: Option<&str>, f: impl FnOnce()) {
+        let _guard = env_guard();
         let previous = std::env::var_os(key);
         match value {
             Some(v) => unsafe { std::env::set_var(key, v) },
