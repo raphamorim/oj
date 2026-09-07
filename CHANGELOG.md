@@ -5,6 +5,13 @@ All notable changes to oj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.24] - 2026-09-07
+
+### Fixed
+- A restarted SSR-container process now RECONNECTS and recovers instead of degrading forever. 0.1.23 stopped the `EPIPE` crash by marking the plugin bridge "down" on a write failure, but "down" was permanent: a container that restarted mid-session (a supervisor relaunch) left the bridge dead for the rest of the process, so every later render served oj's own resolve/load fallback with no plugin pipeline. The bridge now reconnects to a restarted container over the recreated fifos and retries the call once, so a transient restart returns the real result; if no container comes back within the reconnect window (`OJ_SSR_BRIDGE_RECONNECT_MS`, default 5s) the call returns null and reports "down", and "down" is no longer terminal, so a later call re-probes and heals a container that comes back afterward. Every fifo open on the recovery path is non-blocking, so a container that dies mid-reconnect can no longer hang the synchronous render thread on `openSync`, and the first re-probe of a still-dead container fast-fails instead of stalling for the full window.
+- A stale or partial reply frame left in the reply fifo by a dying container can no longer misframe the next call. On reconnect the bridge drains any residual bytes before retrying, a reply-length cap rejects a garbage length header (which would otherwise drive a multi-gigabyte buffer allocation) as a stream desync, and a malformed reply is recovered like a container death (reconnect and retry) rather than thrown as a hard SSR error.
+- The Start SSR loader no longer persists an under-transformed module when the container is momentarily gone. A `down` container skips the plugin `load`/`transformUserCode` steps, so the loader must not cache that render under the same key a healthy render uses; the outer `ssr-loader` disk cache and the unclaimed-`.js` marker are now both guarded by the bridge's `down()` signal (matching the guard already on the inner transform caches), so a one-off container blip can no longer freeze a plugin-untransformed or falsely-unclaimed module on disk across restarts.
+
 ## [0.1.23] - 2026-09-07
 
 ### Fixed
