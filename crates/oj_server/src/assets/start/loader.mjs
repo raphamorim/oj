@@ -1044,7 +1044,13 @@ export function load(url, context, next) {
       define: DEFINE,
     });
     const code = withInlineMap(out);
-    cachePut(raw.includes("import.meta.glob") ? null : key, code);
+    // A DOWN container skipped the plugin load()/transformUserCode steps above,
+    // so `code` is under-transformed (jsx/define only) yet `key` is identical to
+    // a healthy render's key (both hash diskRaw when load() returns null). Do NOT
+    // persist it, or every future render serves the plugin-untransformed module
+    // across restarts (a silent hydration mismatch) - the poisoning down() guards.
+    const skipCache = raw.includes("import.meta.glob") || (container != null && container.down());
+    cachePut(skipCache ? null : key, code);
     return { format: "module", source: code, shortCircuit: true };
   }
   if (url.includes("?ojv=") && isTanstack(url)) {
@@ -1092,7 +1098,11 @@ export function load(url, context, next) {
       if (diskRaw != null && diskRaw.includes("import.meta.glob")) {
         return { format: "module", source: transformGlob(diskRaw, path), shortCircuit: true };
       }
-      cachePut(key, "1");
+      // A null load() from a DOWN container means "couldn't ask", not "no plugin
+      // claims it": marking it unclaimed would freeze a plugin-claimed module as
+      // unclaimed on disk forever, bypassing the load hook across restarts. Only
+      // record the unclaimed marker when the container actually answered.
+      if (!container.down()) cachePut(key, "1");
     }
   }
   if (clean.startsWith("file:") && clean.includes("/node_modules/")) {
