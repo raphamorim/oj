@@ -234,7 +234,10 @@ function speculativeContainer(raw) {
       return specPack.get(key);
     }
     const v = raw[method](...args) ?? null;
-    if (key && !specPack.has(key)) {
+    // Never persist a result the bridge produced while the container was down:
+    // a one-off container restart would otherwise freeze a null resolve/load into
+    // the speculation pack (and its on-disk file) across process restarts.
+    if (key && !specPack.has(key) && !raw.down()) {
       specPack.set(key, v);
       specPending.push({ k: key, v });
     }
@@ -255,6 +258,8 @@ export function revalidateSpeculation() {
   for (const [key, { method, args }] of speculatedCalls) {
     let live;
     try { live = rawContainer[method](...args) ?? null; } catch { continue; }
+    // A down container can't revalidate; don't overwrite the pack with its null.
+    if (rawContainer.down()) continue;
     if (JSON.stringify(live) !== JSON.stringify(specPack.get(key) ?? null)) {
       specPack.set(key, live);
       specDirty = true;
@@ -1023,7 +1028,12 @@ export function load(url, context, next) {
         if (tucHit !== "\0none") raw = tucHit;
       } else {
         const t = container.transformUserCode(raw, path);
-        cachePut(tucKey, t ?? "\0none");
+        // A null from a DOWN container means "couldn't transform", not "no
+        // transform": persisting "\0none" would serve this file untransformed
+        // forever (across restarts), a silent hydration mismatch. Only cache a
+        // real result; a down container just skips the user-code transform for
+        // this render and retries next time (when it has reconnected).
+        if (!container.down()) cachePut(tucKey, t ?? "\0none");
         if (t != null) raw = t;
       }
     }

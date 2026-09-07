@@ -64,6 +64,63 @@ export function loadPluginContainerSync(app, _opts) {
     return buf;
   }
 
+  // Reopen the fifos to a RESTARTED container. Bounded (a healthy plugin-host
+  // restart re-creates the fifos within seconds); returns false if the container
+  // does not come back in the window, so a truly-dead container can't hang a
+  // request the way connect()'s 300s boot deadline would.
+  const RECONNECT_MS = Number(process.env.OJ_SSR_BRIDGE_RECONNECT_MS) || 30_000;
+  function reconnect() {
+    const deadline = Date.now() + RECONNECT_MS;
+    for (;;) {
+      if (existsSync(join(dir, "disabled"))) return false;
+      try {
+        closeSync(openSync(reqPath, constants.O_WRONLY | constants.O_NONBLOCK));
+        break;
+      } catch {}
+      if (Date.now() > deadline) return false;
+      sleep(25);
+    }
+    try {
+      reqFd = openSync(reqPath, "w");
+      repFd = openSync(repPath, "r");
+    } catch {
+      return false;
+    }
+    state = "up";
+    return true;
+  }
+
+  function closeFds() {
+    try { if (reqFd >= 0) closeSync(reqFd); } catch {}
+    try { if (repFd >= 0) closeSync(repFd); } catch {}
+    reqFd = -1;
+    repFd = -1;
+  }
+
+  // Send `frame` and read its reply. A container DEATH (write EPIPE, or the
+  // reply pipe closing in readExact) sets state="down" and throws; a plugin
+  // error (`m.error`) throws WITHOUT touching state, so callers can tell a
+  // recoverable death from a real error.
+  function sendRecv(id, frame) {
+    let off = 0;
+    while (off < frame.length) {
+      try {
+        off += writeSync(reqFd, frame, off, frame.length - off);
+      } catch (e) {
+        if (e.code === "EAGAIN" || e.code === "EINTR") { sleep(1); continue; }
+        state = "down";
+        throw e;
+      }
+    }
+    for (;;) {
+      const head = readExact(4);
+      const m = JSON.parse(readExact(head.readUInt32LE(0)).toString("utf8"));
+      if (m.id !== id) continue;
+      if (m.error != null) throw new Error(m.error);
+      return m.value ?? null;
+    }
+  }
+
   function call(method, args) {
     if (state === "down") return null;
     const id = ++seq;
@@ -78,28 +135,27 @@ export function loadPluginContainerSync(app, _opts) {
     const frame = Buffer.allocUnsafe(4 + json.length);
     frame.writeUInt32LE(json.length, 0);
     json.copy(frame, 4);
-    let off = 0;
-    while (off < frame.length) {
+    // Send/receive, reconnecting ONCE to a restarted container on a death and
+    // retrying, so a transient plugin-host restart RECOVERS (returns the real
+    // result) instead of crashing (the old unguarded EPIPE) or degrading forever
+    // (a permanent "down" a later restart never heals). Only a death (state ->
+    // "down") is retried; a plugin `m.error` propagates unchanged. A container
+    // that stays gone past reconnect()'s window lands "down" and returns null.
+    for (let reconnected = false; ; reconnected = true) {
       try {
-        off += writeSync(reqFd, frame, off, frame.length - off);
+        const v = sendRecv(id, frame);
+        if (first) process.stderr.write(`[oj-phase] ${Date.now()} bridge: ${method}#${id} returned\n`);
+        return v;
       } catch (e) {
-        if (e.code === "EAGAIN" || e.code === "EINTR") { sleep(1); continue; }
-        // The SSR container's read end is gone (the plugin host exited or
-        // restarted): an unguarded writeSync throws EPIPE and crashes the whole
-        // loader/SSR process. Degrade to "down" and return null so the caller
-        // falls back to oj's own resolve/load, exactly as readExact handles the
-        // reply pipe closing.
-        state = "down";
-        return null;
+        if (state !== "down") throw e;
+        if (reconnected) return null;
+        closeFds();
+        state = "idle";
+        if (!reconnect()) {
+          state = "down";
+          return null;
+        }
       }
-    }
-    for (;;) {
-      const head = readExact(4);
-      const m = JSON.parse(readExact(head.readUInt32LE(0)).toString("utf8"));
-      if (m.id !== id) continue;
-      if (first) process.stderr.write(`[oj-phase] ${Date.now()} bridge: ${method}#${id} returned\n`);
-      if (m.error != null) throw new Error(m.error);
-      return m.value ?? null;
     }
   }
 
@@ -111,6 +167,10 @@ export function loadPluginContainerSync(app, _opts) {
     env: () => call("__env", []),
     defines: () => call("__define", []),
     heap: () => (state === "up" ? call("__heap", []) : null),
+    // The bridge could not serve this call (container gone past the reconnect
+    // window): callers must NOT persist such a null into the loader cache, or a
+    // one-off container blip poisons a module's transform across restarts.
+    down: () => state === "down",
     bootstrapDone: () => existsSync(join(dir, "ready")),
   };
 }
