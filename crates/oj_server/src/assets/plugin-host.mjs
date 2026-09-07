@@ -439,27 +439,51 @@ environment.config.consumer =
 environment.transformRequest = async (rawId) => {
   const id = String(rawId ?? "");
   if (!id) return null;
-  const noQuery = id.split("?")[0];
-  // Vite's transformRequest loads the module (its plugin `load` chain, then the
-  // file) before running the transform pipeline. Mirror that so a dependency
-  // served by a plugin `load` hook (a virtual id, a `\0`-prefixed module) is
-  // handled too, not only an on-disk file -- a server-fn dependency in a real
-  // app can be plugin-served, and returning null there would re-throw the same
-  // `could not load module info`.
+  const qIdx = id.indexOf("?");
+  const bareId = qIdx === -1 ? id : id.slice(0, qIdx);
+  const query = qIdx === -1 ? "" : id.slice(qIdx);
+  // Vite's transformRequest is resolve -> load -> transform (doTransform). Mirror
+  // it: (1) the plugin `load` chain serves virtual/plugin-served ids (a `\0`
+  // module) and (2) the file backs an absolute path, a `/@fs/` url, or a
+  // root-relative url (Vite's asSrc). (3) A bare/relative specifier or a url that
+  // neither serves nor exists is RESOLVED like Vite and re-entered. An id that
+  // already loads or is an on-disk file is used as-is, so an already-resolved id
+  // -- what TanStack passes, and the key its getModuleInfo looks up -- is never
+  // rewritten.
   let source = null;
-  const loaded = await loadFull(id);
+  const loaded = await loadFull(bareId);
   if (loaded && loaded.code != null) {
     source = loaded.code;
   } else {
-    const filePath = noQuery.startsWith("/@fs/") ? noQuery.slice(4) : noQuery;
-    if (!isAbsolute(filePath) || !existsSync(filePath)) return null;
-    try {
-      source = readFileSync(filePath, "utf8");
-    } catch {
+    const root = resolvedConfig?.root ?? environment.config?.root ?? process.cwd();
+    // `/foo` is both a valid absolute fs path and a Vite root-relative url, so
+    // probe a real absolute file (TanStack passes bare `p.display()` paths)
+    // BEFORE treating a leading `/` as root-relative (Vite's asSrc).
+    let filePath = null;
+    if (bareId.startsWith("/@fs/")) {
+      const p = bareId.slice(4);
+      if (existsSync(p)) filePath = p;
+    } else if (isAbsolute(bareId) && existsSync(bareId)) {
+      filePath = bareId;
+    } else if (bareId.startsWith("/")) {
+      const p = pathResolve(root, "." + bareId);
+      if (existsSync(p)) filePath = p;
+    }
+    if (filePath) {
+      try {
+        source = readFileSync(filePath, "utf8");
+      } catch {
+        return null;
+      }
+    } else {
+      // Not loadable and not on disk: resolve it like Vite, then re-enter with
+      // the resolved id (`ctx.resolve` runs the plugin chain then oj's resolver).
+      const r = await ctx.resolve(bareId, undefined);
+      if (r && r.id && r.id !== bareId) return environment.transformRequest(r.id + query);
       return null;
     }
   }
-  const out = JSON.parse(await transform(source, id, null));
+  const out = JSON.parse(await transform(source, bareId + query, null));
   return { code: out.code };
 };
 // The resolved config (defaults + plugin `config` hooks). configureServer must

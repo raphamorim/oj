@@ -133,3 +133,58 @@ test("transformRequest loads a plugin-served (virtual) dependency via the load c
     fx.cleanup();
   }
 });
+
+test("transformRequest maps a root-relative url dependency to a file (Vite asSrc), not only absolute paths", async () => {
+  const fx = tmpProject({ prefix: "oj-tr-url-" });
+  const csrf = path.join(fx.root, "csrf.js");
+  fx.write("csrf.js", "export const x = 1;\n");
+  fx.write("middleware.js", "export const createMiddleware = () => ({});\n");
+  // The dependency is passed as a ROOT-RELATIVE URL ('/middleware.js'), the form
+  // a Vite plugin would hand transformRequest -- not an absolute path. The
+  // disk-only impl (isAbsolute check) returns null for it; the fix maps it to
+  // <root>/middleware.js so the capture ingest still runs.
+  fx.write(
+    "oj.plugins.mjs",
+    [
+      `const CSRF = ${JSON.stringify(csrf)};`,
+      'const URLID = "/middleware.js";',
+      "const cache = new Set();",
+      "export default [",
+      "  { name: 'capture', transform(code, id) {",
+      "      if (id.endsWith('?lookup')) { cache.add(id.slice(0, -'?lookup'.length)); return null; }",
+      "      return null;",
+      "  } },",
+      "  { name: 'compiler', async transform(code, id) {",
+      "      if (id !== CSRF) return null;",
+      "      if (!cache.has(URLID)) {",
+      "        await this.environment.transformRequest(URLID + '?lookup');",
+      "        if (!cache.has(URLID)) throw new Error('could not load module info for ' + URLID);",
+      "      }",
+      "      return { code: 'export const x = () => {};' };",
+      "  } },",
+      "];",
+      "",
+    ].join("\n"),
+  );
+  const host = rpcSidecar("plugin-host.mjs", {
+    args: [
+      path.join(fx.root, "oj.plugins.mjs"),
+      JSON.stringify({
+        config: { root: fx.root },
+        env: { command: "serve", mode: "development" },
+        environment: { name: "client", mode: "dev" },
+      }),
+    ],
+    env: { OJ_CACHE_ROOT: fx.root },
+    cwd: fx.root,
+  });
+  try {
+    const res = await host.send({ id: 1, hook: "transform", args: ["import '/x';\n", csrf, "null"] });
+    assert.equal(res.error, undefined, `transform must not error: ${res.error}`);
+    const out = JSON.parse(res.result);
+    assert.equal(out.code, "export const x = () => {};", "root-relative url dependency mapped to <root>/middleware.js");
+  } finally {
+    host.close();
+    fx.cleanup();
+  }
+});
