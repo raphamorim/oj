@@ -231,8 +231,14 @@ async function runDev() {
         // A browser-observed 500/crash in oj's own pipeline leaves its cause
         // only in oj's server log; surface a bounded tail on the thrown error
         // so CI names the compile/loader failure instead of a bare status.
-        e.message += `\n--- oj server log (tail) ---\n${log.slice(-3000)}`;
-        throw e;
+        // Guard the message mutation: a non-Error throw (a string, say) has no
+        // writable .message, and clobbering it would hide the real failure.
+        const tail = `\n--- oj server log (tail) ---\n${log.slice(-3000)}`;
+        if (e instanceof Error) {
+          e.message += tail;
+          throw e;
+        }
+        throw new Error(String(e) + tail);
       } finally {
         await browser.close();
       }
