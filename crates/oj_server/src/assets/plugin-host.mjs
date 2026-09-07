@@ -422,6 +422,35 @@ const environment = {
 // directly in applyToEnvironment, so it must be present or they throw.
 environment.config.consumer =
   environment.config.consumer ?? (envName === "client" ? "client" : "server");
+// Vite's DevEnvironment carries `transformRequest`, which runs the module
+// pipeline for one id. oj otherwise stubs it, but a plugin's transform can
+// depend on it: TanStack Start's server-fn compiler, in dev, calls
+// `this.environment.transformRequest(<id>?tss-server-fn-lookup)` so its
+// `capture-server-fn-module-lookup` transform hook ingests a dependency (e.g.
+// createMiddleware.js) into the compiler's module cache BEFORE it reads that
+// dependency via getModuleInfo. Stubbed to a no-op, the ingest never happens,
+// so correctness falls to module ordering -- and a cold concurrent first load
+// that compiles createCsrfMiddleware.js before its createMiddleware.js
+// dependency throws `could not load module info`, which oj serves as a hard 500
+// that permanently breaks hydration (~1% of cold loads). Running the transform
+// fires the capture hook and populates the cache on demand, as Vite does. Only
+// the capture hook matches the `?tss-server-fn-lookup` id (the compiler's own
+// transform excludes it), so there is no recompile or recursion here.
+environment.transformRequest = async (rawId) => {
+  const id = String(rawId ?? "");
+  if (!id) return null;
+  const noQuery = id.split("?")[0];
+  const filePath = noQuery.startsWith("/@fs/") ? noQuery.slice(4) : noQuery;
+  if (!isAbsolute(filePath) || !existsSync(filePath)) return null;
+  let source;
+  try {
+    source = readFileSync(filePath, "utf8");
+  } catch {
+    return null;
+  }
+  const out = JSON.parse(await transform(source, id, null));
+  return { code: out.code };
+};
 // The resolved config (defaults + plugin `config` hooks). configureServer must
 // receive this, not the raw initial.config, so plugins reading resolved-only
 // fields (experimental, environments, plugins) don't throw. Seeded with the
