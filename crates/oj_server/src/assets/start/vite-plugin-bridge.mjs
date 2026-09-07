@@ -272,6 +272,34 @@ export function createPluginContainer(vite, allPlugins, {
     plugins: allPlugins,
     isProduction: mode === "production",
   };
+  // Vite's resolveConfig runs resolveEnvironmentResolveOptions for EVERY
+  // environment, so each `environments[name].resolve` is a complete object
+  // (Vite's configDefaults.resolve: external:[], noExternal:[], dedupe:[],
+  // alias:[], extensions, plus consumer-based conditions/mainFields). Plugins
+  // read it in configResolved -- e.g. @cloudflare/vite-plugin's
+  // validateWorkerEnvironmentOptions inspects
+  // `environments[worker].resolve.external` and throws when `resolve` is
+  // undefined. Mirror Vite: layer the top-level resolve over the structural
+  // defaults for every environment (the env's own resolve wins). The actual SSR
+  // resolution conditions are applied by oj's resolver, not read from here, so
+  // the array defaults are the structural shape plugins inspect.
+  for (const name of Object.keys(resolvedConfig.environments)) {
+    const envc = resolvedConfig.environments[name] ?? {};
+    envc.resolve = {
+      conditions: [],
+      mainFields: [],
+      extensions: [],
+      dedupe: [],
+      noExternal: [],
+      external: [],
+      externalConditions: [],
+      alias: [],
+      preserveSymlinks: false,
+      ...(resolvedConfig.resolve ?? {}),
+      ...(envc.resolve ?? {}),
+    };
+    resolvedConfig.environments[name] = envc;
+  }
   // Vite resolves `build.outDir` ("dist") and an absolute `publicDir` ("" when
   // disabled); build plugins compute output paths from both.
   resolvedConfig.build = { outDir: "dist", ...resolvedConfig.build };
