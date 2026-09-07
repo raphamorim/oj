@@ -234,7 +234,10 @@ function speculativeContainer(raw) {
       return specPack.get(key);
     }
     const v = raw[method](...args) ?? null;
-    if (key && !specPack.has(key)) {
+    // Never persist a result the bridge produced while the container was down:
+    // a one-off container restart would otherwise freeze a null resolve/load into
+    // the speculation pack (and its on-disk file) across process restarts.
+    if (key && !specPack.has(key) && !raw.down()) {
       specPack.set(key, v);
       specPending.push({ k: key, v });
     }
@@ -255,6 +258,8 @@ export function revalidateSpeculation() {
   for (const [key, { method, args }] of speculatedCalls) {
     let live;
     try { live = rawContainer[method](...args) ?? null; } catch { continue; }
+    // A down container can't revalidate; don't overwrite the pack with its null.
+    if (rawContainer.down()) continue;
     if (JSON.stringify(live) !== JSON.stringify(specPack.get(key) ?? null)) {
       specPack.set(key, live);
       specDirty = true;
@@ -1023,7 +1028,12 @@ export function load(url, context, next) {
         if (tucHit !== "\0none") raw = tucHit;
       } else {
         const t = container.transformUserCode(raw, path);
-        cachePut(tucKey, t ?? "\0none");
+        // A null from a DOWN container means "couldn't transform", not "no
+        // transform": persisting "\0none" would serve this file untransformed
+        // forever (across restarts), a silent hydration mismatch. Only cache a
+        // real result; a down container just skips the user-code transform for
+        // this render and retries next time (when it has reconnected).
+        if (!container.down()) cachePut(tucKey, t ?? "\0none");
         if (t != null) raw = t;
       }
     }
@@ -1034,7 +1044,13 @@ export function load(url, context, next) {
       define: DEFINE,
     });
     const code = withInlineMap(out);
-    cachePut(raw.includes("import.meta.glob") ? null : key, code);
+    // A DOWN container skipped the plugin load()/transformUserCode steps above,
+    // so `code` is under-transformed (jsx/define only) yet `key` is identical to
+    // a healthy render's key (both hash diskRaw when load() returns null). Do NOT
+    // persist it, or every future render serves the plugin-untransformed module
+    // across restarts (a silent hydration mismatch) - the poisoning down() guards.
+    const skipCache = raw.includes("import.meta.glob") || (container != null && container.down());
+    cachePut(skipCache ? null : key, code);
     return { format: "module", source: code, shortCircuit: true };
   }
   if (url.includes("?ojv=") && isTanstack(url)) {
@@ -1082,7 +1098,11 @@ export function load(url, context, next) {
       if (diskRaw != null && diskRaw.includes("import.meta.glob")) {
         return { format: "module", source: transformGlob(diskRaw, path), shortCircuit: true };
       }
-      cachePut(key, "1");
+      // A null load() from a DOWN container means "couldn't ask", not "no plugin
+      // claims it": marking it unclaimed would freeze a plugin-claimed module as
+      // unclaimed on disk forever, bypassing the load hook across restarts. Only
+      // record the unclaimed marker when the container actually answered.
+      if (!container.down()) cachePut(key, "1");
     }
   }
   if (clean.startsWith("file:") && clean.includes("/node_modules/")) {
