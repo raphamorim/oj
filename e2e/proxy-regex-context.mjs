@@ -58,6 +58,11 @@ try {
 } finally {
   if (srv) srv.kill("SIGKILL");
   backend.close();
-  fs.rmSync(app, { recursive: true, force: true });
+  // The SIGKILLed server's node children flush for a beat and race the removal
+  // (ENOTEMPTY); retry like proxy-target-forms.mjs / start-cloudflare-dev.mjs.
+  for (let i = 0; ; i++) {
+    try { fs.rmSync(app, { recursive: true, force: true }); break; }
+    catch { if (i >= 20) break; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100); }
+  }
 }
 process.exit(failed ? 1 : 0);
