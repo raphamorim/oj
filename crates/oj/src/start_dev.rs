@@ -14,6 +14,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use futures_util::SinkExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::broadcast;
@@ -1399,6 +1400,10 @@ async fn start_hmr_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<()>
             }
             incoming = socket.recv() => match incoming {
                 None | Some(Err(_)) => break,
+                Some(Ok(Message::Close(_))) => {
+                    let _ = socket.close().await;
+                    break;
+                }
                 Some(Ok(_)) => {}
             },
         }
@@ -1819,18 +1824,31 @@ mod tests {
 
     impl HmrTestServer {
         async fn start() -> Self {
+            Self::start_with_gate(None).await
+        }
+
+        async fn start_with_gate(gate: Option<Arc<tokio::sync::Notify>>) -> Self {
             let (reload_tx, _) = broadcast::channel(16);
             let app = axum::Router::new()
                 .route(
                     "/@oj-start/hmr",
                     axum::routing::get(
-                        |ws: WebSocketUpgrade, State(tx): State<broadcast::Sender<()>>| async move {
+                        |ws: WebSocketUpgrade,
+                         State((tx, gate)): State<(
+                            broadcast::Sender<()>,
+                            Option<Arc<tokio::sync::Notify>>,
+                        )>| async move {
                             let rx = tx.subscribe();
-                            ws.on_upgrade(move |socket| start_hmr_socket(socket, rx))
+                            ws.on_upgrade(move |socket| async move {
+                                if let Some(gate) = gate {
+                                    gate.notified().await;
+                                }
+                                start_hmr_socket(socket, rx).await;
+                            })
                         },
                     ),
                 )
-                .with_state(reload_tx.clone());
+                .with_state((reload_tx.clone(), gate));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("ws://{}/@oj-start/hmr", listener.local_addr().unwrap());
             let task = tokio::spawn(async move {
@@ -1868,6 +1886,39 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(matches!(response, ClientMessage::Close(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn start_hmr_completes_close_handshakes_while_reloads_arrive() {
+        use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let server = HmrTestServer::start_with_gate(Some(gate.clone())).await;
+        let close = CloseFrame {
+            code: CloseCode::Normal,
+            reason: "leaving the preview".into(),
+        };
+        for attempt in 0..64 {
+            let (mut client, _) = connect_async(&server.url).await.unwrap();
+            client.close(Some(close.clone())).await.unwrap();
+            assert_eq!(server.reload_tx.send(()).unwrap(), 1);
+            // Let the I/O driver observe the close frame before releasing the handler.
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            gate.notify_one();
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    match client.next().await {
+                        Some(Ok(ClientMessage::Close(frame))) => break frame,
+                        Some(Ok(ClientMessage::Text(text))) => assert_eq!(text, "reload"),
+                        other => panic!("close handshake failed on attempt {attempt}: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("close handshake did not finish while a reload was pending");
+            assert_eq!(reply, Some(close.clone()));
+            server.wait_for_no_subscribers().await;
         }
     }
 
